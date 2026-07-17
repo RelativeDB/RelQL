@@ -1,0 +1,84 @@
+#include "rt_c.h"
+
+#include <cstring>
+#include <string>
+
+#include "rt.hpp"
+
+namespace {
+void set_err(char* err, size_t errlen, const std::string& msg) {
+  if (!err || errlen == 0) return;
+  std::strncpy(err, msg.c_str(), errlen - 1);
+  err[errlen - 1] = '\0';
+}
+}  // namespace
+
+struct rt_model {
+  rt::Model model;
+};
+
+extern "C" {
+
+rt_model* rt_model_load(const char* path, char* err, size_t errlen) {
+  try {
+    auto* m = new rt_model{rt::Model::load(path)};
+    return m;
+  } catch (const std::exception& e) {
+    set_err(err, errlen, e.what());
+    return nullptr;
+  }
+}
+
+void rt_model_free(rt_model* m) { delete m; }
+
+int64_t rt_model_num_params(const rt_model* m) {
+  int64_t n = 0;
+  for (const auto& [k, t] : m->model.store) n += t.numel();
+  return n;
+}
+
+int rt_forward(const rt_model* m, int32_t B, int32_t S,
+               const int64_t* node_idxs, const int64_t* f2p,
+               const int64_t* col_idxs, const int64_t* table_idxs,
+               const uint8_t* is_padding, const int64_t* sem_types,
+               const uint8_t* is_target, const float* number_v,
+               const float* datetime_v, const float* boolean_v,
+               const float* text_v, const float* col_name_v,
+               int32_t n_threads, float* out_target_scores,
+               char* err, size_t errlen) {
+  try {
+    if (B <= 0 || S <= 0) throw std::runtime_error("B and S must be positive");
+    const size_t BS = (size_t)B * S;
+    rt::Batch b;
+    b.B = B;
+    b.S = S;
+    b.node_idxs.assign(node_idxs, node_idxs + BS);
+    b.f2p.assign(f2p, f2p + BS * rt::kMaxF2p);
+    b.col_idxs.assign(col_idxs, col_idxs + BS);
+    b.table_idxs.assign(table_idxs, table_idxs + BS);
+    b.is_padding.assign(is_padding, is_padding + BS);
+    b.sem_types.assign(sem_types, sem_types + BS);
+    b.is_target.assign(is_target, is_target + BS);
+    b.number_v.assign(number_v, number_v + BS);
+    b.datetime_v.assign(datetime_v, datetime_v + BS);
+    b.boolean_v.assign(boolean_v, boolean_v + BS);
+    b.text_v.assign(text_v, text_v + BS * rt::kDText);
+    b.col_name_v.assign(col_name_v, col_name_v + BS * rt::kDText);
+
+    rt::Output out = rt::forward(m->model, b, n_threads, /*debug_taps=*/false);
+    for (int r = 0; r < B; r++) {
+      float acc = 0.f;
+      for (int s = 0; s < S; s++) {
+        size_t i = (size_t)r * S + s;
+        if (out.sorted_is_target[i]) acc += out.yhat_number[i];
+      }
+      out_target_scores[r] = acc;
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    set_err(err, errlen, e.what());
+    return 1;
+  }
+}
+
+}  // extern "C"

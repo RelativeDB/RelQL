@@ -1,0 +1,12 @@
+[package]
+name = "relativedb"
+version = "0.1.0"
+edition = "2021"
+description = "Predictive queries (PQL) over your own data — the Rust peer of the Java (dev.relativedb) and Python (relativedb) libraries. GraphQL-style execution: the engine owns the query language, planning, context assembly, and model routing; all data access goes through user-defined retrievers."
+license = "Apache-2.0"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+libloading = "0.8"
+
+[dev-dependencies]

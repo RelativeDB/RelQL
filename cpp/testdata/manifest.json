@@ -1,0 +1,131 @@
+{
+ "node_idxs": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "int64"
+ },
+ "f2p_nbr_idxs": {
+  "shape": [
+   5,
+   16,
+   5
+  ],
+  "dtype": "int64"
+ },
+ "col_name_idxs": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "int64"
+ },
+ "table_name_idxs": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "int64"
+ },
+ "is_padding": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "uint8"
+ },
+ "sem_types": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "int64"
+ },
+ "is_targets": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "uint8"
+ },
+ "number_values": {
+  "shape": [
+   5,
+   16,
+   1
+  ],
+  "dtype": "float32"
+ },
+ "datetime_values": {
+  "shape": [
+   5,
+   16,
+   1
+  ],
+  "dtype": "float32"
+ },
+ "boolean_values": {
+  "shape": [
+   5,
+   16,
+   1
+  ],
+  "dtype": "float32"
+ },
+ "text_values": {
+  "shape": [
+   5,
+   16,
+   384
+  ],
+  "dtype": "float32"
+ },
+ "col_name_values": {
+  "shape": [
+   5,
+   16,
+   384
+  ],
+  "dtype": "float32"
+ },
+ "sort_idxs": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "int64"
+ },
+ "x_embed": {
+  "shape": [
+   5,
+   16,
+   512
+  ],
+  "dtype": "float32"
+ },
+ "x_block0": {
+  "shape": [
+   5,
+   16,
+   512
+  ],
+  "dtype": "float32"
+ },
+ "yhat_number": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "float32"
+ },
+ "sorted_is_targets": {
+  "shape": [
+   5,
+   16
+  ],
+  "dtype": "uint8"
+ },
+ "_checkpoint": "/Users/henneberger/.cache/huggingface/hub/models--stanford-star--rt-j/snapshots/1f552a738a0f8dada8af77db913b2b90511e2f00/classification/model.safetensors",
+ "_note": "inputs are PRE-sort; x_embed/x_block0/yhat are POST-sort"
+}

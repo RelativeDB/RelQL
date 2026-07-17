@@ -1,0 +1,6 @@
+/target
+.relativedb/
+.relativedb_history
+*.duckdb.wal
+.idea/
+runs/

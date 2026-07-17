@@ -1,0 +1,93 @@
+.hero {
+  padding: 4rem 0 3rem;
+  text-align: center;
+}
+
+.heroTitle {
+  font-size: 3rem;
+}
+
+.heroSubtitle {
+  max-width: 46rem;
+  margin: 0 auto 1.5rem;
+  font-size: 1.15rem;
+}
+
+.heroCode {
+  max-width: 34rem;
+  margin: 0 auto;
+  text-align: left;
+}
+
+.heroCaption {
+  margin-top: 0.75rem;
+  color: var(--ifm-color-emphasis-600);
+  font-size: 0.95rem;
+}
+
+.buttons {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+
+.section {
+  padding: 3rem 0;
+}
+
+.sectionAlt {
+  background: var(--ifm-color-emphasis-100);
+}
+
+.bench {
+  margin: 1.5rem 0 0.5rem;
+}
+
+.benchRow {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0.75rem;
+  gap: 1rem;
+}
+
+.benchLabel {
+  flex: 0 0 16rem;
+  text-align: right;
+  font-size: 0.95rem;
+}
+
+.benchTrack {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.benchBar {
+  height: 1.4rem;
+  min-width: 4px;
+  border-radius: 3px;
+  background: var(--ifm-color-emphasis-400);
+}
+
+.benchBarHighlight {
+  background: var(--ifm-color-primary);
+}
+
+.benchValue {
+  white-space: nowrap;
+  font-size: 0.9rem;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.benchNote {
+  color: var(--ifm-color-emphasis-600);
+  font-size: 0.9rem;
+}
+
+@media (max-width: 768px) {
+  .benchLabel {
+    flex-basis: 9rem;
+  }
+}

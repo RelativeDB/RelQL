@@ -1,0 +1,94 @@
+name: DuckDB extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/duckdb-extension.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "duckdb-extension/**"
+  pull_request:
+    paths:
+      - ".github/workflows/duckdb-extension.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "duckdb-extension/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.duckdb.version }} / ${{ runner.os }} ${{ runner.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        duckdb:
+          - version: v1.5.1
+            crate: 1.10501.0
+          - version: v1.5.2
+            crate: 1.10502.0
+          - version: v1.5.3
+            crate: 1.10503.0
+          - version: v1.5.4
+            crate: 1.10504.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "duckdb-extension -> target"
+          key: ${{ matrix.duckdb.crate }}-${{ runner.os }}-${{ runner.arch }}
+          cache-on-failure: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install matching DuckDB runtime
+        run: >-
+          python -m pip install --only-binary=:all:
+          "duckdb==${DUCKDB_VERSION#v}"
+        env:
+          DUCKDB_VERSION: ${{ matrix.duckdb.version }}
+
+      - name: Select matching Rust API crate
+        run: python duckdb-extension/tools/pin_duckdb_crate.py "${DUCKDB_CRATE_VERSION}"
+        env:
+          DUCKDB_CRATE_VERSION: ${{ matrix.duckdb.crate }}
+
+      - name: Build loadable extension
+        run: make -C duckdb-extension release DUCKDB_VERSION="${DUCKDB_VERSION}"
+        env:
+          DUCKDB_VERSION: ${{ matrix.duckdb.version }}
+
+      - name: Detect DuckDB platform
+        id: platform
+        run: echo "value=$(make -s -C duckdb-extension print-platform)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test graph prediction
+        run: >-
+          python duckdb-extension/tests/smoke.py
+          --extension duckdb-extension/build/release/relativedb.duckdb_extension
+
+      - name: Smoke test context tuning
+        if: matrix.duckdb.version == 'v1.5.4' && runner.os == 'Linux'
+        run: >-
+          python duckdb-extension/tests/smoke.py --tune
+          --extension duckdb-extension/build/release/relativedb.duckdb_extension
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relativedb-${{ matrix.duckdb.version }}-${{ steps.platform.outputs.value }}
+          path: duckdb-extension/build/release/relativedb.duckdb_extension
+          if-no-files-found: error

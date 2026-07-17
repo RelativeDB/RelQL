@@ -1,0 +1,3 @@
+rootProject.name = 'relativedb'
+include 'relativedb-core'
+include 'relativedb-rt'

@@ -1,0 +1,108 @@
+---
+title: Quickstart
+description: Your first prediction in each language.
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Quickstart
+
+Predict 90-day churn for every customer, as of July 1.
+
+<Tabs groupId="lang">
+<TabItem value="python" label="Python">
+
+With pandas, the schema is inferred from your frames (PKs from `*_id` naming,
+time columns from datetime dtypes):
+
+```python
+import pandas as pd
+import relativedb
+
+ds = relativedb.from_dataframes(
+    {"customers": customers, "products": products, "orders": orders},
+    links=[("orders", "customer_id", "customers"),
+           ("orders", "product_id", "products")])
+
+df = ds.predict(
+    "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+    anchor_time=pd.Timestamp("2026-07-01"))
+print(df)   # entity_id, probability — one row per customer
+```
+
+</TabItem>
+<TabItem value="java" label="Java">
+
+Declare the schema, wire retrievers over your DAOs, execute:
+
+```java
+RelativeDbSchema schema = RelativeDbSchema.newSchema()
+    .table(TableDef.newTable("customers").column("age", NUMBER)
+        .column("signup_date", DATETIME).primaryKey("customer_id").build())
+    .table(TableDef.newTable("orders").column("qty", NUMBER)
+        .column("order_date", DATETIME).primaryKey("order_id")
+        .timeColumn("order_date").build())
+    .link(LinkDef.link("orders", "customer_id", "customers"))
+    .build();
+
+RetrieverWiring wiring = RetrieverWiring.newWiring()
+    .entities("customers", (table, ids, bound) -> customerDao.byIds(ids))
+    .entities("orders",    (table, ids, bound) -> orderDao.byIds(ids, bound))
+    .defaultLinks((link, parent, bound, limit) ->
+        orderDao.recentByCustomer(parent, bound.asOf().orElse(Instant.MAX), limit))
+    .build();
+
+RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring).build();
+
+PredictionResult churn = engine.execute(ExecutionInput.newInput()
+    .query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+    .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
+    .build()).toCompletableFuture().join();
+```
+
+</TabItem>
+<TabItem value="rust" label="Rust">
+
+Closures implement the retriever traits directly:
+
+```rust
+let schema = Schema::new_schema()
+    .table(TableDef::new_table("customers")
+        .column("age", ValueType::Number)
+        .column("signup_date", ValueType::Datetime)
+        .primary_key("customer_id").build())
+    .table(TableDef::new_table("orders")
+        .column("qty", ValueType::Number)
+        .column("order_date", ValueType::Datetime)
+        .primary_key("order_id").time_column("order_date").build())
+    .link(LinkDef::link("orders", "customer_id", "customers"))
+    .build();
+
+let wiring = RetrieverWiring::new_wiring()
+    .entities("customers", entity_lookup)
+    .default_links(newest_first_children)
+    .scanner("customers", customer_scan)   // enables FOR EACH
+    .build();
+
+let mut engine = Engine::new(schema, wiring);
+let result = engine.execute(
+    ExecutionInput::query(
+        "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+    .anchor_time(anchor))?;
+```
+
+</TabItem>
+</Tabs>
+
+:::info No model required
+By default predictions come from a transparent, model-free history baseline —
+the full pipeline runs with zero model artifacts. Swap in the real RT-J model
+via the [native backend](../how-to/use-native-backend).
+:::
+
+## Next steps
+
+- Learn the query language: [PQL tutorial](/pql/tutorial)
+- Understand the pipeline: [Architecture](../concepts/architecture)
+- Connect real storage: [Wire custom retrievers](../how-to/wire-custom-retrievers)

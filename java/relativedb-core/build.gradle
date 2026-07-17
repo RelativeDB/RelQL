@@ -1,0 +1,14 @@
+plugins {
+    id 'java-library'
+    id 'antlr'
+}
+
+dependencies {
+    antlr 'org.antlr:antlr4:4.13.1'
+    api 'org.antlr:antlr4-runtime:4.13.1'
+}
+
+generateGrammarSource {
+    outputDirectory = file("${buildDir}/generated-src/antlr/main/dev/relativedb/query/antlr")
+    arguments += ['-package', 'dev.relativedb.query.antlr', '-visitor', '-no-listener']
+}
