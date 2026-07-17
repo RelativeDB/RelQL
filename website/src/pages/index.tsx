@@ -36,8 +36,44 @@ function Hero() {
             Learn PQL
           </Link>
         </div>
+        <div className={styles.social}>
+          <iframe
+            src="https://ghbtns.com/github-btn.html?user=henneberger&repo=relativedb&type=star&count=true&size=large"
+            frameBorder="0"
+            scrolling="0"
+            width="140"
+            height="30"
+            title="Star relativedb on GitHub"
+          />
+          <iframe
+            src="https://ghbtns.com/github-btn.html?user=henneberger&type=follow&count=true&size=large"
+            frameBorder="0"
+            scrolling="0"
+            width="230"
+            height="30"
+            title="Follow henneberger on GitHub"
+          />
+        </div>
       </div>
     </header>
+  );
+}
+
+function VideoStub() {
+  return (
+    <section className={styles.section}>
+      <div className="container">
+        <Heading as="h2">See it in action</Heading>
+        <div className={styles.videoStub}>
+          {/* TODO: replace with the real YouTube embed, e.g.
+              <iframe src="https://www.youtube.com/embed/VIDEO_ID" ... /> */}
+          <div className={styles.videoPlaceholder}>
+            <span className={styles.videoPlayIcon}>▶</span>
+            <p>Video coming soon</p>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -173,6 +209,7 @@ export default function Home(): ReactNode {
       <Hero />
       <main>
         <Pillars />
+        <VideoStub />
         <RelationalTransformers />
         <Benchmark />
       </main>

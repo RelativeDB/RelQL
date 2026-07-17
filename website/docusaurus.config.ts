@@ -67,6 +67,12 @@ const config: Config = {
           label: 'PQL Language',
           activeBaseRegex: '/pql/',
         },
+        {
+          href: 'https://github.com/henneberger/relativedb',
+          position: 'right',
+          className: 'header-github-link',
+          'aria-label': 'GitHub repository',
+        },
       ],
     },
     footer: {
@@ -78,6 +84,14 @@ const config: Config = {
             {label: 'Getting started', to: '/docs/getting-started/installation'},
             {label: 'PQL language', to: '/pql/'},
             {label: 'How-to guides', to: '/docs/how-to/predict-churn'},
+          ],
+        },
+        {
+          title: 'Community',
+          items: [
+            {label: 'GitHub', href: 'https://github.com/henneberger/relativedb'},
+            {label: 'Issues', href: 'https://github.com/henneberger/relativedb/issues'},
+            {label: 'Discussions', href: 'https://github.com/henneberger/relativedb/discussions'},
           ],
         },
         {
