@@ -327,3 +327,237 @@ fn model_config_defaults_and_routing() {
     assert!(relaxed.check_checkpoint_embedding("all-mpnet-base-v2").is_ok());
     assert!(cfg.check_checkpoint_embedding("all-MiniLM-L12-v2").is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// AS OF anchor binding + EXPLAIN (contract EXPLAIN_ASOF_CONTRACT.md)
+// ---------------------------------------------------------------------------
+
+const CHURN: &str =
+    "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id";
+
+/// Backend that records whether the model was ever asked to score.
+struct SpyBackend {
+    calls: Arc<Mutex<usize>>,
+}
+impl ModelBackend for SpyBackend {
+    fn score(
+        &mut self,
+        _query: &ParsedQuery,
+        _task_type: TaskType,
+        contexts: &[relativedb::EntityContext],
+        _model_uri: &str,
+        _config: &ModelConfig,
+    ) -> Result<Vec<EntityPrediction>, relativedb::Error> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(contexts.iter().map(|c| EntityPrediction::new(c.entity_id.clone())).collect())
+    }
+}
+
+fn pred_ids(res: &relativedb::PredictionResult) -> std::collections::HashSet<String> {
+    res.predictions.iter().map(|p| p.id.to_string()).collect()
+}
+
+fn all_three() -> std::collections::HashSet<String> {
+    ["C1", "C7", "C9"].iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn as_of_date_overrides_anchor_time() {
+    // t0 hides O4 (2026-07-05); AS OF 2026-08-01 admits it -> strictly more rows.
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let later = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN CONTEXT {} AS OF 2026-08-01", CHURN)).anchor_time(t0()))
+        .unwrap();
+    let base = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN CONTEXT {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    let lc = later.context.as_ref().unwrap();
+    let bc = base.context.as_ref().unwrap();
+    assert!(lc.total_rows > bc.total_rows, "date anchor should admit O4/P3");
+    assert_eq!(lc.anchor.unwrap(), dt("2026-08-01"));
+    // execution under the date anchor still covers every entity
+    let res = eng
+        .execute(ExecutionInput::query(format!("{} AS OF 2026-08-01", CHURN)).anchor_time(t0()))
+        .unwrap();
+    assert_eq!(pred_ids(&res), all_three());
+}
+
+#[test]
+fn as_of_param_binds_from_params() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .execute(ExecutionInput::query(format!("{} AS OF :t", CHURN)).param("t", dt("2026-08-01")))
+        .unwrap();
+    assert_eq!(pred_ids(&res), all_three());
+}
+
+#[test]
+fn as_of_param_missing_raises() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let err = eng
+        .execute(ExecutionInput::query(format!("{} AS OF :t", CHURN)))
+        .unwrap_err();
+    assert!(format!("{}", err).contains("t"), "error should name the param: {}", err);
+}
+
+#[test]
+fn as_of_param_falls_back_to_anchor_time() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .execute(ExecutionInput::query(format!("{} AS OF :t", CHURN)).anchor_time(t0()))
+        .unwrap();
+    let base = eng.execute(ExecutionInput::query(CHURN).anchor_time(t0())).unwrap();
+    let rp: Vec<(String, Option<f64>)> =
+        res.predictions.iter().map(|p| (p.id.to_string(), p.probability)).collect();
+    let bp: Vec<(String, Option<f64>)> =
+        base.predictions.iter().map(|p| (p.id.to_string(), p.probability)).collect();
+    assert_eq!(rp, bp);
+}
+
+#[test]
+fn as_of_now_equals_no_as_of() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let now = eng.execute(ExecutionInput::query(format!("{} AS OF NOW", CHURN)).anchor_time(t0())).unwrap();
+    let base = eng.execute(ExecutionInput::query(CHURN).anchor_time(t0())).unwrap();
+    let np: Vec<Option<f64>> = now.predictions.iter().map(|p| p.probability).collect();
+    let bp: Vec<Option<f64>> = base.predictions.iter().map(|p| p.probability).collect();
+    assert_eq!(np, bp);
+}
+
+#[test]
+fn explain_plan_does_not_invoke_model() {
+    let calls = Arc::new(Mutex::new(0usize));
+    let spy = SpyBackend { calls: Arc::clone(&calls) };
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(spy));
+    let res = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN PLAN {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    assert_eq!(res.mode, "PLAN");
+    assert!(res.context.is_none());
+    assert!(res.predictions.is_none());
+    assert_eq!(*calls.lock().unwrap(), 0); // model never touched
+}
+
+#[test]
+fn explain_plan_fields() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN PLAN {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    let plan = &res.plan;
+    assert_eq!(plan.task_type, TaskType::BinaryClassification);
+    assert_eq!(plan.output, "probability");
+    assert_eq!(plan.entity.table, "customers");
+    assert_eq!(plan.entity.pk, "customer_id");
+    assert_eq!(plan.entity.selector, "FOR EACH");
+    assert_eq!(plan.as_of.source, "execution-anchor");
+    assert!(plan.target.contains("COUNT(orders.*)"));
+    let tgt: Vec<&relativedb::WindowInfo> =
+        plan.windows.iter().filter(|w| w.role == "target").collect();
+    assert_eq!(tgt.len(), 1);
+    assert_eq!(tgt[0].start, 0.0);
+    assert_eq!(tgt[0].end, 90.0);
+    assert_eq!(relativedb::TimeUnit::from_keyword("DAYS"), Some(tgt[0].unit));
+}
+
+#[test]
+fn bare_explain_defaults_to_plan() {
+    let calls = Arc::new(Mutex::new(0usize));
+    let spy = SpyBackend { calls: Arc::clone(&calls) };
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(spy));
+    let res = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    assert_eq!(res.mode, "PLAN");
+    assert_eq!(*calls.lock().unwrap(), 0);
+}
+
+#[test]
+fn explain_on_non_explain_query_defaults_plan() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng.explain(ExecutionInput::query(CHURN).anchor_time(t0())).unwrap();
+    assert_eq!(res.mode, "PLAN");
+    assert!(res.predictions.is_none());
+}
+
+#[test]
+fn execute_on_explain_query_errors() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let err = eng
+        .execute(ExecutionInput::query(format!("EXPLAIN PLAN {}", CHURN)).anchor_time(t0()))
+        .unwrap_err();
+    assert!(format!("{}", err).to_lowercase().contains("explain"), "got: {}", err);
+}
+
+#[test]
+fn explain_context_populates_counts_no_predictions() {
+    let calls = Arc::new(Mutex::new(0usize));
+    let spy = SpyBackend { calls: Arc::clone(&calls) };
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(spy));
+    let res = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN CONTEXT {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    assert_eq!(res.mode, "CONTEXT");
+    assert!(res.predictions.is_none());
+    assert_eq!(*calls.lock().unwrap(), 0);
+    let ctx = res.context.as_ref().unwrap();
+    assert_eq!(ctx.entities_covered, 3);
+    assert!(ctx.total_rows > 0);
+    assert!(ctx.total_cells > 0);
+    assert!(ctx.per_table.contains_key("customers"));
+}
+
+#[test]
+fn explain_analyze_has_predictions() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN ANALYZE {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    assert_eq!(res.mode, "ANALYZE");
+    assert!(res.context.is_some());
+    let preds = res.predictions.as_ref().unwrap();
+    assert_eq!(pred_ids(preds), all_three());
+}
+
+#[test]
+fn explain_ablation_warns_not_implemented() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .explain(
+            ExecutionInput::query(format!("EXPLAIN ABLATION {} ABLATE TABLE products", CHURN))
+                .anchor_time(t0()),
+        )
+        .unwrap();
+    assert_eq!(res.mode, "ABLATION");
+    assert!(res.plan.warnings.iter().any(|w| w.contains("ablation not implemented")));
+    assert!(res.plan.ablations.iter().any(|a| a.name == "products"));
+}
+
+#[test]
+fn render_json_parses() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .explain(
+            ExecutionInput::query(format!("EXPLAIN ANALYZE FORMAT JSON {}", CHURN))
+                .anchor_time(t0()),
+        )
+        .unwrap();
+    let json = res.render();
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(v["mode"], "ANALYZE");
+    assert_eq!(v["plan"]["task_type"], "binary_classification");
+    assert_eq!(v["predictions"].as_array().unwrap().len(), 3);
+    assert_eq!(v["plan"]["as_of"]["source"], "execution-anchor");
+}
+
+#[test]
+fn render_text_contains_target_and_task() {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng
+        .explain(ExecutionInput::query(format!("EXPLAIN PLAN {}", CHURN)).anchor_time(t0()))
+        .unwrap();
+    let text = res.render();
+    assert!(text.contains("binary_classification"));
+    assert!(text.contains("COUNT(orders.*)"));
+    assert!(text.contains("PLAN"));
+}

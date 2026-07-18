@@ -15,8 +15,8 @@ from .model import (DEFAULT_CLASSIFICATION_MODEL_URI, DEFAULT_EMBEDDING_MODEL,
                     ModelConfig)
 from .engine import (ContextPolicy, ContextTruncationWarning, Engine,
                      EntityContext, EntityPrediction, ExecutionError,
-                     ExecutionInput, HistoryBaselineBackend, ModelBackend,
-                     PredictionResult, SamplerMode)
+                     ExecutionInput, ExplainResult, HistoryBaselineBackend,
+                     ModelBackend, PredictionResult, SamplerMode)
 from .csc import CscIndex
 
 
@@ -41,7 +41,8 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "Engine", "ExecutionInput", "ExecutionError", "ContextPolicy",
     "ContextTruncationWarning",
-    "SamplerMode", "PredictionResult", "EntityPrediction", "EntityContext",
+    "SamplerMode", "PredictionResult", "ExplainResult",
+    "EntityPrediction", "EntityContext",
     "ModelBackend", "HistoryBaselineBackend", "CscIndex",
     "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
 ]

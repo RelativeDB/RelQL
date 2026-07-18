@@ -5,6 +5,7 @@ import com.relativedb.query.ValidatedQuery;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -16,6 +17,7 @@ public final class ExecutionInput {
     private final boolean perEntityAnchor;
     private final Instant contextAnchorTime;  // nullable = same as anchorTime
     private final List<Object> entityIds;     // empty = from query / all
+    private final Map<String, Instant> params; // AS OF :name bindings (default empty)
 
     private ExecutionInput(BuilderImpl b) {
         this.pql = b.pql;
@@ -24,6 +26,7 @@ public final class ExecutionInput {
         this.perEntityAnchor = b.perEntityAnchor;
         this.contextAnchorTime = b.contextAnchorTime;
         this.entityIds = List.copyOf(b.entityIds);
+        this.params = Map.copyOf(b.params);
     }
 
     public static Builder newInput() { return new BuilderImpl(); }
@@ -39,6 +42,8 @@ public final class ExecutionInput {
         Builder contextAnchorTime(Instant t);
         /** Overrides {@code FOR ... IN (...)}. */
         Builder entityIds(List<Object> ids);
+        /** Timestamp bindings for {@code AS OF :name} params (name -> instant). */
+        Builder params(Map<String, Instant> params);
         ExecutionInput build();
     }
 
@@ -48,6 +53,7 @@ public final class ExecutionInput {
     public boolean perEntityAnchor() { return perEntityAnchor; }
     public Optional<Instant> contextAnchorTime() { return Optional.ofNullable(contextAnchorTime); }
     public List<Object> entityIds() { return entityIds; }
+    public Map<String, Instant> params() { return params; }
 
     private static final class BuilderImpl implements Builder {
         String pql;
@@ -56,6 +62,7 @@ public final class ExecutionInput {
         boolean perEntityAnchor;
         Instant contextAnchorTime;
         List<Object> entityIds = new ArrayList<>();
+        Map<String, Instant> params = new java.util.LinkedHashMap<>();
 
         @Override public Builder query(String pql) {
             this.pql = Objects.requireNonNull(pql); this.validated = null; return this;
@@ -68,6 +75,9 @@ public final class ExecutionInput {
         @Override public Builder contextAnchorTime(Instant t) { this.contextAnchorTime = t; return this; }
         @Override public Builder entityIds(List<Object> ids) {
             this.entityIds = new ArrayList<>(Objects.requireNonNull(ids)); return this;
+        }
+        @Override public Builder params(Map<String, Instant> params) {
+            this.params = new java.util.LinkedHashMap<>(Objects.requireNonNull(params)); return this;
         }
         @Override public ExecutionInput build() {
             if (pql == null && validated == null) {

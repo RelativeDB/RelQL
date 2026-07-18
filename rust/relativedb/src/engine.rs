@@ -10,14 +10,14 @@
 //! is re-checked and dropped if it is newer than the bound (F24 — a buggy
 //! retriever must not leak the future into context).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 use crate::csc::CscIndex;
 use crate::evaluate::{eval_bool, eval_value, EvalValue};
 use crate::model::ModelConfig;
-use crate::pql::ast::{ParsedQuery, TaskType, Window};
+use crate::pql::ast::{ParsedQuery, TargetExpr, TaskType, TimeUnit, Window};
 use crate::pql::{parse, validate};
 use crate::retrieve::{EntityId, RetrieverWiring, Row, TemporalBound, Value};
 use crate::schema::{LinkDef, Schema};
@@ -98,6 +98,9 @@ pub struct ExecutionInput {
     pub context_anchor_time: Option<DateTime<Utc>>,
     /// overrides FOR ... IN (...)
     pub entity_ids: Option<Vec<EntityId>>,
+    /// `AS OF :param` bindings (name -> timestamp). Consulted when the query's
+    /// `AS OF` clause names a `:param`; empty by default.
+    pub params: HashMap<String, DateTime<Utc>>,
 }
 
 impl ExecutionInput {
@@ -121,6 +124,16 @@ impl ExecutionInput {
     }
     pub fn entity_ids(mut self, ids: Vec<EntityId>) -> Self {
         self.entity_ids = Some(ids);
+        self
+    }
+    /// Bind a single `AS OF :name` parameter to a timestamp.
+    pub fn param(mut self, name: impl Into<String>, t: DateTime<Utc>) -> Self {
+        self.params.insert(name.into(), t);
+        self
+    }
+    /// Replace the whole `AS OF :param` binding map.
+    pub fn params(mut self, params: HashMap<String, DateTime<Utc>>) -> Self {
+        self.params = params;
         self
     }
 }
@@ -516,13 +529,34 @@ impl Engine {
             None => parse(&input.query)?,
         };
         validate(&pq, &self.schema)?;
+        if pq.explain.is_some() {
+            return Err(Error::Execution(ExecutionError(
+                "this is an EXPLAIN query — call explain() instead of execute()".into(),
+            )));
+        }
         let task_type = pq.task_type(Some(&self.schema));
         let model_uri = self.model_config.model_uri_for(task_type).to_string();
+        // AS OF: bind the effective anchor before any assembly.
+        let eff_input = self.effective_input(&pq, &input)?;
+        let contexts = self.assemble_all(&pq, &eff_input)?;
+        let preds = self
+            .model_backend
+            .score(&pq, task_type, &contexts, &model_uri, &self.model_config)?;
+        Ok(PredictionResult { task_type, predictions: preds, model_uri })
+    }
+
+    /// Resolve, assemble and WHERE-filter the per-entity contexts. `input`'s
+    /// `anchor_time` is assumed to already be the effective (AS OF-bound) anchor.
+    fn assemble_all(
+        &self,
+        pq: &ParsedQuery,
+        input: &ExecutionInput,
+    ) -> Result<Vec<EntityContext>, Error> {
         let entity_table = pq.entity_key.table.clone();
-        let ids = self.resolve_entity_ids(&pq, &input)?;
+        let ids = self.resolve_entity_ids(pq, input)?;
         let mut contexts: Vec<EntityContext> = Vec::new();
         for eid in ids {
-            let anchor = self.anchor_for(&entity_table, &eid, &input)?;
+            let anchor = self.anchor_for(&entity_table, &eid, input)?;
             let ctx = self.assemble_context(&entity_table, &eid, anchor)?;
             if let Some(w) = &pq.where_ {
                 let ok = eval_bool(
@@ -537,10 +571,67 @@ impl Engine {
             }
             contexts.push(ctx);
         }
-        let preds = self
-            .model_backend
-            .score(&pq, task_type, &contexts, &model_uri, &self.model_config)?;
-        Ok(PredictionResult { task_type, predictions: preds, model_uri })
+        Ok(contexts)
+    }
+
+    /// A copy of `input` whose `anchor_time` is the effective AS OF anchor
+    /// (see [`Engine::effective_anchor`]).
+    fn effective_input(
+        &self,
+        pq: &ParsedQuery,
+        input: &ExecutionInput,
+    ) -> Result<ExecutionInput, Error> {
+        let eff = self.effective_anchor(pq, input)?;
+        let mut out = input.clone();
+        out.anchor_time = eff;
+        Ok(out)
+    }
+
+    /// Resolve the query's `AS OF` clause against `ExecutionInput` (contract
+    /// Part A):
+    ///
+    /// * absent / `AS OF NOW` -> the execution anchor (`input.anchor_time`);
+    /// * `AS OF <date>` -> the parsed date (UTC), OVERRIDING `anchor_time`;
+    /// * `AS OF :param` -> the value bound in `input.params`, falling back to
+    ///   `anchor_time`; a clear error if neither is present.
+    fn effective_anchor(
+        &self,
+        pq: &ParsedQuery,
+        input: &ExecutionInput,
+    ) -> Result<Option<DateTime<Utc>>, Error> {
+        let as_of = match &pq.as_of {
+            None => return Ok(input.anchor_time),
+            Some(a) => a,
+        };
+        match as_of.kind.as_str() {
+            "now" => Ok(input.anchor_time),
+            "date" => {
+                let s = as_of.value.as_deref().ok_or_else(|| {
+                    Error::Execution(ExecutionError("AS OF <date> is missing its value".into()))
+                })?;
+                Ok(Some(parse_as_of_date(s)?))
+            }
+            "param" => {
+                let name = as_of.value.as_deref().ok_or_else(|| {
+                    Error::Execution(ExecutionError("AS OF :param is missing its name".into()))
+                })?;
+                if let Some(v) = input.params.get(name) {
+                    Ok(Some(*v))
+                } else if let Some(t) = input.anchor_time {
+                    Ok(Some(t))
+                } else {
+                    Err(Error::Execution(ExecutionError(format!(
+                        "AS OF :{} is unbound: supply it in ExecutionInput.params, or set \
+                         anchor_time as a fallback",
+                        name
+                    ))))
+                }
+            }
+            other => Err(Error::Execution(ExecutionError(format!(
+                "unknown AS OF kind {:?}",
+                other
+            )))),
+        }
     }
 
     /// Convenience: execute a RelQL string with an anchor time.
@@ -596,6 +687,762 @@ impl Engine {
             }
         }
         Ok(anchor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXPLAIN
+// ---------------------------------------------------------------------------
+
+/// One framed aggregation surfaced in an [`ExplainPlan`].
+#[derive(Clone, Debug)]
+pub struct WindowInfo {
+    pub table: String,
+    pub time_column: Option<String>,
+    pub start: f64,
+    pub end: f64,
+    pub unit: TimeUnit,
+    pub horizons: i64,
+    pub step: Option<f64>,
+    /// `target` | `where` | `assuming`.
+    pub role: String,
+}
+
+/// The seed-entity descriptor in an [`ExplainPlan`].
+#[derive(Clone, Debug)]
+pub struct EntityPlan {
+    pub table: String,
+    pub pk: String,
+    /// `"FOR EACH"` or the explicit id list rendered as text.
+    pub selector: String,
+}
+
+/// A declared-but-not-applied `ABLATE` clause.
+#[derive(Clone, Debug)]
+pub struct AblationPlan {
+    pub name: String,
+    pub note: String,
+}
+
+/// How the effective anchor was bound (contract Part B, `as_of`).
+#[derive(Clone, Debug)]
+pub struct AsOfPlan {
+    /// `query-date` | `query-param` | `execution-anchor`.
+    pub source: String,
+    pub value: Option<DateTime<Utc>>,
+}
+
+/// The parse+validate plan, computed WITHOUT scoring.
+#[derive(Clone, Debug)]
+pub struct ExplainPlan {
+    pub target: String,
+    pub task_type: TaskType,
+    pub entity: EntityPlan,
+    pub output: String,
+    pub windows: Vec<WindowInfo>,
+    pub where_present: bool,
+    pub assuming_present: bool,
+    pub as_of: AsOfPlan,
+    pub ablations: Vec<AblationPlan>,
+    pub warnings: Vec<String>,
+}
+
+/// Per-table assembly statistics (CONTEXT / ANALYZE).
+#[derive(Clone, Debug, Default)]
+pub struct TableStats {
+    pub rows: usize,
+    pub cells: usize,
+    pub min_time: Option<DateTime<Utc>>,
+    pub max_time: Option<DateTime<Utc>>,
+}
+
+/// The result of assembling context under the effective anchor, without scoring.
+#[derive(Clone, Debug)]
+pub struct ExplainContext {
+    pub anchor: Option<DateTime<Utc>>,
+    pub entities_covered: usize,
+    pub total_rows: usize,
+    pub total_cells: usize,
+    pub per_table: BTreeMap<String, TableStats>,
+    /// Non-seed rows admitted via a link traversal.
+    pub links_traversed: usize,
+    /// Rows a scanner surfaced that the temporal bound rejected (best-effort;
+    /// only computed for tables with a wired scanner).
+    pub rows_rejected: usize,
+    /// Schema tables that produced no rows in any entity's context.
+    pub tables_unreachable: Vec<String>,
+}
+
+/// The full EXPLAIN payload; render with [`ExplainResult::render`].
+#[derive(Clone, Debug)]
+pub struct ExplainResult {
+    /// `PLAN` | `CONTEXT` | `ANALYZE` | `ABLATION`.
+    pub mode: String,
+    /// `TEXT` | `JSON`.
+    pub format: String,
+    pub plan: ExplainPlan,
+    pub context: Option<ExplainContext>,
+    pub predictions: Option<PredictionResult>,
+}
+
+impl ExplainResult {
+    /// Render per `format`: an indented multi-section TEXT dump, or a stable
+    /// snake_case JSON object.
+    pub fn render(&self) -> String {
+        if self.format.eq_ignore_ascii_case("JSON") {
+            self.render_json()
+        } else {
+            self.render_text()
+        }
+    }
+
+    fn render_text(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("EXPLAIN {} (FORMAT {})\n", self.mode, self.format));
+        let p = &self.plan;
+        s.push_str("PLAN\n");
+        s.push_str(&format!("  target:    {}\n", p.target));
+        s.push_str(&format!("  task_type: {}\n", task_type_name(p.task_type)));
+        s.push_str(&format!(
+            "  entity:    {} (pk {}) {}\n",
+            p.entity.table, p.entity.pk, p.entity.selector
+        ));
+        s.push_str(&format!("  output:    {}\n", p.output));
+        if p.windows.is_empty() {
+            s.push_str("  windows:   (none)\n");
+        } else {
+            s.push_str("  windows:\n");
+            for w in &p.windows {
+                s.push_str(&format!(
+                    "    - [{}] {}{} ({} .. {} {}, horizons {}{})\n",
+                    w.role,
+                    w.table,
+                    w.time_column
+                        .as_ref()
+                        .map(|c| format!(".{}", c))
+                        .unwrap_or_default(),
+                    fmt_f(w.start),
+                    fmt_f(w.end),
+                    time_unit_name(w.unit),
+                    w.horizons,
+                    w.step.map(|s| format!(", step {}", fmt_f(s))).unwrap_or_default(),
+                ));
+            }
+        }
+        s.push_str(&format!("  where:     {}\n", if p.where_present { "present" } else { "absent" }));
+        s.push_str(&format!(
+            "  assuming:  {}\n",
+            if p.assuming_present { "carried, not applied" } else { "absent" }
+        ));
+        s.push_str(&format!(
+            "  as_of:     source={} value={}\n",
+            p.as_of.source,
+            p.as_of.value.map(|v| v.to_rfc3339()).unwrap_or_else(|| "unbounded".into())
+        ));
+        if !p.ablations.is_empty() {
+            s.push_str("  ablations:\n");
+            for a in &p.ablations {
+                s.push_str(&format!("    - {} ({})\n", a.name, a.note));
+            }
+        }
+        if !p.warnings.is_empty() {
+            s.push_str("  warnings:\n");
+            for w in &p.warnings {
+                s.push_str(&format!("    - {}\n", w));
+            }
+        }
+        if let Some(c) = &self.context {
+            s.push_str("CONTEXT\n");
+            s.push_str(&format!(
+                "  anchor:            {}\n",
+                c.anchor.map(|v| v.to_rfc3339()).unwrap_or_else(|| "unbounded".into())
+            ));
+            s.push_str(&format!("  entities_covered:  {}\n", c.entities_covered));
+            s.push_str(&format!("  total_rows:        {}\n", c.total_rows));
+            s.push_str(&format!("  total_cells:       {}\n", c.total_cells));
+            s.push_str(&format!("  links_traversed:   {}\n", c.links_traversed));
+            s.push_str(&format!("  rows_rejected:     {}\n", c.rows_rejected));
+            if !c.tables_unreachable.is_empty() {
+                s.push_str(&format!("  tables_unreachable: {}\n", c.tables_unreachable.join(", ")));
+            }
+            s.push_str("  per_table:\n");
+            for (t, st) in &c.per_table {
+                s.push_str(&format!(
+                    "    - {}: rows={} cells={} min_time={} max_time={}\n",
+                    t,
+                    st.rows,
+                    st.cells,
+                    st.min_time.map(|v| v.to_rfc3339()).unwrap_or_else(|| "-".into()),
+                    st.max_time.map(|v| v.to_rfc3339()).unwrap_or_else(|| "-".into()),
+                ));
+            }
+        }
+        if let Some(pr) = &self.predictions {
+            s.push_str("PREDICTIONS\n");
+            s.push_str(&format!("  model_uri:   {}\n", pr.model_uri));
+            s.push_str(&format!("  predictions: {}\n", pr.predictions.len()));
+        }
+        s
+    }
+
+    fn render_json(&self) -> String {
+        let p = &self.plan;
+        let mut out = String::new();
+        out.push('{');
+        out.push_str(&format!("\"mode\":{},", json_str(&self.mode)));
+        out.push_str(&format!("\"format\":{},", json_str(&self.format)));
+        // plan
+        out.push_str("\"plan\":{");
+        out.push_str(&format!("\"target\":{},", json_str(&p.target)));
+        out.push_str(&format!("\"task_type\":{},", json_str(task_type_name(p.task_type))));
+        out.push_str(&format!(
+            "\"entity\":{{\"table\":{},\"pk\":{},\"selector\":{}}},",
+            json_str(&p.entity.table),
+            json_str(&p.entity.pk),
+            json_str(&p.entity.selector)
+        ));
+        out.push_str(&format!("\"output\":{},", json_str(&p.output)));
+        out.push_str("\"windows\":[");
+        for (i, w) in p.windows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"table\":{},\"time_column\":{},\"start\":{},\"end\":{},\"unit\":{},\"horizons\":{},\"step\":{},\"role\":{}}}",
+                json_str(&w.table),
+                w.time_column.as_ref().map(|c| json_str(c)).unwrap_or_else(|| "null".into()),
+                json_num(w.start),
+                json_num(w.end),
+                json_str(time_unit_name(w.unit)),
+                w.horizons,
+                w.step.map(json_num).unwrap_or_else(|| "null".into()),
+                json_str(&w.role),
+            ));
+        }
+        out.push_str("],");
+        out.push_str(&format!("\"where_present\":{},", p.where_present));
+        out.push_str(&format!("\"assuming_present\":{},", p.assuming_present));
+        out.push_str(&format!(
+            "\"as_of\":{{\"source\":{},\"value\":{}}},",
+            json_str(&p.as_of.source),
+            p.as_of.value.map(|v| json_str(&v.to_rfc3339())).unwrap_or_else(|| "null".into())
+        ));
+        out.push_str("\"ablations\":[");
+        for (i, a) in p.ablations.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"table\":{},\"note\":{}}}",
+                json_str(&a.name),
+                json_str(&a.note)
+            ));
+        }
+        out.push_str("],");
+        out.push_str("\"warnings\":[");
+        for (i, w) in p.warnings.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_str(w));
+        }
+        out.push_str("]");
+        out.push('}'); // plan
+        // context
+        match &self.context {
+            None => out.push_str(",\"context\":null"),
+            Some(c) => {
+                out.push_str(",\"context\":{");
+                out.push_str(&format!(
+                    "\"anchor\":{},",
+                    c.anchor.map(|v| json_str(&v.to_rfc3339())).unwrap_or_else(|| "null".into())
+                ));
+                out.push_str(&format!("\"entities_covered\":{},", c.entities_covered));
+                out.push_str(&format!("\"total_rows\":{},", c.total_rows));
+                out.push_str(&format!("\"total_cells\":{},", c.total_cells));
+                out.push_str(&format!("\"links_traversed\":{},", c.links_traversed));
+                out.push_str(&format!("\"rows_rejected\":{},", c.rows_rejected));
+                out.push_str("\"tables_unreachable\":[");
+                for (i, t) in c.tables_unreachable.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&json_str(t));
+                }
+                out.push_str("],");
+                out.push_str("\"tables\":{");
+                for (i, (t, st)) in c.per_table.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!(
+                        "{}:{{\"rows\":{},\"cells\":{},\"min_time\":{},\"max_time\":{}}}",
+                        json_str(t),
+                        st.rows,
+                        st.cells,
+                        st.min_time.map(|v| json_str(&v.to_rfc3339())).unwrap_or_else(|| "null".into()),
+                        st.max_time.map(|v| json_str(&v.to_rfc3339())).unwrap_or_else(|| "null".into()),
+                    ));
+                }
+                out.push_str("}}"); // per_table, context
+            }
+        }
+        // predictions (array of per-entity results, for cross-language parity)
+        match &self.predictions {
+            None => out.push_str(",\"predictions\":null"),
+            Some(pr) => {
+                out.push_str(&format!(",\"model_uri\":{}", json_str(&pr.model_uri)));
+                out.push_str(",\"predictions\":[");
+                for (i, p) in pr.predictions.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!(
+                        "{{\"id\":{},\"value\":{},\"probability\":{},\"class\":{},\"ranked\":[{}],\"forecast\":[{}]}}",
+                        json_str(&p.id.to_string()),
+                        p.value.map(json_num).unwrap_or_else(|| "null".into()),
+                        p.probability.map(json_num).unwrap_or_else(|| "null".into()),
+                        p.predicted_class.as_ref().map(|c| json_str(c)).unwrap_or_else(|| "null".into()),
+                        p.ranked.iter().map(|r| json_str(r)).collect::<Vec<_>>().join(","),
+                        p.forecast.iter().map(|f| json_num(*f)).collect::<Vec<_>>().join(","),
+                    ));
+                }
+                out.push(']');
+            }
+        }
+        out.push('}');
+        out
+    }
+}
+
+impl Engine {
+    /// Compute an [`ExplainResult`] for `input` (contract Part B). PLAN never
+    /// assembles context or scores; CONTEXT assembles but does not score;
+    /// ANALYZE assembles and scores; ABLATION returns PLAN with a warning
+    /// (ablation is intentionally not implemented). A non-EXPLAIN query is
+    /// explained as PLAN.
+    pub fn explain(&mut self, input: ExecutionInput) -> Result<ExplainResult, Error> {
+        let pq: ParsedQuery = match input.parsed.clone() {
+            Some(p) => p,
+            None => parse(&input.query)?,
+        };
+        validate(&pq, &self.schema)?;
+
+        let (mode, format) = match &pq.explain {
+            Some(e) => (e.mode.to_uppercase(), e.format.to_uppercase()),
+            None => ("PLAN".to_string(), "TEXT".to_string()),
+        };
+        let eff_input = self.effective_input(&pq, &input)?;
+        let mut plan = self.build_plan(&pq, &input, eff_input.anchor_time);
+
+        let mut result = ExplainResult {
+            mode: mode.clone(),
+            format,
+            plan: plan.clone(),
+            context: None,
+            predictions: None,
+        };
+
+        match mode.as_str() {
+            "CONTEXT" => {
+                let contexts = self.assemble_all(&pq, &eff_input)?;
+                result.context = Some(self.context_stats(&contexts, eff_input.anchor_time));
+            }
+            "ANALYZE" => {
+                let task_type = pq.task_type(Some(&self.schema));
+                let model_uri = self.model_config.model_uri_for(task_type).to_string();
+                let contexts = self.assemble_all(&pq, &eff_input)?;
+                result.context = Some(self.context_stats(&contexts, eff_input.anchor_time));
+                let preds = self.model_backend.score(
+                    &pq,
+                    task_type,
+                    &contexts,
+                    &model_uri,
+                    &self.model_config,
+                )?;
+                result.predictions =
+                    Some(PredictionResult { task_type, predictions: preds, model_uri });
+            }
+            "ABLATION" => {
+                plan.warnings.push("ablation not implemented".to_string());
+                result.plan = plan;
+            }
+            // PLAN (and any unknown mode): parse+validate only.
+            _ => {}
+        }
+        Ok(result)
+    }
+
+    fn build_plan(
+        &self,
+        pq: &ParsedQuery,
+        input: &ExecutionInput,
+        eff_anchor: Option<DateTime<Utc>>,
+    ) -> ExplainPlan {
+        let task_type = pq.task_type(Some(&self.schema));
+        let entity = EntityPlan {
+            table: pq.entity_key.table.clone(),
+            pk: pq.entity_key.column.clone(),
+            selector: self.render_selector(pq, input),
+        };
+        let output = output_form(pq, task_type);
+        let windows = self.collect_windows(pq);
+        let as_of = self.plan_as_of(pq, eff_anchor);
+
+        let ablations: Vec<AblationPlan> = pq
+            .ablations
+            .iter()
+            .map(|a| AblationPlan { name: a.name.clone(), note: "declared, not applied".into() })
+            .collect();
+
+        let mut warnings = Vec::new();
+        if pq.assuming.is_some() {
+            warnings.push("ASSUMING is carried but not applied".to_string());
+        }
+        if !pq.ablations.is_empty() {
+            warnings.push("ABLATE clauses are declared but not applied".to_string());
+        }
+
+        ExplainPlan {
+            target: render_expr(&pq.target),
+            task_type,
+            entity,
+            output,
+            windows,
+            where_present: pq.where_.is_some(),
+            assuming_present: pq.assuming.is_some(),
+            as_of,
+            ablations,
+            warnings,
+        }
+    }
+
+    fn render_selector(&self, pq: &ParsedQuery, input: &ExecutionInput) -> String {
+        if let Some(ids) = &input.entity_ids {
+            let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+            return format!("IN ({})", list.join(", "));
+        }
+        if pq.entity_ids.is_empty() {
+            "FOR EACH".to_string()
+        } else {
+            let list: Vec<String> = pq.entity_ids.iter().map(render_lit).collect();
+            format!("IN ({})", list.join(", "))
+        }
+    }
+
+    fn collect_windows(&self, pq: &ParsedQuery) -> Vec<WindowInfo> {
+        let mut out = Vec::new();
+        let push = |expr: &TargetExpr, role: &str, out: &mut Vec<WindowInfo>| {
+            for a in expr.aggregations() {
+                if let Some(w) = a.window {
+                    let time_column = self
+                        .schema
+                        .table(&a.column.table)
+                        .and_then(|t| t.time_column.clone());
+                    out.push(WindowInfo {
+                        table: a.column.table.clone(),
+                        time_column,
+                        start: w.start,
+                        end: w.end,
+                        unit: w.unit,
+                        horizons: w.horizons,
+                        step: w.step,
+                        role: role.to_string(),
+                    });
+                }
+            }
+        };
+        push(&pq.target, "target", &mut out);
+        if let Some(w) = &pq.where_ {
+            push(w, "where", &mut out);
+        }
+        if let Some(a) = &pq.assuming {
+            push(a, "assuming", &mut out);
+        }
+        out
+    }
+
+    fn plan_as_of(&self, pq: &ParsedQuery, eff_anchor: Option<DateTime<Utc>>) -> AsOfPlan {
+        let source = match &pq.as_of {
+            Some(a) if a.kind == "date" => "query-date",
+            Some(a) if a.kind == "param" => "query-param",
+            _ => "execution-anchor",
+        };
+        AsOfPlan { source: source.to_string(), value: eff_anchor }
+    }
+
+    fn context_stats(
+        &self,
+        contexts: &[EntityContext],
+        anchor: Option<DateTime<Utc>>,
+    ) -> ExplainContext {
+        let mut per_table: BTreeMap<String, TableStats> = BTreeMap::new();
+        let mut total_rows = 0usize;
+        let mut total_cells = 0usize;
+        let mut links_traversed = 0usize;
+
+        for ctx in contexts {
+            let seed_table = ctx.rows.first().map(|r| r.table.clone());
+            for r in &ctx.rows {
+                let st = per_table.entry(r.table.clone()).or_default();
+                st.rows += 1;
+                let cells = r.cells.len() + if r.timestamp.is_some() { 1 } else { 0 };
+                st.cells += cells;
+                total_rows += 1;
+                total_cells += cells;
+                if let Some(ts) = r.timestamp {
+                    st.min_time = Some(st.min_time.map_or(ts, |m| m.min(ts)));
+                    st.max_time = Some(st.max_time.map_or(ts, |m| m.max(ts)));
+                }
+                // A non-seed row was reached by a link traversal.
+                let is_seed =
+                    seed_table.as_deref() == Some(r.table.as_str()) && r.id == ctx.entity_id;
+                if !is_seed {
+                    links_traversed += 1;
+                }
+            }
+        }
+
+        let tables_unreachable: Vec<String> = self
+            .schema
+            .tables
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|n| !per_table.contains_key(n))
+            .collect();
+
+        let touched: Vec<String> = per_table.keys().cloned().collect();
+        let rows_rejected = self.count_rejected_by_bound(&touched, anchor);
+
+        ExplainContext {
+            anchor,
+            entities_covered: contexts.iter().filter(|c| !c.rows.is_empty()).count(),
+            total_rows,
+            total_cells,
+            per_table,
+            links_traversed,
+            rows_rejected,
+            tables_unreachable,
+        }
+    }
+
+    /// Best-effort count of rows a wired scanner surfaces that the temporal
+    /// bound would reject. Only computed in Retriever mode for tables with a
+    /// scanner; returns 0 when the anchor is unbounded or no scanner exists.
+    fn count_rejected_by_bound(&self, tables: &[String], anchor: Option<DateTime<Utc>>) -> usize {
+        let a = match anchor {
+            Some(a) => a,
+            None => return 0,
+        };
+        if self.sampler_mode != SamplerMode::Retriever {
+            return 0;
+        }
+        let mut n = 0usize;
+        for t in tables {
+            if !self.wiring.scanners.contains_key(t) {
+                continue;
+            }
+            if let Ok(scanner) = self.wiring.table_scanner(t) {
+                for r in scanner.scan(t, &TemporalBound::unbounded()) {
+                    if let Some(ts) = r.timestamp {
+                        if ts > a {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        n
+    }
+}
+
+/// Parse an `AS OF <date>` value: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, or RFC3339.
+fn parse_as_of_date(s: &str) -> Result<DateTime<Utc>, Error> {
+    let s = s.trim();
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt.and_utc());
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc());
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    Err(Error::Execution(ExecutionError(format!(
+        "AS OF date {:?} is not parseable (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
+        s
+    ))))
+}
+
+fn task_type_name(t: TaskType) -> &'static str {
+    match t {
+        TaskType::Regression => "regression",
+        TaskType::BinaryClassification => "binary_classification",
+        TaskType::MulticlassClassification => "multiclass_classification",
+        TaskType::MultilabelRanking => "multilabel_ranking",
+        TaskType::Forecasting => "forecasting",
+    }
+}
+
+fn time_unit_name(u: crate::pql::ast::TimeUnit) -> &'static str {
+    use crate::pql::ast::TimeUnit as U;
+    match u {
+        U::Seconds => "seconds",
+        U::Minutes => "minutes",
+        U::Hours => "hours",
+        U::Days => "days",
+        U::Weeks => "weeks",
+        U::Months => "months",
+        U::Years => "years",
+    }
+}
+
+fn output_form(pq: &ParsedQuery, task_type: TaskType) -> String {
+    if let Some(ret) = &pq.ret {
+        return ret.kind.to_lowercase();
+    }
+    match task_type {
+        TaskType::Regression => "value",
+        TaskType::BinaryClassification => "probability",
+        TaskType::MulticlassClassification => "class",
+        TaskType::MultilabelRanking => "ranked",
+        TaskType::Forecasting => "value-per-horizon",
+    }
+    .to_string()
+}
+
+fn fmt_f(v: f64) -> String {
+    if v.is_infinite() {
+        if v > 0.0 { "+inf".into() } else { "-inf".into() }
+    } else if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{}", v)
+    }
+}
+
+/// A human-readable normalization of a target/where expression.
+fn render_expr(e: &TargetExpr) -> String {
+    use crate::pql::ast::CondRhs;
+    match e {
+        TargetExpr::Aggregation(a) => {
+            let mut s = format!("{}({})", a.func.keyword(), a.column);
+            if let Some(w) = a.window {
+                s.push_str(&format!(
+                    " OVER ({} .. {} {})",
+                    fmt_f(w.start),
+                    fmt_f(w.end),
+                    time_unit_name(w.unit)
+                ));
+            }
+            s
+        }
+        TargetExpr::ColumnRef(c) => format!("{}", c),
+        TargetExpr::Condition(c) => {
+            let left = render_expr(&c.left);
+            let op = render_op(c.op);
+            let rhs = match &c.right {
+                CondRhs::Empty => String::new(),
+                CondRhs::One(l) => render_lit(l),
+                CondRhs::List(ls) => {
+                    format!("({})", ls.iter().map(render_lit).collect::<Vec<_>>().join(", "))
+                }
+                CondRhs::Expr(e) => render_expr(e),
+            };
+            if rhs.is_empty() {
+                format!("{} {}", left, op)
+            } else {
+                format!("{} {} {}", left, op, rhs)
+            }
+        }
+        TargetExpr::LogicalOp(l) => {
+            let op = match l.op {
+                crate::pql::ast::BoolOp::And => "AND",
+                crate::pql::ast::BoolOp::Or => "OR",
+            };
+            format!("({} {} {})", render_expr(&l.left), op, render_expr(&l.right))
+        }
+        TargetExpr::Not(e) => format!("NOT ({})", render_expr(e)),
+        TargetExpr::Arith(a) => {
+            format!("({} {} {})", render_expr(&a.left), a.op, render_expr(&a.right))
+        }
+        TargetExpr::Func(f) => {
+            let args: Vec<String> = f.args.iter().map(render_expr).collect();
+            format!("{}({})", f.name, args.join(", "))
+        }
+        TargetExpr::Case(_) => "CASE ... END".to_string(),
+        TargetExpr::Lit(l) => render_lit(l),
+    }
+}
+
+fn render_op(op: crate::pql::ast::Operator) -> &'static str {
+    use crate::pql::ast::Operator as O;
+    match op {
+        O::Gt => ">",
+        O::Lt => "<",
+        O::Eq => "=",
+        O::Neq => "!=",
+        O::Ge => ">=",
+        O::Le => "<=",
+        O::StartsWith => "STARTS_WITH",
+        O::EndsWith => "ENDS_WITH",
+        O::Contains => "CONTAINS",
+        O::NotContains => "NOT_CONTAINS",
+        O::Like => "LIKE",
+        O::NotLike => "NOT LIKE",
+        O::In => "IN",
+        O::NotIn => "NOT IN",
+        O::IsNull => "IS NULL",
+        O::IsNotNull => "IS NOT NULL",
+    }
+}
+
+fn render_lit(l: &crate::pql::ast::Literal) -> String {
+    use crate::pql::ast::Literal;
+    match l {
+        Literal::Str(s) => format!("'{}'", s),
+        Literal::Num(n) => {
+            if n.fract() == 0.0 {
+                format!("{}", *n as i64)
+            } else {
+                format!("{}", n)
+            }
+        }
+        Literal::Bool(b) => format!("{}", b),
+        Literal::Date(d) => format!("'{}'", d.to_rfc3339()),
+        Literal::Null => "NULL".to_string(),
+    }
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_num(v: f64) -> String {
+    if v.is_finite() {
+        if v.fract() == 0.0 {
+            format!("{}", v as i64)
+        } else {
+            format!("{}", v)
+        }
+    } else if v > 0.0 {
+        "\"+inf\"".to_string()
+    } else {
+        "\"-inf\"".to_string()
     }
 }
 

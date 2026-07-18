@@ -36,8 +36,9 @@ pub mod schema;
 use std::fmt;
 
 pub use engine::{
-    ContextPolicy, Engine, EntityContext, EntityPrediction, ExecutionError, ExecutionInput,
-    HistoryBaselineBackend, ModelBackend, PredictionResult, SamplerMode,
+    AblationPlan, AsOfPlan, ContextPolicy, Engine, EntityContext, EntityPlan, EntityPrediction,
+    ExecutionError, ExecutionInput, ExplainContext, ExplainPlan, ExplainResult,
+    HistoryBaselineBackend, ModelBackend, PredictionResult, SamplerMode, TableStats, WindowInfo,
 };
 pub use model::{
     EmbeddingMismatchError, ModelConfig, DEFAULT_CLASSIFICATION_MODEL_URI,

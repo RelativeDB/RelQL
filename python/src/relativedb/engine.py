@@ -12,6 +12,8 @@ retriever must not leak the future into context).
 """
 from __future__ import annotations
 
+import json
+import math
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field, replace
@@ -22,15 +24,16 @@ from typing import Any, Optional, Protocol, Sequence, Union
 from .csc import CscIndex
 from .evaluate import eval_bool, eval_value
 from .model import ModelConfig
-from .pql.ast import (AggFunc, Aggregation, ColumnRef, ParsedQuery, TaskType,
-                      Window)
+from .pql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
+                      Explain, Func, Lit, LogicalOp, Not, ParsedQuery, TaskType,
+                      Window, _find_aggregations)
 from .pql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema
 
 __all__ = [
     "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
-    "EntityPrediction", "PredictionResult", "ModelBackend",
+    "EntityPrediction", "PredictionResult", "ExplainResult", "ModelBackend",
     "HistoryBaselineBackend", "Engine", "ExecutionError",
     "ContextTruncationWarning",
 ]
@@ -39,6 +42,71 @@ __all__ = [
 # are biased low when the fanout cap drops children. (FIRST/LAST/MIN/MAX and
 # the DISTINCT/LIST variants are far less sensitive to a dropped tail.)
 _COUNTING_AGGS = frozenset({AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG})
+
+# Default output form per task type (contract Part B, `plan.output`), used
+# when the query has no explicit RETURN spec.
+_TASK_DEFAULT_OUTPUT = {
+    TaskType.REGRESSION: "value",
+    TaskType.BINARY_CLASSIFICATION: "probability",
+    TaskType.MULTICLASS_CLASSIFICATION: "class",
+    TaskType.MULTILABEL_RANKING: "ranked",
+    TaskType.FORECASTING: "value-per-horizon",
+}
+
+
+def _num(x: float):
+    """JSON-safe numeric: pass finite floats through, stringify infinities."""
+    if isinstance(x, float) and math.isinf(x):
+        return "inf" if x > 0 else "-inf"
+    return x
+
+
+def _window_str(w: Window) -> str:
+    s = f"OVER ({_num(w.start)}, {_num(w.end)}] {w.unit.value}"
+    if w.horizons > 1:
+        s += f" HORIZONS {w.horizons}"
+    return s
+
+
+def _lit_str(v: Any) -> str:
+    if isinstance(v, str):
+        return repr(v)
+    if isinstance(v, tuple):
+        return "(" + ", ".join(_lit_str(x) for x in v) + ")"
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
+def _expr_str(e: Any) -> str:
+    """Normalized human-readable rendering of a target/where expression."""
+    if isinstance(e, ColumnRef):
+        return str(e)
+    if isinstance(e, Lit):
+        return _lit_str(e.value)
+    if isinstance(e, Aggregation):
+        s = f"{e.func.value}({e.column})"
+        if e.window is not None:
+            s += " " + _window_str(e.window)
+        return s
+    if isinstance(e, Condition):
+        rhs = (_expr_str(e.right_expr) if e.right_expr is not None
+               else _lit_str(e.right))
+        return f"{_expr_str(e.left)} {e.op.value} {rhs}"
+    if isinstance(e, LogicalOp):
+        return f"({_expr_str(e.left)} {e.op.value} {_expr_str(e.right)})"
+    if isinstance(e, Not):
+        return f"NOT ({_expr_str(e.expr)})"
+    if isinstance(e, Arith):
+        return f"({_expr_str(e.left)} {e.op} {_expr_str(e.right)})"
+    if isinstance(e, Func):
+        return f"{e.name}(" + ", ".join(_expr_str(a) for a in e.args) + ")"
+    if isinstance(e, Case):
+        parts = " ".join(f"WHEN {_expr_str(c)} THEN {_expr_str(t)}"
+                         for c, t in e.whens)
+        els = f" ELSE {_expr_str(e.else_)}" if e.else_ is not None else ""
+        return f"CASE {parts}{els} END"
+    return str(e)
 
 
 class ExecutionError(RuntimeError):
@@ -94,6 +162,7 @@ class ExecutionInput:
     per_entity_anchor: bool = False              # anchor_time="entity" semantics
     context_anchor_time: Optional[datetime] = None  # decouple context "now"
     entity_ids: Optional[Sequence[Any]] = None   # overrides FOR ... IN (...)
+    params: Optional[dict[str, datetime]] = None  # AS OF :name bindings
 
 
 @dataclass
@@ -147,6 +216,114 @@ class PredictionResult:
     predictions: tuple[EntityPrediction, ...]
     model_uri: str = ""
     stats: dict = field(default_factory=dict)   # context-assembly diagnostics
+
+
+def _pred_to_dict(p: "EntityPrediction") -> dict:
+    return {
+        "id": p.id,
+        "value": p.value,
+        "probability": p.probability,
+        "class_probs": dict(p.class_probs),
+        "ranked": list(p.ranked),
+        "forecast": list(p.forecast),
+        "predicted_class": p.predicted_class,
+        "quantiles": {str(k): v for k, v in p.quantiles.items()},
+        "interval": list(p.interval) if p.interval is not None else None,
+    }
+
+
+@dataclass(frozen=True)
+class ExplainResult:
+    """The result of :meth:`Engine.explain`. ``plan`` is always present;
+    ``context`` is populated for CONTEXT/ANALYZE; ``predictions`` only for
+    ANALYZE. ``render()`` produces the human TEXT or machine JSON form."""
+
+    mode: str                        # PLAN | CONTEXT | ANALYZE | ABLATION
+    format: str                      # TEXT | JSON
+    plan: dict
+    context: Optional[dict] = None
+    predictions: Optional[tuple["EntityPrediction", ...]] = None
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "mode": self.mode,
+            "format": self.format,
+            "plan": self.plan,
+        }
+        if self.context is not None:
+            d["context"] = self.context
+        if self.predictions is not None:
+            d["predictions"] = [_pred_to_dict(p) for p in self.predictions]
+        return d
+
+    def render(self) -> str:
+        if self.format.upper() == "JSON":
+            return json.dumps(self.to_dict(), indent=2, default=str)
+        return self._render_text()
+
+    def _render_text(self) -> str:
+        p = self.plan
+        lines: list[str] = []
+        lines.append(f"EXPLAIN {self.mode}")
+        lines.append("")
+        lines.append("PLAN")
+        lines.append(f"  target:    {p.get('target')}")
+        lines.append(f"  task_type: {p.get('task_type')}")
+        ent = p.get("entity", {})
+        lines.append(
+            f"  entity:    {ent.get('table')}.{ent.get('pk')} "
+            f"[{ent.get('selector')}]")
+        lines.append(f"  output:    {p.get('output')}")
+        ao = p.get("as_of", {})
+        lines.append(
+            f"  as_of:     {ao.get('source')} ({ao.get('value')})")
+        lines.append(
+            f"  where:     {'present' if p.get('where_present') else 'none'}")
+        lines.append(
+            f"  assuming:  "
+            f"{'carried, not applied' if p.get('assuming_present') else 'none'}")
+        windows = p.get("windows", [])
+        if windows:
+            lines.append("  windows:")
+            for w in windows:
+                lines.append(
+                    f"    - [{w['role']}] {w['table']}.{w['time_column']} "
+                    f"({w['start']}, {w['end']}] {w['unit']} "
+                    f"horizons={w['horizons']} step={w['step']}")
+        ablations = p.get("ablations", [])
+        if ablations:
+            lines.append("  ablations:")
+            for a in ablations:
+                lines.append(f"    - {a['table']}: {a['note']}")
+        warnings_ = p.get("warnings", [])
+        if warnings_:
+            lines.append("  warnings:")
+            for w in warnings_:
+                lines.append(f"    - {w}")
+        if self.context is not None:
+            c = self.context
+            lines.append("")
+            lines.append("CONTEXT")
+            lines.append(f"  entities_covered: {c.get('entities_covered')}")
+            lines.append(f"  total_rows:       {c.get('total_rows')}")
+            lines.append(f"  total_cells:      {c.get('total_cells')}")
+            lines.append(f"  links_traversed:  {c.get('links_traversed')}")
+            lines.append(
+                f"  tables_unreachable: {c.get('tables_unreachable')}")
+            tables = c.get("tables", {})
+            if tables:
+                lines.append("  per-table:")
+                for name, t in tables.items():
+                    lines.append(
+                        f"    - {name}: rows={t['rows']} cells={t['cells']} "
+                        f"min_time={t['min_time']} max_time={t['max_time']}")
+        if self.predictions is not None:
+            lines.append("")
+            lines.append("PREDICTIONS")
+            for pr in self.predictions:
+                lines.append(f"  - {_pred_to_dict(pr)}")
+        return "\n".join(lines)
+
 
 class ModelBackend(Protocol):
     """Anything that can score assembled contexts. The built-in
@@ -324,7 +501,13 @@ class Engine:
             input = ExecutionInput(query=input, **kwargs)
         pq = (parse(input.query) if isinstance(input.query, str)
               else input.query)
+        if pq.explain is not None:
+            # An EXPLAIN-prefixed query must never silently score; route it.
+            return self.explain(replace(input, query=pq))
         validate(pq, self.schema)
+        # Bind the effective anchor (AS OF) before any assembly/scoring so it
+        # threads through the temporal bound and pseudo-anchors unchanged.
+        input = replace(input, anchor_time=self._effective_anchor(pq, input))
         task_type = pq.task_type(self.schema)
         model_uri = self.model_config.model_uri_for(task_type)
         entity_table = pq.entity_key.table
@@ -403,6 +586,212 @@ class Engine:
             if rows and rows[0].timestamp is not None:
                 return rows[0].timestamp
         return anchor
+
+    # -- AS OF: resolve the effective anchor --------------------------------
+    def _effective_anchor(self, pq: ParsedQuery,
+                          input: ExecutionInput) -> Optional[datetime]:
+        """Resolve the effective anchor from the query's ``AS OF`` clause
+        (contract Part A). Absent/NOW -> ``anchor_time`` (the execution
+        anchor, NOT wall clock); DATE -> parsed date (overrides); PARAM ->
+        ``params[name]``, else ``anchor_time``, else a clear error."""
+        ao = pq.as_of
+        if ao is None or ao.kind == "now":
+            return input.anchor_time
+        if ao.kind == "date":
+            return self._parse_anchor_date(ao.value)
+        if ao.kind == "param":
+            name = ao.value
+            params = input.params or {}
+            if name in params:
+                return self._coerce_anchor(params[name])
+            if input.anchor_time is not None:
+                return input.anchor_time
+            raise ExecutionError(
+                f"AS OF :{name} — no value bound for parameter {name!r} "
+                f"(supply ExecutionInput.params={{{name!r}: <datetime>}}) and "
+                f"no anchor_time fallback is available")
+        raise ExecutionError(f"unknown AS OF kind {ao.kind!r}")
+
+    @staticmethod
+    def _coerce_anchor(v: Any) -> datetime:
+        if isinstance(v, datetime):
+            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+        if isinstance(v, str):
+            return Engine._parse_anchor_date(v)
+        raise ExecutionError(
+            f"AS OF param must bind to a datetime or date string, got {v!r}")
+
+    @staticmethod
+    def _parse_anchor_date(text: Optional[str]) -> datetime:
+        s = (text or "").strip()
+        fmt = "%Y-%m-%d %H:%M:%S" if " " in s else "%Y-%m-%d"
+        try:
+            d = datetime.strptime(s, fmt)
+        except ValueError as e:
+            raise ExecutionError(
+                f"AS OF: cannot parse date {text!r} "
+                f"(expected YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'): {e}")
+        return d.replace(tzinfo=timezone.utc)
+
+    # -- EXPLAIN ------------------------------------------------------------
+    def explain(self, input: Union[ExecutionInput, str], **kwargs) -> ExplainResult:
+        """Explain a query without (PLAN/CONTEXT) or with (ANALYZE) scoring.
+        A non-EXPLAIN query is explained as PLAN by default."""
+        if isinstance(input, str):
+            input = ExecutionInput(query=input, **kwargs)
+        pq = (parse(input.query) if isinstance(input.query, str)
+              else input.query)
+        validate(pq, self.schema)
+        ex = pq.explain or Explain()
+        mode = (ex.mode or "PLAN").upper()
+        fmt = (ex.format or "TEXT").upper()
+        effective = self._effective_anchor(pq, input)
+
+        plan = self._build_plan(pq, input, effective)
+        context: Optional[dict] = None
+        predictions: Optional[tuple[EntityPrediction, ...]] = None
+
+        if mode == "ABLATION":
+            plan["warnings"] = list(plan.get("warnings", [])) + [
+                "ablation not implemented — declared ABLATE tables are not "
+                "applied"]
+
+        if mode in ("CONTEXT", "ANALYZE"):
+            context, contexts = self._assemble_report(pq, input, effective)
+            if mode == "ANALYZE":
+                task_type = pq.task_type(self.schema)
+                model_uri = self.model_config.model_uri_for(task_type)
+                predictions = tuple(self.model_backend.score(
+                    pq, task_type, contexts, model_uri, self.model_config))
+
+        return ExplainResult(mode=mode, format=fmt, plan=plan,
+                             context=context, predictions=predictions)
+
+    def _build_plan(self, pq: ParsedQuery, input: ExecutionInput,
+                    effective: Optional[datetime]) -> dict:
+        task_type = pq.task_type(self.schema)
+        # entity selector
+        if input.entity_ids is not None:
+            selector = list(input.entity_ids)
+        elif pq.entity_ids:
+            selector = list(pq.entity_ids)
+        else:
+            selector = "FOR EACH"
+        # output form
+        if pq.ret is not None:
+            output = pq.ret.kind.lower()
+        else:
+            output = _TASK_DEFAULT_OUTPUT[task_type]
+        # windows across target / where / assuming
+        windows: list[dict] = []
+        self._collect_windows(pq.target_aggregations, "target", windows)
+        if pq.where is not None:
+            self._collect_windows(_find_aggregations(pq.where), "where", windows)
+        if pq.assuming is not None:
+            self._collect_windows(_find_aggregations(pq.assuming), "assuming",
+                                  windows)
+        # as_of provenance
+        ao = pq.as_of
+        if ao is None or ao.kind == "now":
+            source = "execution-anchor"
+        elif ao.kind == "date":
+            source = "query-date"
+        else:
+            source = "query-param"
+        as_of = {
+            "source": source,
+            "value": effective.isoformat() if effective is not None else None,
+        }
+        if ao is not None and ao.kind == "param":
+            as_of["param"] = ao.value
+
+        warnings_: list[str] = []
+        if pq.assuming is not None:
+            warnings_.append("ASSUMING clause carried, not applied")
+
+        return {
+            "target": _expr_str(pq.target),
+            "task_type": task_type.value,
+            "entity": {
+                "table": pq.entity_key.table,
+                "pk": pq.entity_key.column,
+                "selector": selector,
+            },
+            "output": output,
+            "windows": windows,
+            "where_present": pq.where is not None,
+            "assuming_present": pq.assuming is not None,
+            "as_of": as_of,
+            "ablations": [{"table": a.name, "note": "declared, not applied"}
+                          for a in pq.ablations],
+            "warnings": warnings_,
+        }
+
+    def _collect_windows(self, aggs, role: str, out: list[dict]) -> None:
+        for a in aggs:
+            w = a.window
+            if w is None:
+                continue
+            t = self.schema.table(a.column.table)
+            out.append({
+                "table": a.column.table,
+                "time_column": t.time_column if t is not None else None,
+                "start": _num(w.start),
+                "end": _num(w.end),
+                "unit": w.unit.value,
+                "horizons": w.horizons,
+                "step": _num(w.step) if w.step is not None else None,
+                "role": role,
+            })
+
+    def _assemble_report(self, pq: ParsedQuery, input: ExecutionInput,
+                         effective: Optional[datetime]):
+        """Assemble per-entity context via the normal path (no scoring) and
+        summarize it (contract: EXPLAIN CONTEXT)."""
+        eff_input = replace(input, anchor_time=effective)
+        entity_table = pq.entity_key.table
+        ids = self._resolve_entity_ids(pq, eff_input)
+        contexts: list[EntityContext] = []
+        for eid in ids:
+            anchor = self._anchor_for(entity_table, eid, eff_input)
+            ctx = self.assemble_context(entity_table, eid, anchor)
+            if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
+                continue
+            contexts.append(ctx)
+
+        tables: dict[str, dict] = {}
+        links_traversed = 0
+        for ctx in contexts:
+            for r in ctx.rows:
+                t = tables.setdefault(
+                    r.table, {"rows": 0, "cells": 0,
+                              "min_time": None, "max_time": None})
+                t["rows"] += 1
+                t["cells"] += len(r.cells) + (1 if r.timestamp is not None else 0)
+                links_traversed += len(r.parents)
+                if r.timestamp is not None:
+                    ts = r.timestamp.isoformat()
+                    if t["min_time"] is None or ts < t["min_time"]:
+                        t["min_time"] = ts
+                    if t["max_time"] is None or ts > t["max_time"]:
+                        t["max_time"] = ts
+
+        reachable = set(tables)
+        unreachable = sorted(tbl.name for tbl in self.schema.tables
+                             if tbl.name not in reachable)
+        report = {
+            "entities_covered": len(contexts),
+            "anchor": effective.isoformat() if effective is not None else None,
+            "total_rows": sum(t["rows"] for t in tables.values()),
+            "total_cells": sum(t["cells"] for t in tables.values()),
+            "links_traversed": links_traversed,
+            "tables": tables,
+            "tables_unreachable": unreachable,
+            "truncated_children": sum(c.truncated_children for c in contexts),
+            "contexts_hit_cell_budget": sum(1 for c in contexts
+                                            if c.hit_cell_budget),
+        }
+        return report, contexts
 
 
 # ---------------------------------------------------------------------------
