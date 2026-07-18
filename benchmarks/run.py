@@ -107,9 +107,36 @@ def _probability_granularity_probe(ds: D.Dataset) -> dict:
     return out
 
 
+def _use_backend(ds, which: str) -> str:
+    """Swap the dataset engine's model backend. Returns the label actually used
+    (falls back to the baseline with a note if the native RT-J engine or its
+    checkpoints are unavailable)."""
+    if which != "rtj":
+        ds.engine.model_backend = HistoryBaselineBackend()
+        return "history-baseline"
+    try:
+        from relativedb.rt_native import (RtNativeBackend,
+                                          RtNativeUnavailableError)
+        ds.engine.model_backend = RtNativeBackend(schema=ds.schema)
+        return "rtj-native"
+    except Exception as e:  # RtNativeUnavailableError, missing checkpoint, etc.
+        print(f"  ! RT-J native backend unavailable ({type(e).__name__}: {e}); "
+              f"falling back to history baseline")
+        ds.engine.model_backend = HistoryBaselineBackend()
+        return "history-baseline (rtj unavailable)"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--backend", choices=["baseline", "rtj"], default="baseline",
+                    help="scoring backend: 'baseline' (model-free history) or "
+                         "'rtj' (the native RT-J model — needs librt_c + cached "
+                         "checkpoints; much slower). Compare a run of each to "
+                         "benchmark the model against the baseline and naives.")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="cap entities scored per dataset (recommended with "
+                         "--backend rtj, which does per-entity model inference).")
     args = ap.parse_args()
     RESULTS.mkdir(exist_ok=True)
     report = {"tasks": [], "audits": {}}
@@ -141,10 +168,14 @@ def main():
 
     # ----- datasets -----
     t0 = time.time()
-    ml = D.movielens()
-    ret = D.online_retail(max_customers=400 if args.quick else 1500)
+    ml = D.movielens(max_users=args.limit)
+    ret = D.online_retail(max_customers=args.limit or (400 if args.quick else 1500))
     print(f"\nloaded corpus in {time.time()-t0:.1f}s  "
           f"(movielens={len(ml.entity_ids)} users, retail={len(ret.entity_ids)} customers)")
+    backend_label = _use_backend(ml, args.backend)
+    _use_backend(ret, args.backend)
+    print(f"scoring backend: {backend_label}")
+    report["backend"] = backend_label
 
     tasks = []
     # Online Retail — the repeat-behavior domain: churn, count, value, ranking
