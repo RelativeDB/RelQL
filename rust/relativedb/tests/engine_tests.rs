@@ -14,7 +14,7 @@ use relativedb::{
     ParsedQuery, SamplerMode, TaskType, TemporalBound,
 };
 
-use common::{churn_schema, churn_rows, churn_wiring, dt, in_memory_wiring};
+use common::{churn_schema, churn_rows, churn_wiring, dt, in_memory_wiring, StubBackend};
 
 fn t0() -> DateTime<Utc> {
     dt("2026-07-01")
@@ -140,6 +140,7 @@ fn csc_context_equals_retriever_context() {
 #[test]
 fn csc_execute_end_to_end() {
     let mut eng = Engine::new(churn_schema(), churn_wiring())
+        .model_backend(Box::new(StubBackend))
         .sampler_mode(SamplerMode::Csc)
         .build()
         .unwrap();
@@ -210,7 +211,7 @@ fn for_each_without_scanner_raises() {
         })
         .default_links(|_l: &LinkDef, _p: &EntityId, _b: &TemporalBound, _n: usize| Vec::new())
         .build();
-    let mut eng = Engine::new(churn_schema(), wiring);
+    let mut eng = Engine::new(churn_schema(), wiring).model_backend(Box::new(StubBackend));
     assert!(eng
         .execute(ExecutionInput::query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id").anchor_time(t0()))
         .is_err());
@@ -226,10 +227,15 @@ fn for_each_without_scanner_raises() {
 // ---------------------------------------------------------------------------
 
 fn run_c7(pql: &str) -> EntityPrediction {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let res = eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap();
     assert_eq!(res.predictions.len(), 1);
     res.predictions.into_iter().next().unwrap()
+}
+
+fn run_c7_err(pql: &str) -> relativedb::Error {
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
+    eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap_err()
 }
 
 #[test]
@@ -255,24 +261,22 @@ fn return_distribution_two_entries_sum_one() {
 }
 
 #[test]
-fn return_quantiles_three_monotonic() {
-    let p = run_c7(
+fn return_quantiles_execution_unsupported() {
+    // A single-head point model exposes no quantile distribution: execution errors.
+    let err = run_c7_err(
         "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.5, 0.9)",
     );
-    assert_eq!(p.quantiles.len(), 3);
-    let qs: Vec<f64> = p.quantiles.iter().map(|(q, _)| *q).collect();
-    assert_eq!(qs, vec![0.1, 0.5, 0.9]);
-    let vs: Vec<f64> = p.quantiles.iter().map(|(_, v)| *v).collect();
-    assert!(vs[0] <= vs[1] && vs[1] <= vs[2], "monotonic, got {:?}", vs);
+    let msg = format!("{}", err).to_lowercase();
+    assert!(msg.contains("quantiles"), "expected unsupported error, got: {}", err);
 }
 
 #[test]
-fn return_interval_lo_le_hi() {
-    let p = run_c7(
+fn return_interval_execution_unsupported() {
+    let err = run_c7_err(
         "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN INTERVAL 80%",
     );
-    let (lo, hi) = p.interval.expect("interval set");
-    assert!(lo <= hi, "lo <= hi, got ({}, {})", lo, hi);
+    let msg = format!("{}", err).to_lowercase();
+    assert!(msg.contains("interval"), "expected unsupported error, got: {}", err);
 }
 
 #[test]
@@ -364,7 +368,7 @@ fn all_three() -> std::collections::HashSet<String> {
 #[test]
 fn as_of_date_overrides_anchor_time() {
     // t0 hides O4 (2026-07-05); AS OF 2026-08-01 admits it -> strictly more rows.
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let later = eng
         .explain(ExecutionInput::query(format!("EXPLAIN CONTEXT {} AS OF 2026-08-01", CHURN)).anchor_time(t0()))
         .unwrap();
@@ -384,7 +388,7 @@ fn as_of_date_overrides_anchor_time() {
 
 #[test]
 fn as_of_param_binds_from_params() {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let res = eng
         .execute(ExecutionInput::query(format!("{} AS OF :t", CHURN)).param("t", dt("2026-08-01")))
         .unwrap();
@@ -393,7 +397,7 @@ fn as_of_param_binds_from_params() {
 
 #[test]
 fn as_of_param_missing_raises() {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let err = eng
         .execute(ExecutionInput::query(format!("{} AS OF :t", CHURN)))
         .unwrap_err();
@@ -402,7 +406,7 @@ fn as_of_param_missing_raises() {
 
 #[test]
 fn as_of_param_falls_back_to_anchor_time() {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let res = eng
         .execute(ExecutionInput::query(format!("{} AS OF :t", CHURN)).anchor_time(t0()))
         .unwrap();
@@ -416,7 +420,7 @@ fn as_of_param_falls_back_to_anchor_time() {
 
 #[test]
 fn as_of_now_equals_no_as_of() {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let now = eng.execute(ExecutionInput::query(format!("{} AS OF NOW", CHURN)).anchor_time(t0())).unwrap();
     let base = eng.execute(ExecutionInput::query(CHURN).anchor_time(t0())).unwrap();
     let np: Vec<Option<f64>> = now.predictions.iter().map(|p| p.probability).collect();
@@ -509,7 +513,7 @@ fn explain_context_populates_counts_no_predictions() {
 
 #[test]
 fn explain_analyze_has_predictions() {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let res = eng
         .explain(ExecutionInput::query(format!("EXPLAIN ANALYZE {}", CHURN)).anchor_time(t0()))
         .unwrap();
@@ -535,7 +539,7 @@ fn explain_ablation_warns_not_implemented() {
 
 #[test]
 fn render_json_parses() {
-    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
     let res = eng
         .explain(
             ExecutionInput::query(format!("EXPLAIN ANALYZE FORMAT JSON {}", CHURN))

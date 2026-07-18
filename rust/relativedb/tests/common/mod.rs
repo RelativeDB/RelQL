@@ -8,9 +8,46 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
+use relativedb::engine::ModelBackend;
 use relativedb::{
-    EntityId, LinkDef, RetrieverWiring, Row, Schema, TableDef, TemporalBound, ValueType,
+    EntityContext, EntityId, EntityPrediction, Error, LinkDef, ModelConfig, ParsedQuery,
+    RetrieverWiring, Row, Schema, TableDef, TaskType, TemporalBound, ValueType,
 };
+
+/// A tiny deterministic test double implementing [`ModelBackend`]. It ships no
+/// real model — it just emits a fixed scalar per task type so the engine's own
+/// plumbing (context assembly, temporal correctness, routing, RETURN shaping,
+/// EXPLAIN, AS OF) can be exercised offline. Real-model behaviour is covered
+/// separately by the native/golden tests.
+pub struct StubBackend;
+
+impl ModelBackend for StubBackend {
+    fn score(
+        &mut self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        contexts: &[EntityContext],
+        _model_uri: &str,
+        _config: &ModelConfig,
+    ) -> Result<Vec<EntityPrediction>, Error> {
+        let n = query.num_forecasts.unwrap_or(1).max(1) as usize;
+        Ok(contexts
+            .iter()
+            .map(|c| {
+                let mut p = EntityPrediction::new(c.entity_id.clone());
+                match task_type {
+                    TaskType::BinaryClassification => p.probability = Some(0.5),
+                    TaskType::Forecasting => {
+                        p.value = Some(1.0);
+                        p.forecast = vec![1.0; n];
+                    }
+                    _ => p.value = Some(1.0),
+                }
+                p
+            })
+            .collect())
+    }
+}
 
 pub fn dt(s: &str) -> DateTime<Utc> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")

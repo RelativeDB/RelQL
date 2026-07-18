@@ -24,7 +24,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use libloading::Library;
 
-use crate::engine::{EntityContext, EntityPrediction, HistoryBaselineBackend, ModelBackend};
+use crate::engine::{EntityContext, EntityPrediction, ModelBackend};
+use crate::engine::ExecutionError;
 use crate::evaluate::{eval_bool, eval_value, EvalValue};
 use crate::model::ModelConfig;
 use crate::pql::ast::{ParsedQuery, TaskType};
@@ -444,7 +445,6 @@ pub struct RtNativeBackend {
     pub max_seq_len: usize,
     models: HashMap<String, RtModel>,
     lib: Option<Arc<RtLib>>,
-    fallback: HistoryBaselineBackend,
 }
 
 impl RtNativeBackend {
@@ -458,7 +458,6 @@ impl RtNativeBackend {
             max_seq_len: 1024,
             models: HashMap::new(),
             lib: None,
-            fallback: HistoryBaselineBackend::new(3),
         }
     }
 
@@ -819,14 +818,17 @@ impl ModelBackend for RtNativeBackend {
         task_type: TaskType,
         contexts: &[EntityContext],
         model_uri: &str,
-        config: &ModelConfig,
+        _config: &ModelConfig,
     ) -> Result<Vec<EntityPrediction>, Error> {
-        // single-number-head C ABI cannot express these; use the baseline
+        // The single-number score head cannot express a class/label set.
         if matches!(
             task_type,
             TaskType::MulticlassClassification | TaskType::MultilabelRanking
         ) {
-            return self.fallback.score(query, task_type, contexts, model_uri, config);
+            return Err(Error::Execution(ExecutionError(
+                "the checkpoint's single score head cannot produce multiclass / ranking output"
+                    .into(),
+            )));
         }
         if contexts.is_empty() {
             return Ok(Vec::new());

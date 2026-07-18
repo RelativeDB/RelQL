@@ -16,8 +16,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from relativedb import ExecutionInput                       # noqa: E402
-from relativedb.engine import HistoryBaselineBackend        # noqa: E402
 from benchmarks.harness import audit_fixes, audit_grammar, audit_leakage  # noqa: E402
 from benchmarks.harness import backtest as B                # noqa: E402
 from benchmarks.harness import datasets as D                # noqa: E402
@@ -90,53 +88,25 @@ def _print_rank(r: B.TaskResult):
         print(f"    ! {n}")
 
 
-def _probability_granularity_probe(ds: D.Dataset) -> dict:
-    """Confirm binary probabilities are quantized to num_history_windows+1
-    levels — a structural calibration ceiling of the default backend."""
-    q = (f"PREDICT COUNT(purchases.*) OVER (90 DAYS FOLLOWING) = 0 "
-         f"FOR EACH customers.customer_id "
-         f"WHERE COUNT(purchases.*) OVER (90 DAYS PRECEDING) > 0")
-    out = {}
-    for w in (3, 8, 20):
-        ds.engine.model_backend = HistoryBaselineBackend(num_history_windows=w)
-        res = ds.engine.execute(ExecutionInput(query=q, anchor_time=ds.anchors[1]))
-        probs = {round(p.probability, 4) for p in res.predictions
-                 if p.probability is not None}
-        out[w] = len(probs)
-    ds.engine.model_backend = HistoryBaselineBackend()   # restore default
-    return out
-
-
-def _use_backend(ds, which: str) -> str:
-    """Swap the dataset engine's model backend. Returns the label actually used
-    (falls back to the baseline with a note if the native RT-J engine or its
-    checkpoints are unavailable)."""
-    if which != "rtj":
-        ds.engine.model_backend = HistoryBaselineBackend()
-        return "history-baseline"
-    try:
-        from relativedb.rt_native import (RtNativeBackend,
-                                          RtNativeUnavailableError)
-        ds.engine.model_backend = RtNativeBackend(schema=ds.schema)
-        return "rtj-native"
-    except Exception as e:  # RtNativeUnavailableError, missing checkpoint, etc.
-        print(f"  ! RT-J native backend unavailable ({type(e).__name__}: {e}); "
-              f"falling back to history baseline")
-        ds.engine.model_backend = HistoryBaselineBackend()
-        return "history-baseline (rtj unavailable)"
+def _use_backend(ds) -> str:
+    """Wire the dataset engine to the native RT-J model backend. Raises if the
+    native engine or its checkpoints are unavailable — there is no model-free
+    fallback scorer."""
+    from relativedb.rt_native import RtNativeBackend
+    ds.engine.model_backend = RtNativeBackend(schema=ds.schema)
+    return "rtj-native"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--backend", choices=["baseline", "rtj"], default="baseline",
-                    help="scoring backend: 'baseline' (model-free history) or "
-                         "'rtj' (the native RT-J model — needs librt_c + cached "
-                         "checkpoints; much slower). Compare a run of each to "
-                         "benchmark the model against the baseline and naives.")
+    ap.add_argument("--backend", choices=["rtj"], default="rtj",
+                    help="scoring backend: 'rtj' (the native RT-J model — needs "
+                         "librt_c + cached checkpoints). There is no model-free "
+                         "fallback; a run with rtj unavailable errors out.")
     ap.add_argument("--limit", type=int, default=None,
-                    help="cap entities scored per dataset (recommended with "
-                         "--backend rtj, which does per-entity model inference).")
+                    help="cap entities scored per dataset (recommended, since "
+                         "rtj does per-entity model inference).")
     args = ap.parse_args()
     RESULTS.mkdir(exist_ok=True)
     report = {"tasks": [], "audits": {}}
@@ -172,8 +142,8 @@ def main():
     ret = D.online_retail(max_customers=args.limit or (400 if args.quick else 1500))
     print(f"\nloaded corpus in {time.time()-t0:.1f}s  "
           f"(movielens={len(ml.entity_ids)} users, retail={len(ret.entity_ids)} customers)")
-    backend_label = _use_backend(ml, args.backend)
-    _use_backend(ret, args.backend)
+    backend_label = _use_backend(ml)
+    _use_backend(ret)
     print(f"scoring backend: {backend_label}")
     report["backend"] = backend_label
 
@@ -199,17 +169,6 @@ def main():
             _print_reg(r)
         else:
             _print_rank(r)
-
-    # ----- probability granularity probe -----
-    print("\n" + "=" * 78)
-    print("DIAGNOSTIC: binary probability granularity")
-    print("=" * 78)
-    gran = _probability_granularity_probe(ret)
-    report["audits"]["probability_granularity"] = gran
-    print("distinct probabilities produced, by num_history_windows:")
-    for w, n in gran.items():
-        print(f"    num_history_windows={w:2d} -> {n} distinct probabilities")
-    print("    (the window-vote emits at most num_history_windows+1 levels)")
 
     # ----- truncation-instrumentation guard -----
     print("\n" + "=" * 78)
@@ -256,9 +215,6 @@ def main():
                     f"gives no lift over naive baseline {bn:.3f}")
         for n in r.notes:
             all_findings.append(f"[{r.dataset}] {r.task}: {n}")
-    all_findings.append(
-        "binary probabilities are quantized to <=num_history_windows+1 levels "
-        "(coarse ranking/calibration)")
 
     print("\n" + "=" * 78)
     print(f"CONSOLIDATED FINDINGS ({len(all_findings)})")

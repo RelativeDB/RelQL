@@ -4,12 +4,7 @@ import com.relativedb.engine.ExecutionInput;
 import com.relativedb.engine.ExplainResult;
 import com.relativedb.engine.PredictionResult;
 import com.relativedb.engine.RelativeDbEngine;
-import com.relativedb.model.ModelBackend;
-import com.relativedb.model.ModelCapabilities;
-import com.relativedb.model.ModelOutput;
-import com.relativedb.model.TokenBatch;
 import com.relativedb.query.Explain;
-import com.relativedb.query.TaskType;
 import com.relativedb.retrieve.RetrieverWiring;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -17,11 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static com.relativedb.TestData.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,20 +22,9 @@ class ExplainAsOfTest {
 
     private Store store;
     private RetrieverWiring wiring;
-    private final AtomicReference<TokenBatch> lastBatch = new AtomicReference<>();
-    private final AtomicInteger scoreCalls = new AtomicInteger();
 
-    /** Records every score() call so tests can assert the model is (not) invoked. */
-    private final ModelBackend spyBackend = new ModelBackend() {
-        @Override public ModelCapabilities capabilities() { return ModelCapabilities.all(8192); }
-        @Override public CompletionStage<ModelOutput> score(TokenBatch batch, TaskType taskType) {
-            scoreCalls.incrementAndGet();
-            lastBatch.set(batch);
-            return CompletableFuture.completedFuture(
-                    taskType == TaskType.BINARY_CLASSIFICATION
-                            ? ModelOutput.binary(0.83) : ModelOutput.regression(12.5));
-        }
-    };
+    /** The shared stub records batches and score() calls (asserted below). */
+    private final StubBackend spyBackend = new StubBackend();
 
     @BeforeEach
     void setUp() {
@@ -64,7 +44,7 @@ class ExplainAsOfTest {
     }
 
     private boolean batchHasOrderQty(double qty) {
-        return lastBatch.get().tokens().stream()
+        return spyBackend.lastBatch.get().tokens().stream()
                 .anyMatch(t -> t.table().equals("orders") && t.normalizedValue() == qty);
     }
 
@@ -137,7 +117,7 @@ class ExplainAsOfTest {
                 .entityIds(List.of(1L))
                 .build());
         assertEquals(Explain.Mode.PLAN, r.mode());
-        assertEquals(0, scoreCalls.get(), "PLAN must not invoke the model");
+        assertEquals(0, spyBackend.scoreCalls.get(), "PLAN must not invoke the model");
         assertTrue(r.context().isEmpty());
         assertTrue(r.predictions().isEmpty());
     }
@@ -180,7 +160,7 @@ class ExplainAsOfTest {
                 .entityIds(List.of(1L))
                 .build());
         assertEquals(Explain.Mode.CONTEXT, r.mode());
-        assertEquals(0, scoreCalls.get(), "CONTEXT must not score");
+        assertEquals(0, spyBackend.scoreCalls.get(), "CONTEXT must not score");
         assertTrue(r.predictions().isEmpty());
 
         Map<String, Object> ctx = r.context().orElseThrow();
@@ -202,7 +182,7 @@ class ExplainAsOfTest {
         PredictionResult pr = r.predictions().orElseThrow();
         assertEquals(1, pr.predictions().size());
         assertEquals(0.83, pr.predictions().get(0).probability().orElseThrow(), 1e-9);
-        assertTrue(scoreCalls.get() > 0);
+        assertTrue(spyBackend.scoreCalls.get() > 0);
     }
 
     // ------------------------------------------------------------------

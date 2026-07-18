@@ -1,5 +1,6 @@
 """Native RT model backend — scores contexts with the golden-verified C++
-RT-J engine (``librt_c``) instead of the history baseline.
+RT-J engine (``librt_c``). This is the engine's only real scoring backend;
+there is no model-free scorer.
 
 Three layers:
 
@@ -35,8 +36,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .engine import (EntityContext, EntityPrediction, HistoryBaselineBackend,
-                     ModelBackend)
+from .engine import EntityContext, EntityPrediction, ModelBackend
 from .evaluate import eval_bool, eval_value
 from .model import ModelConfig
 from .pql.ast import ParsedQuery, TaskType
@@ -369,7 +369,8 @@ class RtNativeBackend:
     Classification scores are logits -> sigmoid -> probability; regression
     scores are normalized -> denormalized with the in-context label stats.
     Multiclass classification and ranking need heads the single-score C ABI
-    does not expose; they fall back to :class:`HistoryBaselineBackend`.
+    does not expose; they raise a clear error. ``RETURN QUANTILES/INTERVAL``
+    likewise raise — a single point head exposes no empirical distribution.
     """
 
     def __init__(self, *, schema: Optional[Schema] = None,
@@ -385,7 +386,6 @@ class RtNativeBackend:
         self.num_history_windows = max(1, num_history_windows)
         self.max_seq_len = max_seq_len
         self._models: dict[str, RtModel] = {}
-        self._fallback = HistoryBaselineBackend(num_history_windows)
 
     # -- model handles ------------------------------------------------------
     def _model_for(self, model_uri: str) -> RtModel:
@@ -398,11 +398,19 @@ class RtNativeBackend:
     def score(self, query: ParsedQuery, task_type: TaskType,
               contexts: list[EntityContext], model_uri: str,
               config: ModelConfig) -> list[EntityPrediction]:
+        ret = query.ret
+        ret_kind = ret.kind if ret is not None else None
+        # A single point head exposes no empirical distribution — these RETURN
+        # forms need a quantile/distribution head the checkpoint does not have.
+        if ret_kind in ("QUANTILES", "INTERVAL"):
+            raise RtNativeError(
+                "RETURN QUANTILES/INTERVAL requires a quantile/distribution "
+                "head the current checkpoint does not expose")
         if task_type in (TaskType.MULTICLASS_CLASSIFICATION,
                          TaskType.MULTILABEL_RANKING):
-            # single-number-head C ABI cannot express these; use the baseline
-            return self._fallback.score(query, task_type, contexts,
-                                        model_uri, config)
+            raise RtNativeError(
+                "the checkpoint's single score head cannot produce multiclass "
+                "/ ranking output")
         if not contexts:
             return []
         model = self._model_for(model_uri)
@@ -413,8 +421,8 @@ class RtNativeBackend:
         for ctx, s in zip(contexts, scores):
             s = float(s)
             if task_type is TaskType.BINARY_CLASSIFICATION:
-                preds.append(EntityPrediction(
-                    ctx.entity_id, probability=1.0 / (1.0 + math.exp(-s))))
+                p = 1.0 / (1.0 + math.exp(-s))
+                preds.append(self._shape_binary(ctx.entity_id, ret_kind, p))
             else:  # REGRESSION / FORECASTING: denormalize with label stats
                 v = s * label_sd + label_mu
                 if task_type is TaskType.FORECASTING:
@@ -424,6 +432,25 @@ class RtNativeBackend:
                 else:
                     preds.append(EntityPrediction(ctx.entity_id, value=v))
         return preds
+
+    @staticmethod
+    def _shape_binary(entity_id: Any, ret_kind: Optional[str],
+                      p: float) -> EntityPrediction:
+        """Shape the model's binary probability per the RETURN clause (moved
+        here from the deleted history baseline; operates on the model output,
+        not on any history-window heuristic)."""
+        if ret_kind == "CLASS":
+            # Hard decision at threshold 0.5, not the score.
+            return EntityPrediction(
+                entity_id, predicted_class="true" if p >= 0.5 else "false")
+        if ret_kind == "DISTRIBUTION":
+            return EntityPrediction(
+                entity_id, class_probs={"true": p, "false": 1.0 - p})
+        if ret_kind == "EXPECTED_VALUE":
+            # Expected value of the 0/1 indicator is p.
+            return EntityPrediction(entity_id, value=p)
+        # PROBABILITY (explicit) or default.
+        return EntityPrediction(entity_id, probability=p)
 
     # -- batch building -----------------------------------------------------
     def _sem_for_cell(self, table: str, col: str, value: Any) -> Optional[int]:

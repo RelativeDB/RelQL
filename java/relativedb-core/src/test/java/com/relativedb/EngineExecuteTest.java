@@ -3,9 +3,6 @@ package com.relativedb;
 import com.relativedb.engine.RelativeDbEngine;
 import com.relativedb.engine.ExecutionInput;
 import com.relativedb.engine.PredictionResult;
-import com.relativedb.model.ModelBackend;
-import com.relativedb.model.ModelCapabilities;
-import com.relativedb.model.ModelOutput;
 import com.relativedb.model.TokenBatch;
 import com.relativedb.query.TaskType;
 import com.relativedb.retrieve.EntityId;
@@ -15,30 +12,17 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static com.relativedb.TestData.*;
 import static org.junit.jupiter.api.Assertions.*;
 
-/** End-to-end execute() with a scripted model backend. */
+/** End-to-end execute() with the shared deterministic stub backend. */
 class EngineExecuteTest {
 
     private Store store;
     private RetrieverWiring wiring;
-    private final AtomicReference<TokenBatch> lastBatch = new AtomicReference<>();
-
-    private final ModelBackend fakeBackend = new ModelBackend() {
-        @Override public ModelCapabilities capabilities() { return ModelCapabilities.all(8192); }
-        @Override public CompletionStage<ModelOutput> score(TokenBatch batch, TaskType taskType) {
-            lastBatch.set(batch);
-            return CompletableFuture.completedFuture(
-                    taskType == TaskType.BINARY_CLASSIFICATION
-                            ? ModelOutput.binary(0.83) : ModelOutput.regression(12.5));
-        }
-    };
+    private final StubBackend fakeBackend = new StubBackend();
 
     @BeforeEach
     void setUp() {
@@ -73,7 +57,7 @@ class EngineExecuteTest {
 
         // The token batch fed to the model must respect the anchor: order 103
         // (2026-08-01) is newer than the anchor and must not be tokenized.
-        TokenBatch batch = lastBatch.get();
+        TokenBatch batch = fakeBackend.lastBatch.get();
         assertNotNull(batch);
         assertTrue(batch.tokens().stream().noneMatch(t -> t.table().equals("orders")
                         && t.normalizedValue() == 9.0),

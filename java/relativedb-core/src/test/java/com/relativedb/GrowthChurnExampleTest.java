@@ -33,11 +33,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0 FOR EACH users.user_id
  *
  * Data plants the signal: "engaged" users stream weekly up to the anchor;
- * "fading" users stopped ~45 days before it. The backend here is a
- * transparent context-evidence baseline (churn risk decays with the amount
- * of recent activity that reached the model's context window) — it stands in
- * for a real RT backend while exercising the full pipeline: RelQL parse →
- * validation → retriever hop loop → temporal guard → tokenization → scoring.
+ * "fading" users stopped ~45 days before it. The backend here is a tiny
+ * deterministic test-only stub whose score decays with the amount of recent
+ * activity that reached the model's context window — it is not a shipped
+ * predictor, it just makes the full pipeline observable end to end: RelQL parse
+ * → validation → retriever hop loop → temporal guard → tokenization → scoring.
+ * The assertion checks that temporally-filtered evidence actually routes into
+ * the score, so fading users (less recent activity) score riskier.
  */
 class GrowthChurnExampleTest {
 
@@ -56,8 +58,8 @@ class GrowthChurnExampleTest {
             .link(LinkDef.link("events", "user_id", "users"))
             .build();
 
-    /** Context-evidence baseline: p(churn) = 1 / (1 + recent event tokens). */
-    static final ModelBackend BASELINE = new ModelBackend() {
+    /** Test-only stub: p(churn) = 1 / (1 + recent event tokens in context). */
+    static final ModelBackend EVIDENCE_STUB = new ModelBackend() {
         @Override public ModelCapabilities capabilities() { return ModelCapabilities.all(8192); }
         @Override public CompletionStage<ModelOutput> score(TokenBatch batch, TaskType taskType) {
             long evidence = batch.tokens().stream()
@@ -98,7 +100,7 @@ class GrowthChurnExampleTest {
                 .build();
 
         RelativeDbEngine engine = RelativeDbEngine.newEngine(SCHEMA, wiring)
-                .modelBackend(BASELINE)
+                .modelBackend(EVIDENCE_STUB)
                 .build();
 
         List<EntityId> all = new ArrayList<>(engaged);

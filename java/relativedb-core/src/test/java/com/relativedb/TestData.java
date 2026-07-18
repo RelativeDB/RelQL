@@ -1,5 +1,10 @@
 package com.relativedb;
 
+import com.relativedb.model.ModelBackend;
+import com.relativedb.model.ModelCapabilities;
+import com.relativedb.model.ModelOutput;
+import com.relativedb.model.TokenBatch;
+import com.relativedb.query.TaskType;
 import com.relativedb.retrieve.EntityId;
 import com.relativedb.retrieve.Row;
 import com.relativedb.retrieve.TemporalBound;
@@ -13,7 +18,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Shared fixture: a customers/orders graph with an in-memory backing store. */
 final class TestData {
@@ -85,6 +93,27 @@ final class TestData {
                 }
                 @Override public void cancel() { done = true; }
             });
+        }
+    }
+
+    /**
+     * The one shared test-only {@link ModelBackend}: deterministic scores
+     * ({@code binary 0.83} / {@code regression 12.5}) with no model artifacts.
+     * Records the last batch and the number of score() calls so engine/plumbing
+     * tests can assert what reached the model and whether it was invoked.
+     */
+    static final class StubBackend implements ModelBackend {
+        final AtomicReference<TokenBatch> lastBatch = new AtomicReference<>();
+        final AtomicInteger scoreCalls = new AtomicInteger();
+
+        @Override public ModelCapabilities capabilities() { return ModelCapabilities.all(8192); }
+
+        @Override public CompletionStage<ModelOutput> score(TokenBatch batch, TaskType taskType) {
+            lastBatch.set(batch);
+            scoreCalls.incrementAndGet();
+            return CompletableFuture.completedFuture(
+                    taskType == TaskType.BINARY_CLASSIFICATION
+                            ? ModelOutput.binary(0.83) : ModelOutput.regression(12.5));
         }
     }
 

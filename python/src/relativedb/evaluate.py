@@ -1,7 +1,8 @@
 """Expression evaluation over an assembled context.
 
-Used for WHERE-clause entity filtering and by the built-in history baseline
-backend. Aggregation windows are ``(anchor + start, anchor + end]`` (start
+Used for WHERE-clause entity filtering and for the native backend's
+self-label history windows. Aggregation windows are
+``(anchor + start, anchor + end]`` (start
 excluded, end included), matching the grammar's window semantics.
 """
 from __future__ import annotations

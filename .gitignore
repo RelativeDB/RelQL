@@ -10,3 +10,4 @@ __pycache__/
 benchmarks/corpus/
 benchmarks/results/
 .venv-bench/
+artifacts/

@@ -15,14 +15,13 @@ from __future__ import annotations
 import json
 import math
 import warnings
-from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional, Protocol, Sequence, Union
 
 from .csc import CscIndex
-from .evaluate import eval_bool, eval_value
+from .evaluate import eval_bool
 from .model import ModelConfig
 from .pql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
                       Explain, Func, Lit, LogicalOp, Not, ParsedQuery, TaskType,
@@ -34,7 +33,7 @@ from .schema import Schema
 __all__ = [
     "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
     "EntityPrediction", "PredictionResult", "ExplainResult", "ModelBackend",
-    "HistoryBaselineBackend", "Engine", "ExecutionError",
+    "Engine", "ExecutionError",
     "ContextTruncationWarning",
 ]
 
@@ -326,9 +325,10 @@ class ExplainResult:
 
 
 class ModelBackend(Protocol):
-    """Anything that can score assembled contexts. The built-in
-    :class:`HistoryBaselineBackend` is a model-free reference; real backends
-    load the checkpoint at ``model_uri`` (routed by task type)."""
+    """Anything that can score assembled contexts. The real backend
+    (:class:`~relativedb.rt_native.RtNativeBackend`) loads the checkpoint at
+    ``model_uri`` (routed by task type); engine tests use a tiny deterministic
+    test double. There is no built-in model-free scorer."""
 
     def score(self, query: ParsedQuery, task_type: TaskType,
               contexts: list[EntityContext], model_uri: str,
@@ -400,7 +400,7 @@ class Engine:
         self.schema = schema
         self.wiring = wiring
         self.model_config = model_config or ModelConfig.defaults()
-        self.model_backend: ModelBackend = model_backend or HistoryBaselineBackend()
+        self.model_backend: Optional[ModelBackend] = model_backend
         self.context_policy = context_policy or ContextPolicy()
         self.sampler_mode = sampler_mode
         self._csc_index: Optional[CscIndex] = None
@@ -410,6 +410,16 @@ class Engine:
     def refresh(self) -> None:
         """(Re)build the CSC snapshot from the wired TableScanners."""
         self._csc_index = CscIndex.build(self.schema, self.wiring)
+
+    def _require_backend(self) -> ModelBackend:
+        """Scoring paths (execute, EXPLAIN ANALYZE) need a model backend; the
+        engine ships none. Parse/validate/EXPLAIN PLAN/CONTEXT/AS OF never
+        reach here."""
+        if self.model_backend is None:
+            raise ExecutionError(
+                "Engine requires a model backend (e.g. RtNativeBackend); "
+                "there is no built-in model-free scorer.")
+        return self.model_backend
 
     def _sampler(self):
         if self.sampler_mode is SamplerMode.CSC:
@@ -520,8 +530,8 @@ class Engine:
                 continue
             contexts.append(ctx)
         stats = self._collect_stats(pq, task_type, contexts)
-        preds = self.model_backend.score(pq, task_type, contexts, model_uri,
-                                         self.model_config)
+        preds = self._require_backend().score(pq, task_type, contexts,
+                                              model_uri, self.model_config)
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
                                 model_uri=model_uri, stats=stats)
@@ -661,7 +671,7 @@ class Engine:
             if mode == "ANALYZE":
                 task_type = pq.task_type(self.schema)
                 model_uri = self.model_config.model_uri_for(task_type)
-                predictions = tuple(self.model_backend.score(
+                predictions = tuple(self._require_backend().score(
                     pq, task_type, contexts, model_uri, self.model_config))
 
         return ExplainResult(mode=mode, format=fmt, plan=plan,
@@ -792,165 +802,3 @@ class Engine:
                                             if c.hit_cell_budget),
         }
         return report, contexts
-
-
-# ---------------------------------------------------------------------------
-# Built-in model-free backend: predicts from the entity's own history
-# ---------------------------------------------------------------------------
-
-class HistoryBaselineBackend:
-    """Reference backend, no checkpoint: evaluates the target expression over
-    trailing historical windows of the assembled context ("self labels",
-    F65 — the strongest zero-shot signal). Real model backends implement the
-    same :class:`ModelBackend` protocol and load ``model_uri``.
-
-    ASSUMING clauses are parsed and carried on the query but ignored here
-    (counterfactual injection is a context-transformer concern; see the
-    design's open questions).
-    """
-
-    def __init__(self, num_history_windows: int = 3):
-        self.num_history_windows = max(1, num_history_windows)
-
-    def score(self, query: ParsedQuery, task_type: TaskType,
-              contexts: list[EntityContext], model_uri: str,
-              config: ModelConfig) -> list[EntityPrediction]:
-        return [self._score_one(query, task_type, ctx) for ctx in contexts]
-
-    def _score_one(self, query: ParsedQuery, task_type: TaskType,
-                   ctx: EntityContext) -> EntityPrediction:
-        rows_by_table = ctx.rows_by_table()
-        cells = ctx.entity_cells(query.entity_key.table)
-        aggs = query.target_aggregations
-        window = next((a.window for a in aggs if a.window is not None), None)
-        span = window.span() if window is not None else None
-
-        ret = query.ret
-        ret_kind = ret.kind if ret is not None else None
-
-        if task_type is TaskType.FORECASTING:
-            base = self._history_mean(query, rows_by_table, cells, ctx.anchor, span)
-            n = query.num_forecasts or 1
-            forecast = tuple([base] * n)
-            # Forecasting keeps its series; RETURN QUANTILES/INTERVAL/EXPECTED
-            # shape the summary value/quantiles/interval alongside it.
-            if ret_kind in ("QUANTILES", "INTERVAL"):
-                values = self._history_values(query, rows_by_table, cells,
-                                              ctx.anchor, span)
-                return EntityPrediction(
-                    ctx.entity_id, value=base, forecast=forecast,
-                    quantiles=self._quantiles_for(ret, values),
-                    interval=self._interval_for(ret, values))
-            return EntityPrediction(ctx.entity_id, value=base,
-                                    forecast=forecast)
-        if task_type is TaskType.MULTILABEL_RANKING:
-            return self._rank(query, rows_by_table, ctx)
-        if task_type is TaskType.BINARY_CLASSIFICATION:
-            p = self._history_prob(query, rows_by_table, cells, ctx.anchor, span)
-            if ret_kind == "CLASS":
-                # Hard decision (threshold at 0.5), not the score.
-                label = "true" if p >= 0.5 else "false"
-                return EntityPrediction(ctx.entity_id, predicted_class=label)
-            if ret_kind == "DISTRIBUTION":
-                return EntityPrediction(
-                    ctx.entity_id,
-                    class_probs={"true": p, "false": 1.0 - p})
-            if ret_kind == "EXPECTED_VALUE":
-                # Expected value of the 0/1 indicator is p.
-                return EntityPrediction(ctx.entity_id, value=p)
-            # PROBABILITY (explicit) or default.
-            return EntityPrediction(ctx.entity_id, probability=p)
-        if task_type is TaskType.MULTICLASS_CLASSIFICATION:
-            v = self._latest_value(query, rows_by_table, cells, ctx.anchor, span)
-            if v is None:
-                return EntityPrediction(ctx.entity_id)
-            if ret_kind == "CLASS":
-                return EntityPrediction(ctx.entity_id, predicted_class=str(v))
-            # DISTRIBUTION / MULTICLASS / default: the degenerate distribution.
-            return EntityPrediction(ctx.entity_id, class_probs={str(v): 1.0})
-        # regression
-        v = self._history_mean(query, rows_by_table, cells, ctx.anchor, span)
-        if ret_kind in ("QUANTILES", "INTERVAL"):
-            values = self._history_values(query, rows_by_table, cells,
-                                          ctx.anchor, span)
-            return EntityPrediction(
-                ctx.entity_id, value=v,
-                quantiles=self._quantiles_for(ret, values),
-                interval=self._interval_for(ret, values))
-        return EntityPrediction(ctx.entity_id, value=v)
-
-    def _quantiles_for(self, ret, values: list[float]) -> dict[float, float]:
-        if ret is None or ret.kind != "QUANTILES" or not values:
-            return {}
-        return {float(q): self._empirical_quantile(values, float(q))
-                for q in ret.quantiles}
-
-    def _interval_for(self, ret, values: list[float]):
-        if ret is None or ret.kind != "INTERVAL" or not values:
-            return None
-        pct = ret.interval or 0
-        lo = (1.0 - pct / 100.0) / 2.0
-        hi = 1.0 - lo
-        return (self._empirical_quantile(values, lo),
-                self._empirical_quantile(values, hi))
-
-    @staticmethod
-    def _empirical_quantile(values: list[float], q: float) -> float:
-        """Linear-interpolation empirical quantile (numpy "linear" semantics),
-        pure Python."""
-        xs = sorted(values)
-        n = len(xs)
-        if n == 1:
-            return xs[0]
-        idx = q * (n - 1)
-        lo = int(idx)              # floor
-        hi = min(lo + 1, n - 1)    # ceil, clamped
-        frac = idx - lo
-        return xs[lo] + (xs[hi] - xs[lo]) * frac
-
-    def _pseudo_anchors(self, anchor: Optional[datetime], span) -> list[Optional[datetime]]:
-        if anchor is None or span is None:
-            return [anchor]
-        return [anchor - span * k for k in range(1, self.num_history_windows + 1)]
-
-    def _history_values(self, query, rows_by_table, cells, anchor, span) -> list[float]:
-        """Per-pseudo-anchor numeric target evaluations (bools -> 0.0/1.0)."""
-        vals = []
-        for pa in self._pseudo_anchors(anchor, span):
-            v = eval_value(query.target, rows_by_table, cells, pa)
-            if isinstance(v, bool):
-                v = 1.0 if v else 0.0
-            if isinstance(v, (int, float)):
-                vals.append(float(v))
-        return vals
-
-    def _history_mean(self, query, rows_by_table, cells, anchor, span) -> Optional[float]:
-        vals = self._history_values(query, rows_by_table, cells, anchor, span)
-        return sum(vals) / len(vals) if vals else None
-
-    def _history_prob(self, query, rows_by_table, cells, anchor, span) -> float:
-        outcomes = [eval_bool(query.target, rows_by_table, cells, pa)
-                    for pa in self._pseudo_anchors(anchor, span)]
-        return sum(1.0 for o in outcomes if o) / len(outcomes)
-
-    def _latest_value(self, query, rows_by_table, cells, anchor, span):
-        pa = self._pseudo_anchors(anchor, span)[0]
-        v = eval_value(query.target, rows_by_table, cells, pa)
-        if isinstance(v, list):
-            return v[-1] if v else None
-        return v
-
-    def _rank(self, query: ParsedQuery, rows_by_table, ctx) -> EntityPrediction:
-        agg = next(iter(query.target_aggregations), None)
-        if agg is None:
-            return EntityPrediction(ctx.entity_id)
-        rows = rows_by_table.get(agg.column.table, [])
-        # FK targets (the recommendation pattern) live in Row.parents, never in
-        # cells (F17); fall back accordingly.
-        def _val(r):
-            v = r.cells.get(agg.column.column)
-            return v if v is not None else r.parents.get(agg.column.column)
-        counts = Counter(v for r in rows if (v := _val(r)) is not None)
-        k = query.top_k or 10
-        ranked = tuple(v for v, _ in counts.most_common(k))
-        return EntityPrediction(ctx.entity_id, ranked=ranked)

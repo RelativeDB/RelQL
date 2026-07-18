@@ -28,10 +28,10 @@ pipeline, and no temporal leakage by construction.
 3. **Temporal context assembly** — the engine hops your relational graph to
    build a per-entity context, and guarantees nothing newer than the anchor
    time enters it. See [Temporal correctness](concepts/temporal-correctness).
-4. **Model backends** — contexts are scored by a pluggable backend: a
-   transparent history baseline by default, or **RT-J**, a relational
-   transformer foundation model that predicts in-context. See
-   [Model backends](concepts/model-backends).
+4. **Model backends** — contexts are scored by a required, pluggable backend.
+   The shipped one is `RtNativeBackend`, running **RT-J**, a relational
+   transformer foundation model that predicts in-context. There is no model-free
+   default. See [Model backends](concepts/model-backends).
 
 ## Three peer libraries
 

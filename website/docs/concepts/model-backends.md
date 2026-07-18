@@ -1,30 +1,37 @@
 ---
 title: Model backends
-description: The scoring SPI, the built-in baseline, and checkpoint routing.
+description: The scoring SPI, the required RT-J backend, and checkpoint routing.
 ---
 
 # Model backends
 
-Scoring is behind a two-method `ModelBackend` SPI. Two implementations ship:
-
-## HistoryBaselineBackend (default)
-
-Model-free: evaluates the query target over the entity's **own trailing
-history windows** ("self labels") and aggregates. Transparent, deterministic,
-zero artifacts — the whole pipeline runs and tests without a model. Use it for
-development, testing, and as a sanity floor for model quality.
+Scoring is behind a two-method `ModelBackend` SPI. **A model backend is
+required** — the engine has no built-in scorer and raises a clear error if you
+execute a query without one. The shipped backend is `RtNativeBackend`, which
+runs the RT-J relational foundation model.
 
 ## RtNativeBackend
 
-Scores contexts with real **RT-J** checkpoints through the native C++ engine
-(`librt_c`). It converts each context into the raw RT token batch — one token
-per feature cell, FK links as the node graph, per-column z-scores for numbers,
-pinned MiniLM embeddings (384-dim) for text cells and `"<column> of <table>"`
-schema phrases — plus a masked *task* row anchored at prediction time, with
-the entity's own past outcomes as in-context examples.
+`RtNativeBackend` is the scoring path. It scores contexts with real **RT-J**
+checkpoints through the native C++ engine (`librt_c`), so it needs `librt_c`
+built and available plus a cached `stanford-star/rt-j` checkpoint.
+
+It converts each context into the raw RT token batch — one token per feature
+cell, FK links as the node graph, per-column z-scores for numbers, pinned
+MiniLM embeddings (384-dim) for text cells and `"<column> of <table>"` schema
+phrases — plus a masked *task* row anchored at prediction time, with the
+entity's own past outcomes as in-context examples.
 
 Classification logits pass through a sigmoid; regression outputs denormalize
 with in-context label statistics.
+
+### Supported output types
+
+The current single-score-head checkpoint supports **binary classification**
+and **regression**. `RETURN CLASS`, `RETURN DISTRIBUTION`, `RETURN
+PROBABILITY`, and `RETURN EXPECTED VALUE` work. **Multiclass**, **ranking**,
+and `RETURN QUANTILES` / `RETURN INTERVAL` are **not** supported by this
+checkpoint and raise a clear error.
 
 ## Checkpoint routing
 
@@ -44,3 +51,10 @@ downloads implicitly. `file://` and plain paths also work.
 
 Implement `ModelBackend` to plug in any scorer; the engine hands you assembled
 contexts and the routed model URI.
+
+## Testing device
+
+The engine's own unit tests use a tiny **deterministic stub** backend so the
+pipeline can be exercised without loading a checkpoint. It is a test double,
+not a shipped or default predictor — do not rely on it to serve real
+predictions.

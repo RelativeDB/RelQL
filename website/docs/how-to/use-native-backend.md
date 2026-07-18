@@ -1,12 +1,13 @@
 ---
 title: Use the native RT-J backend
-description: Swap the history baseline for the real relational transformer.
+description: Wire the required RT-J backend — the engine's only scoring path.
 ---
 
 # Use the native RT-J backend
 
-Goal: score predictions with the real RT-J model instead of the built-in
-history baseline.
+`RtNativeBackend` is the scoring path: the engine has no model-free default and
+raises a clear error if you execute a query without a model backend. This page
+sets it up — build `librt_c`, get the checkpoint, and wire the backend.
 
 ## 1. Build the C++ engine
 
@@ -58,7 +59,8 @@ let engine = Engine::new(schema, wiring)
 - Text cells require MiniLM embeddings: Python computes them with
   sentence-transformers; Java and Rust take a `TextEncoder` (a precomputed
   table works for closed vocabularies).
-- Multiclass and ranking currently fall back to the history baseline (the C
-  ABI exposes a single score head).
+- Multiclass, ranking, and `RETURN QUANTILES`/`INTERVAL` are unsupported by the
+  current single-head checkpoint (the C ABI exposes a single score head); they
+  raise a clear error.
 - A missing library or checkpoint raises a clear, actionable error — nothing
   fails silently.

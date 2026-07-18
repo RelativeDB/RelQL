@@ -4,7 +4,7 @@ The golden test feeds the raw PRE-sort arrays dumped from the PyTorch
 reference (cpp/testdata, B=5 S=16) straight through the ctypes layer and
 checks the target scores of BOTH checkpoints; it is the acceptance gate for
 the binding. The e2e test runs the README churn scenario with
-:class:`RtNativeBackend` instead of the history baseline.
+:class:`RtNativeBackend` (the engine's only real scoring backend).
 """
 import json
 import math
@@ -112,3 +112,42 @@ def test_churn_end_to_end_with_native_backend(churn_schema):
     # soft ranking check: the long-inactive C9 (only order 2026-01-15-ish era,
     # none in context window) should look riskier than recently-active C1
     assert probs["C9"] > probs["C1"], probs
+
+
+# --------------------------------------------------------------------------
+# RETURN output-shaping — moved from the deleted history baseline onto the
+# native backend's model probability.
+# --------------------------------------------------------------------------
+
+def _native_engine(schema):
+    pytest.importorskip("sentence_transformers")
+    _lib_or_skip()
+    _checkpoint_or_skip("classification")
+    from relativedb import Engine
+    return Engine(schema, in_memory_wiring(churn_rows()),
+                  model_backend=RtNativeBackend(schema=schema))
+
+
+def test_return_class_emits_hard_label(churn_schema):
+    from relativedb import ExecutionInput
+    eng = _native_engine(churn_schema)
+    res = eng.execute(ExecutionInput(
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+              "FOR customers.customer_id = 'C7' RETURN CLASS",
+        anchor_time=dt("2026-07-01")))
+    pred = res.predictions[0]
+    assert pred.predicted_class in ("true", "false")   # hard label at 0.5
+    assert pred.probability is None                     # not the score
+    assert not pred.class_probs
+
+
+def test_return_distribution_two_key_dist(churn_schema):
+    from relativedb import ExecutionInput
+    eng = _native_engine(churn_schema)
+    res = eng.execute(ExecutionInput(
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+              "FOR customers.customer_id = 'C7' RETURN DISTRIBUTION",
+        anchor_time=dt("2026-07-01")))
+    pred = res.predictions[0]
+    assert set(pred.class_probs) == {"true", "false"}
+    assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-9

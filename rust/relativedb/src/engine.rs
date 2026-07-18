@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 use crate::csc::CscIndex;
-use crate::evaluate::{eval_bool, eval_value, EvalValue};
+use crate::evaluate::eval_bool;
 use crate::model::ModelConfig;
-use crate::pql::ast::{ParsedQuery, TargetExpr, TaskType, TimeUnit, Window};
+use crate::pql::ast::{ParsedQuery, TargetExpr, TaskType, TimeUnit};
 use crate::pql::{parse, validate};
 use crate::retrieve::{EntityId, RetrieverWiring, Row, TemporalBound, Value};
 use crate::schema::{LinkDef, Schema};
@@ -215,9 +215,9 @@ pub struct PredictionResult {
     pub model_uri: String,
 }
 
-/// Anything that can score assembled contexts. The built-in
-/// [`HistoryBaselineBackend`] is a model-free reference; real backends load the
-/// checkpoint at `model_uri` (routed by task type).
+/// Anything that can score assembled contexts. Real backends (e.g.
+/// [`crate::native::RtNativeBackend`]) load the checkpoint at `model_uri`
+/// (routed by task type). There is no built-in model-free scorer.
 pub trait ModelBackend {
     fn score(
         &mut self,
@@ -328,7 +328,9 @@ pub struct Engine {
     pub schema: Schema,
     pub wiring: RetrieverWiring,
     pub model_config: ModelConfig,
-    pub model_backend: Box<dyn ModelBackend>,
+    /// The scoring backend. `None` until one is set via [`Engine::model_backend`];
+    /// scoring (execute / EXPLAIN ANALYZE) errors when it is missing.
+    pub model_backend: Option<Box<dyn ModelBackend>>,
     pub context_policy: ContextPolicy,
     pub sampler_mode: SamplerMode,
     csc_index: Option<CscIndex>,
@@ -340,7 +342,7 @@ impl Engine {
             schema,
             wiring,
             model_config: ModelConfig::defaults(),
-            model_backend: Box::new(HistoryBaselineBackend::new(3)),
+            model_backend: None,
             context_policy: ContextPolicy::default(),
             sampler_mode: SamplerMode::Retriever,
             csc_index: None,
@@ -352,7 +354,7 @@ impl Engine {
         self
     }
     pub fn model_backend(mut self, b: Box<dyn ModelBackend>) -> Engine {
-        self.model_backend = b;
+        self.model_backend = Some(b);
         self
     }
     pub fn context_policy(mut self, p: ContextPolicy) -> Engine {
@@ -539,10 +541,33 @@ impl Engine {
         // AS OF: bind the effective anchor before any assembly.
         let eff_input = self.effective_input(&pq, &input)?;
         let contexts = self.assemble_all(&pq, &eff_input)?;
-        let preds = self
-            .model_backend
-            .score(&pq, task_type, &contexts, &model_uri, &self.model_config)?;
+        let preds = self.score_contexts(&pq, task_type, &model_uri, &contexts)?;
         Ok(PredictionResult { task_type, predictions: preds, model_uri })
+    }
+
+    /// Score assembled contexts with the configured backend, then apply any
+    /// explicit `RETURN` output shaping. Errors when no backend is set.
+    fn score_contexts(
+        &mut self,
+        pq: &ParsedQuery,
+        task_type: TaskType,
+        model_uri: &str,
+        contexts: &[EntityContext],
+    ) -> Result<Vec<EntityPrediction>, Error> {
+        let backend = self.model_backend.as_mut().ok_or_else(|| {
+            Error::Execution(ExecutionError(
+                "Engine requires a model backend (e.g. RtNativeBackend); there is no \
+                 built-in model-free scorer"
+                    .into(),
+            ))
+        })?;
+        let mut preds = backend.score(pq, task_type, contexts, model_uri, &self.model_config)?;
+        if let Some(ret) = &pq.ret {
+            for p in &mut preds {
+                apply_return_shaping(ret, task_type, p)?;
+            }
+        }
+        Ok(preds)
     }
 
     /// Resolve, assemble and WHERE-filter the per-entity contexts. `input`'s
@@ -1053,13 +1078,7 @@ impl Engine {
                 let model_uri = self.model_config.model_uri_for(task_type).to_string();
                 let contexts = self.assemble_all(&pq, &eff_input)?;
                 result.context = Some(self.context_stats(&contexts, eff_input.anchor_time));
-                let preds = self.model_backend.score(
-                    &pq,
-                    task_type,
-                    &contexts,
-                    &model_uri,
-                    &self.model_config,
-                )?;
+                let preds = self.score_contexts(&pq, task_type, &model_uri, &contexts)?;
                 result.predictions =
                     Some(PredictionResult { task_type, predictions: preds, model_uri });
             }
@@ -1459,355 +1478,54 @@ fn literal_to_entity_id(l: &crate::pql::ast::Literal) -> EntityId {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in model-free backend: predicts from the entity's own history
+// RETURN output shaping (model-side)
 // ---------------------------------------------------------------------------
 
-/// Reference backend, no checkpoint: evaluates the target expression over
-/// trailing historical windows of the assembled context ("self labels", F65 —
-/// the strongest zero-shot signal). Real model backends implement the same
-/// [`ModelBackend`] trait and load `model_uri`.
-pub struct HistoryBaselineBackend {
-    pub num_history_windows: usize,
-}
-
-impl HistoryBaselineBackend {
-    pub fn new(num_history_windows: usize) -> HistoryBaselineBackend {
-        HistoryBaselineBackend { num_history_windows: num_history_windows.max(1) }
-    }
-
-    fn pseudo_anchors(&self, anchor: Option<DateTime<Utc>>, span: Option<chrono::Duration>) -> Vec<Option<DateTime<Utc>>> {
-        match (anchor, span) {
-            (Some(a), Some(s)) => (1..=self.num_history_windows as i32).map(|k| Some(a - s * k)).collect(),
-            _ => vec![anchor],
+/// Shape a raw scalar prediction for an explicit `RETURN <kind>`. Operates only
+/// on the model's scalar output (the probability / value the backend produced):
+///
+/// * `PROBABILITY` — binary probability, already the default output.
+/// * `EXPECTED VALUE` — binary: the probability *is* the expected value;
+///   regression/forecasting: the point estimate, already set.
+/// * `CLASS` — binary hard label (threshold 0.5).
+/// * `DISTRIBUTION` — binary `{"true":p,"false":1-p}`.
+/// * `QUANTILES` / `INTERVAL` — need an empirical/quantile distribution the
+///   single-head point checkpoints do not expose; these error.
+fn apply_return_shaping(
+    ret: &crate::pql::ast::ReturnSpec,
+    task_type: TaskType,
+    p: &mut EntityPrediction,
+) -> Result<(), Error> {
+    match ret.kind.as_str() {
+        // binary probability is already the default output
+        "PROBABILITY" => {}
+        "EXPECTED_VALUE" => {
+            if task_type == TaskType::BinaryClassification {
+                p.value = p.probability;
+            }
+            // regression/forecasting: value is already the point estimate.
         }
-    }
-
-    /// The per-pseudo-anchor numeric history values of the target expression.
-    fn history_values(
-        &self,
-        query: &ParsedQuery,
-        rows_by_table: &HashMap<String, Vec<Row>>,
-        cells: &[(String, Value)],
-        anchor: Option<DateTime<Utc>>,
-        span: Option<chrono::Duration>,
-    ) -> Vec<f64> {
-        let mut vals = Vec::new();
-        for pa in self.pseudo_anchors(anchor, span) {
-            let v = eval_value(&query.target, rows_by_table, cells, pa);
-            if let Some(n) = v.as_number() {
-                vals.push(n);
+        "CLASS" => {
+            if task_type == TaskType::BinaryClassification {
+                let prob = p.probability.unwrap_or(0.0);
+                p.predicted_class =
+                    Some(if prob >= 0.5 { "true".into() } else { "false".into() });
             }
         }
-        vals
-    }
-
-    fn history_mean(
-        &self,
-        query: &ParsedQuery,
-        rows_by_table: &HashMap<String, Vec<Row>>,
-        cells: &[(String, Value)],
-        anchor: Option<DateTime<Utc>>,
-        span: Option<chrono::Duration>,
-    ) -> Option<f64> {
-        let vals = self.history_values(query, rows_by_table, cells, anchor, span);
-        if vals.is_empty() {
-            None
-        } else {
-            Some(vals.iter().sum::<f64>() / vals.len() as f64)
-        }
-    }
-
-    fn history_prob(
-        &self,
-        query: &ParsedQuery,
-        rows_by_table: &HashMap<String, Vec<Row>>,
-        cells: &[(String, Value)],
-        anchor: Option<DateTime<Utc>>,
-        span: Option<chrono::Duration>,
-    ) -> f64 {
-        let anchors = self.pseudo_anchors(anchor, span);
-        let n = anchors.len().max(1);
-        let hits = anchors
-            .into_iter()
-            .filter(|pa| eval_bool(&query.target, rows_by_table, cells, *pa))
-            .count();
-        hits as f64 / n as f64
-    }
-
-    fn latest_value(
-        &self,
-        query: &ParsedQuery,
-        rows_by_table: &HashMap<String, Vec<Row>>,
-        cells: &[(String, Value)],
-        anchor: Option<DateTime<Utc>>,
-        span: Option<chrono::Duration>,
-    ) -> EvalValue {
-        let pa = self.pseudo_anchors(anchor, span).into_iter().next().flatten();
-        let v = eval_value(&query.target, rows_by_table, cells, pa);
-        if let EvalValue::List(items) = &v {
-            return items.last().map(value_to_eval).unwrap_or(EvalValue::Null);
-        }
-        v
-    }
-
-    fn score_one(
-        &self,
-        query: &ParsedQuery,
-        task_type: TaskType,
-        ctx: &EntityContext,
-    ) -> EntityPrediction {
-        let rows_by_table = ctx.rows_by_table();
-        let cells = ctx.entity_cells(&query.entity_key.table);
-        let window: Option<Window> =
-            query.target_aggregations().iter().find_map(|a| a.window);
-        let span = window.and_then(|w| w.span());
-
-        let mut p = match task_type {
-            TaskType::Forecasting => {
-                let base = self.history_mean(query, &rows_by_table, &cells, ctx.anchor, span);
-                let n = query.num_forecasts.unwrap_or(1).max(1) as usize;
-                let mut p = EntityPrediction::new(ctx.entity_id.clone());
-                p.value = base;
-                if let Some(b) = base {
-                    p.forecast = vec![b; n];
-                }
-                p
-            }
-            TaskType::MultilabelRanking => self.rank(query, &rows_by_table, ctx),
-            TaskType::BinaryClassification => {
-                let prob = self.history_prob(query, &rows_by_table, &cells, ctx.anchor, span);
-                let mut p = EntityPrediction::new(ctx.entity_id.clone());
-                p.probability = Some(prob);
-                p
-            }
-            TaskType::MulticlassClassification => {
-                let v = self.latest_value(query, &rows_by_table, &cells, ctx.anchor, span);
-                let mut p = EntityPrediction::new(ctx.entity_id.clone());
-                if !matches!(v, EvalValue::Null) {
-                    p.class_probs = vec![(eval_value_to_key(&v), 1.0)];
-                }
-                p
-            }
-            TaskType::Regression => {
-                let v = self.history_mean(query, &rows_by_table, &cells, ctx.anchor, span);
-                let mut p = EntityPrediction::new(ctx.entity_id.clone());
-                p.value = v;
-                p
-            }
-        };
-
-        // RETURN shaping: the default (no RETURN) output above is unchanged.
-        if let Some(ret) = &query.ret {
-            self.apply_return(
-                ret,
-                query,
-                task_type,
-                &rows_by_table,
-                &cells,
-                ctx.anchor,
-                span,
-                &mut p,
-            );
-        }
-        p
-    }
-
-    /// Shape `p` for an explicit `RETURN <kind>`, reusing the same history-window
-    /// machinery as the default output (see the RETURN execution contract §3).
-    #[allow(clippy::too_many_arguments)]
-    fn apply_return(
-        &self,
-        ret: &crate::pql::ast::ReturnSpec,
-        query: &ParsedQuery,
-        task_type: TaskType,
-        rows_by_table: &HashMap<String, Vec<Row>>,
-        cells: &[(String, Value)],
-        anchor: Option<DateTime<Utc>>,
-        span: Option<chrono::Duration>,
-        p: &mut EntityPrediction,
-    ) {
-        match ret.kind.as_str() {
-            "EXPECTED_VALUE" => match task_type {
-                TaskType::BinaryClassification => {
-                    let prob = self.history_prob(query, rows_by_table, cells, anchor, span);
-                    p.value = Some(prob);
-                }
-                // regression/forecasting: value = history mean (already set for
-                // both above; forecasting keeps its forecast series).
-                _ => {}
-            },
-            // PROBABILITY (binary): probability is already the default.
-            "PROBABILITY" => {}
-            "CLASS" => match task_type {
-                TaskType::BinaryClassification => {
-                    let prob = p
-                        .probability
-                        .unwrap_or_else(|| self.history_prob(query, rows_by_table, cells, anchor, span));
-                    p.predicted_class =
-                        Some(if prob >= 0.5 { "true".into() } else { "false".into() });
-                }
-                TaskType::MulticlassClassification => {
-                    let v = self.latest_value(query, rows_by_table, cells, anchor, span);
-                    if !matches!(v, EvalValue::Null) {
-                        p.predicted_class = Some(eval_value_to_key(&v));
-                    }
-                }
-                _ => {}
-            },
-            "DISTRIBUTION" => match task_type {
-                TaskType::BinaryClassification => {
-                    let prob = p
-                        .probability
-                        .unwrap_or_else(|| self.history_prob(query, rows_by_table, cells, anchor, span));
-                    p.class_probs = vec![("true".into(), prob), ("false".into(), 1.0 - prob)];
-                }
-                // multiclass: class_probs already holds the distribution.
-                _ => {}
-            },
-            "QUANTILES" => {
-                let vals = self.history_values(query, rows_by_table, cells, anchor, span);
-                if !vals.is_empty() {
-                    p.quantiles = ret
-                        .quantiles
-                        .iter()
-                        .map(|&q| (q, empirical_quantile(&vals, q)))
-                        .collect();
-                }
-            }
-            "INTERVAL" => {
-                let vals = self.history_values(query, rows_by_table, cells, anchor, span);
-                if !vals.is_empty() {
-                    let pct = ret.interval.unwrap_or(0) as f64;
-                    let lo = (1.0 - pct / 100.0) / 2.0;
-                    let hi = 1.0 - lo;
-                    p.interval = Some((
-                        empirical_quantile(&vals, lo),
-                        empirical_quantile(&vals, hi),
-                    ));
-                }
-            }
-            // MULTILABEL -> ranking output (already in `ranked`).
-            // MULTICLASS -> multiclass class_probs (already set).
-            _ => {}
-        }
-    }
-
-    fn rank(
-        &self,
-        query: &ParsedQuery,
-        rows_by_table: &HashMap<String, Vec<Row>>,
-        ctx: &EntityContext,
-    ) -> EntityPrediction {
-        let agg = match query.target_aggregations().into_iter().next() {
-            Some(a) => a,
-            None => return EntityPrediction::new(ctx.entity_id.clone()),
-        };
-        let empty = Vec::new();
-        let rows = rows_by_table.get(&agg.column.table).unwrap_or(&empty);
-        // FK targets (recommendation pattern) live in Row.parents, never in
-        // cells (F17); fall back accordingly.
-        let mut order: Vec<String> = Vec::new();
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for r in rows {
-            let key = if let Some(v) = r.get_cell(&agg.column.column) {
-                Some(value_to_key(v))
-            } else {
-                r.get_parent(&agg.column.column).map(|p| p.to_string())
-            };
-            if let Some(k) = key {
-                if !counts.contains_key(&k) {
-                    order.push(k.clone());
-                }
-                *counts.entry(k).or_insert(0) += 1;
+        "DISTRIBUTION" => {
+            if task_type == TaskType::BinaryClassification {
+                let prob = p.probability.unwrap_or(0.0);
+                p.class_probs = vec![("true".into(), prob), ("false".into(), 1.0 - prob)];
             }
         }
-        // most_common: count desc, ties by first-seen order
-        let mut items: Vec<(usize, String)> = order
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (i, k.clone()))
-            .collect();
-        items.sort_by(|a, b| {
-            counts[&b.1]
-                .cmp(&counts[&a.1])
-                .then(a.0.cmp(&b.0))
-        });
-        let k = query.top_k.unwrap_or(10).max(0) as usize;
-        let ranked = items.into_iter().take(k).map(|(_, key)| key).collect();
-        let mut p = EntityPrediction::new(ctx.entity_id.clone());
-        p.ranked = ranked;
-        p
-    }
-}
-
-impl ModelBackend for HistoryBaselineBackend {
-    fn score(
-        &mut self,
-        query: &ParsedQuery,
-        task_type: TaskType,
-        contexts: &[EntityContext],
-        _model_uri: &str,
-        _config: &ModelConfig,
-    ) -> Result<Vec<EntityPrediction>, Error> {
-        Ok(contexts.iter().map(|c| self.score_one(query, task_type, c)).collect())
-    }
-}
-
-/// Empirical quantile of `sample` at `q in [0,1]` using linear interpolation on
-/// the sorted sample (numpy.quantile / percentile "linear" semantics).
-fn empirical_quantile(sample: &[f64], q: f64) -> f64 {
-    debug_assert!(!sample.is_empty());
-    let mut xs: Vec<f64> = sample.to_vec();
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let q = q.clamp(0.0, 1.0);
-    let n = xs.len();
-    if n == 1 {
-        return xs[0];
-    }
-    let idx = q * (n - 1) as f64;
-    let lo = idx.floor() as usize;
-    let hi = idx.ceil() as usize;
-    let frac = idx - lo as f64;
-    xs[lo] + (xs[hi] - xs[lo]) * frac
-}
-
-fn value_to_eval(v: &Value) -> EvalValue {
-    match v {
-        Value::Number(n) => EvalValue::Num(*n),
-        Value::Boolean(b) => EvalValue::Bool(*b),
-        Value::Text(s) => EvalValue::Text(s.clone()),
-        Value::Datetime(d) => EvalValue::Date(*d),
-    }
-}
-
-fn value_to_key(v: &Value) -> String {
-    match v {
-        Value::Number(n) => {
-            if n.fract() == 0.0 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{}", n)
-            }
+        "QUANTILES" | "INTERVAL" => {
+            return Err(Error::Execution(ExecutionError(
+                "RETURN QUANTILES/INTERVAL requires a quantile/distribution head the \
+                 current checkpoint does not expose"
+                    .into(),
+            )));
         }
-        Value::Boolean(b) => format!("{}", b),
-        Value::Text(s) => s.clone(),
-        Value::Datetime(d) => d.to_rfc3339(),
+        _ => {}
     }
-}
-
-fn eval_value_to_key(v: &EvalValue) -> String {
-    match v {
-        EvalValue::Num(n) => {
-            if n.fract() == 0.0 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{}", n)
-            }
-        }
-        EvalValue::Bool(b) => format!("{}", b),
-        EvalValue::Text(s) => s.clone(),
-        EvalValue::Date(d) => d.to_rfc3339(),
-        EvalValue::Null => "None".into(),
-        EvalValue::List(_) => "[...]".into(),
-    }
+    Ok(())
 }

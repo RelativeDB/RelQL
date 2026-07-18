@@ -5,12 +5,31 @@ from datetime import datetime, timezone
 
 import pytest
 
-from relativedb import (ColumnDef, LinkDef, RetrieverWiring, Row, Schema,
-                      TableDef, TemporalBound, ValueType)
+from relativedb import (ColumnDef, EntityPrediction, LinkDef, RetrieverWiring,
+                      Row, Schema, TableDef, TaskType, TemporalBound, ValueType)
 
 
 def dt(s: str) -> datetime:
     return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+
+class StubBackend:
+    """Tiny deterministic test-only ModelBackend. The engine ships no scorer;
+    plumbing tests (routing, AS OF, CSC execute, EXPLAIN ANALYZE) use this so
+    they stay fast and offline without a real checkpoint. RETURN output-shaping
+    is a native-backend concern and is exercised in test_rt_native.py."""
+
+    def score(self, query, task_type, contexts, model_uri, config):
+        binary = task_type is TaskType.BINARY_CLASSIFICATION
+        return [EntityPrediction(c.entity_id,
+                                 probability=0.5 if binary else None,
+                                 value=None if binary else 1.0)
+                for c in contexts]
+
+
+@pytest.fixture
+def stub_backend() -> StubBackend:
+    return StubBackend()
 
 
 @pytest.fixture

@@ -49,9 +49,11 @@ These registry coordinates are prepared but will not resolve until the first
 release is published. See [Releasing the libraries](../contributing/releases)
 for the manual dry-run workflow and registry setup.
 
-## Native model engine (optional)
+## Native model engine (required for scoring)
 
-The RT-J model backend needs the C++ library `librt_c`:
+Scoring requires a model backend — there is no model-free default. The shipped
+backend, `RtNativeBackend`, runs the RT-J relational model through the C++
+library `librt_c`:
 
 ```bash
 cd cpp
@@ -59,5 +61,5 @@ cmake -B build -S . && cmake --build build -j
 ```
 
 All libraries auto-discover `cpp/build/librt_c.{dylib,so}`, or set
-`RELATIVEDB_RT_LIB`. Everything else works without it — the default backend is
-model-free.
+`RELATIVEDB_RT_LIB`. Parsing and validation work without it, but executing a
+query needs `librt_c` plus a cached `stanford-star/rt-j` checkpoint.

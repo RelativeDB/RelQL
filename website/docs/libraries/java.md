@@ -27,7 +27,7 @@ RetrieverWiring wiring  = RetrieverWiring.newWiring()... .build();
 
 RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
     .samplerMode(SamplerMode.CSC)        // optional
-    .modelBackend(backend)               // optional; default = history baseline
+    .modelBackend(new RtNativeBackend(schema))   // required; runs RT-J
     .build();
 
 PredictionResult r = engine.execute(ExecutionInput.newInput()

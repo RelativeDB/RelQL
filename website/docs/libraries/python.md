@@ -38,12 +38,12 @@ application-owned reference connector—not part of the installed package.
 - **Schema** — `Schema.new_schema().table(TableDef.new_table(...)...).link(LinkDef(...)).build()`
 - **Wiring** — `RetrieverWiring.new_wiring().entities(...).default_links(...).scanner(...).build()`;
   retrievers are plain callables (`typing.Protocol`)
-- **Engine** — `Engine(schema, wiring)`;
+- **Engine** — `Engine(schema, wiring, model_backend=...)`;
   `engine.execute(ExecutionInput(query=..., anchor_time=..., entity_ids=...))`
 - **RelQL** — `relativedb.parse(q)`, `relativedb.validate(pq, schema)`,
   `pq.task_type()`
-- **Backends** — `HistoryBaselineBackend` (default),
-  `RtNativeBackend(schema=...)` for RT-J
+- **Backends** — a model backend is required; `RtNativeBackend(schema=...)`
+  runs RT-J. There is no model-free default
 
 Errors are specific: `PqlSyntaxError`, `PqlValidationError`, `SchemaError`,
 `WiringError`, `ExecutionError`, `RtNativeUnavailableError`.

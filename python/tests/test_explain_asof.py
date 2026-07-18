@@ -36,12 +36,13 @@ class SpyBackend:
 # AS OF
 # ---------------------------------------------------------------------------
 
-def test_as_of_date_overrides_anchor_time(churn_schema, churn_wiring):
+def test_as_of_date_overrides_anchor_time(churn_schema, churn_wiring,
+                                          stub_backend):
     """AS OF <date> binds the anchor and overrides ExecutionInput.anchor_time.
     With T0 (2026-07-01) O4 (2026-07-05) is hidden; AS OF 2026-08-01 admits it,
     proving the date wins over the passed anchor_time and threads through the
     temporal bound."""
-    eng = Engine(churn_schema, churn_wiring)
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     later = eng.explain(ExecutionInput(
         query="EXPLAIN CONTEXT " + CHURN + " AS OF 2026-08-01", anchor_time=T0))
     base = eng.explain(ExecutionInput(
@@ -55,8 +56,8 @@ def test_as_of_date_overrides_anchor_time(churn_schema, churn_wiring):
     assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
 
 
-def test_as_of_param_binds_from_params(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring)
+def test_as_of_param_binds_from_params(churn_schema, churn_wiring, stub_backend):
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     res = eng.execute(ExecutionInput(
         query=CHURN + " AS OF :t", params={"t": dt("2026-08-01")}))
     assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
@@ -69,17 +70,18 @@ def test_as_of_param_missing_raises(churn_schema, churn_wiring):
     assert "t" in str(ei.value)
 
 
-def test_as_of_param_falls_back_to_anchor_time(churn_schema, churn_wiring):
+def test_as_of_param_falls_back_to_anchor_time(churn_schema, churn_wiring,
+                                               stub_backend):
     """No param binding but an anchor_time present -> fall back to it."""
-    eng = Engine(churn_schema, churn_wiring)
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     res = eng.execute(ExecutionInput(query=CHURN + " AS OF :t", anchor_time=T0))
     base = eng.execute(ExecutionInput(query=CHURN, anchor_time=T0))
     assert ({p.id: p.probability for p in res.predictions} ==
             {p.id: p.probability for p in base.predictions})
 
 
-def test_as_of_now_equals_no_as_of(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring)
+def test_as_of_now_equals_no_as_of(churn_schema, churn_wiring, stub_backend):
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     now = eng.execute(ExecutionInput(query=CHURN + " AS OF NOW", anchor_time=T0))
     base = eng.execute(ExecutionInput(query=CHURN, anchor_time=T0))
     assert ({p.id: p.probability for p in now.predictions} ==
@@ -166,8 +168,9 @@ def test_explain_context_populates_counts_no_predictions(churn_schema,
 # EXPLAIN ANALYZE — assemble + score
 # ---------------------------------------------------------------------------
 
-def test_explain_analyze_has_predictions(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring)
+def test_explain_analyze_has_predictions(churn_schema, churn_wiring,
+                                         stub_backend):
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     res = eng.explain(ExecutionInput(query="EXPLAIN ANALYZE " + CHURN,
                                      anchor_time=T0))
     assert res.mode == "ANALYZE"
@@ -191,8 +194,8 @@ def test_explain_ablation_warns_not_implemented(churn_schema, churn_wiring):
 # render()
 # ---------------------------------------------------------------------------
 
-def test_render_json_parses(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring)
+def test_render_json_parses(churn_schema, churn_wiring, stub_backend):
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     res = eng.explain(ExecutionInput(
         query="EXPLAIN ANALYZE FORMAT JSON " + CHURN, anchor_time=T0))
     obj = json.loads(res.render())

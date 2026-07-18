@@ -45,5 +45,5 @@ The engine assembles the temporally-bounded context; the model scores it.
 Checkpoints are routed per task type (classification vs regression), text
 cells embed with a pinned MiniLM encoder, and inference runs in a
 [dependency-light C++ engine](../libraries/cpp) verified against the PyTorch
-reference. A model-free history baseline is built in, so nothing requires the
-model to be present.
+reference. Scoring requires this model backend (`RtNativeBackend`) — there is
+no model-free default; the engine's own tests use a deterministic stub.

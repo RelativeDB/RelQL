@@ -178,7 +178,7 @@ public final class RelativeDbEngine {
             TokenBatch batch = toTokenBatch(context);
             instrumentation.onModelInvoked(id, batch.size());
             ModelOutput out = resolved.score(batch, taskType).toCompletableFuture().join();
-            predictions.add(decode(id, taskType, out, vq.query(), context, effectiveAnchor));
+            predictions.add(decode(id, taskType, out, vq.query()));
         }
         return new PredictionResult(taskType, predictions);
     }
@@ -583,10 +583,10 @@ public final class RelativeDbEngine {
 
     private ModelBackend resolveBackend(TaskType taskType) {
         if (backend != null) return backend;
-        throw new IllegalStateException("no ModelBackend configured. The core engine does not "
-                + "bundle a model runtime: add a backend artifact (e.g. relativedb-model-rt) or "
-                + "pass Builder.modelBackend(...). Routing was ready to use checkpoint '"
-                + modelConfig.modelUriFor(taskType) + "' with embedding model '"
+        throw new IllegalStateException("Engine requires a model backend (e.g. RtNativeBackend); "
+                + "there is no built-in model-free scorer. Add a backend artifact "
+                + "(e.g. relativedb-rt) or pass Builder.modelBackend(...). Routing was ready to use "
+                + "checkpoint '" + modelConfig.modelUriFor(taskType) + "' with embedding model '"
                 + modelConfig.embeddingModel() + "'.");
     }
 
@@ -647,8 +647,8 @@ public final class RelativeDbEngine {
     private final ReturnShaper returnShaper = new ReturnShaper();
 
     private PredictionResult.EntityPrediction decode(EntityId id, TaskType taskType, ModelOutput out,
-            com.relativedb.query.ParsedQuery query, ContextGraph context, Instant anchor) {
-        return returnShaper.shape(id, taskType, out, query, context, anchor);
+            com.relativedb.query.ParsedQuery query) {
+        return returnShaper.shape(id, taskType, out, query);
     }
 
     private static final class BuilderImpl implements Builder {

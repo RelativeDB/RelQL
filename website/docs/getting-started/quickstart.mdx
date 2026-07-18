@@ -18,7 +18,7 @@ in pandas, pandas remains an application dependency:
 
 ```python
 import pandas as pd
-from relativedb import Engine, ExecutionInput, RetrieverWiring, Row
+from relativedb import Engine, ExecutionInput, RetrieverWiring, Row, RtNativeBackend
 
 customer_rows = [Row("customers", r.customer_id, {"age": float(r.age)})
                  for r in customers.itertuples()]
@@ -34,7 +34,10 @@ wiring = (RetrieverWiring.new_wiring()
     .scanner("customers", scan_customers)
     .build())
 
-result = Engine(schema, wiring).execute(ExecutionInput(
+# Scoring requires a model backend. RtNativeBackend runs the RT-J relational
+# model; it needs librt_c and a cached stanford-star/rt-j checkpoint.
+engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
+result = engine.execute(ExecutionInput(
     query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id",
     anchor_time=pd.Timestamp("2026-07-01").to_pydatetime()))
 ```
@@ -61,7 +64,10 @@ RetrieverWiring wiring = RetrieverWiring.newWiring()
         orderDao.recentByCustomer(parent, bound.asOf().orElse(Instant.MAX), limit))
     .build();
 
-RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring).build();
+// Scoring requires a model backend; RtNativeBackend runs the RT-J model.
+RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
+    .modelBackend(new RtNativeBackend(schema))
+    .build();
 
 PredictionResult churn = engine.execute(ExecutionInput.newInput()
     .query("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id")
@@ -93,7 +99,9 @@ let wiring = RetrieverWiring::new_wiring()
     .scanner("customers", customer_scan)   // enables FOR EACH
     .build();
 
-let mut engine = Engine::new(schema, wiring);
+// Scoring requires a model backend; RtNativeBackend runs the RT-J model.
+let mut engine = Engine::new(schema, wiring)
+    .model_backend(RtNativeBackend::new(&schema)?);
 let result = engine.execute(
     ExecutionInput::query(
         "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id")
@@ -103,10 +111,13 @@ let result = engine.execute(
 </TabItem>
 </Tabs>
 
-:::info No model required
-By default predictions come from a transparent, model-free history baseline —
-the full pipeline runs with zero model artifacts. Swap in the real RT-J model
-via the [native backend](../how-to/use-native-backend).
+:::info A model backend is required
+Scoring runs through the RT-J relational foundation model via `RtNativeBackend`
+— there is no model-free default, and the engine errors without a backend. See
+[Use the native backend](../how-to/use-native-backend) for building `librt_c`
+and fetching the checkpoint. The current single-head checkpoint supports binary
+classification and regression; multiclass, ranking, and `RETURN
+QUANTILES`/`INTERVAL` are not supported.
 :::
 
 ## Next steps

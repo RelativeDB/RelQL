@@ -11,7 +11,7 @@ from relativedb import (ContextPolicy, Engine, ExecutionInput, ModelConfig,
 from relativedb.csc import CscIndex
 from relativedb.schema import LinkDef
 
-from conftest import churn_rows, dt, in_memory_wiring
+from conftest import StubBackend, churn_rows, dt, in_memory_wiring
 
 T0 = dt("2026-07-01")
 
@@ -117,7 +117,8 @@ def test_csc_context_equals_retriever_context(churn_schema, churn_wiring):
 
 
 def test_csc_execute_end_to_end(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring, sampler_mode=SamplerMode.CSC)
+    eng = Engine(churn_schema, churn_wiring, sampler_mode=SamplerMode.CSC,
+                 model_backend=StubBackend())
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
               "FOR EACH customers.customer_id",
@@ -162,6 +163,18 @@ def test_engine_routes_model_uri_by_task_type(churn_schema, churn_wiring):
     assert [c[1] for c in backend.calls] == [c[2] for c in cases]
 
 
+def test_execute_without_backend_raises_clear_error(churn_schema, churn_wiring):
+    """The engine ships no model-free scorer; scoring with no backend set is a
+    clear error (parse/validate/EXPLAIN PLAN/CONTEXT still work — see
+    test_explain_asof)."""
+    from relativedb import ExecutionError
+    eng = Engine(churn_schema, churn_wiring)   # no model_backend
+    with pytest.raises(ExecutionError, match="requires a model backend"):
+        eng.execute(ExecutionInput(
+            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+                  "FOR customers.customer_id = 'C7'", anchor_time=T0))
+
+
 def test_for_each_without_scanner_raises():
     """FOR EACH over all entities needs enumeration; plain retrievers can't."""
     from relativedb import ExecutionError, RetrieverWiring
@@ -172,7 +185,7 @@ def test_for_each_without_scanner_raises():
                         [by_id[t][i] for i in ids if i in by_id[t]])
               .default_links(lambda l, p, b, lim: [])
               .build())
-    eng = Engine(_make_schema(), wiring)
+    eng = Engine(_make_schema(), wiring, model_backend=StubBackend())
     with pytest.raises(ExecutionError):
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
@@ -203,50 +216,32 @@ def _make_schema():
 # RETURN clause execution (contract §3)
 # ---------------------------------------------------------------------------
 
-def _predict_one(schema, wiring, pql, eid="C7"):
-    eng = Engine(schema, wiring)
-    res = eng.execute(ExecutionInput(query=pql, anchor_time=T0))
-    preds = {p.id: p for p in res.predictions}
-    return res, preds[eid]
+def test_return_quantiles_interval_unsupported(churn_schema, churn_wiring):
+    """QUANTILES / INTERVAL parse+validate fine, but a single point-head
+    checkpoint exposes no empirical distribution — execution raises. (The fake
+    history-window quantile computation was deleted with the baseline.)"""
+    from relativedb.rt_native import RtNativeBackend, RtNativeError
+    eng = Engine(churn_schema, churn_wiring,
+                 model_backend=RtNativeBackend(schema=churn_schema))
+    for ret in ("QUANTILES (0.1, 0.5, 0.9)", "INTERVAL 80%"):
+        with pytest.raises(RtNativeError, match="QUANTILES/INTERVAL"):
+            eng.execute(ExecutionInput(
+                query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
+                      f"FOR customers.customer_id = 'C7' RETURN {ret}",
+                anchor_time=T0))
 
 
-def test_return_class_emits_hard_label(churn_schema, churn_wiring):
-    _, pred = _predict_one(
-        churn_schema, churn_wiring,
-        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-        "FOR customers.customer_id = 'C7' RETURN CLASS")
-    assert pred.predicted_class in ("true", "false")
-    assert pred.probability is None            # not the score
-    assert not pred.class_probs
-
-
-def test_return_distribution_two_key_dist(churn_schema, churn_wiring):
-    _, pred = _predict_one(
-        churn_schema, churn_wiring,
-        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-        "FOR customers.customer_id = 'C7' RETURN DISTRIBUTION")
-    assert set(pred.class_probs) == {"true", "false"}
-    assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-9
-
-
-def test_return_quantiles_three_entries_ordered(churn_schema, churn_wiring):
-    _, pred = _predict_one(
-        churn_schema, churn_wiring,
-        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-        "FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.5, 0.9)")
-    assert set(pred.quantiles) == {0.1, 0.5, 0.9}
-    q10, q50, q90 = pred.quantiles[0.1], pred.quantiles[0.5], pred.quantiles[0.9]
-    assert q10 <= q50 <= q90
-
-
-def test_return_interval_lo_le_hi(churn_schema, churn_wiring):
-    _, pred = _predict_one(
-        churn_schema, churn_wiring,
-        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-        "FOR customers.customer_id = 'C7' RETURN INTERVAL 80%")
-    assert pred.interval is not None
-    lo, hi = pred.interval
-    assert lo <= hi
+def test_multiclass_ranking_output_unsupported(churn_schema, churn_wiring):
+    """The single-score C ABI cannot express multiclass / ranking heads; the
+    native backend raises rather than falling back to a fake scorer. (Raised
+    before the checkpoint is loaded, so this runs offline.)"""
+    from relativedb.rt_native import RtNativeBackend, RtNativeError
+    eng = Engine(churn_schema, churn_wiring,
+                 model_backend=RtNativeBackend(schema=churn_schema))
+    with pytest.raises(RtNativeError, match="multiclass"):
+        eng.execute(ExecutionInput(
+            query="PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) "
+                  "RANK TOP 5 FOR customers.customer_id = 'C7'", anchor_time=T0))
 
 
 def test_return_quantiles_on_boolean_target_rejected(churn_schema, churn_wiring):

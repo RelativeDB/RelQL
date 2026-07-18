@@ -23,10 +23,12 @@ selects the model checkpoint and the output form — you never declare it.
 family routes to `hf://stanford-star/rt-j/classification` and
 regression/forecasting to `hf://stanford-star/rt-j/regression`.
 
-The output column above is the *logical* form each task produces. The built-in
-history baseline produces all of them; the native RT-J backend currently serves
-binary-classification and regression heads, so multiclass and ranking targets
-fall back to the baseline (see [Model backends](/docs/concepts/model-backends)).
+The output column above is the *logical* form each task produces. The RT-J
+backend (`RtNativeBackend`) is the only scoring path, and its current
+single-head checkpoint serves **binary-classification** and **regression**.
+Multiclass and ranking targets — and `RETURN QUANTILES`/`INTERVAL` — are not
+supported by this checkpoint and raise a clear error (see
+[Model backends](/docs/concepts/model-backends)).
 
 ## Checking a query
 

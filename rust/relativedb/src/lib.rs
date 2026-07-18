@@ -37,8 +37,8 @@ use std::fmt;
 
 pub use engine::{
     AblationPlan, AsOfPlan, ContextPolicy, Engine, EntityContext, EntityPlan, EntityPrediction,
-    ExecutionError, ExecutionInput, ExplainContext, ExplainPlan, ExplainResult,
-    HistoryBaselineBackend, ModelBackend, PredictionResult, SamplerMode, TableStats, WindowInfo,
+    ExecutionError, ExecutionInput, ExplainContext, ExplainPlan, ExplainResult, ModelBackend,
+    PredictionResult, SamplerMode, TableStats, WindowInfo,
 };
 pub use model::{
     EmbeddingMismatchError, ModelConfig, DEFAULT_CLASSIFICATION_MODEL_URI,
