@@ -8,10 +8,12 @@ against the PyTorch reference. ~700 lines, no torch, no Python at inference.
 inference it now also hosts two components that were previously reimplemented
 per language, so the bindings can delegate instead of diverging:
 
-- **PQL parser** (`src/pql.{hpp,cpp}`, C ABI `pql_parse` in `src/pql_c.h`) —
-  hand-written lexer + recursive-descent parser producing a JSON AST. Test:
-  `./build/pql_test`. Python binding: `relativedb.pql.native`; cross-language
-  equivalence: `python/tests/test_native_parser.py`.
+- **RelQL parser** (`src/pql.{hpp,cpp}`, C ABI `pql_parse` in `src/pql_c.h`) —
+  hand-written lexer + recursive-descent parser producing a JSON AST. Implements
+  the v2 grammar (`OVER (...)`/`WINDOW` frames, `HORIZONS`, `AS OF`, `RETURN`,
+  `EXPLAIN`, `EXISTS`; see `RelQL_EVOLUTION.md`). Test: `./build/pql_test`. Python
+  binding: `relativedb.pql.native`; cross-language equivalence:
+  `python/tests/test_native_parser.py`.
 - **CSC index** (`src/csc.{hpp,cpp}`, C ABI `csc_build`/`csc_children`/`csc_free`
   in `src/csc_c.h`) — lex-sorted adjacency + binary-searched "latest ≤ anchor"
   children. Test: `./build/csc_test`. Python binding: `relativedb.csc_native`;

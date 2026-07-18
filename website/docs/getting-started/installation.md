@@ -26,7 +26,7 @@ connectors. The distribution is `relationdb`, while the Python import remains
 
 Requires Java 17+. Maven publications under group `com.relativedb`:
 
-- `relationdb` — engine, schema, PQL parser, retriever SPI
+- `relationdb` — engine, schema, RelQL parser, retriever SPI
 - `relationdb-rt` — optional JNA binding to the native RT-J engine
 
 ```kotlin

@@ -1,4 +1,4 @@
-//! The PQL parser — the single source of truth is the shared C++ parser
+//! The RelQL parser — the single source of truth is the shared C++ parser
 //! (`pql_parse` in `librt_c`); this module calls it and deserializes its JSON
 //! AST into the crate's [`ParsedQuery`](super::ast::ParsedQuery). The same
 //! parser backs the Python and Java bindings, so the grammar lives in exactly
@@ -21,15 +21,18 @@ use std::sync::OnceLock;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use libloading::Library;
 
+use std::collections::HashMap;
+
 use super::ast::{
-    AggFunc, Aggregation, BoolOp, ColumnRef, CondRhs, Condition, Literal, LogicalOp, Operator,
-    ParsedQuery, RankKind, TargetExpr, TimeUnit, Window,
+    Ablation, AggFunc, Aggregation, Arith, AsOf, BoolOp, Case, ColumnRef, CondRhs, Condition,
+    Explain, Func, Literal, LogicalOp, Operator, ParsedQuery, RankKind, ReturnSpec, TargetExpr,
+    TimeUnit, Window,
 };
 
 const OUT: usize = 1 << 16; // 64 KiB JSON buffer — beyond any real query's AST
 const ERR: usize = 1024;
 
-/// A PQL parse error — a syntax error reported by the shared C++ parser, or a
+/// A RelQL parse error — a syntax error reported by the shared C++ parser, or a
 /// hard "library unavailable" error when `librt_c` cannot be loaded.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SyntaxError {
@@ -93,7 +96,7 @@ pub fn native_available() -> bool {
 
 fn syn(msg: impl Into<String>) -> SyntaxError {
     let message = msg.into();
-    let rendered = format!("PQL syntax error: {}", message);
+    let rendered = format!("RelQL syntax error: {}", message);
     SyntaxError { message, pos: -1, rendered }
 }
 
@@ -108,7 +111,7 @@ fn cstr(buf: &[u8]) -> String {
 pub fn parse_native(query: &str) -> Result<ParsedQuery, SyntaxError> {
     let lib = lib().ok_or_else(|| {
         syn(format!(
-            "librt_c could not be loaded, so PQL cannot be parsed (it is a hard runtime \
+            "librt_c could not be loaded, so RelQL cannot be parsed (it is a hard runtime \
              dependency). Build cpp/ with cmake, or set RELATIVEDB_RT_LIB to the built library. \
              Searched: {}",
             crate::native::candidate_lib_paths().join(", ")
@@ -365,10 +368,8 @@ fn lit(j: &Json) -> Result<Literal, SyntaxError> {
         Json::Null => Ok(Literal::Null),
         Json::Str(s) => Ok(Literal::Str(s.clone())),
         Json::Num(n) => Ok(Literal::Num(*n)),
-        // The PQL grammar has no boolean literal; the Rust AST has no Bool
-        // variant. Booleans should never appear, but map defensively so the
-        // parser never panics on unexpected JSON.
-        Json::Bool(b) => Ok(Literal::Num(if *b { 1.0 } else { 0.0 })),
+        // TRUE/FALSE value literals emit as JSON booleans.
+        Json::Bool(b) => Ok(Literal::Bool(*b)),
         Json::Obj(_) => {
             let d = j.get("date").and_then(Json::as_str).ok_or_else(|| syn("bad literal object"))?;
             Ok(Literal::Date(parse_date(d)?))
@@ -412,6 +413,23 @@ fn opt_expr(j: Option<&Json>) -> Result<Option<TargetExpr>, SyntaxError> {
     }
 }
 
+/// Decode a `<window>` object (`start/end/unit/horizons/step`). `horizons`
+/// defaults to 1 and `step` to `None` (= frame width) when absent.
+fn window(w: &Json) -> Result<Window, SyntaxError> {
+    let start = bound(w.get("start").ok_or_else(|| syn("window missing start"))?)?;
+    let end = bound(w.get("end").ok_or_else(|| syn("window missing end"))?)?;
+    let unit_name = w.get("unit").and_then(Json::as_str).ok_or_else(|| syn("window missing unit"))?;
+    let unit = TimeUnit::from_keyword(&unit_name.to_ascii_uppercase())
+        .ok_or_else(|| syn(format!("unknown time unit {:?}", unit_name)))?;
+    let horizons = w.get("horizons").and_then(num_i64).unwrap_or(1);
+    let step = match w.get("step") {
+        None | Some(Json::Null) => None,
+        Some(Json::Num(n)) => Some(*n),
+        Some(_) => return Err(syn("window step must be a number or null")),
+    };
+    Ok(Window { start, end, unit, horizons, step })
+}
+
 fn expr(o: &Json) -> Result<TargetExpr, SyntaxError> {
     let kind = o.get("kind").and_then(Json::as_str).ok_or_else(|| syn("expr missing kind"))?;
     match kind {
@@ -424,14 +442,7 @@ fn expr(o: &Json) -> Result<TargetExpr, SyntaxError> {
             let filter = opt_expr(o.get("filter"))?.map(Box::new);
             let window = match o.get("window") {
                 None | Some(Json::Null) => None,
-                Some(w) => {
-                    let start = bound(w.get("start").ok_or_else(|| syn("window missing start"))?)?;
-                    let end = bound(w.get("end").ok_or_else(|| syn("window missing end"))?)?;
-                    let unit_name = w.get("unit").and_then(Json::as_str).ok_or_else(|| syn("window missing unit"))?;
-                    let unit = TimeUnit::from_keyword(&unit_name.to_ascii_uppercase())
-                        .ok_or_else(|| syn(format!("unknown time unit {:?}", unit_name)))?;
-                    Some(Window { start, end, unit })
-                }
+                Some(w) => Some(window(w)?),
             };
             Ok(TargetExpr::Aggregation(Aggregation { func, column, filter, window }))
         }
@@ -439,24 +450,68 @@ fn expr(o: &Json) -> Result<TargetExpr, SyntaxError> {
             let left = Box::new(expr(o.get("left").ok_or_else(|| syn("cond missing left"))?)?);
             let op_name = o.get("op").and_then(Json::as_str).ok_or_else(|| syn("cond missing op"))?;
             let op = operator(op_name)?;
-            let right_json = o.get("right");
-            let right = match op {
-                Operator::IsNull | Operator::IsNotNull => CondRhs::Empty,
-                Operator::In | Operator::NotIn => {
-                    let arr = match right_json {
-                        Some(Json::Arr(items)) => items,
-                        _ => return Err(syn("IN/NOT IN expects a list literal")),
-                    };
-                    let mut lits = Vec::with_capacity(arr.len());
-                    for it in arr {
-                        lits.push(lit(it)?);
+            // An expression RHS (column-to-column / expr-to-expr) takes
+            // precedence: when `right_expr` is present, `right` is null.
+            let right = if let Some(re) = o.get("right_expr").filter(|v| !matches!(v, Json::Null)) {
+                CondRhs::Expr(Box::new(expr(re)?))
+            } else {
+                let right_json = o.get("right");
+                match op {
+                    Operator::IsNull | Operator::IsNotNull => CondRhs::Empty,
+                    Operator::In | Operator::NotIn => {
+                        let arr = match right_json {
+                            Some(Json::Arr(items)) => items,
+                            _ => return Err(syn("IN/NOT IN expects a list literal")),
+                        };
+                        let mut lits = Vec::with_capacity(arr.len());
+                        for it in arr {
+                            lits.push(lit(it)?);
+                        }
+                        CondRhs::List(lits)
                     }
-                    CondRhs::List(lits)
+                    _ => CondRhs::One(lit(right_json.ok_or_else(|| syn("cond missing right"))?)?),
                 }
-                _ => CondRhs::One(lit(right_json.ok_or_else(|| syn("cond missing right"))?)?),
             };
             Ok(TargetExpr::Condition(Condition { left, op, right }))
         }
+        "arith" => {
+            let op = o.get("op").and_then(Json::as_str).and_then(|s| s.chars().next())
+                .ok_or_else(|| syn("arith missing op"))?;
+            let left = Box::new(expr(o.get("left").ok_or_else(|| syn("arith missing left"))?)?);
+            let right = Box::new(expr(o.get("right").ok_or_else(|| syn("arith missing right"))?)?);
+            Ok(TargetExpr::Arith(Arith { op, left, right }))
+        }
+        "func" => {
+            let name = o.get("name").and_then(Json::as_str).ok_or_else(|| syn("func missing name"))?.to_string();
+            let args = match o.get("args") {
+                Some(Json::Arr(items)) => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        v.push(expr(it)?);
+                    }
+                    v
+                }
+                _ => return Err(syn("func missing args")),
+            };
+            Ok(TargetExpr::Func(Func { name, args }))
+        }
+        "case" => {
+            let whens = match o.get("whens") {
+                Some(Json::Arr(items)) => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        let cond = expr(it.get("cond").ok_or_else(|| syn("case when missing cond"))?)?;
+                        let then = expr(it.get("then").ok_or_else(|| syn("case when missing then"))?)?;
+                        v.push((cond, then));
+                    }
+                    v
+                }
+                _ => return Err(syn("case missing whens")),
+            };
+            let else_ = opt_expr(o.get("else"))?.map(Box::new);
+            Ok(TargetExpr::Case(Case { whens, else_ }))
+        }
+        "lit" => Ok(TargetExpr::Lit(lit(o.get("value").ok_or_else(|| syn("lit missing value"))?)?)),
         "logic" => {
             let op = match o.get("op").and_then(Json::as_str) {
                 Some("AND") => BoolOp::And,
@@ -496,6 +551,60 @@ fn query_from_json(o: &Json, text: &str) -> Result<ParsedQuery, SyntaxError> {
     };
     let top_k = o.get("top_k").and_then(num_i64);
     let num_forecasts = o.get("num_forecasts").and_then(num_i64);
+
+    let explain = match o.get("explain") {
+        None | Some(Json::Null) => None,
+        Some(e) => Some(Explain {
+            mode: e.get("mode").and_then(Json::as_str).unwrap_or("PLAN").to_string(),
+            format: e.get("format").and_then(Json::as_str).unwrap_or("TEXT").to_string(),
+        }),
+    };
+    let as_of = match o.get("as_of") {
+        None | Some(Json::Null) => None,
+        Some(a) => Some(AsOf {
+            kind: a.get("kind").and_then(Json::as_str).unwrap_or("now").to_string(),
+            value: a.get("value").and_then(Json::as_str).map(str::to_string),
+        }),
+    };
+    let ablations = match o.get("ablations") {
+        Some(Json::Arr(items)) => {
+            let mut v = Vec::with_capacity(items.len());
+            for it in items {
+                v.push(Ablation {
+                    kind: it.get("kind").and_then(Json::as_str).unwrap_or("table").to_string(),
+                    name: it.get("name").and_then(Json::as_str).unwrap_or("").to_string(),
+                });
+            }
+            v
+        }
+        _ => Vec::new(),
+    };
+    let ret = match o.get("ret") {
+        None | Some(Json::Null) => None,
+        Some(r) => {
+            let kind = r.get("kind").and_then(Json::as_str).unwrap_or("").to_string();
+            let quantiles = match r.get("quantiles") {
+                Some(Json::Arr(items)) => items.iter().filter_map(|j| match j {
+                    Json::Num(n) => Some(*n),
+                    _ => None,
+                }).collect(),
+                _ => Vec::new(),
+            };
+            let interval = r.get("interval").and_then(num_i64);
+            Some(ReturnSpec { kind, quantiles, interval })
+        }
+    };
+    let windows = match o.get("windows") {
+        Some(Json::Obj(fields)) => {
+            let mut m = HashMap::with_capacity(fields.len());
+            for (name, w) in fields {
+                m.insert(name.clone(), window(w)?);
+            }
+            m
+        }
+        _ => HashMap::new(),
+    };
+
     Ok(ParsedQuery {
         target,
         entity_key,
@@ -505,6 +614,11 @@ fn query_from_json(o: &Json, text: &str) -> Result<ParsedQuery, SyntaxError> {
         rank,
         top_k,
         num_forecasts,
+        explain,
+        as_of,
+        ablations,
+        ret,
+        windows,
         text: text.to_string(),
     })
 }

@@ -60,7 +60,7 @@ class EngineExecuteTest {
                 .build();
 
         PredictionResult churn = engine.execute(ExecutionInput.newInput()
-                .query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+                .query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
                 .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
                 .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
@@ -86,7 +86,7 @@ class EngineExecuteTest {
                 .modelBackend(fakeBackend)
                 .build();
         PredictionResult r = engine.execute(ExecutionInput.newInput()
-                .query("PREDICT SUM(orders.qty, 0, 30) FOR customers.customer_id = 1")
+                .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 1")
                 .build()).toCompletableFuture().join();
         assertEquals(TaskType.REGRESSION, r.taskType());
         assertEquals(EntityId.of(1L), r.predictions().get(0).id());
@@ -100,7 +100,7 @@ class EngineExecuteTest {
                 .build();
         CompletionException e = assertThrows(CompletionException.class, () ->
                 engine.execute(ExecutionInput.newInput()
-                        .query("PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id")
+                        .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id")
                         .build()).toCompletableFuture().join());
         assertTrue(e.getCause().getMessage().contains("entityIds"));
     }
@@ -110,7 +110,7 @@ class EngineExecuteTest {
         RelativeDbEngine engine = RelativeDbEngine.newEngine(SCHEMA, wiring).build();
         CompletionException e = assertThrows(CompletionException.class, () ->
                 engine.execute(ExecutionInput.newInput()
-                        .query("PREDICT SUM(orders.qty, 0, 30) FOR customers.customer_id = 1")
+                        .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 1")
                         .build()).toCompletableFuture().join());
         assertTrue(e.getCause() instanceof IllegalStateException);
         assertTrue(e.getCause().getMessage().contains("hf://stanford-star/rt-j/regression"),

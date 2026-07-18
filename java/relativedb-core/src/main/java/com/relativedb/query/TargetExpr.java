@@ -5,4 +5,6 @@ package com.relativedb.query;
  * (The design doc's sealed interface, extended with {@link Not} — the grammar
  * has a NOT operator but the doc's LogicalOp is strictly binary.)
  */
-public sealed interface TargetExpr permits Aggregation, ColumnRef, Condition, LogicalOp, Not { }
+public sealed interface TargetExpr
+        permits Aggregation, ColumnRef, Condition, LogicalOp, Not,
+                Arith, Func, Case, LitExpr { }

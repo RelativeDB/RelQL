@@ -35,7 +35,7 @@ wiring = (RetrieverWiring.new_wiring()
     .build())
 
 result = Engine(schema, wiring).execute(ExecutionInput(
-    query="PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+    query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id",
     anchor_time=pd.Timestamp("2026-07-01").to_pydatetime()))
 ```
 
@@ -64,7 +64,7 @@ RetrieverWiring wiring = RetrieverWiring.newWiring()
 RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring).build();
 
 PredictionResult churn = engine.execute(ExecutionInput.newInput()
-    .query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+    .query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
     .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
     .build()).toCompletableFuture().join();
 ```
@@ -96,7 +96,7 @@ let wiring = RetrieverWiring::new_wiring()
 let mut engine = Engine::new(schema, wiring);
 let result = engine.execute(
     ExecutionInput::query(
-        "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
     .anchor_time(anchor))?;
 ```
 
@@ -111,6 +111,6 @@ via the [native backend](../how-to/use-native-backend).
 
 ## Next steps
 
-- Learn the query language: [PQL tutorial](/pql/tutorial)
+- Learn the query language: [RelQL tutorial](/pql/tutorial)
 - Understand the pipeline: [Architecture](../concepts/architecture)
 - Connect real storage: [Wire custom retrievers](../how-to/wire-custom-retrievers)

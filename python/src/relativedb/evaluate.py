@@ -11,8 +11,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from .pql.ast import (AggFunc, Aggregation, ColumnRef, Condition, LogicalOp,
-                      Not, Operator, TargetExpr, Window)
+from .pql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
+                      Func, Lit, LogicalOp, Not, Operator, TargetExpr, Window)
 from .retrieve import Row
 
 __all__ = ["eval_value", "eval_bool", "eval_row_predicate", "EvalError"]
@@ -88,10 +88,28 @@ def eval_value(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
     """Evaluate a valueExpr (aggregation or static column) over the context."""
     if isinstance(expr, ColumnRef):
         return entity_cells.get(expr.column)
+    if isinstance(expr, Lit):
+        return expr.value
+    if isinstance(expr, Arith):
+        return _eval_arith(expr, rows_by_table, entity_cells, anchor)
+    if isinstance(expr, Func):
+        return _eval_func(expr, rows_by_table, entity_cells, anchor)
+    if isinstance(expr, Case):
+        for cond, then in expr.whens:
+            if eval_bool(cond, rows_by_table, entity_cells, anchor):
+                return eval_value(then, rows_by_table, entity_cells, anchor)
+        if expr.else_ is not None:
+            return eval_value(expr.else_, rows_by_table, entity_cells, anchor)
+        return None
+    if isinstance(expr, (Condition, LogicalOp, Not)):
+        # a boolean expression used in value position -> 0/1
+        return eval_bool(expr, rows_by_table, entity_cells, anchor)
     if not isinstance(expr, Aggregation):
         raise EvalError(f"not a value expression: {expr!r}")
     rows = _agg_rows(expr, rows_by_table, anchor)
     col = expr.column.column
+    if expr.func is AggFunc.EXISTS:
+        return len(rows) > 0
     if expr.func is AggFunc.COUNT:
         if col == "*":
             return float(len(rows))
@@ -122,6 +140,54 @@ def eval_value(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
     if expr.func is AggFunc.MAX:
         return max(nums)
     raise EvalError(f"unsupported aggregation {expr.func}")
+
+
+def _as_num(v: Any) -> Optional[float]:
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None
+
+
+def _eval_arith(expr: Arith, rows_by_table, entity_cells, anchor) -> Any:
+    l = _as_num(eval_value(expr.left, rows_by_table, entity_cells, anchor))
+    r = _as_num(eval_value(expr.right, rows_by_table, entity_cells, anchor))
+    if l is None or r is None:                 # SQL NULL propagation
+        return None
+    if expr.op == "+":
+        return l + r
+    if expr.op == "-":
+        return l - r
+    if expr.op == "*":
+        return l * r
+    if expr.op == "/":
+        return None if r == 0 else l / r       # division by zero -> NULL
+    raise EvalError(f"unsupported arithmetic op {expr.op!r}")
+
+
+def _eval_func(expr: Func, rows_by_table, entity_cells, anchor) -> Any:
+    name = expr.name.upper()
+    raw = [eval_value(a, rows_by_table, entity_cells, anchor) for a in expr.args]
+    if name == "COALESCE":
+        return next((v for v in raw if v is not None), None)
+    if name == "NULLIF":
+        a, b = (raw + [None, None])[:2]
+        return None if a == b else a
+    nums = [_as_num(v) for v in raw]
+    if name == "ABS":
+        return None if nums[0] is None else abs(nums[0])
+    if name == "LOG":
+        return None if not nums or nums[0] is None or nums[0] <= 0 else math.log(nums[0])
+    if name == "EXP":
+        return None if not nums or nums[0] is None else math.exp(nums[0])
+    if name == "LEAST":
+        present = [n for n in nums if n is not None]
+        return min(present) if present else None
+    if name == "GREATEST":
+        present = [n for n in nums if n is not None]
+        return max(present) if present else None
+    raise EvalError(f"unsupported function {expr.name!r}")
 
 
 def _like_to_regex(pattern: str) -> "re.Pattern[str]":
@@ -199,6 +265,10 @@ def eval_bool(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
         return not eval_bool(expr.expr, rows_by_table, entity_cells, anchor)
     if isinstance(expr, Condition):
         left = eval_value(expr.left, rows_by_table, entity_cells, anchor)
-        return _compare(expr.op, left, expr.right)
+        right = expr.right
+        if expr.right_expr is not None:
+            right = eval_value(expr.right_expr, rows_by_table, entity_cells,
+                               anchor)
+        return _compare(expr.op, left, right)
     value = eval_value(expr, rows_by_table, entity_cells, anchor)
     return bool(value)

@@ -6,7 +6,7 @@ import com.sun.jna.ptr.IntByReference;
 
 /**
  * Raw JNA mapping of the shared C++ runtime ({@code librt_c}) entry points that
- * relativedb-core delegates to: the PQL parser ({@code pql_parse}) and the CSC
+ * relativedb-core delegates to: the RelQL parser ({@code pql_parse}) and the CSC
  * adjacency index ({@code csc_build} / {@code csc_children} / {@code csc_free}).
  *
  * <p>These are the same symbols the Python bindings load via ctypes

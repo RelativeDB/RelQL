@@ -6,7 +6,7 @@
 //! bindings. This module keeps only the Rust-side bookkeeping: table row
 //! storage, the id<->dense-index mapping, and the seed/cohort lookups.
 //! `librt_c` is a hard dependency (the same native library the RT-J model and
-//! PQL parser require) — there is no in-language fallback.
+//! RelQL parser require) — there is no in-language fallback.
 
 use std::collections::HashMap;
 

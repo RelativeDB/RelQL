@@ -3,13 +3,13 @@
 predict weekly units
 sold per store for the next 4 weeks.
 
-    PREDICT SUM(sales.qty, 0, 7, days)
-    FORECAST 4 TIMEFRAMES
+    PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)
     FOR EACH stores.store_id
 
-FORECAST N TIMEFRAMES yields N values, each spaced by the aggregation window
-(7 days x 4 = a 28-day outlook). Planted signal: a flagship store sells ~5x
-the volume of an outlet store.
+A multi-horizon window — a frame plus HORIZONS N — yields N values, each
+stepped forward by the frame width (STEP defaults to the frame; here 7 days
+x 4 = a 28-day outlook). Planted signal: a flagship store sells ~5x the volume
+of an outlet store.
 """
 import numpy as np
 import pandas as pd
@@ -47,7 +47,7 @@ schema = (Schema.new_schema()
           .link(LinkDef("sales", "store_id", "stores")).build())
 wiring = wire_pandas_frames(schema, {"stores": stores, "sales": sales})
 result = Engine(schema, wiring).execute(ExecutionInput(
-    query="PREDICT SUM(sales.qty, 0, 7, days) FORECAST 4 TIMEFRAMES "
+    query="PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) "
           "FOR EACH stores.store_id",
     anchor_time=ANCHOR.to_pydatetime()))
 df = predictions_frame(result)
@@ -56,7 +56,7 @@ print(df.to_string())
 
 # --- checks ---------------------------------------------------------------
 by = {r.entity_id: r for r in df.itertuples()}
-assert all(len(by[s].forecast) == 4 for s in DAILY), "4 timeframes per store"
+assert all(len(by[s].forecast) == 4 for s in DAILY), "4 horizons per store"
 flag = np.mean(by["S_FLAGSHIP"].forecast)
 outlet = np.mean(by["S_OUTLET"].forecast)
 print(f"mean weekly forecast — flagship: {flag:.0f}   outlet: {outlet:.0f}")

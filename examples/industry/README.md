@@ -2,7 +2,7 @@
 
 Runnable, self-checking examples targeted at common industry use cases,
 modeled on the Kumo docs' example library. Each generates synthetic data with a **planted
-signal**, runs a PQL query through the full pipeline (parse → validate →
+signal**, runs a RelQL query through the full pipeline (parse → validate →
 retriever hop loop → temporal guard → scoring), and **asserts** the
 predictions recover the signal.
 
@@ -17,12 +17,12 @@ cd relativedb/examples/industry
 ../../python/.venv/bin/python growth_churn.py
 ```
 
-| Example | Industry | PQL pattern | Checks |
+| Example | Industry | RelQL pattern | Checks |
 |---|---|---|---|
-| `growth_churn.py` | Subscription / streaming | `PREDICT COUNT(events.*, 0, 30, days) = 0 … WHERE COUNT(events.*, -90, 0, days) > 0` | fading users score ≫ engaged; long-inactive users excluded by WHERE |
-| `fraud_chargeback.py` | Payments | `PREDICT COUNT(chargebacks.*, 0, 60, days) > 0` | all 8 planted abuser accounts recovered in top-8; clean accounts ≈ 0 |
-| `bizops_demand_forecast.py` | Retail | `PREDICT SUM(sales.qty, 0, 7, days) FORECAST 4 TIMEFRAMES` | 4 timeframes/store; flagship ≫ outlet; plausible weekly magnitude |
-| `pzn_buy_it_again.py` | Grocery / personalization | `PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3` | habitual staple ranked #1 per customer (FK ranking via `Row.parents`) |
+| `growth_churn.py` | Subscription / streaming | `PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0 … WHERE COUNT(events.*) OVER (90 DAYS PRECEDING) > 0` | fading users score ≫ engaged; long-inactive users excluded by WHERE |
+| `fraud_chargeback.py` | Payments | `PREDICT COUNT(chargebacks.*) OVER (60 DAYS FOLLOWING) > 0` | all 8 planted abuser accounts recovered in top-8; clean accounts ≈ 0 |
+| `bizops_demand_forecast.py` | Retail | `PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)` | 4 horizons/store; flagship ≫ outlet; plausible weekly magnitude |
+| `pzn_buy_it_again.py` | Grocery / personalization | `PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3` | habitual staple ranked #1 per customer (FK ranking via `Row.parents`) |
 
 A Java counterpart of the churn example lives in the test suite:
 `java/relativedb-core/src/test/java/com/relativedb/GrowthChurnExampleTest.java`

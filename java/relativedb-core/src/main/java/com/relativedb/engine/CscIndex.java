@@ -30,7 +30,7 @@ import java.util.concurrent.Flow;
  * the native index point back into this index's own row lists.
  *
  * <p>{@code librt_c} is a hard dependency (the same native library the RT-J
- * model and PQL parser require): {@link #build} fails fast if it is absent.
+ * model and RelQL parser require): {@link #build} fails fast if it is absent.
  */
 public final class CscIndex implements ContextSource {
 

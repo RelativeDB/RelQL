@@ -4,7 +4,7 @@ score accounts by the
 risk of a chargeback in the next 60 days, using transaction volume and prior
 chargeback history in the relational graph.
 
-    PREDICT COUNT(chargebacks.*, 0, 60, days) > 0
+    PREDICT COUNT(chargebacks.*) OVER (60 DAYS FOLLOWING) > 0
     FOR EACH accounts.account_id
 
 Planted signal: "abuser" accounts have a history of periodic chargebacks
@@ -64,7 +64,7 @@ wiring = wire_pandas_frames(schema, {
     "chargebacks": chargebacks,
 })
 result = Engine(schema, wiring).execute(ExecutionInput(
-    query="PREDICT COUNT(chargebacks.*, 0, 60, days) > 0 "
+    query="PREDICT COUNT(chargebacks.*) OVER (60 DAYS FOLLOWING) > 0 "
           "FOR EACH accounts.account_id",
     anchor_time=ANCHOR.to_pydatetime()))
 df = predictions_frame(result)

@@ -1,6 +1,6 @@
 # relativedb
 
-Predictive queries (PQL) over **your own data**. GraphQL-style execution: the
+Predictive queries (RelQL) over **your own data**. GraphQL-style execution: the
 engine owns the query language, planning, temporal context assembly, and model
 routing — all data access goes through **user-defined retrievers** wired to a
 declared schema. There are **no bundled database connectors**: bring
@@ -59,7 +59,7 @@ schema = (relativedb.Schema.new_schema()
 # See examples/industry/pandas_connector.py for a complete implementation.
 wiring = wire_my_dataframes(schema, {"customers": customers, "orders": orders})
 result = relativedb.Engine(schema, wiring).execute(relativedb.ExecutionInput(
-    query="PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+    query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id",
     anchor_time=pd.Timestamp("2026-07-01").to_pydatetime()))
 df = pd.DataFrame({"entity_id": [p.id for p in result.predictions],
                    "probability": [p.probability for p in result.predictions]})
@@ -101,7 +101,7 @@ engine = Engine(schema, wiring)   # ModelConfig.defaults():
                                   #   regression/forecasting -> hf://stanford-star/rt-j/regression
                                   #   embeddings: all-MiniLM-L12-v2 (384-d, pinned)
 result = engine.execute(ExecutionInput(
-    query="PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR customers.customer_id = 'C7'",
+    query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR customers.customer_id = 'C7'",
     anchor_time=pd.Timestamp("2026-07-01").to_pydatetime()))
 ```
 
@@ -133,24 +133,34 @@ fanouts (KumoRFM geometry) or a uniform `bfs_width` with a global cell budget
 (RT geometry). Parents are always followed; children are width-bounded and
 newest-first; `MONTHS` windows use a 30-day approximation.
 
-## PQL
+## RelQL
 
-The full grammar (`grammar/Pql.g4` upstream) is supported by a hand-written
-recursive-descent parser — aggregations with windows and inline filters,
-`FORECAST N TIMEFRAMES`, `RANK TOP K` / `CLASSIFY`, `WHERE` / `ASSUMING`,
-`IN` / `LIKE` / `STARTS WITH` / `IS NULL`, `-INF` bounds, soft keywords
-(`usage.count`), case-insensitive keywords, comments.
+The grammar is single-sourced in the C++ layer (`cpp/src/pql.{hpp,cpp}`,
+exposed through `librt_c`); every binding decodes the same JSON AST. It covers
+aggregations with trailing `OVER (...)` window frames and inline filters,
+`OVER (... HORIZONS N [STEP dur])` multi-horizon forecasting, named
+`WINDOW name AS (...)` templates, `EXISTS` / `NOT EXISTS`, richer target
+expressions (`+ - * /`, `CASE WHEN`, `COALESCE`/`NULLIF`/`ABS`/`LOG`/`EXP`/
+`LEAST`/`GREATEST`, `TRUE`/`FALSE`, column-to-column comparison),
+`RANK TOP K` / `CLASSIFY`, `WHERE` / `ASSUMING`, `AS OF <anchor>`,
+`RETURN <spec>`, `ABLATE TABLE`, an `EXPLAIN [...]` prefix,
+`IN` / `LIKE` / `STARTS WITH` / `IS NULL`, `UNBOUNDED PRECEDING` bounds, soft
+keywords (`usage.count`), case-insensitive keywords, comments. Positional
+windows (`COUNT(orders.*, 0, 90, days)`) and `FORECAST N TIMEFRAMES` are
+removed — use `OVER (90 DAYS FOLLOWING)` and `HORIZONS N` instead.
 
 ```python
-pq = relativedb.parse("PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id")
+pq = relativedb.parse("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id")
 pq.task_type()                    # TaskType.REGRESSION
 relativedb.validate(pq, schema)     # bind names/types/windows against the schema
 ```
 
-Task inference routes the model: bare aggregation → regression; aggregation
-vs literal → binary classification; `FIRST`/`LAST`/static categorical →
-multiclass; `LIST_DISTINCT` (+ `RANK TOP K`) → ranking; `FORECAST` →
-forecasting.
+Task inference routes the model: bare aggregation (or arithmetic/function
+expression) → regression; aggregation vs literal, `EXISTS`/`NOT EXISTS`, or a
+boolean literal → binary classification; `FIRST`/`LAST`/static categorical →
+multiclass; `LIST_DISTINCT` (+ `RANK TOP K`) → ranking; a target window with
+`HORIZONS N` (N > 1) → forecasting. `AS OF`, `RETURN`, `ABLATE`, and `EXPLAIN`
+are represented on the parsed query; execution honors them best-effort.
 
 ## Model backends
 
@@ -195,7 +205,7 @@ baseline (the C ABI exposes a single score head).
 .venv/bin/python -m pytest
 ```
 
-Covers the full 44-query PQL corpus (plus 20 malformed rejections), the
+Covers the full 54-query RelQL corpus (plus malformed rejections), the
 temporal-leakage guard (a future row never enters context, even from a buggy
 retriever), CSC/retriever context equivalence, model-URI routing, and the
 explicit retriever-to-churn-prediction path end to end.

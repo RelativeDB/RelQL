@@ -1,4 +1,4 @@
-// test_pql.cpp — self-contained conformance test for the C++ PQL parser.
+// test_pql.cpp — self-contained conformance test for the C++ RelQL parser.
 //
 // 1. Parses every line of examples.pql (default ../python/tests/data/examples.pql
 //    relative to the build dir; overridable via argv[1]).
@@ -58,23 +58,32 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("PASS: %d/%d parsed\n", parsed, (int)lines.size());
-  if (parsed != 44) {
-    std::fprintf(stderr, "ERROR: expected 44 example queries, got %d\n",
+  if (parsed != 54) {
+    std::fprintf(stderr, "ERROR: expected 54 example queries, got %d\n",
                  (int)lines.size());
     ok = false;
   }
 
   const std::vector<std::string> bad = {
       "PREDICT FOR EACH e.id",
-      "SUM(t.x,0,30) FOR EACH e.id",
-      "PREDICT SUM(t.x,0,30)",
-      "PREDICT SUM(t.x,0,30) FOR EACH e",
-      "PREDICT SUM(t.x 0 30) FOR EACH e.id",
-      "PREDICT SUM(t.x,0,30 FOR EACH e.id",
-      "PREDICT BOGUS(t.x,0,30) FOR EACH e.id",
-      "PREDICT SUM(t.x,0,30) FOR EACH e.id WHERE",
-      "PREDICT LIST_DISTINCT(t.a,0,30) RANK TOP -1 FOR EACH e.id",
-      "PREDICT SUM(t.x,0,30) FOR EACH e.id EXTRA JUNK",
+      "SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id",  // missing PREDICT
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING)",        // missing FOR
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e",  // no .column
+      "PREDICT SUM(t.x, 0, 30) FOR EACH e.id",  // positional form removed
+      "PREDICT SUM(t.x) OVER (30 DAYS) FOR EACH e.id",  // no PRECEDING/FOLLOWING
+      "PREDICT SUM(t.x) OVER (30 FOLLOWING) FOR EACH e.id",  // missing unit
+      "PREDICT SUM(t.x) OVER (0 DAYS FOLLOWING) FOR EACH e.id",  // zero duration
+      "PREDICT SUM(t.x) OVER (RANGE BETWEEN 30 DAYS FOLLOWING) FOR EACH e.id",
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING HORIZONS 0) FOR EACH e.id",
+      "PREDICT SUM(t.x) OVER (UNBOUNDED PRECEDING HORIZONS 3) FOR EACH e.id",
+      "PREDICT SUM(t.x) OVER (RANGE BETWEEN 24 HOURS PRECEDING AND 3 MONTHS "
+      "FOLLOWING) FOR EACH e.id",                      // mixed unit domains
+      "PREDICT SUM(t.x) OVER undeclared_win FOR EACH e.id",  // undeclared window
+      "PREDICT BOGUS(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id",  // bad func
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id WHERE",
+      "PREDICT LIST_DISTINCT(t.a) OVER (30 DAYS FOLLOWING) RANK TOP -1 FOR EACH "
+      "e.id",
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id EXTRA JUNK",
   };
   int rejected = 0;
   for (const std::string& q : bad) {

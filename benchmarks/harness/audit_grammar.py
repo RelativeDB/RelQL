@@ -17,14 +17,14 @@ from pathlib import Path
 from relativedb import PqlSyntaxError, PqlValidationError, parse
 from relativedb.pql.ast import AggFunc, Aggregation, Operator, TimeUnit
 
-CORPUS_PQL = Path(__file__).resolve().parent.parent.parent / "python/tests/data/examples.pql"
+CORPUS_RelQL = Path(__file__).resolve().parent.parent.parent / "python/tests/data/examples.pql"
 
 # (query, why) — grammatically valid per README/grammar; must parse.
 SHOULD_PARSE = [
-    ("PREDICT SUM(t.x, 0, 30) FOR EACH e.id", "minimal regression"),
-    ("PREDICT COUNT(t.*, -INF, 0) > 0 FOR EACH e.id", "unbounded lookback"),
-    ("PREDICT COUNT(t.*, 0, 30, days) = 0 FOR EACH e.id WHERE COUNT(t.*, -90, 0) > 0", "where"),
-    ("PREDICT LAST(s.status, 0, 90) = 'X' FOR EACH e.id", "string eq"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id", "minimal regression"),
+    ("PREDICT COUNT(t.*) OVER (UNBOUNDED PRECEDING) > 0 FOR EACH e.id", "unbounded lookback"),
+    ("PREDICT COUNT(t.*) OVER (30 DAYS FOLLOWING) = 0 FOR EACH e.id WHERE COUNT(t.*) OVER (90 DAYS PRECEDING) > 0", "where"),
+    ("PREDICT LAST(s.status) OVER (90 DAYS FOLLOWING) = 'X' FOR EACH e.id", "string eq"),
     ("PREDICT t.col IN ('A','B','C') FOR EACH e.id", "IN list"),
     ("PREDICT t.col NOT IN ('A') FOR EACH e.id", "NOT IN"),
     ("PREDICT t.d IS NULL FOR EACH e.id", "IS NULL"),
@@ -35,45 +35,63 @@ SHOULD_PARSE = [
     ("PREDICT t.d NOT CONTAINS 'x' FOR EACH e.id", "NOT CONTAINS"),
     ("PREDICT t.d LIKE '%x%' FOR EACH e.id", "LIKE"),
     ("PREDICT t.d NOT LIKE '%x' FOR EACH e.id", "NOT LIKE"),
-    ("PREDICT NOT LAST(t.a, 0, 30) > 30 FOR EACH e.id", "NOT prefix"),
-    ("PREDICT SUM(t.p,0,30)>10 OR COUNT(v.*,0,30)>20 FOR EACH e.id", "OR"),
+    ("PREDICT NOT LAST(t.a) OVER (30 DAYS FOLLOWING) > 30 FOR EACH e.id", "NOT prefix"),
+    ("PREDICT SUM(t.p) OVER (30 DAYS FOLLOWING) > 10 OR COUNT(v.*) OVER (30 DAYS FOLLOWING) > 20 FOR EACH e.id", "OR"),
     ("PREDICT a.x = 'IT' AND a.y <= 1990-01-01 FOR EACH a.id", "AND + date literal"),
-    ("PREDICT SUM(t.x,0,30) FOR EACH e.id ASSUMING COUNT(n.*,0,7) > 2", "ASSUMING"),
-    ("PREDICT LIST_DISTINCT(t.a,0,30) RANK TOP 12 FOR EACH e.id", "RANK TOP"),
-    ("PREDICT LIST_DISTINCT(t.a,0,30) CLASSIFY FOR EACH e.id", "CLASSIFY"),
-    ("PREDICT SUM(u.count,0,1,days) FORECAST 28 TIMEFRAMES FOR EACH a.id", "FORECAST"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id ASSUMING COUNT(n.*) OVER (7 DAYS FOLLOWING) > 2", "ASSUMING"),
+    ("PREDICT LIST_DISTINCT(t.a) OVER (30 DAYS FOLLOWING) RANK TOP 12 FOR EACH e.id", "RANK TOP"),
+    ("PREDICT LIST_DISTINCT(t.a) OVER (30 DAYS FOLLOWING) CLASSIFY FOR EACH e.id", "CLASSIFY"),
+    ("PREDICT SUM(u.count) OVER (1 DAY FOLLOWING HORIZONS 28) FOR EACH a.id", "multi-horizon window"),
     ("PREDICT COUNT(t.* WHERE t.amount > 100) FOR EACH e.id", "inline agg filter"),
-    ("PREDICT COUNT(t.*, 0, 30, months) FOR EACH e.id", "months unit"),
-    ("PREDICT COUNT(t.*, 0, 6, hours) > 0 FOR EACH e.id", "hours unit"),
-    ("PREDICT SUM(m.value,0,90,seconds) FOR EACH d.id", "seconds unit"),
-    ("PREDICT COUNT(o.*,0,90,days)=0 FOR users.user_id IN (42, 123)", "pinned IN"),
-    ("PREDICT COUNT(o.*,0,90,days)=0 FOR users.user_id = 42", "pinned single"),
-    ("PREDICT SUM(t.x,0,30) FOR EACH e.id WHERE (a.c='US' OR b.n<10000) AND a.d='V'", "nested parens"),
-    ("predict sum(t.x, 0, 30) for each e.id", "lowercase keywords"),
-    ("PREDICT  SUM( t.x , 0 , 30 )   FOR   EACH   e.id", "whitespace"),
-    ("PREDICT SUM(t.x, 0, 30) FOR EACH e.id -- trailing comment", "line comment"),
+    ("PREDICT COUNT(t.*) OVER (30 MONTHS FOLLOWING) FOR EACH e.id", "months unit"),
+    ("PREDICT COUNT(t.*) OVER (6 HOURS FOLLOWING) > 0 FOR EACH e.id", "hours unit"),
+    ("PREDICT SUM(m.value) OVER (90 SECONDS FOLLOWING) FOR EACH d.id", "seconds unit"),
+    ("PREDICT COUNT(o.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)", "pinned IN"),
+    ("PREDICT COUNT(o.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42", "pinned single"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id WHERE (a.c='US' OR b.n<10000) AND a.d='V'", "nested parens"),
+    ("predict sum(t.x) over (30 days following) for each e.id", "lowercase keywords"),
+    ("PREDICT  SUM( t.x )   OVER  ( 30 DAYS FOLLOWING )   FOR   EACH   e.id", "whitespace"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id -- trailing comment", "line comment"),
+    # --- new v2 frame / clause forms ---
+    ("PREDICT SUM(t.value) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) FOR EACH e.id", "RANGE BETWEEN frame"),
+    ("PREDICT MAX(t.value) OVER (7 DAYS FOLLOWING HORIZONS 4) FOR EACH e.id", "frame with HORIZONS"),
+    ("PREDICT SUM(o.revenue) OVER w - SUM(o.cost) OVER w FOR EACH e.id WINDOW w AS (30 DAYS FOLLOWING)", "named WINDOW + OVER w"),
+    ("PREDICT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH e.id", "EXISTS aggregation"),
+    ("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH e.id WHERE EXISTS(orders.*) OVER (90 DAYS PRECEDING)", "NOT EXISTS + EXISTS where"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id AS OF :prediction_time", "AS OF param"),
+    ("PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH e.id RETURN PROBABILITY", "RETURN PROBABILITY"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id RETURN QUANTILES (0.10, 0.50, 0.90)", "RETURN QUANTILES"),
+    ("EXPLAIN PLAN FORMAT TEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH e.id RETURN PROBABILITY", "EXPLAIN PLAN prefix"),
 ]
 
 # (query, why) — must be rejected (syntax or validation). Silent accept = bug.
 SHOULD_REJECT = [
     ("PREDICT FOR EACH e.id", "no target"),
-    ("SUM(t.x,0,30) FOR EACH e.id", "missing PREDICT"),
-    ("PREDICT SUM(t.x,0,30)", "missing FOR EACH"),
-    ("PREDICT SUM(t.x,0,30) FOR EACH e", "entity key not table.col"),
-    ("PREDICT SUM(t.x 0 30) FOR EACH e.id", "missing commas"),
-    ("PREDICT SUM(t.x,0,30 FOR EACH e.id", "unbalanced paren"),
-    ("PREDICT BOGUS(t.x,0,30) FOR EACH e.id", "unknown agg func"),
-    ("PREDICT SUM(t.x,0,30) FOR EACH e.id WHERE", "dangling WHERE"),
-    ("PREDICT SUM(t.x,0,30) RANK TOP FOR EACH e.id", "RANK TOP without k"),
-    ("PREDICT LIST_DISTINCT(t.a,0,30) RANK TOP -1 FOR EACH e.id", "negative k"),
-    ("PREDICT SUM(t.x,0,30) FORECAST TIMEFRAMES FOR EACH e.id", "FORECAST without n"),
-    ("PREDICT SUM(t.x,0,30) FOR EACH e.id EXTRA JUNK", "trailing junk"),
+    ("SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id", "missing PREDICT"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING)", "missing FOR EACH"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e", "entity key not table.col"),
+    ("PREDICT SUM(t.x) OVER 30 DAYS FOLLOWING FOR EACH e.id", "frame missing parens"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING FOR EACH e.id", "unbalanced paren"),
+    ("PREDICT BOGUS(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id", "unknown agg func"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id WHERE", "dangling WHERE"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) RANK TOP FOR EACH e.id", "RANK TOP without k"),
+    ("PREDICT LIST_DISTINCT(t.a) OVER (30 DAYS FOLLOWING) RANK TOP -1 FOR EACH e.id", "negative k"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id EXTRA JUNK", "trailing junk"),
     ("PREDICT t.d LIKE FOR EACH e.id", "LIKE without pattern"),
+    # --- old positional-window / FORECAST forms are now syntax errors ---
+    ("PREDICT SUM(t.x, 0, 30) FOR EACH e.id", "positional window removed"),
+    ("PREDICT COUNT(orders.*, 0, 90, days) FOR EACH e.id", "positional window w/ unit removed"),
+    ("PREDICT COUNT(t.*, -90, 0) > 0 FOR EACH e.id", "positional lookback removed"),
+    ("PREDICT SUM(u.count, 0, 1, days) FORECAST 28 TIMEFRAMES FOR EACH a.id", "FORECAST clause removed"),
+    # --- new v2 frame validation errors ---
+    ("PREDICT SUM(t.x) OVER (30 DAYS) FOR EACH e.id", "frame missing PRECEDING/FOLLOWING"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING HORIZONS 0) FOR EACH e.id", "horizons must be positive"),
+    ("PREDICT SUM(t.x) OVER undeclared_window FOR EACH e.id", "undeclared window name"),
 ]
 
 
 def _load_corpus() -> list[str]:
-    return [ln.strip() for ln in CORPUS_PQL.read_text().splitlines()
+    return [ln.strip() for ln in CORPUS_RelQL.read_text().splitlines()
             if ln.strip() and not ln.startswith("#")]
 
 

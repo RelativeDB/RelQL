@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use super::ast::{AggFunc, ColumnRef, ParsedQuery, TargetExpr};
+use super::ast::{AggFunc, ColumnRef, CondRhs, ParsedQuery, TargetExpr};
 use crate::schema::Schema;
 
 /// A schema-binding validation error.
@@ -17,7 +17,7 @@ pub struct ValidationError(pub String);
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PQL validation error: {}", self.0)
+        write!(f, "RelQL validation error: {}", self.0)
     }
 }
 impl std::error::Error for ValidationError {}
@@ -92,13 +92,56 @@ fn walk_columns(expr: &TargetExpr, schema: &Schema) -> Result<(), ValidationErro
             Ok(())
         }
         TargetExpr::ColumnRef(c) => check_column(c, schema, false, false, false),
-        TargetExpr::Condition(c) => walk_columns(&c.left, schema),
+        TargetExpr::Condition(c) => {
+            walk_columns(&c.left, schema)?;
+            if let CondRhs::Expr(e) = &c.right {
+                walk_columns(e, schema)?;
+            }
+            Ok(())
+        }
         TargetExpr::LogicalOp(l) => {
             walk_columns(&l.left, schema)?;
             walk_columns(&l.right, schema)
         }
         TargetExpr::Not(e) => walk_columns(e, schema),
+        TargetExpr::Arith(a) => {
+            walk_columns(&a.left, schema)?;
+            walk_columns(&a.right, schema)
+        }
+        TargetExpr::Func(f) => {
+            for a in &f.args {
+                walk_columns(a, schema)?;
+            }
+            Ok(())
+        }
+        TargetExpr::Case(c) => {
+            for (cond, then) in &c.whens {
+                walk_columns(cond, schema)?;
+                walk_columns(then, schema)?;
+            }
+            if let Some(e) = &c.else_ {
+                walk_columns(e, schema)?;
+            }
+            Ok(())
+        }
+        TargetExpr::Lit(_) => Ok(()),
     }
+}
+
+/// Error if any aggregation reachable from `expr` carries a multi-horizon
+/// (`HORIZONS > 1`) window — permitted only on the PREDICT target.
+fn reject_multi_horizon(expr: &TargetExpr, clause: &str) -> Result<(), ValidationError> {
+    for agg in expr.aggregations() {
+        if let Some(w) = &agg.window {
+            if w.horizons > 1 {
+                return Err(ValidationError(format!(
+                    "HORIZONS > 1 is only allowed on the PREDICT target, not in {}",
+                    clause
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Bind a parsed query against a schema: tables/columns exist, the entity key is
@@ -127,9 +170,11 @@ pub fn validate(query: &ParsedQuery, schema: &Schema) -> Result<ValidatedQuery, 
     }
     if let Some(w) = &query.where_ {
         walk_columns(w, schema)?;
+        reject_multi_horizon(w, "WHERE")?;
     }
     if let Some(a) = &query.assuming {
         walk_columns(a, schema)?;
+        reject_multi_horizon(a, "ASSUMING")?;
     }
     let task_type = query.task_type(Some(schema));
     Ok(ValidatedQuery { query: query.clone(), task_type })

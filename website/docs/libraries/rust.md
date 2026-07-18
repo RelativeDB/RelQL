@@ -50,5 +50,5 @@ RELATIVEDB_RT_LIB=../cpp/build/librt_c.dylib \
   cargo test --test golden_tests -- --nocapture
 ```
 
-The shared 44-query PQL corpus lives in this crate
+The shared 44-query RelQL corpus lives in this crate
 (`tests/data/examples.pql`) and is exercised by all three languages.

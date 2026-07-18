@@ -93,9 +93,9 @@ def _print_rank(r: B.TaskResult):
 def _probability_granularity_probe(ds: D.Dataset) -> dict:
     """Confirm binary probabilities are quantized to num_history_windows+1
     levels — a structural calibration ceiling of the default backend."""
-    q = (f"PREDICT COUNT(purchases.*, 0, 90, days) = 0 "
+    q = (f"PREDICT COUNT(purchases.*) OVER (90 DAYS FOLLOWING) = 0 "
          f"FOR EACH customers.customer_id "
-         f"WHERE COUNT(purchases.*, -90, 0, days) > 0")
+         f"WHERE COUNT(purchases.*) OVER (90 DAYS PRECEDING) > 0")
     out = {}
     for w in (3, 8, 20):
         ds.engine.model_backend = HistoryBaselineBackend(num_history_windows=w)

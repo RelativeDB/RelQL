@@ -1,3 +1,11 @@
+> **Note (finalized syntax):** The `DURING NEXT ...` phrasing explored below was
+> a strawman. The finalized readable-window surface is the SQL-window-style
+> `OVER (...)` clause — e.g. `COUNT(orders.*) OVER (90 DAYS FOLLOWING)`,
+> `OVER (90 DAYS PRECEDING)`, `OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS
+> FOLLOWING)`, with `HORIZONS N`/`STEP` for multi-horizon forecasts and named
+> `WINDOW name AS (...)` frames. See `RelQL_EVOLUTION.md` for the authoritative
+> spec. The brainstorm below is kept for historical context.
+
 ## Highest-value improvements
 
 ### 1. Make time windows readable

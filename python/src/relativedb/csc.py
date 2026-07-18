@@ -5,7 +5,7 @@ one non-trivial algorithm here — lives once in the C++ layer (``cpp/src/csc.*`
 via :mod:`relativedb.csc_native`), shared with the Java and Rust bindings.
 This module keeps only the Python-side bookkeeping: table row storage, the
 id<->dense-index mapping, and the seed/cohort lookups. ``librt_c`` is a hard
-dependency (the same native library the RT-J model and PQL parser require).
+dependency (the same native library the RT-J model and RelQL parser require).
 """
 from __future__ import annotations
 

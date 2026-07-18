@@ -16,7 +16,7 @@ Reproduce: `.venv-bench/bin/python benchmarks/run.py`
 | Brightkite check-ins | SNAP | ~4.5M check-ins | ~58k users (top 1,500 used) | mobility; locations recur; a 3rd, independent domain |
 
 Protocol: for each anchor `T`, context = rows `≤ T` (engine-enforced), target =
-PQL window `(T, T+h]`, truth = the actual outcome from real future rows, scored
+RelQL window `(T, T+h]`, truth = the actual outcome from real future rows, scored
 against naive baselines.
 
 ## Changes made
@@ -34,14 +34,14 @@ against naive baselines.
 
 ## Parser + CSC consolidation (C++)
 
-Both the PQL grammar and the CSC adjacency now live **once** in `librt_c`. The
+Both the RelQL grammar and the CSC adjacency now live **once** in `librt_c`. The
 per-language hand-written parsers and CSC binary-search were deleted — the
 Python/Java/Rust bindings call the C ABI directly with **no fallback**;
 `librt_c` is a hard dependency (the same library the RT-J model requires).
 
 | Component | C++ | C ABI (in `librt_c`) | Bindings | Correctness test |
 |---|---|---|---|---|
-| PQL parser | `cpp/src/pql.{hpp,cpp}` | `pql_parse` → JSON AST | `pql/native.py`, Java `NativePqlParser`, Rust `pql/native.rs` | C++ `test_pql` (44 parse + 10 reject) + each binding's JSON→AST tests |
+| RelQL parser | `cpp/src/pql.{hpp,cpp}` | `pql_parse` → JSON AST | `pql/native.py`, Java `NativePqlParser`, Rust `pql/native.rs` | C++ `test_pql` (44 parse + 10 reject) + each binding's JSON→AST tests |
 | CSC index | `cpp/src/csc.{hpp,cpp}` | `csc_build`/`csc_children`/`csc_free` | `csc_native.{py,rs}`, Java `NativeCsc` | C++ `csc_test` (22,502 vs brute force) + per-binding brute-force equivalence |
 
 - Each language keeps only its id↔dense mapping, row storage, and JSON→AST

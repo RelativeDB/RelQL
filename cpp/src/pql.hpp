@@ -1,13 +1,19 @@
-/* pql.hpp — dependency-light C++20 PQL lexer + recursive-descent parser.
+/* pql.hpp — dependency-light C++20 RelQL lexer + recursive-descent parser.
  *
- * Faithful to python/src/relativedb/pql/parser.py and java Pql.g4. Parses a
- * PQL predictive query into an AST and serializes it to a JSON string in the
- * schema the language bindings deserialize. No third-party dependencies.
+ * Parses a RelQL predictive query into an AST and serializes it to a JSON string
+ * in the schema the language bindings deserialize. No third-party dependencies.
+ *
+ * Grammar v2 (see RelQL_EVOLUTION.md): temporal frames use a trailing
+ * `OVER (window_spec)` / `OVER window_name` clause and `WINDOW name AS (...)`
+ * declarations; the old positional `AGG(col, start, end[, unit])` form is gone.
+ * Adds EXISTS, multi-horizon windows (HORIZONS/STEP), richer value expressions
+ * (arithmetic, CASE, COALESCE/NULLIF/ABS/LOG/EXP/LEAST/GREATEST, TRUE/FALSE),
+ * and query-level AS OF / RETURN / ABLATE / EXPLAIN clauses.
  */
-#ifndef RELATIVEDB_PQL_HPP
-#define RELATIVEDB_PQL_HPP
+#ifndef RELATIVEDB_RelQL_HPP
+#define RELATIVEDB_RelQL_HPP
 
-#include <cstdint>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -16,13 +22,13 @@
 namespace pql {
 
 // ---------------------------------------------------------------------------
-// Enums (names/values mirror ast.py)
+// Enums (names/values mirror the binding ASTs)
 // ---------------------------------------------------------------------------
 enum class AggFunc {
-  SUM, AVG, MIN, MAX, COUNT, COUNT_DISTINCT, LIST_DISTINCT, FIRST, LAST
+  SUM, AVG, MIN, MAX, COUNT, COUNT_DISTINCT, LIST_DISTINCT, FIRST, LAST, EXISTS
 };
 
-enum class TimeUnit { SECONDS, MINUTES, HOURS, DAYS, WEEKS, MONTHS };
+enum class TimeUnit { SECONDS, MINUTES, HOURS, DAYS, WEEKS, MONTHS, YEARS };
 
 enum class Operator {
   GT, LT, EQ, NEQ, GE, LE,
@@ -56,16 +62,24 @@ struct Lit {
 // ---------------------------------------------------------------------------
 // Window / Expr
 // ---------------------------------------------------------------------------
+// A normalized temporal frame `(start, end]` in `unit`, with an optional
+// multi-horizon projection. `start`/`end` are offsets from the query anchor
+// NOW (may be +/- infinity). `horizons` >= 1; when > 1 the query forecasts.
+// `step` (present only when explicit) is the horizon stride in `unit`; when
+// absent the effective step defaults to the frame width `end - start`.
 struct Window {
   double start = 0.0;   // may be +/- infinity
   double end = 0.0;
   TimeUnit unit = TimeUnit::DAYS;
+  long long horizons = 1;
+  bool has_step = false;
+  double step = 0.0;
 };
 
-enum class ExprKind { Agg, Col, Cond, Logic, Not };
+enum class ExprKind { Agg, Col, Cond, Logic, Not, Arith, Func, Case, Lit };
 
 struct Expr {
-  ExprKind kind;
+  ExprKind kind = ExprKind::Col;
 
   // Col
   std::string table;
@@ -76,12 +90,14 @@ struct Expr {
   std::shared_ptr<Expr> filter;   // inline WHERE inside the agg (nullable)
   bool has_window = false;
   Window window;
+  std::string window_ref;         // OVER <name> reference, resolved post-parse
 
   // Cond
   std::shared_ptr<Expr> left;     // value expr
   Operator op = Operator::EQ;
   bool has_right = false;         // false => right is null (IS NULL etc.)
   Lit right;
+  std::shared_ptr<Expr> right_expr;  // non-literal comparison RHS (nullable)
 
   // Logic
   BoolOp bop = BoolOp::AND;
@@ -90,22 +106,82 @@ struct Expr {
 
   // Not
   std::shared_ptr<Expr> inner;
+
+  // Arith (op in {+,-,*,/})
+  char arith_op = '+';
+  std::shared_ptr<Expr> a_left;
+  std::shared_ptr<Expr> a_right;
+
+  // Func (COALESCE/NULLIF/ABS/LOG/EXP/LEAST/GREATEST)
+  std::string func_name;
+  std::vector<std::shared_ptr<Expr>> args;
+
+  // Case
+  std::vector<std::shared_ptr<Expr>> when_conds;
+  std::vector<std::shared_ptr<Expr>> when_thens;
+  std::shared_ptr<Expr> case_else;   // nullable
+
+  // Lit (literal in value position)
+  Lit lit;
 };
 
 using ExprPtr = std::shared_ptr<Expr>;
 
+// ---------------------------------------------------------------------------
+// Query-level clauses
+// ---------------------------------------------------------------------------
+enum class ExplainMode { NONE, PLAN, CONTEXT, ANALYZE, ABLATION };
+enum class ExplainFormat { TEXT, JSON };
+
+struct Explain {
+  bool present = false;
+  ExplainMode mode = ExplainMode::PLAN;
+  ExplainFormat format = ExplainFormat::TEXT;
+};
+
+enum class AnchorKind { PARAM, DATE, NOW };
+
+struct AsOf {
+  bool present = false;
+  AnchorKind kind = AnchorKind::NOW;
+  std::string value;  // param name (without ':') or date text
+};
+
+struct Ablation {
+  std::string kind = "table";
+  std::string name;
+};
+
+enum class ReturnKind {
+  EXPECTED_VALUE, PROBABILITY, CLASS, DISTRIBUTION, QUANTILES, INTERVAL,
+  MULTILABEL, MULTICLASS
+};
+
+struct ReturnSpec {
+  bool present = false;
+  ReturnKind kind = ReturnKind::EXPECTED_VALUE;
+  std::vector<double> quantiles;
+  bool has_interval = false;
+  long long interval = 0;
+};
+
 struct ParsedQuery {
+  Explain explain;
   ExprPtr target;
   std::string entity_table;
   std::string entity_column;
   std::vector<Lit> entity_ids;
   ExprPtr where;                  // nullable
   ExprPtr assuming;               // nullable
+  AsOf as_of;
+  std::vector<Ablation> ablations;
+  ReturnSpec ret;
+  std::map<std::string, Window> windows;  // declared WINDOW templates
   RankKind rank = RankKind::NONE;
   bool has_top_k = false;
   long long top_k = 0;
   bool has_num_forecasts = false;
-  long long num_forecasts = 0;
+  long long num_forecasts = 0;    // derived from target window horizons
 };
 
 // Thrown on any lex/parse (syntax) error.
@@ -114,10 +190,10 @@ class PqlError : public std::runtime_error {
   explicit PqlError(const std::string& msg) : std::runtime_error(msg) {}
 };
 
-// Parse a PQL query. Throws PqlError on syntax error.
+// Parse a RelQL query. Throws PqlError on syntax error.
 ParsedQuery parse(const std::string& query);
 
-// Schema-less task-type inference (matches ParsedQuery.task_type(None)).
+// Schema-less task-type inference.
 TaskType task_type(const ParsedQuery& q);
 
 // Serialize a parsed query to the JSON AST schema.
@@ -128,4 +204,4 @@ std::string parse_to_json(const std::string& query);
 
 }  // namespace pql
 
-#endif  // RELATIVEDB_PQL_HPP
+#endif  // RELATIVEDB_RelQL_HPP

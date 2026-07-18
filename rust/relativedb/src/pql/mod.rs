@@ -1,4 +1,4 @@
-//! PQL: parsing (via the shared C++ parser), typed AST, schema-bound
+//! RelQL: parsing (via the shared C++ parser), typed AST, schema-bound
 //! validation, task-type inference.
 
 pub mod ast;
@@ -6,13 +6,14 @@ pub mod native;
 pub mod validate;
 
 pub use ast::{
-    AggFunc, Aggregation, BoolOp, ColumnRef, CondRhs, Condition, Literal, LogicalOp, Operator,
-    ParsedQuery, RankKind, TargetExpr, TaskType, TimeUnit, Window,
+    Ablation, AggFunc, Aggregation, Arith, AsOf, BoolOp, Case, ColumnRef, CondRhs, Condition,
+    Explain, Func, Literal, LogicalOp, Operator, ParsedQuery, RankKind, ReturnSpec, TargetExpr,
+    TaskType, TimeUnit, Window,
 };
 pub use native::SyntaxError;
 pub use validate::{parse_and_validate, validate, ValidatedQuery, ValidationError};
 
-/// Parse a PQL query string into a [`ParsedQuery`] (no schema needed).
+/// Parse a RelQL query string into a [`ParsedQuery`] (no schema needed).
 ///
 /// The parser is single-sourced on the shared C++ implementation (`pql_parse`
 /// in `librt_c`) — the same parser used by the Python and Java bindings. There

@@ -14,7 +14,8 @@ import java.util.OptionalLong;
  * are encoded as {@link Long#MIN_VALUE}/{@link Long#MAX_VALUE}.
  */
 public record Aggregation(AggFunc func, ColumnRef column, Optional<Filter> filter,
-                          OptionalLong start, long end, TimeUnit unit) implements TargetExpr {
+                          OptionalLong start, long end, TimeUnit unit,
+                          long horizons, OptionalLong step) implements TargetExpr {
 
     /** Sentinel for an unbounded past window bound ({@code -INF}). */
     public static final long NEG_INF = Long.MIN_VALUE;
@@ -23,6 +24,9 @@ public record Aggregation(AggFunc func, ColumnRef column, Optional<Filter> filte
 
     /** True when the aggregation carries a temporal window. */
     public boolean hasWindow() { return unit != null; }
+
+    /** True when the window projects more than one forecast horizon. */
+    public boolean isMultiHorizon() { return horizons > 1; }
 
     public long startOr(long fallback) { return start.orElse(fallback); }
 }

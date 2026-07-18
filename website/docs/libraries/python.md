@@ -40,7 +40,7 @@ application-owned reference connector—not part of the installed package.
   retrievers are plain callables (`typing.Protocol`)
 - **Engine** — `Engine(schema, wiring)`;
   `engine.execute(ExecutionInput(query=..., anchor_time=..., entity_ids=...))`
-- **PQL** — `relativedb.parse(q)`, `relativedb.validate(pq, schema)`,
+- **RelQL** — `relativedb.parse(q)`, `relativedb.validate(pq, schema)`,
   `pq.task_type()`
 - **Backends** — `HistoryBaselineBackend` (default),
   `RtNativeBackend(schema=...)` for RT-J
@@ -54,6 +54,6 @@ Errors are specific: `PqlSyntaxError`, `PqlValidationError`, `SchemaError`,
 .venv/bin/python -m pytest
 ```
 
-Covers the shared 44-query PQL corpus (+20 rejections), the temporal-leakage
+Covers the shared 44-query RelQL corpus (+20 rejections), the temporal-leakage
 guard, CSC ≡ retriever equivalence, model routing, and the retriever→churn
 path end to end.

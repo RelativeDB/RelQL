@@ -1,6 +1,6 @@
 # benchmarks — real-corpus backtest harness
 
-Extensive, measurement-driven testing of relativedb / PQL against **real
+Extensive, measurement-driven testing of relativedb / RelQL against **real
 relational data with a strict point-in-time backtest**. See
 [`FINDINGS.md`](FINDINGS.md) for results.
 
@@ -38,7 +38,7 @@ backend change is judged across the whole grid, not one dataset's one number.
 | `run.py` | depth view: audits + per-task backtest on retail + movielens |
 | `run_suite.py` | breadth view: the generalizability matrix across all 3 datasets |
 
-PQL parsing and the CSC index are single-sourced in the C++ layer (`librt_c`),
+RelQL parsing and the CSC index are single-sourced in the C++ layer (`librt_c`),
 a hard dependency — the same native library the RT-J model requires. The Python
 CSC binding is checked against a brute-force reference by
 `python/tests/test_native_csc.py`; parser correctness rides on the C++
@@ -46,7 +46,7 @@ conformance test (`cpp/src/test_pql.cpp`) plus `python/tests/test_pql_parser.py`
 
 ## Method
 
-For each anchor `T`: context = rows `≤ T` (engine-enforced), target = PQL
+For each anchor `T`: context = rows `≤ T` (engine-enforced), target = RelQL
 window `(T, T+h]`, truth computed **independently** from the raw frames (never
 by re-running the engine), scored against naive baselines. A metric only counts
 as "signal" when the engine beats the one-liner a user could write without it.

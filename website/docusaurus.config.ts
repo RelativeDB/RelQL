@@ -11,7 +11,7 @@ const config: Config = {
     v4: true,
   },
 
-  url: 'https://relativedb.com',
+  url: 'https://relql.com',
   baseUrl: '/',
 
   organizationName: 'relativedb',
@@ -64,7 +64,7 @@ const config: Config = {
         {
           to: '/pql/',
           position: 'left',
-          label: 'PQL Language',
+          label: 'RelQL Language',
           activeBaseRegex: '/pql/',
         },
         {
@@ -82,7 +82,7 @@ const config: Config = {
           title: 'Documentation',
           items: [
             {label: 'Getting started', to: '/docs/getting-started/installation'},
-            {label: 'PQL language', to: '/pql/'},
+            {label: 'RelQL language', to: '/pql/'},
             {label: 'How-to guides', to: '/docs/how-to/predict-churn'},
           ],
         },

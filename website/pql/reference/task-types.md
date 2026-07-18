@@ -12,9 +12,10 @@ selects the model checkpoint and the output form — you never declare it.
 |---|---|---|
 | bare aggregation — `SUM(...)`, `COUNT(...)` | regression | value |
 | aggregation vs literal — `COUNT(...) = 0` | binary classification | probability |
+| `EXISTS(...)` / `NOT EXISTS(...)` (boolean target) | binary classification | probability |
 | `FIRST` / `LAST` / static categorical column | multiclass classification | class + probabilities |
 | `LIST_DISTINCT(...) RANK TOP K` | ranking | ranked ID list |
-| any target with `FORECAST N TIMEFRAMES` | forecasting | value per timeframe |
+| any target whose window has `HORIZONS > 1` | forecasting | value per horizon |
 
 ## Model routing
 
@@ -27,6 +28,6 @@ regression/forecasting to `hf://stanford-star/rt-j/regression`.
 Every library exposes the inference without executing:
 
 ```python
-pq = relativedb.parse("PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id")
+pq = relativedb.parse("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id")
 pq.task_type()    # TaskType.REGRESSION
 ```

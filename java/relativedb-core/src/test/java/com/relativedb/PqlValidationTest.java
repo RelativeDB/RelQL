@@ -1,8 +1,12 @@
 package com.relativedb;
 
+import com.relativedb.query.AsOf;
 import com.relativedb.query.Pql;
+import com.relativedb.query.PqlSyntaxException;
 import com.relativedb.query.PqlValidationException;
+import com.relativedb.query.ReturnSpec;
 import com.relativedb.query.TaskType;
+import com.relativedb.query.ValidatedQuery;
 import com.relativedb.schema.RelativeDbSchema;
 import com.relativedb.schema.LinkDef;
 import com.relativedb.schema.TableDef;
@@ -45,31 +49,57 @@ class PqlValidationTest {
     @Test
     void bareAggregationIsRegression() {
         assertEquals(TaskType.REGRESSION,
-                taskOf("PREDICT SUM(transactions.price, 0, 30) FOR EACH customers.customer_id"));
+                taskOf("PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void comparedAggregationIsBinaryClassification() {
         assertEquals(TaskType.BINARY_CLASSIFICATION,
-                taskOf("PREDICT COUNT(transactions.*, 0, 90, days) = 0 FOR EACH customers.customer_id"));
+                taskOf("PREDICT COUNT(transactions.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id"));
+    }
+
+    @Test
+    void existsTargetIsBinaryClassification() {
+        assertEquals(TaskType.BINARY_CLASSIFICATION,
+                taskOf("PREDICT EXISTS(transactions.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
+        assertEquals(TaskType.BINARY_CLASSIFICATION,
+                taskOf("PREDICT NOT EXISTS(transactions.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
+    }
+
+    @Test
+    void arithmeticAndFunctionTargetsAreRegression() {
+        assertEquals(TaskType.REGRESSION,
+                taskOf("PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) * 2 FOR EACH customers.customer_id"));
+        assertEquals(TaskType.REGRESSION,
+                taskOf("PREDICT COALESCE(SUM(transactions.price) OVER (30 DAYS FOLLOWING), 0) "
+                        + "FOR EACH customers.customer_id"));
+    }
+
+    @Test
+    void caseTargetIsRegression() {
+        assertEquals(TaskType.REGRESSION,
+                taskOf("PREDICT CASE WHEN COUNT(transactions.*) OVER (30 DAYS FOLLOWING) > 10 THEN 1 ELSE 0 END "
+                        + "FOR EACH customers.customer_id"));
     }
 
     @Test
     void lastOnCategoricalIsMulticlass() {
         assertEquals(TaskType.MULTICLASS_CLASSIFICATION,
-                taskOf("PREDICT LAST(transactions.status, 0, 90) FOR EACH customers.customer_id"));
+                taskOf("PREDICT LAST(transactions.status) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void listDistinctRankIsRanking() {
         assertEquals(TaskType.MULTILABEL_RANKING,
-                taskOf("PREDICT LIST_DISTINCT(transactions.article_id, 0, 30) RANK TOP 12 FOR EACH customers.customer_id"));
+                taskOf("PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING) RANK TOP 12 "
+                        + "FOR EACH customers.customer_id"));
     }
 
     @Test
-    void forecastIsForecasting() {
+    void horizonsTargetIsForecasting() {
         assertEquals(TaskType.FORECASTING,
-                taskOf("PREDICT SUM(transactions.price, 0, 7, days) FORECAST 4 TIMEFRAMES FOR EACH customers.customer_id"));
+                taskOf("PREDICT SUM(transactions.price) OVER (7 DAYS FOLLOWING HORIZONS 4) "
+                        + "FOR EACH customers.customer_id"));
     }
 
     @Test
@@ -84,73 +114,102 @@ class PqlValidationTest {
                 taskOf("PREDICT customers.industry = 'IT' FOR EACH customers.customer_id"));
     }
 
+    // ---- clauses represented, not executed ------------------------------
+
+    @Test
+    void asOfAndReturnAreRepresented() {
+        ValidatedQuery vq = Pql.validate(
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id "
+                + "AS OF :t RETURN EXPECTED VALUE", SCHEMA);
+        assertEquals(TaskType.REGRESSION, vq.taskType());
+        assertEquals(AsOf.Kind.PARAM, vq.query().asOf().orElseThrow().kind());
+        assertEquals(ReturnSpec.Kind.EXPECTED_VALUE, vq.query().ret().orElseThrow().kind());
+    }
+
+    @Test
+    void explainAndAblateDoNotThrow() {
+        assertDoesNotThrow(() -> Pql.validate(
+                "EXPLAIN PLAN PREDICT EXISTS(transactions.*) OVER (30 DAYS FOLLOWING) "
+                + "FOR EACH customers.customer_id ABLATE TABLE articles RETURN PROBABILITY", SCHEMA));
+    }
+
     // ---- binding errors -------------------------------------------------
 
     @Test
     void unknownTableRejected() {
         assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(orders.price, 0, 30) FOR EACH customers.customer_id"));
+                () -> taskOf("PREDICT SUM(orders.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void unknownColumnRejected() {
         assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(transactions.nope, 0, 30) FOR EACH customers.customer_id"));
+                () -> taskOf("PREDICT SUM(transactions.nope) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void entityKeyMustBePrimaryKey() {
         assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(transactions.price, 0, 30) FOR EACH customers.age"));
+                () -> taskOf("PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.age"));
     }
 
     @Test
     void sumRequiresNumericColumn() {
         assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(transactions.status, 0, 30) FOR EACH customers.customer_id"));
+                () -> taskOf("PREDICT SUM(transactions.status) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
-    void wildcardOnlyValidInCount() {
+    void wildcardOnlyValidInCountOrExists() {
         assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(transactions.*, 0, 30) FOR EACH customers.customer_id"));
+                () -> taskOf("PREDICT SUM(transactions.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void listDistinctRequiresRankOrClassify() {
         PqlValidationException e = assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT LIST_DISTINCT(transactions.article_id, 0, 30) FOR EACH customers.customer_id"));
+                () -> taskOf("PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING) "
+                        + "FOR EACH customers.customer_id"));
         assertTrue(e.getMessage().contains("LIST_DISTINCT"));
     }
 
     @Test
     void targetWindowMustBeFuture() {
         assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(transactions.price, -30, 0) FOR EACH customers.customer_id"));
+                () -> taskOf("PREDICT SUM(transactions.price) OVER (30 DAYS PRECEDING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void whereWindowMustBePast() {
         // Past filter window is fine...
         assertDoesNotThrow(() -> taskOf(
-                "PREDICT SUM(transactions.price, 0, 30) FOR EACH customers.customer_id "
-                + "WHERE COUNT(transactions.*, -30, 0) > 0"));
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id "
+                + "WHERE COUNT(transactions.*) OVER (30 DAYS PRECEDING) > 0"));
         // ...a future one is not.
         assertThrows(PqlValidationException.class, () -> taskOf(
-                "PREDICT SUM(transactions.price, 0, 30) FOR EACH customers.customer_id "
-                + "WHERE COUNT(transactions.*, 0, 30) > 0"));
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id "
+                + "WHERE COUNT(transactions.*) OVER (30 DAYS FOLLOWING) > 0"));
     }
 
     @Test
-    void emptyWindowRejected() {
-        assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT SUM(transactions.price, 30, 30) FOR EACH customers.customer_id"));
+    void horizonsOnlyAllowedOnTarget() {
+        assertThrows(PqlValidationException.class, () -> taskOf(
+                "PREDICT SUM(transactions.price) OVER (7 DAYS FOLLOWING) FOR EACH customers.customer_id "
+                + "WHERE COUNT(transactions.*) OVER (7 DAYS PRECEDING HORIZONS 3) > 0"));
+    }
+
+    @Test
+    void emptyWindowRejectedAtParse() {
+        // start >= end is rejected by the parser now (was a validation rule).
+        assertThrows(PqlSyntaxException.class, () -> taskOf(
+                "PREDICT SUM(transactions.price) "
+                + "OVER (RANGE BETWEEN 30 DAYS FOLLOWING AND 30 DAYS FOLLOWING) FOR EACH customers.customer_id"));
     }
 
     @Test
     void staticTemporalMixingRejected() {
         assertThrows(PqlValidationException.class, () -> taskOf(
-                "PREDICT SUM(transactions.price, 0, 30) > 10 OR customers.industry = 'IT' "
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) > 10 OR customers.industry = 'IT' "
                 + "FOR EACH customers.customer_id"));
     }
 
@@ -178,12 +237,7 @@ class PqlValidationTest {
     void fkColumnIsValidRecommendationTarget() {
         // article_id is an FK edge, not a declared column — allowed as a categorical target.
         assertDoesNotThrow(() -> taskOf(
-                "PREDICT LIST_DISTINCT(transactions.article_id, 0, 30) RANK TOP 5 FOR EACH customers.customer_id"));
-    }
-
-    @Test
-    void forecastRequiresWindowedAggregation() {
-        assertThrows(PqlValidationException.class,
-                () -> taskOf("PREDICT customers.age FORECAST 4 TIMEFRAMES FOR EACH customers.customer_id"));
+                "PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING) RANK TOP 5 "
+                + "FOR EACH customers.customer_id"));
     }
 }

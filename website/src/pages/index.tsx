@@ -18,11 +18,11 @@ function Hero() {
         <p className={styles.heroSubtitle}>
           Predictive queries over your own relational data. Declare your
           schema, wire retrievers over the storage you already have, and ask
-          about the future in one line of PQL — no feature engineering, no
+          about the future in one line of RelQL — no feature engineering, no
           training pipeline, no temporal leakage.
         </p>
         <CodeBlock language="sql" className={styles.heroCode}>
-          {`PREDICT COUNT(orders.*, 0, 90, days) = 0\nFOR EACH customers.customer_id`}
+          {`PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0\nFOR EACH customers.customer_id`}
         </CodeBlock>
         <p className={styles.heroCaption}>
           “For every customer, the probability they place zero orders in the
@@ -33,7 +33,7 @@ function Hero() {
             Quickstart
           </Link>
           <Link className="button button--secondary button--lg" to="/pql/">
-            Learn PQL
+            Learn RelQL
           </Link>
         </div>
         <div className={styles.social}>
@@ -80,7 +80,7 @@ function VideoStub() {
 const PILLARS = [
   {
     title: 'A query, not a pipeline',
-    body: 'PQL states the target, the population, and the time window declaratively. Change the question, change the string. Every query is validated against your schema before it runs.',
+    body: 'RelQL states the target, the population, and the time window declaratively. Change the question, change the string. Every query is validated against your schema before it runs.',
   },
   {
     title: 'Your data stays yours',
@@ -205,7 +205,7 @@ function Benchmark() {
 
 export default function Home(): ReactNode {
   return (
-    <Layout description="Predictive queries over your own relational data — PQL, retrievers, and a relational transformer.">
+    <Layout description="Predictive queries over your own relational data — RelQL, retrievers, and a relational transformer.">
       <Hero />
       <main>
         <Pillars />

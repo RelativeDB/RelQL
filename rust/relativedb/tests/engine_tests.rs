@@ -144,7 +144,7 @@ fn csc_execute_end_to_end() {
         .build()
         .unwrap();
     let res = eng
-        .execute(ExecutionInput::query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id").anchor_time(t0()))
+        .execute(ExecutionInput::query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id").anchor_time(t0()))
         .unwrap();
     assert_eq!(res.task_type, TaskType::BinaryClassification);
     let ids: std::collections::HashSet<String> = res.predictions.iter().map(|p| p.id.to_string()).collect();
@@ -179,10 +179,10 @@ fn engine_routes_model_uri_by_task_type() {
     let backend = RecordingBackend { calls: Arc::clone(&calls) };
     let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(backend));
     let cases = [
-        ("PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id", TaskType::Regression, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id", TaskType::BinaryClassification, "hf://stanford-star/rt-j/classification"),
-        ("PREDICT SUM(orders.qty, 0, 7, days) FORECAST 4 TIMEFRAMES FOR EACH customers.customer_id", TaskType::Forecasting, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT LIST_DISTINCT(orders.qty, 0, 30) RANK TOP 5 FOR EACH customers.customer_id", TaskType::MultilabelRanking, "hf://stanford-star/rt-j/classification"),
+        ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id", TaskType::Regression, "hf://stanford-star/rt-j/regression"),
+        ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id", TaskType::BinaryClassification, "hf://stanford-star/rt-j/classification"),
+        ("PREDICT SUM(orders.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) FOR EACH customers.customer_id", TaskType::Forecasting, "hf://stanford-star/rt-j/regression"),
+        ("PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) RANK TOP 5 FOR EACH customers.customer_id", TaskType::MultilabelRanking, "hf://stanford-star/rt-j/classification"),
     ];
     for (pql, expect_task, expect_uri) in cases {
         let res = eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap();
@@ -212,11 +212,11 @@ fn for_each_without_scanner_raises() {
         .build();
     let mut eng = Engine::new(churn_schema(), wiring);
     assert!(eng
-        .execute(ExecutionInput::query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id").anchor_time(t0()))
+        .execute(ExecutionInput::query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id").anchor_time(t0()))
         .is_err());
     // but a pinned id works
     let res = eng
-        .execute(ExecutionInput::query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR customers.customer_id = 'C7'").anchor_time(t0()))
+        .execute(ExecutionInput::query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR customers.customer_id = 'C7'").anchor_time(t0()))
         .unwrap();
     assert_eq!(res.predictions.len(), 1);
 }

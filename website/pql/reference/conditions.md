@@ -14,6 +14,11 @@ rows (inline `WHERE` inside an aggregation), and stating counterfactuals
 
 `=` `==` `!=` `>` `>=` `<` `<=`
 
+Either side of a comparison may be a literal, a static column, an aggregation
+over an `OVER` frame, or a richer expression (arithmetic, `CASE WHEN … END`,
+`COALESCE`, `NULLIF`, `ABS`/`LOG`/`EXP`/`LEAST`/`GREATEST`). Column-to-column
+comparisons are allowed — e.g. `orders.shipped_at > orders.ordered_at`.
+
 ## Boolean composition
 
 `AND`, `OR`, `NOT`, with parentheses.
@@ -40,8 +45,8 @@ movie.title CONTAINS 'Star'
 
 ```sql
 -- entity filter mixing a static attribute and a past-facing aggregation
-WHERE customers.age >= 18 AND COUNT(orders.*, -90, 0, days) > 0
+WHERE customers.age >= 18 AND COUNT(orders.*) OVER (90 DAYS PRECEDING) > 0
 
 -- predicate target: multiclass-style question on a status column
-PREDICT LAST(loan.status, 0, 30) NOT LIKE '%DENIED' FOR EACH loan.id
+PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH loan.id
 ```

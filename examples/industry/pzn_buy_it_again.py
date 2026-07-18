@@ -5,7 +5,7 @@ customer is most likely to purchase in the next 30 days. Uses the canonical
 Kumo recommendation pattern — LIST_DISTINCT over a *foreign key* with
 RANK TOP K (FK values reach the ranker through Row.parents, never as cells).
 
-    PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3
+    PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3
     FOR EACH customers.customer_id
 
 Planted signal: each customer has a habitual staple (bought weekly), a
@@ -65,7 +65,7 @@ wiring = wire_pandas_frames(schema, {
     "customers": customers, "products": products, "orders": orders,
 })
 result = Engine(schema, wiring).execute(ExecutionInput(
-    query="PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3 "
+    query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3 "
           "FOR EACH customers.customer_id",
     anchor_time=ANCHOR.to_pydatetime()))
 df = predictions_frame(result)

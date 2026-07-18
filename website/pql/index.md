@@ -1,18 +1,18 @@
 ---
 id: index
-title: PQL overview
+title: RelQL overview
 slug: /
 description: The Predictive Query Language — SQL for questions about the future.
 ---
 
-# PQL — the Predictive Query Language
+# RelQL — the Predictive Query Language
 
-PQL expresses predictions the way SQL expresses lookups. One statement names a
+RelQL expresses predictions the way SQL expresses lookups. One statement names a
 **target** (what to predict), a **population** (who to predict it for), and an
 **anchor-relative time window**:
 
 ```sql
-PREDICT COUNT(orders.*, 0, 90, days) = 0
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0
 FOR EACH customers.customer_id
 ```
 
@@ -30,13 +30,13 @@ anchor time?*
   [task type](reference/task-types) (classification, regression, ranking,
   forecasting), which selects the model checkpoint and output form.
 
-PQL derives from Kumo/KumoRFM's predictive query language. One grammar, three
+RelQL derives from Kumo/KumoRFM's predictive query language. One grammar, three
 verified implementations (ANTLR in Java; recursive descent in Python and
 Rust), all tested against a shared 44-query corpus.
 
 ## Learn it
 
-- New to PQL? Start with the [tutorial](tutorial) — it builds a query up
+- New to RelQL? Start with the [tutorial](tutorial) — it builds a query up
   clause by clause.
 - Looking something up? See the [reference](reference/query-structure).
 - Want patterns to copy? See the [cookbook](cookbook).

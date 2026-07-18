@@ -10,7 +10,7 @@ import java.util.List;
  * Lazy loader for the shared C++ runtime ({@code librt_c}). Nothing native is
  * touched until {@link #get()} is first called; {@link #get()} returns
  * {@code null} when the library cannot be located, and callers that require it
- * (PQL parsing, and the RT-J model) raise a clear error. {@code librt_c} is a
+ * (RelQL parsing, and the RT-J model) raise a clear error. {@code librt_c} is a
  * hard dependency, mirroring the Python and Rust bindings.
  *
  * <p>Discovery order:

@@ -119,7 +119,7 @@ def test_csc_context_equals_retriever_context(churn_schema, churn_wiring):
 def test_csc_execute_end_to_end(churn_schema, churn_wiring):
     eng = Engine(churn_schema, churn_wiring, sampler_mode=SamplerMode.CSC)
     res = eng.execute(ExecutionInput(
-        query="PREDICT COUNT(orders.*, 0, 90, days) = 0 "
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
               "FOR EACH customers.customer_id",
         anchor_time=T0))
     assert res.task_type is TaskType.BINARY_CLASSIFICATION
@@ -144,14 +144,14 @@ def test_engine_routes_model_uri_by_task_type(churn_schema, churn_wiring):
     backend = RecordingBackend()
     eng = Engine(churn_schema, churn_wiring, model_backend=backend)
     cases = [
-        ("PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id",
+        ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id",
          TaskType.REGRESSION, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+        ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id",
          TaskType.BINARY_CLASSIFICATION, "hf://stanford-star/rt-j/classification"),
-        ("PREDICT SUM(orders.qty, 0, 7, days) FORECAST 4 TIMEFRAMES "
+        ("PREDICT SUM(orders.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) "
          "FOR EACH customers.customer_id",
          TaskType.FORECASTING, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT LIST_DISTINCT(orders.qty, 0, 30) RANK TOP 5 "
+        ("PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) RANK TOP 5 "
          "FOR EACH customers.customer_id",
          TaskType.MULTILABEL_RANKING, "hf://stanford-star/rt-j/classification"),
     ]
@@ -175,11 +175,11 @@ def test_for_each_without_scanner_raises():
     eng = Engine(_make_schema(), wiring)
     with pytest.raises(ExecutionError):
         eng.execute(ExecutionInput(
-            query="PREDICT COUNT(orders.*, 0, 90, days) = 0 "
+            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
                   "FOR EACH customers.customer_id", anchor_time=T0))
     # but pinned ids work
     res = eng.execute(ExecutionInput(
-        query="PREDICT COUNT(orders.*, 0, 90, days) = 0 "
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
               "FOR customers.customer_id = 'C7'", anchor_time=T0))
     assert len(res.predictions) == 1
 

@@ -1,6 +1,6 @@
 # relativedb (Java)
 
-A GraphQL-style engine for PQL predictive queries. The engine owns the query
+A GraphQL-style engine for RelQL predictive queries. The engine owns the query
 language, planning, context assembly, and model invocation — but **never
 touches a database**: all data access goes through user-implemented
 **retrievers** wired to a declared schema.
@@ -9,7 +9,7 @@ touches a database**: all data access goes through user-implemented
 
 | Module | What it is |
 |---|---|
-| `com.relativedb:relationdb` | Schema builder, retriever SPI, ANTLR-based PQL parser + semantic validation, pure-Java context assembly (RETRIEVER and CSC sampler modes), model SPI |
+| `com.relativedb:relationdb` | Schema builder, retriever SPI, RelQL parsing (via the shared C++ parser in `librt_c`) + semantic validation, pure-Java context assembly (RETRIEVER and CSC sampler modes), model SPI |
 | `com.relativedb:relationdb-rt` | Optional JNA binding to the golden-verified C++ RT inference engine (`librt_c`): `RtNativeBackend implements ModelBackend`, scoring with the real Relational Transformer |
 
 Requires Java 17+. Build and test:
@@ -21,7 +21,7 @@ Requires Java 17+. Build and test:
 ## Quickstart
 
 Declare the graph's *shape* (no URLs, no credentials), wire retrievers over
-whatever storage you have, and execute PQL:
+whatever storage you have, and execute RelQL:
 
 ```java
 import com.relativedb.schema.*;
@@ -52,7 +52,7 @@ RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
                                //   embeddings all-MiniLM-L12-v2 (shared by both)
 
 PredictionResult churn = engine.execute(ExecutionInput.newInput()
-    .query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+    .query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
     .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
     .entityIds(List.of(42L))
     .build()).toCompletableFuture().join();
@@ -99,15 +99,18 @@ RelativeDbEngine.newEngine(schema, wiring)
 Context budgets support both geometries: a global cell budget with uniform
 width (`maxContextCells` + `bfsWidth`), or per-hop caps (`fanouts(64, 64)`).
 
-## PQL
+## RelQL
 
-The full grammar lives in `relativedb-core/src/main/antlr/Pql.g4`. Examples:
+There is no Java grammar file: RelQL is parsed by the single shared C++ parser in
+`librt_c` (`pql_parse`), and `NativePqlParser` decodes its JSON AST — the same
+parser the Python and Rust bindings use. Examples:
 
 ```sql
-PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id
-PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR users.user_id IN (42, 123)
-PREDICT LIST_DISTINCT(transactions.article_id, 0, 30) RANK TOP 12 FOR EACH customers.customer_id
-PREDICT SUM(usage.count, 0, 1, days) FORECAST 28 TIMEFRAMES FOR EACH accounts.account_id
+PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)
+PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING) RANK TOP 12 FOR EACH customers.customer_id
+PREDICT SUM(usage.count) OVER (1 DAY FOLLOWING HORIZONS 28) FOR EACH accounts.account_id
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id AS OF :prediction_time RETURN PROBABILITY
 ```
 
 `Pql.parse(query)` gives the typed AST; `Pql.validate(query, schema)` binds it

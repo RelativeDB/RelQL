@@ -2,7 +2,7 @@ package com.relativedb.query;
 
 import com.relativedb.schema.RelativeDbSchema;
 
-/** Entry point: PQL parsing and schema-bound validation. */
+/** Entry point: RelQL parsing and schema-bound validation. */
 public final class Pql {
     private Pql() { }
 

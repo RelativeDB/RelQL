@@ -5,7 +5,7 @@ description: Connect the engine to your own storage — a DAO, REST service, or 
 
 # Wire custom retrievers
 
-Goal: run PQL against data the engine cannot see — behind a DAO, a REST
+Goal: run RelQL against data the engine cannot see — behind a DAO, a REST
 service, or a feature store.
 
 ## 1. Declare the schema (shape only)

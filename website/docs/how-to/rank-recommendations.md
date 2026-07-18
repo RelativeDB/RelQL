@@ -14,7 +14,7 @@ the next 30 days ("buy it again").
 ranking task:
 
 ```sql
-PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3
+PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3
 FOR EACH customers.customer_id
 ```
 

@@ -30,13 +30,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Industry example: streaming-service inactivity churn, mirroring
  * examples/industry/growth_churn.py.
  *
- * PREDICT COUNT(events.*, 0, 30, days) = 0 FOR EACH users.user_id
+ * PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0 FOR EACH users.user_id
  *
  * Data plants the signal: "engaged" users stream weekly up to the anchor;
  * "fading" users stopped ~45 days before it. The backend here is a
  * transparent context-evidence baseline (churn risk decays with the amount
  * of recent activity that reached the model's context window) — it stands in
- * for a real RT backend while exercising the full pipeline: PQL parse →
+ * for a real RT backend while exercising the full pipeline: RelQL parse →
  * validation → retriever hop loop → temporal guard → tokenization → scoring.
  */
 class GrowthChurnExampleTest {
@@ -104,7 +104,7 @@ class GrowthChurnExampleTest {
         List<EntityId> all = new ArrayList<>(engaged);
         all.addAll(fading);
         PredictionResult result = engine.execute(ExecutionInput.newInput()
-                .query("PREDICT COUNT(events.*, 0, 30, days) = 0 FOR EACH users.user_id")
+                .query("PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0 FOR EACH users.user_id")
                 .anchorTime(ANCHOR)
                 .entityIds(all.stream().map(EntityId::raw).toList())
                 .build()).toCompletableFuture().join();

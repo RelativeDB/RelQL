@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "relationdb"
 version = "0.1.0"
-description = "Predictive queries (PQL) over your own data: GraphQL-style user-defined retrievers, no bundled database connectors."
+description = "Predictive queries (RelQL) over your own data: GraphQL-style user-defined retrievers, no bundled database connectors."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

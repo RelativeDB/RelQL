@@ -1,4 +1,4 @@
-# PQL evolution proposal
+# RelQL evolution proposal
 
 ## 1. Temporal window frames
 
@@ -17,7 +17,7 @@ For a Boolean target, probability output is inferred when RETURN is omitted;
 explicit.
 
 In the full form, the only frame component is RANGE BETWEEN. The shorthand may
-omit it when one endpoint is NOW. PQL does not need SQL's PARTITION BY or
+omit it when one endpoint is NOW. RelQL does not need SQL's PARTITION BY or
 ORDER BY syntax:
 
 - FOR EACH already supplies the entity partition.
@@ -103,7 +103,7 @@ Durations use a numeric value followed directly by a unit:
 ~~~
 
 Units may be singular or plural and are case-insensitive. The same form is used
-anywhere PQL expects a duration, including window bounds, STEP, WITHIN, and
+anywhere RelQL expects a duration, including window bounds, STEP, WITHIN, and
 anchor recurrence. Because these positions already require a duration, no
 wrapper keyword or quoted value is needed.
 
@@ -163,7 +163,7 @@ t >  a + l
 t <= a + u
 ~~~
 
-An unbounded endpoint omits its corresponding comparison. This preserves PQL's
+An unbounded endpoint omits its corresponding comparison. This preserves RelQL's
 start-exclusive/end-inclusive convention: (a + l, a + u]. A frame is invalid
 when l >= u.
 
@@ -321,7 +321,7 @@ horizon, including rows rejected for missing timestamps or boundary failures.
 
 ## 2. Richer target expressions
 
-PQL should allow arithmetic and familiar scalar expressions:
+RelQL should allow arithmetic and familiar scalar expressions:
 
 ~~~sql
 PREDICT

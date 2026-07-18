@@ -534,7 +534,7 @@ impl Engine {
         Ok(PredictionResult { task_type, predictions: preds, model_uri })
     }
 
-    /// Convenience: execute a PQL string with an anchor time.
+    /// Convenience: execute a RelQL string with an anchor time.
     pub fn execute_query(
         &mut self,
         query: &str,
@@ -596,6 +596,7 @@ fn literal_to_entity_id(l: &crate::pql::ast::Literal) -> EntityId {
         Literal::Num(n) if n.fract() == 0.0 => EntityId::Int(*n as i64),
         Literal::Num(n) => EntityId::Str(format!("{}", n)),
         Literal::Str(s) => EntityId::Str(s.clone()),
+        Literal::Bool(b) => EntityId::Str(if *b { "true".into() } else { "false".into() }),
         Literal::Date(d) => EntityId::Str(d.to_rfc3339()),
         Literal::Null => EntityId::Str(String::new()),
     }

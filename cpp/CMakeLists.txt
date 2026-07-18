@@ -28,7 +28,7 @@ target_link_libraries(rt_c rt)
 target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)
 
-# Shared PQL parser (C++20 lexer + recursive-descent parser).
+# Shared RelQL parser (C++20 lexer + recursive-descent parser).
 add_library(pql STATIC src/pql.cpp)
 target_include_directories(pql PUBLIC src)
 

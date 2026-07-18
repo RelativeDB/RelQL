@@ -17,8 +17,8 @@ def run(ret: Dataset) -> dict:
     anchor = ret.anchors[1]
     pk = ret.schema.table(ret.entity_table).primary_key
     child = "purchases"
-    count_q = (f"PREDICT COUNT({child}.*, 0, 90, days) FOR EACH "
-               f"{ret.entity_table}.{pk} WHERE COUNT({child}.*, -90, 0, days) > 0")
+    count_q = (f"PREDICT COUNT({child}.*) OVER (90 DAYS FOLLOWING) FOR EACH "
+               f"{ret.entity_table}.{pk} WHERE COUNT({child}.*) OVER (90 DAYS PRECEDING) > 0")
 
     # Under the default cap the truncation is surfaced (warns + stats > 0);
     # under a wide policy it is silent (stats == 0). Predictions are unchanged

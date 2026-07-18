@@ -15,7 +15,7 @@ use crate::pql::ast::{
 };
 use crate::retrieve::{Row, Value};
 
-/// A value produced by evaluating a PQL value-expression.
+/// A value produced by evaluating a RelQL value-expression.
 #[derive(Clone, PartialEq, Debug)]
 pub enum EvalValue {
     Null,
@@ -171,11 +171,37 @@ pub fn eval_value(
                 .unwrap_or(EvalValue::Null);
         }
         TargetExpr::Aggregation(a) => a,
-        _ => return EvalValue::Null,
+        TargetExpr::Lit(l) => return lit_to_eval(l),
+        // Boolean sub-expressions in value position (e.g. a CASE WHEN cond).
+        TargetExpr::Condition(_) | TargetExpr::LogicalOp(_) | TargetExpr::Not(_) => {
+            return EvalValue::Bool(eval_bool(expr, rows_by_table, entity_cells, anchor));
+        }
+        TargetExpr::Arith(a) => {
+            let l = eval_value(&a.left, rows_by_table, entity_cells, anchor);
+            let r = eval_value(&a.right, rows_by_table, entity_cells, anchor);
+            return eval_arith(a.op, &l, &r);
+        }
+        TargetExpr::Func(f) => {
+            return eval_func(f, rows_by_table, entity_cells, anchor);
+        }
+        TargetExpr::Case(c) => {
+            for (cond, then) in &c.whens {
+                if eval_bool(cond, rows_by_table, entity_cells, anchor) {
+                    return eval_value(then, rows_by_table, entity_cells, anchor);
+                }
+            }
+            return match &c.else_ {
+                Some(e) => eval_value(e, rows_by_table, entity_cells, anchor),
+                None => EvalValue::Null,
+            };
+        }
     };
 
     let rows = agg_rows(agg, rows_by_table, anchor);
     let col = &agg.column.column;
+    if agg.func == AggFunc::Exists {
+        return EvalValue::Bool(!rows.is_empty());
+    }
     if agg.func == AggFunc::Count {
         if col == "*" {
             return EvalValue::Num(rows.len() as f64);
@@ -231,6 +257,70 @@ pub fn eval_value(
     }
 }
 
+// -- value expressions ------------------------------------------------------
+
+fn eval_arith(op: char, l: &EvalValue, r: &EvalValue) -> EvalValue {
+    // SQL-style NULL propagation.
+    let (a, b) = match (l.as_number(), r.as_number()) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return EvalValue::Null,
+    };
+    match op {
+        '+' => EvalValue::Num(a + b),
+        '-' => EvalValue::Num(a - b),
+        '*' => EvalValue::Num(a * b),
+        // division by zero → NULL (SQL semantics).
+        '/' => {
+            if b == 0.0 {
+                EvalValue::Null
+            } else {
+                EvalValue::Num(a / b)
+            }
+        }
+        _ => EvalValue::Null,
+    }
+}
+
+fn eval_func(
+    f: &crate::pql::ast::Func,
+    rows_by_table: &HashMap<String, Vec<Row>>,
+    entity_cells: &[(String, Value)],
+    anchor: Option<DateTime<Utc>>,
+) -> EvalValue {
+    let args: Vec<EvalValue> = f
+        .args
+        .iter()
+        .map(|a| eval_value(a, rows_by_table, entity_cells, anchor))
+        .collect();
+    match f.name.as_str() {
+        "COALESCE" => args
+            .into_iter()
+            .find(|v| !matches!(v, EvalValue::Null))
+            .unwrap_or(EvalValue::Null),
+        "NULLIF" => match (args.first(), args.get(1)) {
+            (Some(a), Some(b)) if a == b => EvalValue::Null,
+            (Some(a), _) => a.clone(),
+            _ => EvalValue::Null,
+        },
+        "ABS" => args.first().and_then(EvalValue::as_number).map(|n| EvalValue::Num(n.abs())).unwrap_or(EvalValue::Null),
+        "LOG" => args.first().and_then(EvalValue::as_number).map(|n| EvalValue::Num(n.ln())).unwrap_or(EvalValue::Null),
+        "EXP" => args.first().and_then(EvalValue::as_number).map(|n| EvalValue::Num(n.exp())).unwrap_or(EvalValue::Null),
+        "LEAST" | "GREATEST" => {
+            let nums: Vec<f64> = args.iter().filter_map(EvalValue::as_number).collect();
+            if nums.len() != args.len() || nums.is_empty() {
+                return EvalValue::Null;
+            }
+            let v = if f.name == "LEAST" {
+                nums.iter().cloned().fold(f64::INFINITY, f64::min)
+            } else {
+                nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            };
+            EvalValue::Num(v)
+        }
+        _ => EvalValue::Null,
+    }
+}
+
 // -- comparison -------------------------------------------------------------
 
 fn like_match(text: &str, pattern: &str) -> bool {
@@ -267,8 +357,19 @@ fn lit_to_string(l: &Literal) -> String {
                 format!("{}", n)
             }
         }
+        Literal::Bool(b) => if *b { "True".into() } else { "False".into() },
         Literal::Date(d) => d.to_rfc3339(),
         Literal::Null => "None".into(),
+    }
+}
+
+fn lit_to_eval(l: &Literal) -> EvalValue {
+    match l {
+        Literal::Str(s) => EvalValue::Text(s.clone()),
+        Literal::Num(n) => EvalValue::Num(*n),
+        Literal::Bool(b) => EvalValue::Bool(*b),
+        Literal::Date(d) => EvalValue::Date(*d),
+        Literal::Null => EvalValue::Null,
     }
 }
 
@@ -293,6 +394,8 @@ fn eq_lit(left: &EvalValue, right: &Literal) -> bool {
     match (left, right) {
         (EvalValue::Num(a), Literal::Num(b)) => a == b,
         (EvalValue::Bool(a), Literal::Num(b)) => (if *a { 1.0 } else { 0.0 }) == *b,
+        (EvalValue::Bool(a), Literal::Bool(b)) => a == b,
+        (EvalValue::Num(a), Literal::Bool(b)) => *a == (if *b { 1.0 } else { 0.0 }),
         (EvalValue::Text(a), Literal::Str(b)) => a == b,
         (EvalValue::Date(a), Literal::Date(b)) => a == b,
         (EvalValue::Null, Literal::Null) => true,
@@ -304,9 +407,55 @@ fn ord_lit(left: &EvalValue, right: &Literal) -> Option<Ordering> {
     match (left, right) {
         (EvalValue::Num(a), Literal::Num(b)) => a.partial_cmp(b),
         (EvalValue::Bool(a), Literal::Num(b)) => (if *a { 1.0 } else { 0.0 }).partial_cmp(b),
+        (EvalValue::Bool(a), Literal::Bool(b)) => Some(a.cmp(b)),
         (EvalValue::Text(a), Literal::Str(b)) => Some(a.cmp(b)),
         (EvalValue::Date(a), Literal::Date(b)) => Some(a.cmp(b)),
         _ => None,
+    }
+}
+
+fn eq_val(a: &EvalValue, b: &EvalValue) -> bool {
+    match (a.as_number(), b.as_number()) {
+        (Some(x), Some(y)) => x == y,
+        _ => match (a, b) {
+            (EvalValue::Text(x), EvalValue::Text(y)) => x == y,
+            (EvalValue::Date(x), EvalValue::Date(y)) => x == y,
+            (EvalValue::Null, EvalValue::Null) => true,
+            _ => false,
+        },
+    }
+}
+
+fn ord_val(a: &EvalValue, b: &EvalValue) -> Option<Ordering> {
+    match (a.as_number(), b.as_number()) {
+        (Some(x), Some(y)) => x.partial_cmp(&y),
+        _ => match (a, b) {
+            (EvalValue::Text(x), EvalValue::Text(y)) => Some(x.cmp(y)),
+            (EvalValue::Date(x), EvalValue::Date(y)) => Some(x.cmp(y)),
+            _ => None,
+        },
+    }
+}
+
+/// Compare two evaluated values (expression-to-expression RHS).
+fn compare_values(op: Operator, left: &EvalValue, right: &EvalValue) -> bool {
+    if matches!(left, EvalValue::Null) || matches!(right, EvalValue::Null) {
+        return false;
+    }
+    match op {
+        Operator::Eq => eq_val(left, right),
+        Operator::Neq => !eq_val(left, right),
+        Operator::Gt => ord_val(left, right) == Some(Ordering::Greater),
+        Operator::Lt => ord_val(left, right) == Some(Ordering::Less),
+        Operator::Ge => matches!(ord_val(left, right), Some(Ordering::Greater | Ordering::Equal)),
+        Operator::Le => matches!(ord_val(left, right), Some(Ordering::Less | Ordering::Equal)),
+        Operator::StartsWith => eval_to_string(left).starts_with(&eval_to_string(right)),
+        Operator::EndsWith => eval_to_string(left).ends_with(&eval_to_string(right)),
+        Operator::Contains => eval_to_string(left).contains(&eval_to_string(right)),
+        Operator::NotContains => !eval_to_string(left).contains(&eval_to_string(right)),
+        Operator::Like => like_match(&eval_to_string(left), &eval_to_string(right)),
+        Operator::NotLike => !like_match(&eval_to_string(left), &eval_to_string(right)),
+        _ => false,
     }
 }
 
@@ -392,6 +541,10 @@ pub fn eval_bool(
         TargetExpr::Not(e) => !eval_bool(e, rows_by_table, entity_cells, anchor),
         TargetExpr::Condition(c) => {
             let left = eval_value(&c.left, rows_by_table, entity_cells, anchor);
+            if let CondRhs::Expr(re) = &c.right {
+                let right = eval_value(re, rows_by_table, entity_cells, anchor);
+                return compare_values(c.op, &left, &right);
+            }
             compare(c.op, &left, &c.right)
         }
         other => eval_value(other, rows_by_table, entity_cells, anchor).truthy(),

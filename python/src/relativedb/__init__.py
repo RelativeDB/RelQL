@@ -1,4 +1,4 @@
-"""relativedb — predictive queries (PQL) over your own data.
+"""relativedb — predictive queries (RelQL) over your own data.
 
 GraphQL-style execution: the engine owns the query language, planning,
 context assembly, and model routing — all data access goes through

@@ -63,15 +63,10 @@ final class SemanticValidator {
             if (k <= 0) throw new PqlValidationException("RANK TOP K requires K >= 1, got " + k);
         });
 
-        // FORECAST needs a windowed aggregation target.
-        if (q.numForecasts().isPresent()) {
-            if (q.numForecasts().getAsInt() <= 0) {
-                throw new PqlValidationException("FORECAST requires at least 1 timeframe");
-            }
-            if (!(q.target() instanceof Aggregation agg) || !agg.hasWindow()) {
-                throw new PqlValidationException(
-                        "FORECAST requires a windowed aggregation target");
-            }
+        // Forecasting is now implied by a target window with HORIZONS > 1; the
+        // parser derives num_forecasts from it. Sanity-check the derived count.
+        if (q.numForecasts().isPresent() && q.numForecasts().getAsInt() <= 0) {
+            throw new PqlValidationException("forecast horizon count must be >= 1");
         }
 
         return inferTaskType(q, temporalTarget);
@@ -89,12 +84,29 @@ final class SemanticValidator {
             checkExpr(not.inner(), clause);
         } else if (e instanceof Condition cond) {
             ValueType left = valueType(cond.left(), clause);
-            checkOperator(cond, left);
+            if (cond.rightExpr().isPresent()) {
+                valueType(cond.rightExpr().get(), clause);   // column/expression RHS
+            } else {
+                checkOperator(cond, left);
+            }
         } else if (e instanceof Aggregation agg) {
             checkAggregation(agg, clause);
         } else if (e instanceof ColumnRef ref) {
             resolveColumnType(ref, false);
             if (clause == Clause.TARGET) sawStatic = true;
+        } else if (e instanceof Arith a) {
+            checkExpr(a.left(), clause);
+            checkExpr(a.right(), clause);
+        } else if (e instanceof Func f) {
+            for (TargetExpr arg : f.args()) checkExpr(arg, clause);
+        } else if (e instanceof Case c) {
+            for (Case.When w : c.whens()) {
+                checkExpr(w.cond(), clause);
+                checkExpr(w.then(), clause);
+            }
+            if (c.elseExpr() != null) checkExpr(c.elseExpr(), clause);
+        } else if (e instanceof LitExpr) {
+            // a bare literal binds nothing.
         }
     }
 
@@ -108,7 +120,23 @@ final class SemanticValidator {
             if (clause == Clause.TARGET) sawStatic = true;
             return resolveColumnType(ref, false);
         }
+        if (e instanceof LitExpr lit) {
+            return literalType(lit.value());
+        }
+        if (e instanceof Arith || e instanceof Func || e instanceof Case) {
+            checkExpr(e, clause);          // bind columns / detect temporal
+            return ValueType.NUMBER;       // arithmetic / scalar funcs are numeric
+        }
         throw new PqlValidationException("expected a value expression, got " + e);
+    }
+
+    private static ValueType literalType(Literal lit) {
+        return switch (lit.kind()) {
+            case NUMBER -> ValueType.NUMBER;
+            case BOOLEAN -> ValueType.BOOLEAN;
+            case DATE -> ValueType.DATETIME;
+            case STRING, NULL, LIST -> ValueType.TEXT;
+        };
     }
 
     private void checkAggregation(Aggregation agg, Clause clause) {
@@ -118,6 +146,13 @@ final class SemanticValidator {
                     + ") requires a NUMBER column, got " + operand);
         }
         agg.filter().ifPresent(f -> checkExpr(f.condition(), clause));
+
+        // HORIZONS > 1 is only meaningful on the PREDICT target (it drives
+        // forecasting); it is not allowed inside WHERE / ASSUMING frames.
+        if (agg.isMultiHorizon() && clause != Clause.TARGET) {
+            throw new PqlValidationException(
+                    "HORIZONS > 1 is only allowed on the PREDICT target, not in " + clause);
+        }
 
         if (!agg.hasWindow()) {
             if (clause == Clause.TARGET) sawStatic = true;
@@ -183,6 +218,7 @@ final class SemanticValidator {
     private ValueType aggResultType(Aggregation agg) {
         return switch (agg.func()) {
             case COUNT, COUNT_DISTINCT, SUM, AVG -> ValueType.NUMBER;
+            case EXISTS -> ValueType.BOOLEAN;
             case MIN, MAX, FIRST, LAST, LIST_DISTINCT ->
                     agg.column().isWildcard() ? ValueType.NUMBER : resolveColumnType(agg.column(), false);
         };
@@ -237,12 +273,23 @@ final class SemanticValidator {
             return TaskType.BINARY_CLASSIFICATION;
         }
         if (t instanceof Aggregation agg) {
+            if (agg.func() == AggFunc.EXISTS) {
+                return TaskType.BINARY_CLASSIFICATION;
+            }
             if (agg.func() == AggFunc.FIRST || agg.func() == AggFunc.LAST) {
                 ValueType vt = aggResultType(agg);
                 return vt == ValueType.NUMBER || vt == ValueType.DATETIME
                         ? TaskType.REGRESSION : TaskType.MULTICLASS_CLASSIFICATION;
             }
             return TaskType.REGRESSION;
+        }
+        // Arithmetic / scalar-function / CASE targets are numeric ⇒ regression.
+        if (t instanceof Arith || t instanceof Func || t instanceof Case) {
+            return TaskType.REGRESSION;
+        }
+        if (t instanceof LitExpr lit) {
+            return lit.value().kind() == Literal.Kind.BOOLEAN
+                    ? TaskType.BINARY_CLASSIFICATION : TaskType.REGRESSION;
         }
         // Bare static column.
         ValueType vt = resolveColumnType((ColumnRef) t, false);

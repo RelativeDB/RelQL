@@ -1,4 +1,4 @@
-"""Typed PQL AST + task-type inference.
+"""Typed RelQL AST + task-type inference.
 
 Mirrors the ``dev.rql.query`` records from the Java API design, pythonically.
 """
@@ -13,6 +13,8 @@ from typing import Any, Optional, Union
 __all__ = [
     "AggFunc", "TimeUnit", "Operator", "BoolOp", "TaskType",
     "ColumnRef", "Window", "Aggregation", "Condition", "LogicalOp", "Not",
+    "Arith", "Func", "Case", "Lit",
+    "Explain", "AsOf", "Ablation", "ReturnSpec",
     "TargetExpr", "ParsedQuery", "RankKind",
 ]
 
@@ -27,6 +29,7 @@ class AggFunc(Enum):
     LIST_DISTINCT = "LIST_DISTINCT"
     FIRST = "FIRST"
     LAST = "LAST"
+    EXISTS = "EXISTS"       # boolean existence -> binary_classification
 
 
 class TimeUnit(Enum):
@@ -36,6 +39,8 @@ class TimeUnit(Enum):
     DAYS = "days"
     WEEKS = "weeks"
     MONTHS = "months"
+    YEARS = "years"         # defensive: the parser normalizes calendar frames
+                            # to months, but accept years if ever emitted.
 
     def delta(self, n: float) -> timedelta:
         if self is TimeUnit.SECONDS:
@@ -48,6 +53,8 @@ class TimeUnit(Enum):
             return timedelta(days=n)
         if self is TimeUnit.WEEKS:
             return timedelta(weeks=n)
+        if self is TimeUnit.YEARS:
+            return timedelta(days=365 * n)
         # MONTHS: calendar months are irregular; 30-day approximation,
         # matching the engine's window arithmetic documented in README.
         return timedelta(days=30 * n)
@@ -117,6 +124,8 @@ class Window:
     start: float
     end: float
     unit: TimeUnit = TimeUnit.DAYS
+    horizons: int = 1                       # 1 = single frame; >1 = forecasting
+    step: Optional[float] = None            # horizon stride; None = frame width
 
     def start_delta(self) -> timedelta:
         if math.isinf(self.start):
@@ -147,6 +156,8 @@ class Condition:
     left: "TargetExpr"
     op: Operator
     right: Any = None  # literal | tuple of literals (IN) | None (IS NULL)
+    right_expr: Optional["TargetExpr"] = None  # column/expression RHS; when
+                                               # set, ``right`` is None
 
 
 @dataclass(frozen=True)
@@ -161,19 +172,98 @@ class Not:
     expr: "TargetExpr"
 
 
-TargetExpr = Union[Aggregation, ColumnRef, Condition, LogicalOp, Not]
+@dataclass(frozen=True)
+class Arith:
+    """Arithmetic combination of value expressions: ``left op right``."""
+
+    op: str                       # "+" | "-" | "*" | "/"
+    left: "TargetExpr"
+    right: "TargetExpr"
+
+
+@dataclass(frozen=True)
+class Func:
+    """Scalar function call: COALESCE/NULLIF/ABS/LOG/EXP/LEAST/GREATEST."""
+
+    name: str
+    args: tuple = ()
+
+
+@dataclass(frozen=True)
+class Case:
+    """``CASE WHEN cond THEN then ... ELSE else END``."""
+
+    whens: tuple = ()             # tuple of (cond, then) pairs
+    else_: Optional["TargetExpr"] = None
+
+
+@dataclass(frozen=True)
+class Lit:
+    """A literal appearing in value position (number, bool, string, date)."""
+
+    value: Any = None
+
+
+TargetExpr = Union[Aggregation, ColumnRef, Condition, LogicalOp, Not,
+                   Arith, Func, Case, Lit]
 
 
 def _find_aggregations(expr: TargetExpr) -> list[Aggregation]:
     if isinstance(expr, Aggregation):
         return [expr]
     if isinstance(expr, Condition):
-        return _find_aggregations(expr.left)
+        out = _find_aggregations(expr.left)
+        if expr.right_expr is not None:
+            out += _find_aggregations(expr.right_expr)
+        return out
     if isinstance(expr, LogicalOp):
         return _find_aggregations(expr.left) + _find_aggregations(expr.right)
     if isinstance(expr, Not):
         return _find_aggregations(expr.expr)
+    if isinstance(expr, Arith):
+        return _find_aggregations(expr.left) + _find_aggregations(expr.right)
+    if isinstance(expr, Func):
+        out: list[Aggregation] = []
+        for a in expr.args:
+            out += _find_aggregations(a)
+        return out
+    if isinstance(expr, Case):
+        out = []
+        for cond, then in expr.whens:
+            out += _find_aggregations(cond) + _find_aggregations(then)
+        if expr.else_ is not None:
+            out += _find_aggregations(expr.else_)
+        return out
     return []
+
+
+# ---------------------------------------------------------------------------
+# Query-level clause carriers (represented in the AST; execution best-effort)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Explain:
+    mode: str = "PLAN"            # PLAN | CONTEXT | ANALYZE | ABLATION
+    format: str = "TEXT"          # TEXT | JSON
+
+
+@dataclass(frozen=True)
+class AsOf:
+    kind: str                     # param | date | now
+    value: Optional[str] = None   # param name / date string; None for NOW
+
+
+@dataclass(frozen=True)
+class Ablation:
+    kind: str                     # "table"
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class ReturnSpec:
+    kind: str                     # EXPECTED_VALUE | PROBABILITY | CLASS | ...
+    quantiles: tuple = ()         # for QUANTILES
+    interval: Optional[int] = None  # for INTERVAL <int>%
 
 
 @dataclass(frozen=True)
@@ -187,7 +277,12 @@ class ParsedQuery:
     assuming: Optional[TargetExpr] = None
     rank: Optional[RankKind] = None             # CLASSIFY | RANK TOP K
     top_k: Optional[int] = None                 # RANK TOP K
-    num_forecasts: Optional[int] = None         # FORECAST N TIMEFRAMES
+    num_forecasts: Optional[int] = None         # derived from target HORIZONS>1
+    explain: Optional[Explain] = None           # EXPLAIN [...] prefix
+    as_of: Optional[AsOf] = None                # AS OF anchor
+    ablations: tuple = ()                       # ABLATE TABLE ... (repeatable)
+    ret: Optional[ReturnSpec] = None            # RETURN output spec
+    windows: dict = field(default_factory=dict, compare=False)  # named WINDOW templates
     text: str = field(default="", compare=False)
 
     @property
@@ -205,7 +300,15 @@ class ParsedQuery:
         t = self.target
         if isinstance(t, (Condition, LogicalOp, Not)):
             return TaskType.BINARY_CLASSIFICATION
+        if isinstance(t, Lit):
+            if isinstance(t.value, bool):
+                return TaskType.BINARY_CLASSIFICATION
+            return TaskType.REGRESSION
+        if isinstance(t, (Arith, Func, Case)):
+            return TaskType.REGRESSION
         if isinstance(t, Aggregation):
+            if t.func is AggFunc.EXISTS:
+                return TaskType.BINARY_CLASSIFICATION
             if t.func is AggFunc.LIST_DISTINCT:
                 return TaskType.MULTILABEL_RANKING
             if t.func in (AggFunc.FIRST, AggFunc.LAST):

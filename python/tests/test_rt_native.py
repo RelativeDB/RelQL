@@ -101,7 +101,7 @@ def test_churn_end_to_end_with_native_backend(churn_schema):
     engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
                     model_backend=backend)
     result = engine.execute(ExecutionInput(
-        query="PREDICT COUNT(orders.*, 0, 90, days) = 0 "
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
               "FOR EACH customers.customer_id",
         anchor_time=dt("2026-07-01")))
 

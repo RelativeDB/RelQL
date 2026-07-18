@@ -1,6 +1,6 @@
-"""Binding to the shared C++ PQL parser (``pql_parse`` in ``librt_c``).
+"""Binding to the shared C++ RelQL parser (``pql_parse`` in ``librt_c``).
 
-This is *the* PQL parser for the Python binding — grammar and lexing live once
+This is *the* RelQL parser for the Python binding — grammar and lexing live once
 in the C++ layer, shared with the Java and Rust bindings. The C ABI returns a
 JSON AST (see ``cpp/src/pql.cpp``) which we deserialize into the
 :mod:`relativedb.pql.ast` dataclasses. ``librt_c`` is a hard dependency (the
@@ -17,8 +17,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from .ast import (AggFunc, Aggregation, BoolOp, ColumnRef, Condition,
-                  LogicalOp, Not, Operator, ParsedQuery, RankKind, TargetExpr,
+from .ast import (Ablation, AggFunc, Aggregation, Arith, AsOf, BoolOp, Case,
+                  ColumnRef, Condition, Explain, Func, Lit, LogicalOp, Not,
+                  Operator, ParsedQuery, RankKind, ReturnSpec, TargetExpr,
                   TimeUnit, Window)
 from .parser import PqlSyntaxError
 
@@ -110,6 +111,18 @@ def _lit(x: Any) -> Any:
     return x                                           # str / int / float / bool / None
 
 
+def _window(w: Optional[dict]) -> Optional[Window]:
+    if not w:
+        return None
+    step = w.get("step")
+    return Window(
+        _bound(w["start"]), _bound(w["end"]),
+        TimeUnit[w["unit"].upper()],
+        horizons=int(w.get("horizons", 1)),
+        step=(_bound(step) if step is not None else None),
+    )
+
+
 def _expr(o: Optional[dict]) -> Optional[TargetExpr]:
     if o is None:
         return None
@@ -117,18 +130,47 @@ def _expr(o: Optional[dict]) -> Optional[TargetExpr]:
     if kind == "col":
         return ColumnRef(o["table"], o["column"])
     if kind == "agg":
-        w = o["window"]
-        window = (Window(_bound(w["start"]), _bound(w["end"]),
-                         TimeUnit[w["unit"].upper()]) if w else None)
         return Aggregation(AggFunc[o["func"]], ColumnRef(o["column"]["table"],
-                           o["column"]["column"]), _expr(o["filter"]), window)
+                           o["column"]["column"]), _expr(o.get("filter")),
+                           _window(o.get("window")))
     if kind == "cond":
-        return Condition(_expr(o["left"]), Operator[o["op"]], _lit(o["right"]))
+        rexpr = _expr(o.get("right_expr"))
+        right = None if rexpr is not None else _lit(o.get("right"))
+        return Condition(_expr(o["left"]), Operator[o["op"]], right, rexpr)
     if kind == "logic":
         return LogicalOp(_expr(o["left"]), BoolOp[o["op"]], _expr(o["right"]))
     if kind == "not":
         return Not(_expr(o["expr"]))
+    if kind == "arith":
+        return Arith(o["op"], _expr(o["left"]), _expr(o["right"]))
+    if kind == "func":
+        return Func(o["name"], tuple(_expr(a) for a in o.get("args", ())))
+    if kind == "case":
+        whens = tuple((_expr(w["cond"]), _expr(w["then"]))
+                      for w in o.get("whens", ()))
+        return Case(whens, _expr(o.get("else")))
+    if kind == "lit":
+        return Lit(_lit(o.get("value")))
     raise ValueError(f"unknown expr kind {kind!r}")
+
+
+def _explain(o: Optional[dict]) -> Optional[Explain]:
+    if not o:
+        return None
+    return Explain(o.get("mode", "PLAN"), o.get("format", "TEXT"))
+
+
+def _as_of(o: Optional[dict]) -> Optional[AsOf]:
+    if not o:
+        return None
+    return AsOf(o["kind"], o.get("value"))
+
+
+def _ret(o: Optional[dict]) -> Optional[ReturnSpec]:
+    if not o:
+        return None
+    return ReturnSpec(o["kind"], tuple(o.get("quantiles", ())),
+                      o.get("interval"))
 
 
 def _query_from_json(o: dict, text: str) -> ParsedQuery:
@@ -142,5 +184,11 @@ def _query_from_json(o: dict, text: str) -> ParsedQuery:
         rank=RankKind[o["rank"]] if o.get("rank") else None,
         top_k=o.get("top_k"),
         num_forecasts=o.get("num_forecasts"),
+        explain=_explain(o.get("explain")),
+        as_of=_as_of(o.get("as_of")),
+        ablations=tuple(Ablation(a.get("kind", "table"), a.get("name", ""))
+                        for a in o.get("ablations", ())),
+        ret=_ret(o.get("ret")),
+        windows={name: _window(w) for name, w in o.get("windows", {}).items()},
         text=text,
     )

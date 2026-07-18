@@ -8,7 +8,7 @@ description: The four-stage execution model.
 Every query runs through the same four stages, in every language:
 
 ```
- PQL string
+ RelQL string
     │  parse       → typed AST (syntax errors here)
     ▼
  ParsedQuery
@@ -25,7 +25,7 @@ Every query runs through the same four stages, in every language:
 
 ## Inputs
 
-- **Query** — a PQL string. See the [PQL docs](/pql/).
+- **Query** — a RelQL string. See the [RelQL docs](/pql/).
 - **Anchor time** — the "as of" instant t₀. Context may only contain data at
   or before it; the prediction concerns the window after it.
 - **Entities** — an explicit ID list, or `FOR EACH` over the whole table

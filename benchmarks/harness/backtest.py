@@ -41,9 +41,9 @@ class TaskResult:
 # Binary: activity churn
 # ---------------------------------------------------------------------------
 def churn_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -> TaskResult:
-    q = (f"PREDICT COUNT({child}.*, 0, {horizon_days}, days) = 0 "
+    q = (f"PREDICT COUNT({child}.*) OVER ({horizon_days} DAYS FOLLOWING) = 0 "
          f"FOR EACH {ds.entity_table}.{_pk(ds)} "
-         f"WHERE COUNT({child}.*, -{lookback_days}, 0, days) > 0")
+         f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     y_true, y_prob = [], []
     recency, past_cnt = [], []       # naive churn scores
     t0 = time.time()
@@ -77,9 +77,9 @@ def churn_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -
 # Regression: forward activity count
 # ---------------------------------------------------------------------------
 def count_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -> TaskResult:
-    q = (f"PREDICT COUNT({child}.*, 0, {horizon_days}, days) "
+    q = (f"PREDICT COUNT({child}.*) OVER ({horizon_days} DAYS FOLLOWING) "
          f"FOR EACH {ds.entity_table}.{_pk(ds)} "
-         f"WHERE COUNT({child}.*, -{lookback_days}, 0, days) > 0")
+         f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     y_true, y_pred, past, gmean_src = [], [], [], []
     t0 = time.time()
     for T in ds.anchors:
@@ -103,9 +103,9 @@ def count_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -
 # ---------------------------------------------------------------------------
 def value_task(ds: Dataset, child: str, value_col: str, horizon_days: int,
                lookback_days: int) -> TaskResult:
-    q = (f"PREDICT SUM({child}.{value_col}, 0, {horizon_days}, days) "
+    q = (f"PREDICT SUM({child}.{value_col}) OVER ({horizon_days} DAYS FOLLOWING) "
          f"FOR EACH {ds.entity_table}.{_pk(ds)} "
-         f"WHERE COUNT({child}.*, -{lookback_days}, 0, days) > 0")
+         f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     y_true, y_pred, past = [], [], []
     t0 = time.time()
     for T in ds.anchors:
@@ -129,10 +129,10 @@ def value_task(ds: Dataset, child: str, value_col: str, horizon_days: int,
 # ---------------------------------------------------------------------------
 def ranking_task(ds: Dataset, child: str, item_col: str, horizon_days: int,
                  lookback_days: int, k: int = 10) -> TaskResult:
-    q = (f"PREDICT LIST_DISTINCT({child}.{item_col}, 0, {horizon_days}, days) "
+    q = (f"PREDICT LIST_DISTINCT({child}.{item_col}) OVER ({horizon_days} DAYS FOLLOWING) "
          f"RANK TOP {k} "
          f"FOR EACH {ds.entity_table}.{_pk(ds)} "
-         f"WHERE COUNT({child}.*, -{lookback_days}, 0, days) > 0")
+         f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     recs, rels, pop_recs = [], [], []
     t0 = time.time()
     for T in ds.anchors:

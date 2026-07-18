@@ -1,4 +1,4 @@
-"""PQL parsing (single-sourced in C++) + schema-bound validation.
+"""RelQL parsing (single-sourced in C++) + schema-bound validation.
 
 Parsing lives once in the native layer — ``librt_c``'s ``pql_parse`` (see
 :mod:`relativedb.pql.native`), shared by the Python, Java, and Rust bindings.
@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .ast import ColumnRef, Condition, LogicalOp, Not, ParsedQuery
+from .ast import (Arith, Case, ColumnRef, Condition, Func, Lit, LogicalOp,
+                  Not, ParsedQuery)
 
 __all__ = ["parse", "validate", "PqlSyntaxError", "PqlValidationError",
            "ValidatedQuery"]
@@ -23,7 +24,7 @@ class PqlSyntaxError(ValueError):
         snippet = ""
         if text and 0 <= pos <= len(text):
             snippet = f": ...{text[max(0, pos - 10):pos]}>>>{text[pos:pos + 15]}"
-        super().__init__(f"PQL syntax error{loc}: {message}{snippet}")
+        super().__init__(f"RelQL syntax error{loc}: {message}{snippet}")
 
 
 class PqlValidationError(ValueError):
@@ -31,7 +32,7 @@ class PqlValidationError(ValueError):
 
 
 def parse(query: str) -> ParsedQuery:
-    """Parse a PQL string via the shared C++ parser (``librt_c``). Raises
+    """Parse a RelQL string via the shared C++ parser (``librt_c``). Raises
     :class:`PqlSyntaxError` on malformed input, or
     :class:`~relativedb.pql.native.NativeParserUnavailable` if the native
     library cannot be loaded."""
@@ -91,11 +92,27 @@ def _walk_columns(expr, schema) -> None:
         _check_column(expr, schema, allow_star=False)
     elif isinstance(expr, Condition):
         _walk_columns(expr.left, schema)
+        if expr.right_expr is not None:
+            _walk_columns(expr.right_expr, schema)
     elif isinstance(expr, LogicalOp):
         _walk_columns(expr.left, schema)
         _walk_columns(expr.right, schema)
     elif isinstance(expr, Not):
         _walk_columns(expr.expr, schema)
+    elif isinstance(expr, Arith):
+        _walk_columns(expr.left, schema)
+        _walk_columns(expr.right, schema)
+    elif isinstance(expr, Func):
+        for a in expr.args:
+            _walk_columns(a, schema)
+    elif isinstance(expr, Case):
+        for cond, then in expr.whens:
+            _walk_columns(cond, schema)
+            _walk_columns(then, schema)
+        if expr.else_ is not None:
+            _walk_columns(expr.else_, schema)
+    elif isinstance(expr, Lit):
+        pass
 
 
 def validate(query, schema) -> ValidatedQuery:
@@ -116,8 +133,14 @@ def validate(query, schema) -> ValidatedQuery:
             raise PqlValidationError(
                 f"target window ({agg.window.start}, {agg.window.end}] must "
                 f"be future-facing (start >= 0)")
-    if pq.where is not None:
-        _walk_columns(pq.where, schema)
-    if pq.assuming is not None:
-        _walk_columns(pq.assuming, schema)
+    from .ast import _find_aggregations
+    for clause_name, clause in (("WHERE", pq.where), ("ASSUMING", pq.assuming)):
+        if clause is None:
+            continue
+        _walk_columns(clause, schema)
+        for agg in _find_aggregations(clause):
+            if agg.window is not None and agg.window.horizons > 1:
+                raise PqlValidationError(
+                    f"HORIZONS > 1 is only allowed on the PREDICT target, "
+                    f"not in {clause_name}")
     return ValidatedQuery(pq, pq.task_type(schema))

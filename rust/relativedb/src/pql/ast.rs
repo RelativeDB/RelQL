@@ -1,13 +1,15 @@
-//! Typed PQL AST + task-type inference.
+//! Typed RelQL AST + task-type inference.
 //!
 //! Mirrors the `com.relativedb.query` records (Java) / `relativedb.pql.ast`
 //! (Python).
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 
 use crate::schema::{Schema, ValueType};
 
-/// The 9 platform aggregations.
+/// The platform aggregations.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AggFunc {
     Sum,
@@ -19,10 +21,12 @@ pub enum AggFunc {
     ListDistinct,
     First,
     Last,
+    /// Boolean-existence aggregation (`EXISTS(t.*)`).
+    Exists,
 }
 
 impl AggFunc {
-    /// Uppercase keyword name (as it appears in PQL / the grammar).
+    /// Uppercase keyword name (as it appears in RelQL / the grammar).
     pub fn keyword(&self) -> &'static str {
         match self {
             AggFunc::Sum => "SUM",
@@ -34,6 +38,7 @@ impl AggFunc {
             AggFunc::ListDistinct => "LIST_DISTINCT",
             AggFunc::First => "FIRST",
             AggFunc::Last => "LAST",
+            AggFunc::Exists => "EXISTS",
         }
     }
 
@@ -48,6 +53,7 @@ impl AggFunc {
             "LIST_DISTINCT" => AggFunc::ListDistinct,
             "FIRST" => AggFunc::First,
             "LAST" => AggFunc::Last,
+            "EXISTS" => AggFunc::Exists,
             _ => return None,
         })
     }
@@ -61,6 +67,7 @@ pub enum TimeUnit {
     Days,
     Weeks,
     Months,
+    Years,
 }
 
 impl TimeUnit {
@@ -72,6 +79,7 @@ impl TimeUnit {
             "DAYS" => TimeUnit::Days,
             "WEEKS" => TimeUnit::Weeks,
             "MONTHS" => TimeUnit::Months,
+            "YEARS" => TimeUnit::Years,
             _ => return None,
         })
     }
@@ -86,6 +94,9 @@ impl TimeUnit {
             // MONTHS: calendar months are irregular; 30-day approximation,
             // matching the engine's window arithmetic.
             TimeUnit::Months => 2_592_000.0,
+            // YEARS: defensive only — the C++ parser normalizes calendar
+            // frames to MONTHS and never emits "years". 365-day approximation.
+            TimeUnit::Years => 31_536_000.0,
         }
     }
 
@@ -165,11 +176,12 @@ impl std::fmt::Display for ColumnRef {
     }
 }
 
-/// A PQL literal (string / number / date / null).
+/// A RelQL literal (string / number / boolean / date / null).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Literal {
     Str(String),
     Num(f64),
+    Bool(bool),
     Date(DateTime<Utc>),
     Null,
 }
@@ -177,11 +189,17 @@ pub enum Literal {
 /// Aggregation window `(start, end]` in `unit`.
 ///
 /// `start` is EXCLUDED, `end` is INCLUDED; `±inf` for unbounded.
+///
+/// `horizons` is the number of shifted frame copies (default 1; >1 = multi-
+/// horizon forecasting). `step` is the distance between horizon starts in
+/// `unit` (default = the frame width `end - start`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Window {
     pub start: f64,
     pub end: f64,
     pub unit: TimeUnit,
+    pub horizons: i64,
+    pub step: Option<f64>,
 }
 
 impl Window {
@@ -238,6 +256,8 @@ pub enum CondRhs {
     Empty,
     One(Literal),
     List(Vec<Literal>),
+    /// Column-to-column / expression RHS comparison (`right_expr` in the AST).
+    Expr(Box<TargetExpr>),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -245,6 +265,29 @@ pub struct LogicalOp {
     pub left: Box<TargetExpr>,
     pub op: BoolOp,
     pub right: Box<TargetExpr>,
+}
+
+/// Arithmetic combination of two value expressions (`+ - * /`).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Arith {
+    pub op: char,
+    pub left: Box<TargetExpr>,
+    pub right: Box<TargetExpr>,
+}
+
+/// A scalar function call
+/// (`COALESCE|NULLIF|ABS|LOG|EXP|LEAST|GREATEST`).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Func {
+    pub name: String,
+    pub args: Vec<TargetExpr>,
+}
+
+/// `CASE WHEN cond THEN then ... [ELSE else] END`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Case {
+    pub whens: Vec<(TargetExpr, TargetExpr)>,
+    pub else_: Option<Box<TargetExpr>>,
 }
 
 /// The typed target/where/assuming expression tree.
@@ -255,6 +298,10 @@ pub enum TargetExpr {
     Condition(Condition),
     LogicalOp(LogicalOp),
     Not(Box<TargetExpr>),
+    Arith(Arith),
+    Func(Func),
+    Case(Case),
+    Lit(Literal),
 }
 
 impl TargetExpr {
@@ -268,15 +315,73 @@ impl TargetExpr {
     fn collect_aggregations<'a>(&'a self, out: &mut Vec<&'a Aggregation>) {
         match self {
             TargetExpr::Aggregation(a) => out.push(a),
-            TargetExpr::Condition(c) => c.left.collect_aggregations(out),
+            TargetExpr::Condition(c) => {
+                c.left.collect_aggregations(out);
+                if let CondRhs::Expr(e) = &c.right {
+                    e.collect_aggregations(out);
+                }
+            }
             TargetExpr::LogicalOp(l) => {
                 l.left.collect_aggregations(out);
                 l.right.collect_aggregations(out);
             }
             TargetExpr::Not(e) => e.collect_aggregations(out),
-            TargetExpr::ColumnRef(_) => {}
+            TargetExpr::Arith(a) => {
+                a.left.collect_aggregations(out);
+                a.right.collect_aggregations(out);
+            }
+            TargetExpr::Func(f) => {
+                for a in &f.args {
+                    a.collect_aggregations(out);
+                }
+            }
+            TargetExpr::Case(c) => {
+                for (cond, then) in &c.whens {
+                    cond.collect_aggregations(out);
+                    then.collect_aggregations(out);
+                }
+                if let Some(e) = &c.else_ {
+                    e.collect_aggregations(out);
+                }
+            }
+            TargetExpr::ColumnRef(_) | TargetExpr::Lit(_) => {}
         }
     }
+}
+
+/// `EXPLAIN [mode] [FORMAT fmt]` prefix.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Explain {
+    /// `PLAN | CONTEXT | ANALYZE | ABLATION`.
+    pub mode: String,
+    /// `TEXT | JSON`.
+    pub format: String,
+}
+
+/// `AS OF <anchor>` — binds NOW.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AsOf {
+    /// `param | date | now`.
+    pub kind: String,
+    /// The parameter name (no colon) or the date string; `None` for `now`.
+    pub value: Option<String>,
+}
+
+/// `ABLATE TABLE <name>`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ablation {
+    /// Always `"table"` for now.
+    pub kind: String,
+    pub name: String,
+}
+
+/// `RETURN <output>` — explicit output intent.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ReturnSpec {
+    /// `EXPECTED_VALUE|PROBABILITY|CLASS|DISTRIBUTION|QUANTILES|INTERVAL|MULTILABEL|MULTICLASS`.
+    pub kind: String,
+    pub quantiles: Vec<f64>,
+    pub interval: Option<i64>,
 }
 
 /// The parse result — no schema needed. `validate` binds it to one.
@@ -291,6 +396,16 @@ pub struct ParsedQuery {
     pub rank: Option<RankKind>,
     pub top_k: Option<i64>,
     pub num_forecasts: Option<i64>,
+    /// `EXPLAIN` prefix (represented, not executed).
+    pub explain: Option<Explain>,
+    /// `AS OF` anchor binding (represented, not executed).
+    pub as_of: Option<AsOf>,
+    /// `ABLATE TABLE` clauses (represented, not executed).
+    pub ablations: Vec<Ablation>,
+    /// `RETURN` output intent (represented, not executed).
+    pub ret: Option<ReturnSpec>,
+    /// Declared `WINDOW name AS (...)` templates (normalized).
+    pub windows: HashMap<String, Window>,
     pub text: String,
 }
 
@@ -314,6 +429,7 @@ impl ParsedQuery {
                 TaskType::BinaryClassification
             }
             TargetExpr::Aggregation(a) => match a.func {
+                AggFunc::Exists => TaskType::BinaryClassification,
                 AggFunc::ListDistinct => TaskType::MultilabelRanking,
                 AggFunc::First | AggFunc::Last => Self::static_or_categorical(
                     &a.column,
@@ -325,6 +441,14 @@ impl ParsedQuery {
             TargetExpr::ColumnRef(c) => {
                 Self::static_or_categorical(c, schema, TaskType::MulticlassClassification)
             }
+            // Boolean literal target is a (degenerate) binary target; other
+            // literals and arithmetic/function/CASE value expressions are
+            // numeric → regression.
+            TargetExpr::Lit(Literal::Bool(_)) => TaskType::BinaryClassification,
+            TargetExpr::Lit(_)
+            | TargetExpr::Arith(_)
+            | TargetExpr::Func(_)
+            | TargetExpr::Case(_) => TaskType::Regression,
         }
     }
 

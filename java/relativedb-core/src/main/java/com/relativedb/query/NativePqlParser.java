@@ -8,6 +8,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -15,7 +16,7 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 
 /**
- * The Java PQL parser: delegates to the shared C++ parser ({@code pql_parse} in
+ * The Java RelQL parser: delegates to the shared C++ parser ({@code pql_parse} in
  * {@code librt_c}) and deserializes its JSON AST into {@link ParsedQuery}.
  * Grammar and lexing live once in the C++ layer, shared with the Python and
  * Rust bindings; this is the Java analogue of
@@ -36,7 +37,7 @@ public final class NativePqlParser {
     }
 
     /**
-     * Parse {@code query} with the shared C++ parser. This is the only PQL
+     * Parse {@code query} with the shared C++ parser. This is the only RelQL
      * parser: {@code librt_c} is a hard dependency, so a missing library is a
      * fatal error rather than a fallback.
      *
@@ -47,7 +48,7 @@ public final class NativePqlParser {
         RtCLib lib = RtCNative.get();
         if (lib == null) {
             throw new IllegalStateException(
-                    "PQL parsing requires the native runtime 'librt_c', which could not be "
+                    "RelQL parsing requires the native runtime 'librt_c', which could not be "
                     + "loaded. Build it (cd cpp && cmake --build build) and point the "
                     + "'relativedb.rt.lib' system property or RELATIVEDB_RT_LIB env var at the "
                     + "library file. Underlying cause: " + RtCNative.failure());
@@ -91,8 +92,86 @@ public final class NativePqlParser {
                 ? OptionalInt.empty()
                 : OptionalInt.of((int) num(o.get("num_forecasts")));
 
+        Optional<Explain> explain = explain(o.get("explain"));
+        Optional<AsOf> asOf = asOf(o.get("as_of"));
+        List<Ablation> ablations = ablations(o.get("ablations"));
+        Optional<ReturnSpec> ret = returnSpec(o.get("ret"));
+        Map<String, Window> windows = windows(o.get("windows"));
+
         return new ParsedQuery(expr(o.get("target")), entityKey, List.copyOf(entityIds),
-                where, assuming, topK, problemType, numForecasts);
+                where, assuming, topK, problemType, numForecasts,
+                explain, asOf, ablations, ret, windows);
+    }
+
+    // ---- query-level clauses ----------------------------------------------
+
+    private static Optional<Explain> explain(Object node) {
+        if (node == null) return Optional.empty();
+        Map<String, Object> e = asObject(node);
+        return Optional.of(new Explain(
+                Explain.Mode.valueOf(str(e.get("mode"))),
+                Explain.Format.valueOf(str(e.get("format")))));
+    }
+
+    private static Optional<AsOf> asOf(Object node) {
+        if (node == null) return Optional.empty();
+        Map<String, Object> a = asObject(node);
+        AsOf.Kind kind = AsOf.Kind.valueOf(str(a.get("kind")).toUpperCase());
+        Object value = a.get("value");
+        return Optional.of(new AsOf(kind, value == null ? null : str(value)));
+    }
+
+    private static List<Ablation> ablations(Object node) {
+        if (node == null) return List.of();
+        List<Ablation> out = new ArrayList<>();
+        for (Object x : asArray(node)) {
+            Map<String, Object> m = asObject(x);
+            out.add(new Ablation(str(m.get("kind")), str(m.get("name"))));
+        }
+        return List.copyOf(out);
+    }
+
+    private static Optional<ReturnSpec> returnSpec(Object node) {
+        if (node == null) return Optional.empty();
+        Map<String, Object> r = asObject(node);
+        ReturnSpec.Kind kind = ReturnSpec.Kind.valueOf(str(r.get("kind")));
+        Object qs = r.get("quantiles");
+        double[] quantiles;
+        if (qs == null) {
+            quantiles = new double[0];
+        } else {
+            List<?> list = asArray(qs);
+            quantiles = new double[list.size()];
+            for (int i = 0; i < list.size(); i++) quantiles[i] = num(list.get(i));
+        }
+        OptionalInt interval = r.get("interval") == null
+                ? OptionalInt.empty()
+                : OptionalInt.of((int) num(r.get("interval")));
+        return Optional.of(new ReturnSpec(kind, quantiles, interval));
+    }
+
+    private static Map<String, Window> windows(Object node) {
+        if (node == null) return Map.of();
+        Map<String, Window> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : asObject(node).entrySet()) {
+            out.put(e.getKey(), window(e.getValue()));
+        }
+        return out;
+    }
+
+    private static Window window(Object node) {
+        Map<String, Object> w = asObject(node);
+        OptionalLong start = OptionalLong.of(bound(w.get("start")));
+        long end = bound(w.get("end"));
+        Object unit = w.get("unit");
+        TimeUnit timeUnit = unit == null
+                ? TimeUnit.DAYS
+                : TimeUnit.valueOf(str(unit).toUpperCase());
+        long horizons = w.get("horizons") == null ? 1L : (long) num(w.get("horizons"));
+        OptionalLong step = w.get("step") == null
+                ? OptionalLong.empty()
+                : OptionalLong.of((long) num(w.get("step")));
+        return new Window(start, end, timeUnit, horizons, step);
     }
 
     private static Optional<TargetExpr> optExpr(Object o) {
@@ -107,14 +186,39 @@ public final class NativePqlParser {
                 return new ColumnRef(str(o.get("table")), str(o.get("column")));
             case "agg":
                 return aggregation(o);
-            case "cond":
+            case "cond": {
+                Object rightExprNode = o.get("right_expr");
+                Optional<TargetExpr> rightExpr = rightExprNode == null
+                        ? Optional.empty() : Optional.of(expr(rightExprNode));
                 return new Condition(expr(o.get("left")),
-                        Operator.valueOf(str(o.get("op"))), literal(o.get("right")));
+                        Operator.valueOf(str(o.get("op"))),
+                        literal(o.get("right")), rightExpr);
+            }
             case "logic":
                 return new LogicalOp(expr(o.get("left")),
                         BoolOp.valueOf(str(o.get("op"))), expr(o.get("right")));
             case "not":
                 return new Not(expr(o.get("expr")));
+            case "arith":
+                return new Arith(str(o.get("op")).charAt(0),
+                        expr(o.get("left")), expr(o.get("right")));
+            case "func": {
+                List<TargetExpr> args = new ArrayList<>();
+                for (Object a : asArray(o.get("args"))) args.add(expr(a));
+                return new Func(str(o.get("name")), List.copyOf(args));
+            }
+            case "case": {
+                List<Case.When> whens = new ArrayList<>();
+                for (Object wobj : asArray(o.get("whens"))) {
+                    Map<String, Object> wm = asObject(wobj);
+                    whens.add(new Case.When(expr(wm.get("cond")), expr(wm.get("then"))));
+                }
+                Object elseNode = o.get("else");
+                return new Case(List.copyOf(whens),
+                        elseNode == null ? null : expr(elseNode));
+            }
+            case "lit":
+                return new LitExpr(literal(o.get("value")));
             default:
                 throw new IllegalArgumentException("unknown expr kind: " + kind);
         }
@@ -132,16 +236,12 @@ public final class NativePqlParser {
 
         Object windowNode = o.get("window");
         if (windowNode == null) {
-            return new Aggregation(func, column, filter, OptionalLong.empty(), 0L, null);
+            return new Aggregation(func, column, filter, OptionalLong.empty(), 0L, null,
+                    1L, OptionalLong.empty());
         }
-        Map<String, Object> w = asObject(windowNode);
-        long start = bound(w.get("start"));
-        long end = bound(w.get("end"));
-        Object unit = w.get("unit");
-        TimeUnit timeUnit = unit == null
-                ? TimeUnit.DAYS
-                : TimeUnit.valueOf(str(unit).toUpperCase());
-        return new Aggregation(func, column, filter, OptionalLong.of(start), end, timeUnit);
+        Window w = window(windowNode);
+        return new Aggregation(func, column, filter, w.start(), w.end(), w.unit(),
+                w.horizons(), w.step());
     }
 
     private static long bound(Object v) {
@@ -158,6 +258,7 @@ public final class NativePqlParser {
         if (v == null) return Literal.NULL;
         if (v instanceof String) return Literal.string((String) v);
         if (v instanceof Double) return Literal.number((Double) v);
+        if (v instanceof Boolean) return Literal.bool((Boolean) v);
         if (v instanceof List) {
             List<Literal> items = new ArrayList<>();
             for (Object e : (List<?>) v) items.add(literal(e));

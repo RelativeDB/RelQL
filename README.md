@@ -5,10 +5,10 @@
 relativedb is a predictive-query engine: you declare the *shape* of your
 relational data (tables, keys, links), wire small **retriever** callbacks over
 whatever storage you already have, and ask questions about the **future** in
-**PQL** — a SQL-flavored Predictive Query Language:
+**RelQL** — a SQL-flavored Predictive Query Language:
 
 ```sql
-PREDICT COUNT(orders.*, 0, 90, days) = 0 
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0
 FOR EACH customers.customer_id
 ```
 
@@ -53,7 +53,7 @@ plus a shared native model runtime:
   - [Temporal correctness](#temporal-correctness)
   - [Sampler modes: RETRIEVER vs CSC](#sampler-modes-retriever-vs-csc)
   - [Model backends and routing](#model-backends-and-routing)
-- [PQL — the Predictive Query Language](#pql--the-predictive-query-language)
+- [RelQL — the Predictive Query Language](#relql--the-predictive-query-language)
   - [Clause structure](#clause-structure)
   - [Aggregations and time windows](#aggregations-and-time-windows)
   - [Conditions and operators](#conditions-and-operators)
@@ -86,7 +86,7 @@ again. The classical path to answering them is long and fragile:
 
 relativedb collapses that into a query. Three ideas make this work:
 
-**1. The question is a query, not a pipeline.** PQL expresses the target
+**1. The question is a query, not a pipeline.** RelQL expresses the target
 ("count of orders in the next 90 days is zero"), the population ("for each
 customer"), and any filters or assumptions — declaratively. Change the
 question, change the string.
@@ -111,16 +111,16 @@ pipeline runs (and is testable) with zero model artifacts.
 Everything expressible as *"predict an aggregate/attribute of linked future (or
 missing) data, per entity, as of a point in time"*:
 
-| Domain | Question | PQL sketch |
+| Domain | Question | RelQL sketch |
 |---|---|---|
-| **Growth / subscription** | Which active users will churn? | `PREDICT COUNT(events.*, 0, 30, days) = 0 FOR EACH users.user_id WHERE COUNT(events.*, -90, 0, days) > 0` |
-| **Payments / fraud** | Which accounts will incur a chargeback? | `PREDICT COUNT(chargebacks.*, 0, 60, days) > 0 FOR EACH accounts.account_id` |
-| **Retail / bizops** | Units sold per store, next 4 weeks, weekly? | `PREDICT SUM(sales.qty, 0, 7, days) FORECAST 4 TIMEFRAMES FOR EACH stores.store_id` |
-| **Personalization** | Which products will a shopper buy again? | `PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3 FOR EACH customers.customer_id` |
-| **Revenue** | Customer spend over the next quarter (LTV slice)? | `PREDICT SUM(transactions.price, 0, 90, days) FOR EACH customers.customer_id` |
-| **Credit / risk** | Will this loan avoid denial? | `PREDICT LAST(loan.status, 0, 30) NOT LIKE '%DENIED' FOR EACH loan.id` |
+| **Growth / subscription** | Which active users will churn? | `PREDICT NOT EXISTS(events.*) OVER (30 DAYS FOLLOWING) FOR EACH users.user_id WHERE EXISTS(events.*) OVER (90 DAYS PRECEDING)` |
+| **Payments / fraud** | Which accounts will incur a chargeback? | `PREDICT EXISTS(chargebacks.*) OVER (60 DAYS FOLLOWING) FOR EACH accounts.account_id` |
+| **Retail / bizops** | Units sold per store, next 4 weeks, weekly? | `PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) FOR EACH stores.store_id` |
+| **Personalization** | Which products will a shopper buy again? | `PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3 FOR EACH customers.customer_id` |
+| **Revenue** | Customer spend over the next quarter (LTV slice)? | `PREDICT SUM(transactions.price) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id` |
+| **Credit / risk** | Will this loan avoid denial? | `PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH loan.id` |
 | **Data quality** | Is this static attribute missing/predictable? | `PREDICT articles.description IS NULL FOR EACH articles.id` |
-| **What-if** | Would this user churn *if* they were on premium? | `PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR users.user_id = 42 ASSUMING users.plan = 'premium'` |
+| **What-if** | Would this user churn *if* they were on premium? | `PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42 ASSUMING users.plan = 'premium'` |
 
 Four of these are implemented end-to-end (with planted signal and assertions)
 in [`examples/industry/`](examples/industry/).
@@ -132,7 +132,7 @@ in [`examples/industry/`](examples/industry/).
 Every execution follows the same four stages, in every language:
 
 ```
- PQL string
+ RelQL string
     │  parse            (typed AST; syntax errors here)
     ▼
  ParsedQuery
@@ -249,53 +249,101 @@ downloading); `file://` and plain paths work too.
 
 ---
 
-## PQL — the Predictive Query Language
+## RelQL — the Predictive Query Language
 
-PQL derives from Kumo/KumoRFM's predictive query language. The canonical
-grammar is [`java/relativedb-core/src/main/antlr/Pql.g4`](java/relativedb-core/src/main/antlr/Pql.g4)
-(ANTLR4); the Python and Rust parsers are hand-written recursive-descent
-implementations of the same grammar, all three verified against a shared
-44-query corpus ([`rust/relativedb/tests/data/examples.pql`](rust/relativedb/tests/data/examples.pql))
-plus 20 malformed-query rejection cases.
+RelQL derives from Kumo/KumoRFM's predictive query language. The canonical
+parser is single-sourced in C++ ([`cpp/src/pql.hpp`](cpp/src/pql.hpp) /
+[`cpp/src/pql.cpp`](cpp/src/pql.cpp)) and emits a JSON AST that the Python, Rust,
+and Java bindings decode, all verified against a shared query corpus
+([`rust/relativedb/tests/data/examples.pql`](rust/relativedb/tests/data/examples.pql))
+plus malformed-query rejection cases.
 
 ### Clause structure
 
 Clause order is significant:
 
 ```sql
-PREDICT   <target>                       -- required: what to predict
-[FORECAST <N> TIMEFRAMES]                -- optional: repeat the target over N successive windows
-FOR [EACH] <entity_table>.<pkey>         -- required: the population
-          [= <literal> | IN (<list>)]    --   ...or explicit entities
-[WHERE     <condition>]                  -- optional: filter (past-facing windows)
-[ASSUMING  <temporal_condition>]         -- optional: counterfactual assumption
+[EXPLAIN [PLAN|CONTEXT|ANALYZE|ABLATION] [FORMAT TEXT|JSON]]  -- optional: inspect the plan
+PREDICT   <target> [CLASSIFY | RANK TOP <k>]  -- required: what to predict
+FOR [EACH] <entity_table>.<pkey>              -- required: the population
+          [= <literal> | IN (<list>)]         --   ...or explicit entities
+[WHERE     <condition>]                       -- optional: filter (past-facing windows)
+[ASSUMING  <temporal_condition>]              -- optional: counterfactual assumption
+[AS OF     <anchor>]                          -- optional: bind NOW (:param | DATE | NOW)
+[ABLATE TABLE <name>]                         -- optional: drop a table from context (repeatable)
+[RETURN    <output>]                          -- optional: request the output object
+[WINDOW    <name> AS (<window_spec>)]         -- optional: reusable frame (repeatable)
 ```
 
-Keywords are case-insensitive. `PREDICT, FORECAST, TIMEFRAMES, FOR, EACH,
-WHERE, ASSUMING, CLASSIFY, RANK, TOP` are the clause keywords; common words
-like `count` are *soft* keywords and remain usable as column names
-(`usage.count` parses). Comments and `-INF` bounds are supported.
+The trailing clauses (`WHERE`, `ASSUMING`, `AS OF`, `ABLATE TABLE`, `RETURN`,
+`WINDOW`) may appear in any order; each at most once except `WINDOW`, which is
+repeatable. Keywords are case-insensitive; common words like `count` are *soft*
+keywords and remain usable as column names (`usage.count` parses).
 
-The **target** is either a static column reference (`customers.age`,
-`articles.description IS NULL`) or an aggregation over linked rows in a future
-window, optionally compared against a literal.
+The **target** is a value expression: a static column reference
+(`customers.age`, `articles.description IS NULL`), an aggregation over linked
+rows in a temporal frame, or an arithmetic/functional combination of these
+(`+ - * /`, parens, `CASE WHEN ... THEN ... ELSE ... END`, `COALESCE`, `NULLIF`,
+`ABS/LOG/EXP/LEAST/GREATEST`, `TRUE/FALSE`, column-to-column comparisons),
+optionally compared against a literal.
+
+There is no `FORECAST` clause: a target whose window carries `HORIZONS N`
+(below) makes the query forecasting.
 
 ### Aggregations and time windows
 
 ```
-AGG( table.column | table.* [WHERE <row filter>], start, end [, unit] )
+AGG( table.column | table.* [WHERE <row filter>] ) [ OVER (<window_spec>) | OVER <name> ]
 ```
 
 - **Functions**: `SUM, AVG, MIN, MAX, COUNT, COUNT_DISTINCT, LIST_DISTINCT,
-  FIRST, LAST`.
-- **Windows** are relative to the anchor time: `start` is **excluded**, `end`
-  is **included**. Units: `SECONDS, MINUTES, HOURS, DAYS, WEEKS, MONTHS`
-  (months use a 30-day approximation); omitted unit defaults to days.
-- **Target** windows must be future-facing (non-negative); **filter** windows
-  (in `WHERE`) are past-facing and may be negative or open (`-INF`).
-- **Inline row filters**: `COUNT(t.* WHERE t.amount > 10, 0, 30, days)`.
+  FIRST, LAST, EXISTS`. `EXISTS(t.*)` / `NOT EXISTS(t.*)` is a boolean existence
+  test (a cleaner spelling of `COUNT(t.*) > 0`).
+- **Temporal frames** are attached with a trailing `OVER (...)` clause:
+
+  ```
+  window_spec := frame [HORIZONS <positive-int> [STEP <duration>]]
+  frame       := RANGE BETWEEN bound AND bound
+               | <duration> PRECEDING          -- shorthand: RANGE BETWEEN <dur> PRECEDING AND NOW
+               | <duration> FOLLOWING          -- shorthand: RANGE BETWEEN NOW AND <dur> FOLLOWING
+               | UNBOUNDED PRECEDING           -- shorthand: all history up to NOW
+  bound       := NOW | <duration> PRECEDING | <duration> FOLLOWING
+               | UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING
+  duration    := <positive-number> <unit>
+  ```
+
+- **Units**: `SECOND(S), MINUTE(S), HOUR(S), DAY(S), WEEK(S), MONTH(S), YEAR(S)`,
+  singular or plural, case-insensitive. Frame membership is `(lower, upper]` —
+  start-excluded, end-included, relative to the anchor `NOW`.
+- **Target** frames must be future-facing (`FOLLOWING`); **filter** frames (in
+  `WHERE`) are past-facing (`PRECEDING`, `UNBOUNDED PRECEDING`).
+- **Inline row filters**: `COUNT(t.* WHERE t.amount > 10) OVER (30 DAYS FOLLOWING)`.
+- **Multi-horizon** (forecasting): `SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)`
+  evaluates 4 shifted copies of the frame; `STEP` sets the distance between
+  horizon starts (defaults to the frame width) and enables overlapping horizons.
+- **Named frames**: declare once with a trailing `WINDOW name AS (<window_spec>)`
+  and reference with `OVER name`; this also guarantees alignment when one target
+  combines two framed expressions.
 - `LIST_DISTINCT` targets take a ranking directive: `RANK TOP K` (ranking) or
   `CLASSIFY` (multilabel-style classification).
+
+### Output intent
+
+`RETURN` requests the desired predictive object; the validator rejects an output
+incompatible with the target. Options: `EXPECTED VALUE`, `PROBABILITY`, `CLASS`,
+`DISTRIBUTION`, `QUANTILES (0.10, 0.50, 0.90)`, `INTERVAL 90%`, `MULTILABEL`,
+`MULTICLASS`. When omitted, the output is inferred from the task type.
+
+`AS OF <anchor>` binds `NOW` (the prediction anchor) explicitly — a `:param`, a
+`DATE`, or `NOW`; otherwise the execution input's anchor time binds it.
+
+### Explaining a query
+
+`EXPLAIN` is a prefix. Bare `EXPLAIN` (or `EXPLAIN PLAN`) reports the static
+parse/binding/plan and does **not** invoke the model; `EXPLAIN CONTEXT`
+assembles context without scoring; `EXPLAIN ANALYZE` runs the query and reports
+actual behavior; `EXPLAIN ABLATION` compares ablation variants. `FORMAT TEXT`
+(default) is for people, `FORMAT JSON` is a machine-readable schema.
 
 ### Conditions and operators
 
@@ -318,42 +366,53 @@ list):
 | Target shape | TaskType |
 |---|---|
 | bare aggregation (`SUM(...)`, `COUNT(...)`) | regression |
-| aggregation compared to a literal (`COUNT(...) = 0`) | binary classification |
+| boolean / compared-to-a-literal target (`COUNT(...) = 0`, `EXISTS(...)`) | binary classification |
 | `FIRST`/`LAST`/static categorical column | multiclass classification |
 | `LIST_DISTINCT(...) RANK TOP K` | ranking |
-| any target with `FORECAST N TIMEFRAMES` | forecasting |
+| any target whose window has `HORIZONS N` (N > 1) | forecasting |
 
 ### Example gallery
 
 Real queries from the shared test corpus:
 
 ```sql
-PREDICT SUM(transactions.price, 0, 30) FOR EACH customers.customer_id
+PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id
 
-PREDICT COUNT(transactions.*, 0, 30, days) = 0
+PREDICT COUNT(transactions.*) OVER (30 DAYS FOLLOWING) = 0
 FOR EACH customers.customer_id
-WHERE COUNT(transactions.*, -90, 0, days) > 0
+WHERE COUNT(transactions.*) OVER (90 DAYS PRECEDING) > 0
 
-PREDICT LIST_DISTINCT(transactions.article_id, 0, 30) RANK TOP 12
+PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING) RANK TOP 12
 FOR EACH customers.customer_id
 
-PREDICT SUM(usage.count, 0, 1, days) FORECAST 28 TIMEFRAMES
+PREDICT SUM(usage.count) OVER (1 DAY FOLLOWING HORIZONS 28)
 FOR EACH accounts.account_id
 
-PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR users.user_id IN (42, 123)
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)
 
-PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR users.user_id = 42
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42
 ASSUMING users.plan = 'premium'
 
-PREDICT LAST(loan.status, 0, 30) NOT LIKE '%DENIED' FOR EACH loan.id
+PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH loan.id
 
 PREDICT articles.description IS NULL FOR EACH articles.id
 
 PREDICT movie.title STARTS WITH 'The' FOR EACH movie.id
 
-PREDICT SUM(transactions.value, 15, 45, days) > 100
+PREDICT SUM(transactions.value) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) > 100
 FOR EACH customers.customer_id
 WHERE customers.location NOT IN ('ALASKA', 'HAWAII')
+
+-- A future-window forecast, anchored explicitly, returning quantiles:
+PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)
+FOR EACH stores.store_id
+AS OF :prediction_time
+RETURN QUANTILES (0.10, 0.50, 0.90)
+
+-- Reusable named frame combining two aggregations:
+PREDICT SUM(orders.revenue) OVER w - SUM(orders.cost) OVER w
+FOR EACH customers.customer_id
+WINDOW w AS (30 DAYS FOLLOWING)
 ```
 
 ---
@@ -424,14 +483,14 @@ wiring = (RetrieverWiring.new_wiring()
 
 engine = Engine(schema, wiring)
 result = engine.execute(ExecutionInput(
-    query="PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR customers.customer_id = 'C7'",
+    query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR customers.customer_id = 'C7'",
     anchor_time=t0))
 ```
 
 Parse and validate independently of execution:
 
 ```python
-pq = relativedb.parse("PREDICT SUM(orders.qty, 0, 30) FOR EACH customers.customer_id")
+pq = relativedb.parse("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id")
 pq.task_type()                    # TaskType.REGRESSION
 relativedb.validate(pq, schema)   # binds names/types/windows against the schema
 ```
@@ -456,7 +515,7 @@ exposes a single score head).
 .venv/bin/python -m pytest
 ```
 
-Covers the full PQL corpus and rejections, the temporal-leakage guard,
+Covers the full RelQL corpus and rejections, the temporal-leakage guard,
 CSC ≡ retriever context equivalence, model-URI routing, and explicit
 retriever wiring end to end.
 
@@ -467,7 +526,7 @@ retriever wiring end to end.
 Full docs: [`java/README.md`](java/README.md). Requires Java 17+. Gradle
 Maven publications under group `com.relativedb`:
 
-- **`relationdb`** — schema builder, retriever SPI, ANTLR-based PQL
+- **`relationdb`** — schema builder, retriever SPI, ANTLR-based RelQL
   parser + semantic validation, context assembly (both sampler modes), model
   SPI.
 - **`relationdb-rt`** — optional JNA binding to `librt_c`:
@@ -510,7 +569,7 @@ RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
     .build();
 
 PredictionResult churn = engine.execute(ExecutionInput.newInput()
-    .query("PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+    .query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
     .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
     .entityIds(List.of(42L))
     .build()).toCompletableFuture().join();
@@ -591,7 +650,7 @@ let wiring = RetrieverWiring::new_wiring()
 let mut engine = Engine::new(schema, wiring);
 let result = engine.execute(
     ExecutionInput::query(
-        "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id")
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
     .anchor_time(anchor),
 )?;
 
@@ -649,14 +708,14 @@ and matches final scores to ~3–4 decimals (fp32 op-ordering drift only).
 ## Runnable industry examples
 
 [`examples/industry/`](examples/industry/) — each example generates synthetic
-data with a **planted signal**, runs a real PQL query through the full
+data with a **planted signal**, runs a real RelQL query through the full
 pipeline, and **asserts** the predictions recover the signal:
 
 | Example | Industry | Pattern |
 |---|---|---|
 | `growth_churn.py` | Subscription / streaming | binary churn with an activity `WHERE` filter |
 | `fraud_chargeback.py` | Payments | rare-event risk scoring (all 8 planted abusers recovered) |
-| `bizops_demand_forecast.py` | Retail | multi-horizon `FORECAST` |
+| `bizops_demand_forecast.py` | Retail | multi-horizon `OVER (... HORIZONS N)` |
 | `pzn_buy_it_again.py` | Grocery / personalization | `LIST_DISTINCT … RANK TOP K` ranking |
 
 ```bash
@@ -713,7 +772,7 @@ relativedb/
 │   ├── relativedb-core/    #   engine + ANTLR grammar (src/main/antlr/Pql.g4)
 │   └── relativedb-rt/      #   JNA binding to librt_c
 ├── rust/                   # Cargo workspace
-│   └── relativedb/         #   the `relativedb` crate (+ shared PQL corpus in tests/data/)
+│   └── relativedb/         #   the `relativedb` crate (+ shared RelQL corpus in tests/data/)
 ├── cpp/                    # rt.cpp — native RT-J inference (librt_c)
 └── examples/
     └── industry/           # self-checking end-to-end scenarios

@@ -1,6 +1,6 @@
 # relativedb (Rust)
 
-Predictive queries (**PQL**) over your own data — the Rust peer of the Java
+Predictive queries (**RelQL**) over your own data — the Rust peer of the Java
 (`com.relativedb.*`) and Python (`relativedb`) libraries. Same concepts, same
 behavior, idiomatic Rust.
 
@@ -13,7 +13,7 @@ cargo add relationdb
 
 GraphQL-style execution: the engine owns the query language, planning, context
 assembly, and model routing — **all data access goes through user-defined
-retrievers**. No bundled database connectors. The same PQL query runs against a
+retrievers**. No bundled database connectors. The same RelQL query runs against a
 JDBC service, a REST microservice, a feature store, or an in-memory test double
 — only the wiring changes.
 
@@ -100,7 +100,7 @@ let mut engine = Engine::new(schema, wiring);
 // 4. Run a churn query as of a fixed anchor time.
 let result = engine.execute(
     ExecutionInput::query(
-        "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id",
     )
     .anchor_time(day("2026-07-01")),
 ).unwrap();
