@@ -59,7 +59,7 @@ class SamplerMode(Enum):
 class ContextPolicy:
     """Context assembly knobs (storage-agnostic).
 
-    ``fanouts`` are per-hop child caps (KumoRFM geometry); when unset, a
+    ``fanouts`` are per-hop child caps; when unset, a
     uniform ``bfs_width`` per hop is used (RT geometry). ``max_context_cells``
     is the global cell budget.
     """

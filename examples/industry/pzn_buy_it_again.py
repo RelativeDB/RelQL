@@ -2,7 +2,7 @@
 
 rank the products each
 customer is most likely to purchase in the next 30 days. Uses the canonical
-Kumo recommendation pattern — LIST_DISTINCT over a *foreign key* with
+recommendation pattern — LIST_DISTINCT over a *foreign key* with
 RANK TOP K (FK values reach the ranker through Row.parents, never as cells).
 
     PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3

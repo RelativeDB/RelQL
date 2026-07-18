@@ -215,7 +215,7 @@ locality:
 The hop loop itself is shared: seed → parents (always followed) → children
 (fanout-capped, newest-first) → cohort (optional), stopping at the hop limit
 or the context budget. `ContextPolicy` supports both budget geometries:
-per-hop `fanouts(64, 64)` (KumoRFM-style) or a uniform `bfs_width` under a
+per-hop `fanouts(64, 64)` or a uniform `bfs_width` under a
 global `max_context_cells` budget (RT-style).
 
 ### Model backends and routing
@@ -251,7 +251,7 @@ downloading); `file://` and plain paths work too.
 
 ## RelQL — the Predictive Query Language
 
-RelQL derives from Kumo/KumoRFM's predictive query language. The canonical
+RelQL is a declarative predictive query language. The canonical
 parser is single-sourced in C++ ([`cpp/src/pql.hpp`](cpp/src/pql.hpp) /
 [`cpp/src/pql.cpp`](cpp/src/pql.cpp)) and emits a JSON AST that the Python, Rust,
 and Java bindings decode, all verified against a shared query corpus

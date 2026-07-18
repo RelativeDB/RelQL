@@ -129,7 +129,7 @@ Retrievers are plain callables (`typing.Protocol`s):
 
 Context knobs: `ContextPolicy(fanouts=(64, 64), max_hops=2,
 max_context_cells=8192, cohort_size=..., prefer_latest=True)` — per-hop
-fanouts (KumoRFM geometry) or a uniform `bfs_width` with a global cell budget
+fanouts or a uniform `bfs_width` with a global cell budget
 (RT geometry). Parents are always followed; children are width-bounded and
 newest-first; `MONTHS` windows use a 30-day approximation.
 

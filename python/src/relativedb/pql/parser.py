@@ -75,8 +75,7 @@ def _walk_columns(expr, schema) -> None:
     from .ast import Aggregation as Agg, AggFunc
     if isinstance(expr, Agg):
         # FK columns are legal aggregation targets for set/count aggregations
-        # (the Kumo recommendation pattern: LIST_DISTINCT over a foreign key,
-        # "RANK on a foreign key"); only FIRST/LAST exclude them per the docs.
+        # only FIRST/LAST exclude them per the docs.
         fk_ok = expr.func in (AggFunc.LIST_DISTINCT, AggFunc.COUNT,
                               AggFunc.COUNT_DISTINCT)
         _check_column(expr.column, schema, allow_star=True, allow_fk=fk_ok)

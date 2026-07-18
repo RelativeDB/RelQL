@@ -1,7 +1,6 @@
 # Industry Examples
 
-Runnable, self-checking examples targeted at common industry use cases,
-modeled on the Kumo docs' example library. Each generates synthetic data with a **planted
+Runnable, self-checking examples targeted at common industry use cases' example library. Each generates synthetic data with a **planted
 signal**, runs a RelQL query through the full pipeline (parse → validate →
 retriever hop loop → temporal guard → scoring), and **asserts** the
 predictions recover the signal.

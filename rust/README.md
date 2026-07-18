@@ -131,7 +131,7 @@ Engine::new(schema, wiring).sampler_mode(SamplerMode::Csc).build()?;
 ```
 
 `ContextPolicy` carries both budget geometries: RT-style `max_context_cells` +
-`bfs_width`, and KumoRFM-style per-hop `fanouts(...)`. Every returned row is
+`bfs_width`, and per-hop `fanouts(...)`. Every returned row is
 re-checked against the `TemporalBound` in both modes, so a buggy retriever can
 never leak the future into context (F24).
 

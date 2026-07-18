@@ -30,7 +30,7 @@ anchor time?*
   [task type](reference/task-types) (classification, regression, ranking,
   forecasting), which selects the model checkpoint and output form.
 
-RelQL derives from Kumo/KumoRFM's predictive query language. One grammar, three
+One grammar, three
 verified implementations (ANTLR in Java; recursive descent in Python and
 Rust), all tested against a shared 44-query corpus.
 

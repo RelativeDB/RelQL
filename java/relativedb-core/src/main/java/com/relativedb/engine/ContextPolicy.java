@@ -3,7 +3,7 @@ package com.relativedb.engine;
 /**
  * Context assembly knobs, storage-agnostic. Two budget geometries are
  * supported: RT's global cell budget (maxContextCells + uniform bfsWidth) and
- * KumoRFM's per-hop fanout caps ({@link Builder#fanouts(int...)}, which
+ * per-hop fanout caps ({@link Builder#fanouts(int...)}, which
  * override bfsWidth when set).
  */
 public final class ContextPolicy {
@@ -33,8 +33,8 @@ public final class ContextPolicy {
         /** Children per row (F23). */
         Builder bfsWidth(int w);
         /**
-         * KumoRFM-style per-hop fanout caps (overrides bfsWidth when set),
-         * e.g. {@code fanouts(64, 64)} ≈ KumoRFM NORMAL with num_hops=2.
+         * Per-hop fanout caps (overrides bfsWidth when set),
+         * e.g. {@code fanouts(64, 64)} for a 2-hop budget of 64 children each.
          * Also sets maxHops to the number of fanouts.
          */
         Builder fanouts(int... perHop);
