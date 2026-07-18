@@ -1,7 +1,7 @@
 // Golden test: run the C++ RT forward on the dumped demo batch and compare
 // x_embed / x_block0 / yhat_number against the PyTorch reference (fp32).
 //
-//   ./rt_test <testdata_dir> <model.safetensors> [--bench N]
+//   ./rt_test <testdata_dir> <model.safetensors> [--bench N] [--device cpu|mps|cuda]
 #include "rt.hpp"
 
 #include <chrono>
@@ -49,10 +49,31 @@ Diff diff(const std::vector<float>& a, const std::vector<float>& b,
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3) { fprintf(stderr, "usage: %s <testdata> <safetensors> [--bench N]\n", argv[0]); return 2; }
+  if (argc < 3) { fprintf(stderr, "usage: %s <testdata> <safetensors> [--bench N] [--device cpu|mps|cuda]\n", argv[0]); return 2; }
   std::string dir = argv[1], ckpt = argv[2];
   int bench = 0;
-  if (argc >= 5 && std::string(argv[3]) == "--bench") bench = atoi(argv[4]);
+  // Quantized checkpoints trade a bounded amount of precision for smaller
+  // artifacts + less bandwidth; thresholds scale accordingly. Measured
+  // drift: f16/q8 ~10-20x fp32 (--quantized = 30x), q4 ~50x (use --tol 100).
+  float tol = 1.0f;
+  rt::ForwardOpts opts;
+  for (int i = 3; i < argc; i++) {
+    if (std::string(argv[i]) == "--quantized") tol = 30.0f;
+    if (i + 1 >= argc) break;
+    if (std::string(argv[i]) == "--tol") tol = (float)atof(argv[i + 1]);
+    if (std::string(argv[i]) == "--bench") bench = atoi(argv[i + 1]);
+    if (std::string(argv[i]) == "--device") {
+      std::string d = argv[i + 1];
+      opts.device = d == "mps" ? rt::Device::MPS
+                    : d == "cuda" ? rt::Device::CUDA
+                                  : rt::Device::CPU;
+    }
+  }
+  if (!rt::device_available(opts.device)) {
+    fprintf(stderr, "device %s not available\n", rt::device_name(opts.device));
+    return 2;
+  }
+  printf("device: %s\n", rt::device_name(opts.device));
 
   // Shapes for the demo batch are fixed by the dump (B=5, S=16).
   rt::Batch b;
@@ -78,7 +99,7 @@ int main(int argc, char** argv) {
   printf("loaded checkpoint in %.2fs\n",
          std::chrono::duration<double>(t1 - t0).count());
 
-  rt::Output out = rt::forward(model, b);
+  rt::Output out = rt::forward(model, b, opts);
 
   // reference (post-sort order)
   auto ref_sort = read_bin<int64_t>(dir + "/sort_idxs.bin", BS);
@@ -115,14 +136,16 @@ int main(int argc, char** argv) {
     }
   }
 
-  bool ok = sort_mismatch == 0 && d_e.max_abs < 5e-4 && d_b.max_abs < 5e-3 &&
-            d_y.max_abs < 5e-3;
+  bool ok = sort_mismatch == 0 && d_e.max_abs < 5e-4 * tol &&
+            d_b.max_abs < 5e-3 * tol && d_y.max_abs < 5e-3 * tol;
   printf(ok ? "GOLDEN TEST PASS\n" : "GOLDEN TEST FAIL\n");
 
   if (bench > 0) {
-    rt::forward(model, b);  // warm
+    rt::ForwardOpts bopts = opts;
+    bopts.debug_taps = false;
+    rt::forward(model, b, bopts);  // warm
     auto s0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < bench; i++) rt::forward(model, b);
+    for (int i = 0; i < bench; i++) rt::forward(model, b, bopts);
     auto s1 = std::chrono::steady_clock::now();
     double per = std::chrono::duration<double, std::milli>(s1 - s0).count() / bench;
     printf("bench: %.2f ms / forward (B=%d, S=%d)\n", per, b.B, b.S);

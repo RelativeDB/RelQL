@@ -1,9 +1,7 @@
-# What is RelQL?
-
-Most simply, RelQL is a predictive-query engine for relational data. You declare the shape of your
+# What is RelativeDB/RelQL?
+RelativeDB is an optimized implementation of Relational Transformers (2026), surfaced as RelQL, a predictive query language for relational data. You declare the shape of your
 relational data (tables, keys, links), wire small retriever callbacks over
-whatever storage you already have, and ask questions about the **future** in
-the **RelQL** language:
+whatever storage you already have, and ask questions about the **future**:
 
 ```sql
 PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
@@ -13,25 +11,19 @@ FOR EACH customers.customer_id
 *"For every customer, what is the probability they place zero orders in the
 next 90 days?"*.
 
-The engine parses and validates the query, walks your relational graph through
-your retrievers to assemble a temporally-bounded context per entity, and
-scores it with a pluggable model backend.
+## The model
+The work is based on these papers:
+
+| Resource | Description | Date      |
+| --- | --- |-----------|
+| [stanford-star/relational-transformer](https://github.com/stanford-star/relational-transformer) | RT-J: Large-Scale Pretraining of Relational Transformers for Context-Efficient Predictions — code, in progress | Jul 2026  |
+| [Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data](https://arxiv.org/abs/2510.06377) | Paper (arXiv:2510.06377) | Oct, 2025 |
 
 # Docs
 
 Read the [RelQL book](https://relql.com/docs/).
 
 # Appetizer
-
-
-- Which active users will churn?
-- Which accounts will incur a chargeback?
-- How many units will each store sell per week for the next 4 weeks?
-- Which products will a shopper buy again?
-- How much will a customer spend next quarter (LTV)?
-- Will this loan avoid denial?
-- Is this missing attribute predictable?
-- Would this user churn *if* they were on premium?
 
 ```sql
 # Per active customer, probability of zero orders in the next 90 days.
@@ -53,9 +45,10 @@ PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)
 FOR EACH stores.store_id
 
 # Will spend in the 15–45 day window exceed $100?
-PREDICT SUM(transactions.value) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) > 100
+PREDICT SUM(transactions.value) OVER w > 100
 FOR EACH customers.customer_id
 WHERE customers.location NOT IN ('ALASKA', 'HAWAII')
+WINDOW w AS (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING)
 
 # Auto-label a GitHub issue: predict its label from title, body, and history.
 PREDICT issues.label FOR EACH issues.id
@@ -84,9 +77,8 @@ WINDOW w AS (30 DAYS FOLLOWING)
 
 ## The Python library
 
-
 ```bash
-pip install relationdb
+pip install relativedb
 ```
 
 ## Quickstart: 90-day churn from your own DataFrames
@@ -128,7 +120,7 @@ schema = (relativedb.Schema.new_schema()
         .primary_key("order_id").time_column("order_date").build())
     .link(relativedb.LinkDef("orders", "customer_id", "customers")).build())
 
-# Your connector translates DataFrame records into relationdb.Row objects.
+# Your connector translates DataFrame records into RelativeDB.Row objects.
 # See examples/industry/pandas_connector.py for a complete implementation.
 wiring = wire_my_dataframes(schema, {"customers": customers, "orders": orders})
 # Scoring requires a model backend. The RT-J relational foundation model
@@ -155,7 +147,7 @@ translate records into `Row` objects, and wire retrieval callbacks over the
 storage your application owns:
 
 ```python
-import pandas as pd  # application dependency, not a relationdb dependency
+import pandas as pd  # application dependency, not a RelativeDB dependency
 from relativedb import Engine, ExecutionInput, RetrieverWiring, Row, RtNativeBackend
 
 customer_rows = [Row("customers", r.customer_id, {"age": float(r.age)})
@@ -206,7 +198,8 @@ wiring = (RetrieverWiring.new_wiring()
 
 engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
 result = engine.execute(ExecutionInput(
-    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR customers.customer_id = 'C7'",
+    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id",
+    entity_ids=["C7"],   # score just this cohort; omit to score the whole table
     anchor_time=t0))
 ```
 
@@ -220,8 +213,18 @@ relativedb.validate(pq, schema)   # binds names/types/windows against the schema
 
 ## The Java library
 
-```bash
-<todo maven/gradle>
+```xml
+<!-- Maven -->
+<dependency>
+  <groupId>com.relativedb</groupId>
+  <artifactId>relativedb</artifactId>
+  <version>0.1.0</version>
+</dependency>
+```
+
+```groovy
+// Gradle
+implementation("com.relativedb:relativedb:0.1.0")
 ```
 
 ### Quickstart
@@ -262,7 +265,13 @@ PredictionResult churn = engine.execute(ExecutionInput.newInput()
 ## The Rust library
 
 ```bash
-<todo cargo>
+cargo add relativedb
+```
+
+```toml
+# Cargo.toml
+[dependencies]
+relativedb = "0.1.0"
 ```
 
 ### Quickstart
@@ -313,6 +322,60 @@ for p in &result.predictions {
     println!("{} churn probability = {:?}", p.id, p.probability);
 }
 ```
+
+## Performance — CPU vs Metal (MPS)
+
+The native engine (`librt_c`) runs on the **CPU** (Apple Accelerate / AMX) and,
+on Apple Silicon, on the **GPU** via a Metal/MPS backend (`MPSMatrixMultiplication`
+projections + custom Metal attention/FFN kernels). Both produce **numerically
+identical** output (`max|Δ| = 0`) and pass the batch-isolation check. Select with
+`rt_bench --device cpu|mps` (or `RT_DEVICE` in the C ABI).
+
+Measured on an Apple Silicon laptop, RT-J classification checkpoint, fp32:
+
+**Batch scaling** (context S=16, the per-entity scoring path) — MPS parallelizes
+across the batch and saturates ~3.2–3.5× CPU throughput:
+
+| Batch | CPU ms/fwd | MPS ms/fwd | MPS speedup | CPU ms/entity | MPS ms/entity |
+|---:|---:|---:|:---:|---:|---:|
+| 1    | 16.4   | 7.2   | **2.3×** | 16.4 | 7.2 |
+| 20   | 64.2   | 19.7  | **3.3×** | 3.2  | 1.0 |
+| 80   | 220.7  | 62.6  | **3.5×** | 2.8  | 0.8 |
+| 160  | 431.4  | 122.6 | **3.5×** | 2.7  | 0.8 |
+| 640  | 1581.6 | 485.8 | **3.3×** | 2.5  | 0.8 |
+| 1280 | 3138.3 | 982.0 | **3.2×** | 2.5  | 0.8 |
+
+**Context length** (single sequence, B=1) — RT has no positional encodings and no
+fixed context cap; the reference runs context up to 8192. MPS's edge shrinks as `S`
+grows; **beyond S ≈ 1–2k the two land within measurement noise** and trade places
+run-to-run (only a few iterations at these sizes) — no consistent winner for a lone
+long sequence:
+
+| B × S | CPU ms/fwd | MPS ms/fwd | faster |
+|---|---:|---:|:---:|
+| 1 × 256  | 58.6   | 41.8   | **MPS 1.4×** |
+| 1 × 1024 | 197.2  | 158.0  | **MPS 1.25×** |
+| 1 × 2048 | 387.8  | 405.9  | CPU 1.05× (~tie) |
+| 1 × 4096 | 834.8  | 1031.6 | **CPU 1.24×** |
+| 1 × 8192 | 2320.0 | 2189.9 | MPS 1.06× (~tie) |
+
+**Batched** — MPS's clear win lives in the short-context, high-batch regime;
+batching restores its lead only while sequences stay moderate:
+
+| B × S | CPU ms/fwd | MPS ms/fwd | MPS speedup |
+|---|---:|---:|:---:|
+| 16 × 256  | 747.6  | 270.7  | **2.8×** |
+| 8 × 1024  | 1389.6 | 625.7  | **2.2×** |
+| 32 × 1024 | 5233.9 | 2795.0 | **1.9×** |
+| 8 × 4096  | 6104.9 | 4928.4 | **1.2×** |
+| 4 × 8192  | 7365.3 | 8024.0 | 0.92× (CPU) |
+
+Peak throughput: MPS ~21,000 tok/s (short seq) vs CPU ~6,500 tok/s — but both fall
+to ~3,500–4,000 tok/s at S=8192 (attention-bound), where they converge. MPS uses
+less memory at the largest shapes. **Rule of thumb:** MPS for short-context batched
+scoring (2.3–3.5×); at long single sequences the two are roughly on par. Reproduce
+with `cpp/build/rt_bench <testdata> <ckpt> --device {cpu,mps}` (a few % run-to-run
+variance; raise iteration counts for the long-context rows).
 
 ## Design invariants
 

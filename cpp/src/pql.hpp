@@ -170,7 +170,6 @@ struct ParsedQuery {
   ExprPtr target;
   std::string entity_table;
   std::string entity_column;
-  std::vector<Lit> entity_ids;
   ExprPtr where;                  // nullable
   ExprPtr assuming;               // nullable
   AsOf as_of;

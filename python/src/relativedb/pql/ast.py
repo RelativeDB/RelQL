@@ -271,8 +271,7 @@ class ParsedQuery:
     """The parse result — no schema needed. ``validate`` binds it to one."""
 
     target: TargetExpr
-    entity_key: ColumnRef                       # FOR [EACH] table.pk
-    entity_ids: tuple = ()                      # FOR t.pk = v | IN (...); empty = all
+    entity_key: ColumnRef                       # FOR EACH table.pk
     where: Optional[TargetExpr] = None
     assuming: Optional[TargetExpr] = None
     rank: Optional[RankKind] = None             # CLASSIFY | RANK TOP K

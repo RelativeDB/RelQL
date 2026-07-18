@@ -277,13 +277,9 @@ public final class RelativeDbEngine {
         Map<String, Object> entity = new LinkedHashMap<>();
         entity.put("table", q.entityKey().table());
         entity.put("pk", q.entityKey().column());
-        List<Object> queryIds = q.entityIds().stream()
-                .map(l -> (Object) renderLiteral(l)).toList();
         List<Object> overrideIds = input.entityIds();
         if (!overrideIds.isEmpty()) {
             entity.put("selector", overrideIds.stream().map(String::valueOf).toList());
-        } else if (!queryIds.isEmpty()) {
-            entity.put("selector", queryIds);
         } else {
             entity.put("selector", "FOR EACH");
         }
@@ -545,16 +541,9 @@ public final class RelativeDbEngine {
         return String.valueOf(e);
     }
 
-    private static String renderLiteral(com.relativedb.query.Literal l) {
-        return String.valueOf(l.value());
-    }
-
     private List<EntityId> resolveEntityIds(ExecutionInput input, ValidatedQuery vq, String entityTable) {
         if (!input.entityIds().isEmpty()) {
             return input.entityIds().stream().map(EntityId::of).toList();
-        }
-        if (!vq.query().entityIds().isEmpty()) {
-            return vq.query().entityIds().stream().map(l -> EntityId.of(rawId(l.value()))).toList();
         }
         // FOR EACH over all entities: only enumerable with a TableScanner.
         Optional<com.relativedb.retrieve.TableScanner> scanner = wiring.scanner(entityTable);
@@ -571,14 +560,6 @@ public final class RelativeDbEngine {
         throw new IllegalArgumentException("FOR EACH over all entities of '" + entityTable
                 + "' requires explicit entityIds(...) on the ExecutionInput (RETRIEVER mode "
                 + "cannot enumerate a table) or a TableScanner + SamplerMode.CSC");
-    }
-
-    private static Object rawId(Object literalValue) {
-        // Integer-valued numeric ids surface as longs (FOR users.user_id = 42).
-        if (literalValue instanceof Double d && d == Math.floor(d) && !d.isInfinite()) {
-            return d.longValue();
-        }
-        return literalValue;
     }
 
     private ModelBackend resolveBackend(TaskType taskType) {

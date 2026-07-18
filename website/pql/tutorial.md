@@ -49,11 +49,19 @@ Static attributes work too: `WHERE customers.age >= 18`.
 
 ## Step 4: target specific entities
 
-Replace `FOR EACH` with an explicit selection:
+`FOR EACH` is the only entity clause — a query always names the population by
+its primary key. To score only a specific subset, either constrain them with a
+`WHERE` predicate on the key:
 
 ```sql
-PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR customers.customer_id IN ('C7', 'C9')
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
+FOR EACH customers.customer_id
+WHERE customers.customer_id IN ('C7', 'C9')
 ```
+
+or, more commonly, leave the query general and pass the concrete ids at
+execution time (the `entity_ids` field on the execution input). Keeping ids out
+of the query text means the same query string is reusable across cohorts.
 
 ## Step 5: filter the aggregated rows
 
@@ -94,7 +102,8 @@ FOR EACH customers.customer_id
 
 ```sql
 PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
-FOR customers.customer_id = 'C7'
+FOR EACH customers.customer_id
+WHERE customers.customer_id = 'C7'
 ASSUMING customers.plan = 'premium'
 ```
 

@@ -46,8 +46,6 @@ SHOULD_PARSE = [
     ("PREDICT COUNT(t.*) OVER (30 MONTHS FOLLOWING) FOR EACH e.id", "months unit"),
     ("PREDICT COUNT(t.*) OVER (6 HOURS FOLLOWING) > 0 FOR EACH e.id", "hours unit"),
     ("PREDICT SUM(m.value) OVER (90 SECONDS FOLLOWING) FOR EACH d.id", "seconds unit"),
-    ("PREDICT COUNT(o.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)", "pinned IN"),
-    ("PREDICT COUNT(o.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42", "pinned single"),
     ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR EACH e.id WHERE (a.c='US' OR b.n<10000) AND a.d='V'", "nested parens"),
     ("predict sum(t.x) over (30 days following) for each e.id", "lowercase keywords"),
     ("PREDICT  SUM( t.x )   OVER  ( 30 DAYS FOLLOWING )   FOR   EACH   e.id", "whitespace"),
@@ -83,6 +81,10 @@ SHOULD_REJECT = [
     ("PREDICT COUNT(orders.*, 0, 90, days) FOR EACH e.id", "positional window w/ unit removed"),
     ("PREDICT COUNT(t.*, -90, 0) > 0 FOR EACH e.id", "positional lookback removed"),
     ("PREDICT SUM(u.count, 0, 1, days) FORECAST 28 TIMEFRAMES FOR EACH a.id", "FORECAST clause removed"),
+    # --- pinned entity selector removed; only FOR EACH remains ---
+    ("PREDICT COUNT(o.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)", "pinned IN removed"),
+    ("PREDICT COUNT(o.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42", "pinned single removed"),
+    ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FOR e.id", "bare FOR (needs EACH)"),
     # --- new v2 frame validation errors ---
     ("PREDICT SUM(t.x) OVER (30 DAYS) FOR EACH e.id", "frame missing PRECEDING/FOLLOWING"),
     ("PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING HORIZONS 0) FOR EACH e.id", "horizons must be positive"),

@@ -26,13 +26,44 @@ import java.util.stream.Stream;
  * {@code HF_HUB_CACHE}, env {@code HF_HOME} (+{@code /hub}), then
  * {@code ~/.cache/huggingface/hub}. When several snapshots contain the
  * checkpoint, the lexicographically last one wins (deterministic).
+ *
+ * <p>System property {@code relativedb.rt.quantized} or env
+ * {@code RELATIVEDB_RT_QUANTIZED} selects a quantized checkpoint variant
+ * (produced by {@code cpp/rt_quantize}): {@code 1}/{@code true}/{@code q8}
+ * pick a {@code model.q8.safetensors} sibling, {@code q4} / {@code f16} the
+ * corresponding file, wherever a directory is resolved. Off by default so
+ * fp32 golden parity is untouched; explicit file paths are always used as
+ * given.
  */
 public final class CheckpointResolver {
 
     static final String CACHE_PROP = "relativedb.rt.hf.cache";
     static final String CACHE_ENV = "RELATIVEDB_RT_HF_CACHE";
+    static final String QUANT_PROP = "relativedb.rt.quantized";
+    static final String QUANT_ENV = "RELATIVEDB_RT_QUANTIZED";
 
     private CheckpointResolver() { }
+
+    /** {@code q8}, {@code q4}, {@code f16}, or null (fp32). */
+    static String quantizedVariant() {
+        String v = System.getProperty(QUANT_PROP, System.getenv(QUANT_ENV));
+        if (v == null) return null;
+        v = v.toLowerCase();
+        if (v.equals("1") || v.equals("true") || v.equals("q8")) return "q8";
+        if (v.equals("q4") || v.equals("f16")) return v;
+        return null;
+    }
+
+    /** dir -> dir/model.&lt;variant&gt;.safetensors when opted in and present,
+     *  else dir/model.safetensors. */
+    private static Path pickModel(Path dir) {
+        String v = quantizedVariant();
+        if (v != null) {
+            Path q = dir.resolve("model." + v + ".safetensors");
+            if (Files.isRegularFile(q)) return q;
+        }
+        return dir.resolve("model.safetensors");
+    }
 
     /** Resolves to an existing safetensors file or throws {@link RtException}. */
     public static Path resolve(String uri) {
@@ -54,7 +85,7 @@ public final class CheckpointResolver {
         }
         String raw = uri.startsWith("file://") ? uri.substring("file://".length()) : uri;
         Path p = Path.of(raw);
-        if (Files.isDirectory(p)) p = p.resolve("model.safetensors");
+        if (Files.isDirectory(p)) p = pickModel(p);
         return p;
     }
 
@@ -69,8 +100,7 @@ public final class CheckpointResolver {
         try (Stream<Path> snaps = Files.list(snapshots)) {
             return snaps.filter(Files::isDirectory)
                 .sorted(Comparator.comparing(Path::getFileName).reversed())
-                .map(s -> subdir.isEmpty() ? s.resolve("model.safetensors")
-                                           : s.resolve(subdir).resolve("model.safetensors"))
+                .map(s -> pickModel(subdir.isEmpty() ? s : s.resolve(subdir)))
                 .filter(Files::isRegularFile)
                 .findFirst().orElse(null);
         } catch (IOException e) {

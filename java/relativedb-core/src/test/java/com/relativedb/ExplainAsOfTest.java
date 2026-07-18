@@ -57,7 +57,7 @@ class ExplainAsOfTest {
         // anchorTime would admit the late order; AS OF date must override it.
         engine().execute(ExecutionInput.newInput()
                 .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                        + "FOR customers.customer_id = 1 AS OF 2026-07-01")
+                        + "FOR EACH customers.customer_id AS OF 2026-07-01")
                 .anchorTime(Instant.parse("2026-09-01T00:00:00Z"))
                 .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
@@ -70,7 +70,7 @@ class ExplainAsOfTest {
         // AS OF NOW == the execution anchor: the late order is admitted.
         engine().execute(ExecutionInput.newInput()
                 .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                        + "FOR customers.customer_id = 1 AS OF NOW")
+                        + "FOR EACH customers.customer_id AS OF NOW")
                 .anchorTime(Instant.parse("2026-09-01T00:00:00Z"))
                 .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
@@ -81,7 +81,7 @@ class ExplainAsOfTest {
     void asOfParamBindsFromParamsMap() {
         engine().execute(ExecutionInput.newInput()
                 .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                        + "FOR customers.customer_id = 1 AS OF :t")
+                        + "FOR EACH customers.customer_id AS OF :t")
                 .anchorTime(Instant.parse("2026-09-01T00:00:00Z"))
                 .params(Map.of("t", Instant.parse("2026-07-01T00:00:00Z")))
                 .entityIds(List.of(1L))
@@ -95,7 +95,7 @@ class ExplainAsOfTest {
         CompletionException e = assertThrows(CompletionException.class, () ->
                 engine().execute(ExecutionInput.newInput()
                         .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                                + "FOR customers.customer_id = 1 AS OF :t")
+                                + "FOR EACH customers.customer_id AS OF :t")
                         .entityIds(List.of(1L))
                         .build()).toCompletableFuture().join());
         assertTrue(e.getCause() instanceof IllegalArgumentException);

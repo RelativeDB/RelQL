@@ -16,7 +16,7 @@ public final class ExecutionInput {
     private final Instant anchorTime;         // nullable = unbounded max
     private final boolean perEntityAnchor;
     private final Instant contextAnchorTime;  // nullable = same as anchorTime
-    private final List<Object> entityIds;     // empty = from query / all
+    private final List<Object> entityIds;     // pins the FOR EACH cohort; empty = all
     private final Map<String, Instant> params; // AS OF :name bindings (default empty)
 
     private ExecutionInput(BuilderImpl b) {

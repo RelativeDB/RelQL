@@ -63,6 +63,9 @@ const MALFORMED: &[&str] = &[
     "PREDICT t.c IS FOR EACH t.id",
     "PREDICT (SUM(t.c) OVER (30 DAYS FOLLOWING) FOR EACH t.id", // unbalanced paren
     "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR EACH t.id ASSUMING AND",
+    "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id",       // bare FOR (needs EACH)
+    "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id = 42",  // pinned selector removed
+    "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id IN (1, 2)", // IN selector removed
 ];
 
 #[test]
@@ -102,16 +105,26 @@ fn churn_query_ast() {
 }
 
 #[test]
-fn entity_selectors() {
-    let pq =
-        parse("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)")
-            .unwrap();
-    assert_eq!(pq.entity_ids, vec![Literal::Num(42.0), Literal::Num(123.0)]);
+fn pinned_entity_selector_rejected() {
+    // `FOR t.pk = v` / `FOR t.pk IN (...)` were removed; only `FOR EACH t.pk`
+    // is valid. Concrete ids are supplied at execution time.
+    assert!(parse(
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)"
+    )
+    .is_err());
+    assert!(parse(
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42"
+    )
+    .is_err());
+}
+
+#[test]
+fn assuming_with_for_each() {
     let pq = parse(
-        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42 ASSUMING users.plan = 'premium'",
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH users.user_id WHERE users.user_id = 42 ASSUMING users.plan = 'premium'",
     )
     .unwrap();
-    assert_eq!(pq.entity_ids, vec![Literal::Num(42.0)]);
+    assert_eq!(pq.entity_key, ColumnRef::new("users", "user_id"));
     match pq.assuming.unwrap() {
         TargetExpr::Condition(c) => assert_eq!(c.right, CondRhs::One(Literal::Str("premium".into()))),
         other => panic!("{:?}", other),
@@ -284,14 +297,14 @@ fn explain_as_of_return() {
     assert_eq!(pq.ret.as_ref().unwrap().kind, "PROBABILITY");
 
     // EXPLAIN CONTEXT + AS OF date.
-    let pq = parse("EXPLAIN CONTEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' AS OF 2026-07-01").unwrap();
+    let pq = parse("EXPLAIN CONTEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id WHERE customers.customer_id = 'C7' AS OF 2026-07-01").unwrap();
     assert_eq!(pq.explain.as_ref().unwrap().mode, "CONTEXT");
     let as_of = pq.as_of.as_ref().unwrap();
     assert_eq!(as_of.kind, "date");
     assert_eq!(as_of.value.as_deref(), Some("2026-07-01"));
 
     // RETURN QUANTILES + INTERVAL forms.
-    let pq = parse("PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) FOR customers.customer_id IN ('C7', 'C9') AS OF :prediction_time RETURN QUANTILES (0.10, 0.50, 0.90)").unwrap();
+    let pq = parse("PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) FOR EACH customers.customer_id AS OF :prediction_time RETURN QUANTILES (0.10, 0.50, 0.90)").unwrap();
     let ret = pq.ret.as_ref().unwrap();
     assert_eq!(ret.kind, "QUANTILES");
     assert_eq!(ret.quantiles, vec![0.10, 0.50, 0.90]);

@@ -374,14 +374,8 @@ class Parser {
       q.top_k = k.ival;
     }
     expect("FOR", "'FOR'");
-    if (peek().kind == "EACH" && peek(1).kind != ".") next();
+    expect("EACH", "'EACH' after 'FOR'");
     parseColumnRefInto(q.entity_table, q.entity_column);
-    if (accept("=")) {
-      q.entity_ids.push_back(parseLiteral());
-    } else if (peek().kind == "IN" && peek(1).kind == "(") {
-      next();
-      q.entity_ids = parseListLiteral();
-    }
     parseTrailingClauses(q);
     expect("EOF", "end of query");
     resolveWindowRefs(q);
@@ -1532,12 +1526,7 @@ std::string to_json(const ParsedQuery& q) {
   emitJsonString(out, q.entity_table);
   out += ",\"column\":";
   emitJsonString(out, q.entity_column);
-  out += "},\"entity_ids\":[";
-  for (size_t k = 0; k < q.entity_ids.size(); k++) {
-    if (k) out += ",";
-    emitLit(out, q.entity_ids[k]);
-  }
-  out += "],\"where\":";
+  out += "},\"where\":";
   if (q.where)
     emitExpr(out, *q.where);
   else

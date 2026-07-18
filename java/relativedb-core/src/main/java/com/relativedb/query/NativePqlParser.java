@@ -69,14 +69,6 @@ public final class NativePqlParser {
         Map<String, Object> ek = asObject(o.get("entity_key"));
         ColumnRef entityKey = new ColumnRef(str(ek.get("table")), str(ek.get("column")));
 
-        List<Literal> entityIds = new ArrayList<>();
-        Object ids = o.get("entity_ids");
-        if (ids != null) {
-            for (Object v : asArray(ids)) {
-                entityIds.add(literal(v));
-            }
-        }
-
         Optional<TargetExpr> where = optExpr(o.get("where"));
         Optional<TargetExpr> assuming = optExpr(o.get("assuming"));
 
@@ -98,7 +90,7 @@ public final class NativePqlParser {
         Optional<ReturnSpec> ret = returnSpec(o.get("ret"));
         Map<String, Window> windows = windows(o.get("windows"));
 
-        return new ParsedQuery(expr(o.get("target")), entityKey, List.copyOf(entityIds),
+        return new ParsedQuery(expr(o.get("target")), entityKey,
                 where, assuming, topK, problemType, numForecasts,
                 explain, asOf, ablations, ret, windows);
     }

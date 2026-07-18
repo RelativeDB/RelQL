@@ -58,6 +58,9 @@ MALFORMED = [
     "PREDICT t.c IS FOR EACH t.id",
     "PREDICT (SUM(t.c) OVER (30 DAYS FOLLOWING) FOR EACH t.id",  # unbalanced paren
     "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR EACH t.id ASSUMING AND",
+    "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id",       # bare FOR (needs EACH)
+    "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id = 42",  # pinned selector removed
+    "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id IN (1, 2)",  # IN selector removed
 ]
 
 
@@ -88,13 +91,22 @@ def test_churn_query_ast():
     assert pq.task_type() is TaskType.BINARY_CLASSIFICATION
 
 
-def test_entity_selectors():
+def test_pinned_entity_selector_rejected():
+    # The `FOR t.pk = v` / `FOR t.pk IN (...)` forms were removed; only
+    # `FOR EACH t.pk` is valid. Concrete ids are supplied at execution time.
+    for q in ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+              "FOR users.user_id IN (42, 123)",
+              "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+              "FOR users.user_id = 42"):
+        with pytest.raises(PqlSyntaxError):
+            parse(q)
+
+
+def test_assuming_with_for_each():
     pq = parse("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-               "FOR users.user_id IN (42, 123)")
-    assert pq.entity_ids == (42, 123)
-    pq = parse("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-               "FOR users.user_id = 42 ASSUMING users.plan = 'premium'")
-    assert pq.entity_ids == (42,)
+               "FOR EACH users.user_id WHERE users.user_id = 42 "
+               "ASSUMING users.plan = 'premium'")
+    assert pq.entity_key == ColumnRef("users", "user_id")
     assert isinstance(pq.assuming, Condition)
     assert pq.assuming.right == "premium"
 
@@ -247,7 +259,7 @@ def test_case_target():
 
 def test_return_specs():
     pq = parse("PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING "
-               "AND 45 DAYS FOLLOWING) FOR customers.customer_id IN ('C7', 'C9') "
+               "AND 45 DAYS FOLLOWING) FOR EACH customers.customer_id "
                "AS OF :prediction_time RETURN QUANTILES (0.10, 0.50, 0.90)")
     assert pq.ret.kind == "QUANTILES"
     assert pq.ret.quantiles == (0.10, 0.50, 0.90)
@@ -258,7 +270,8 @@ def test_return_specs():
 
 def test_as_of_variants():
     pq = parse("EXPLAIN CONTEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) "
-               "FOR customers.customer_id = 'C7' AS OF 2026-07-01")
+               "FOR EACH customers.customer_id WHERE customers.customer_id = 'C7' "
+               "AS OF 2026-07-01")
     assert pq.as_of == AsOf("date", "2026-07-01")
 
 

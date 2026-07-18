@@ -96,7 +96,7 @@ pub struct ExecutionInput {
     pub per_entity_anchor: bool,
     /// decouple context "now"
     pub context_anchor_time: Option<DateTime<Utc>>,
-    /// overrides FOR ... IN (...)
+    /// pins the FOR EACH cohort to these ids
     pub entity_ids: Option<Vec<EntityId>>,
     /// `AS OF :param` bindings (name -> timestamp). Consulted when the query's
     /// `AS OF` clause names a `:param`; empty by default.
@@ -678,14 +678,11 @@ impl Engine {
         if let Some(ids) = &input.entity_ids {
             return Ok(ids.clone());
         }
-        if !pq.entity_ids.is_empty() {
-            return Ok(pq.entity_ids.iter().map(literal_to_entity_id).collect());
-        }
         let ids = self.sampler().all_ids(&pq.entity_key.table);
         ids.ok_or_else(|| {
             Error::Execution(ExecutionError(format!(
-                "FOR EACH over all {:?} entities needs either explicit entity_ids, a pinned \
-                 FOR ... IN (...) selector, or a TableScanner wired for the entity table \
+                "FOR EACH over all {:?} entities needs either explicit entity_ids on the \
+                 execution input, or a TableScanner wired for the entity table \
                  (retrievers alone cannot enumerate a table)",
                 pq.entity_key.table
             )))
@@ -1136,17 +1133,12 @@ impl Engine {
         }
     }
 
-    fn render_selector(&self, pq: &ParsedQuery, input: &ExecutionInput) -> String {
+    fn render_selector(&self, _pq: &ParsedQuery, input: &ExecutionInput) -> String {
         if let Some(ids) = &input.entity_ids {
             let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
             return format!("IN ({})", list.join(", "));
         }
-        if pq.entity_ids.is_empty() {
-            "FOR EACH".to_string()
-        } else {
-            let list: Vec<String> = pq.entity_ids.iter().map(render_lit).collect();
-            format!("IN ({})", list.join(", "))
-        }
+        "FOR EACH".to_string()
     }
 
     fn collect_windows(&self, pq: &ParsedQuery) -> Vec<WindowInfo> {
@@ -1462,18 +1454,6 @@ fn json_num(v: f64) -> String {
         "\"+inf\"".to_string()
     } else {
         "\"-inf\"".to_string()
-    }
-}
-
-fn literal_to_entity_id(l: &crate::pql::ast::Literal) -> EntityId {
-    use crate::pql::ast::Literal;
-    match l {
-        Literal::Num(n) if n.fract() == 0.0 => EntityId::Int(*n as i64),
-        Literal::Num(n) => EntityId::Str(format!("{}", n)),
-        Literal::Str(s) => EntityId::Str(s.clone()),
-        Literal::Bool(b) => EntityId::Str(if *b { "true".into() } else { "false".into() }),
-        Literal::Date(d) => EntityId::Str(d.to_rfc3339()),
-        Literal::Null => EntityId::Str(String::new()),
     }
 }
 

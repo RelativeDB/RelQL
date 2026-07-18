@@ -217,7 +217,7 @@ fn for_each_without_scanner_raises() {
         .is_err());
     // but a pinned id works
     let res = eng
-        .execute(ExecutionInput::query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR customers.customer_id = 'C7'").anchor_time(t0()))
+        .execute(ExecutionInput::query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id").entity_ids(vec![EntityId::from("C7")]).anchor_time(t0()))
         .unwrap();
     assert_eq!(res.predictions.len(), 1);
 }
@@ -228,20 +228,23 @@ fn for_each_without_scanner_raises() {
 
 fn run_c7(pql: &str) -> EntityPrediction {
     let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
-    let res = eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap();
+    let res = eng
+        .execute(ExecutionInput::query(pql).entity_ids(vec![EntityId::from("C7")]).anchor_time(t0()))
+        .unwrap();
     assert_eq!(res.predictions.len(), 1);
     res.predictions.into_iter().next().unwrap()
 }
 
 fn run_c7_err(pql: &str) -> relativedb::Error {
     let mut eng = Engine::new(churn_schema(), churn_wiring()).model_backend(Box::new(StubBackend));
-    eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap_err()
+    eng.execute(ExecutionInput::query(pql).entity_ids(vec![EntityId::from("C7")]).anchor_time(t0()))
+        .unwrap_err()
 }
 
 #[test]
 fn return_class_sets_predicted_class() {
     let p = run_c7(
-        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN CLASS",
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id RETURN CLASS",
     );
     let cls = p.predicted_class.expect("predicted_class set");
     assert!(cls == "true" || cls == "false", "hard label, got {:?}", cls);
@@ -250,7 +253,7 @@ fn return_class_sets_predicted_class() {
 #[test]
 fn return_distribution_two_entries_sum_one() {
     let p = run_c7(
-        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN DISTRIBUTION",
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id RETURN DISTRIBUTION",
     );
     assert_eq!(p.class_probs.len(), 2);
     let keys: std::collections::HashSet<&str> =
@@ -264,7 +267,7 @@ fn return_distribution_two_entries_sum_one() {
 fn return_quantiles_execution_unsupported() {
     // A single-head point model exposes no quantile distribution: execution errors.
     let err = run_c7_err(
-        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.5, 0.9)",
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id RETURN QUANTILES (0.1, 0.5, 0.9)",
     );
     let msg = format!("{}", err).to_lowercase();
     assert!(msg.contains("quantiles"), "expected unsupported error, got: {}", err);
@@ -273,7 +276,7 @@ fn return_quantiles_execution_unsupported() {
 #[test]
 fn return_interval_execution_unsupported() {
     let err = run_c7_err(
-        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN INTERVAL 80%",
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id RETURN INTERVAL 80%",
     );
     let msg = format!("{}", err).to_lowercase();
     assert!(msg.contains("interval"), "expected unsupported error, got: {}", err);
@@ -283,7 +286,7 @@ fn return_interval_execution_unsupported() {
 fn return_default_unchanged() {
     // No RETURN: binary target still reports probability, nothing else.
     let p = run_c7(
-        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7'",
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id",
     );
     assert!(p.probability.is_some());
     assert!(p.predicted_class.is_none());
@@ -295,7 +298,7 @@ fn return_default_unchanged() {
 #[test]
 fn return_quantiles_on_boolean_target_rejected() {
     let pq = relativedb::parse(
-        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN QUANTILES (0.5)",
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id RETURN QUANTILES (0.5)",
     )
     .unwrap();
     assert!(relativedb::validate(&pq, &churn_schema()).is_err());
@@ -304,7 +307,7 @@ fn return_quantiles_on_boolean_target_rejected() {
 #[test]
 fn return_probability_on_regression_target_rejected() {
     let pq = relativedb::parse(
-        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN PROBABILITY",
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id RETURN PROBABILITY",
     )
     .unwrap();
     assert!(relativedb::validate(&pq, &churn_schema()).is_err());

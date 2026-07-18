@@ -178,7 +178,6 @@ def _query_from_json(o: dict, text: str) -> ParsedQuery:
     return ParsedQuery(
         target=_expr(o["target"]),
         entity_key=ColumnRef(ek["table"], ek["column"]),
-        entity_ids=tuple(_lit(v) for v in o.get("entity_ids", ())),
         where=_expr(o.get("where")),
         assuming=_expr(o.get("assuming")),
         rank=RankKind[o["rank"]] if o.get("rank") else None,

@@ -28,8 +28,9 @@ Every query runs through the same four stages, in every language:
 - **Query** — a RelQL string. See the [RelQL docs](/pql/).
 - **Anchor time** — the "as of" instant t₀. Context may only contain data at
   or before it; the prediction concerns the window after it.
-- **Entities** — an explicit ID list, or `FOR EACH` over the whole table
-  (enumerated via a `TableScanner`).
+- **Entities** — `FOR EACH` over a table, either enumerated whole (via a
+  `TableScanner`) or narrowed to an explicit ID list supplied on the execution
+  input.
 
 ## The schema carries shape only
 

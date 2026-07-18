@@ -532,16 +532,6 @@ fn expr(o: &Json) -> Result<TargetExpr, SyntaxError> {
 fn query_from_json(o: &Json, text: &str) -> Result<ParsedQuery, SyntaxError> {
     let target = expr(o.get("target").ok_or_else(|| syn("query missing target"))?)?;
     let entity_key = column_ref(o.get("entity_key").ok_or_else(|| syn("query missing entity_key"))?)?;
-    let entity_ids = match o.get("entity_ids") {
-        Some(Json::Arr(items)) => {
-            let mut v = Vec::with_capacity(items.len());
-            for it in items {
-                v.push(lit(it)?);
-            }
-            v
-        }
-        _ => Vec::new(),
-    };
     let where_ = opt_expr(o.get("where"))?;
     let assuming = opt_expr(o.get("assuming"))?;
     let rank = match o.get("rank") {
@@ -608,7 +598,6 @@ fn query_from_json(o: &Json, text: &str) -> Result<ParsedQuery, SyntaxError> {
     Ok(ParsedQuery {
         target,
         entity_key,
-        entity_ids,
         where_,
         assuming,
         rank,

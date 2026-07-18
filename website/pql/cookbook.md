@@ -49,14 +49,21 @@ per day.
 
 ## Specific entities
 
+`FOR EACH` is the only entity clause; narrow to specific ids with a `WHERE`
+predicate on the primary key (or pass `entity_ids` at execution time):
+
 ```sql
-PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id IN (42, 123)
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
+FOR EACH users.user_id
+WHERE users.user_id IN (42, 123)
 ```
 
 ## Counterfactual
 
 ```sql
-PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id = 42
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
+FOR EACH users.user_id
+WHERE users.user_id = 42
 ASSUMING users.plan = 'premium'
 ```
 
@@ -84,7 +91,8 @@ WHERE customers.location NOT IN ('ALASKA', 'HAWAII')
 
 ```sql
 PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING)
-FOR customers.customer_id IN ('C7', 'C9')
+FOR EACH customers.customer_id
+WHERE customers.customer_id IN ('C7', 'C9')
 AS OF :prediction_time
 RETURN QUANTILES (0.10, 0.50, 0.90)
 ```

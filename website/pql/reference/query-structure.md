@@ -36,9 +36,10 @@ multi-horizon window *implies* [forecasting](task-types). See
   richer expression (arithmetic, `CASE WHEN … END`, `COALESCE`, column-to-column
   comparison), optionally compared to a literal. `CLASSIFY` and `RANK TOP k`
   are target directives (see [task types](task-types)).
-- **`FOR EACH table.pk`** — predict for every entity (requires a
-  `TableScanner`). `FOR table.pk = <lit>` / `IN (...)` selects explicit
-  entities.
+- **`FOR EACH table.pk`** — the sole entity clause: names the population by its
+  primary key. Enumerating every entity requires a `TableScanner`; to score a
+  specific subset, constrain the key in `WHERE` (`WHERE table.pk IN (...)`) or
+  pass the concrete ids at execution time (the `entity_ids` execution input).
 - **`WHERE <condition>`** — filters the population using static attributes
   and past-facing aggregations. See [Conditions](conditions).
 - **`ASSUMING <condition>`** — a counterfactual assumption, parsed and

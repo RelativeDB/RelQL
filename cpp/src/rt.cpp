@@ -1,7 +1,5 @@
 #include "rt.hpp"
 
-#include <Accelerate/Accelerate.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -15,6 +13,14 @@
 #include <stdexcept>
 #include <thread>
 
+#include "rt_internal.hpp"
+#include "rt_math.hpp"
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#define RT_SDOT 1
+#include <arm_neon.h>
+#endif
+
 namespace rt {
 
 // ---------------------------------------------------------------------------
@@ -27,18 +33,6 @@ namespace {
 inline float bf16_to_f32(uint16_t v) {
   uint32_t u = static_cast<uint32_t>(v) << 16;
   float f;
-  std::memcpy(&f, &u, 4);
-  return f;
-}
-
-// Round fp32 to bf16 (round-to-nearest-even) and back — used to mirror the
-// Python side's `.bfloat16()` cast of kv counts.
-inline float bf16_round(float f) {
-  uint32_t u;
-  std::memcpy(&u, &f, 4);
-  uint32_t lsb = (u >> 16) & 1;
-  u += 0x7fffu + lsb;
-  u &= 0xffff0000u;
   std::memcpy(&f, &u, 4);
   return f;
 }
@@ -114,20 +108,63 @@ std::unordered_map<std::string, Tensor> load_safetensors(const std::string& path
   auto entries = parse_header(header);
   int64_t data_start = 8 + static_cast<int64_t>(hlen);
 
+  // Scale companions produced by rt_quantize ("<name>.q_scale" for Q8,
+  // "<name>.q4_scale" for Q4) are attached to their base tensor below, not
+  // surfaced as tensors of their own.
+  auto is_scale_companion = [&](const std::string& name) {
+    for (const char* suf : {".q_scale", ".q4_scale"}) {
+      size_t len = std::strlen(suf);
+      if (name.size() > len &&
+          name.compare(name.size() - len, len, suf) == 0 &&
+          entries.count(name.substr(0, name.size() - len)))
+        return true;
+    }
+    return false;
+  };
+  auto read_raw = [&](const HeaderEntry& e, std::vector<uint8_t>& dst) {
+    dst.resize((size_t)(e.end - e.begin));
+    f.seekg(data_start + e.begin);
+    f.read(reinterpret_cast<char*>(dst.data()), (std::streamsize)dst.size());
+  };
+
   std::unordered_map<std::string, Tensor> out;
   std::vector<uint16_t> tmp;
   for (auto& [name, e] : entries) {
+    if (is_scale_companion(name)) continue;
     Tensor t;
     t.shape = e.shape;
     int64_t n = t.numel();
-    t.data.resize(n);
     f.seekg(data_start + e.begin);
     if (e.dtype == "BF16") {
+      t.data.resize(n);
       tmp.resize(n);
       f.read(reinterpret_cast<char*>(tmp.data()), n * 2);
       for (int64_t i = 0; i < n; i++) t.data[i] = bf16_to_f32(tmp[i]);
     } else if (e.dtype == "F32") {
+      t.data.resize(n);
       f.read(reinterpret_cast<char*>(t.data.data()), n * 4);
+    } else if (e.dtype == "F16") {
+      // kept quantized-resident; compute paths dequantize in-kernel
+      t.qtype = (uint8_t)WType::F16;
+      read_raw(e, t.qdata);
+    } else if (e.dtype == "I8") {
+      auto sit = entries.find(name + ".q_scale");
+      if (sit == entries.end() || sit->second.dtype != "F32")
+        throw std::runtime_error("I8 tensor " + name + " missing .q_scale");
+      t.qtype = (uint8_t)WType::Q8;
+      read_raw(e, t.qdata);
+      read_raw(sit->second, t.qscale);
+    } else if (e.dtype == "U8") {
+      // Q4: packed nibbles, stored shape [out, in/2]; logical [out, in]
+      auto sit = entries.find(name + ".q4_scale");
+      if (sit == entries.end() || sit->second.dtype != "F16")
+        throw std::runtime_error("U8 tensor " + name + " missing .q4_scale");
+      t.qtype = (uint8_t)WType::Q4;
+      if (t.shape.size() != 2)
+        throw std::runtime_error("Q4 tensor " + name + " must be 2-D");
+      t.shape[1] *= 2;
+      read_raw(e, t.qdata);
+      read_raw(sit->second, t.qscale);
     } else {
       throw std::runtime_error("unsupported dtype " + e.dtype + " for " + name);
     }
@@ -153,11 +190,28 @@ Model Model::load(const std::string& path) {
   auto lin = [&](const std::string& p, bool bias) {
     Linear l;
     Tensor& w = T(p + ".weight");
+    if (w.qtype != (uint8_t)WType::F32)
+      throw std::runtime_error(p + ".weight must be fp32 (encoders/decoders "
+                               "are never quantized)");
     l.w = w.data.data();
     l.out = static_cast<int>(w.shape[0]);
     l.in = static_cast<int>(w.shape[1]);
     if (bias) l.b = T(p + ".bias").data.data();
     return l;
+  };
+  auto weight = [&](const std::string& p) {
+    Tensor& w = T(p + ".weight");
+    Weight ww;
+    ww.type = (WType)w.qtype;
+    ww.out = static_cast<int>(w.shape[0]);
+    ww.in = static_cast<int>(w.shape[1]);
+    if (ww.type == WType::F32) {
+      ww.f32 = w.data.data();
+    } else {
+      ww.q = w.qdata.data();
+      ww.qs = w.qscale.empty() ? nullptr : w.qscale.data();
+    }
+    return ww;
   };
   for (int t = 0; t < 4; t++) {
     m.enc[t] = lin(std::string("enc_dict.") + kSem[t], true);
@@ -173,24 +227,46 @@ Model Model::load(const std::string& path) {
       std::string ap = pre + "attns." + kAttnName[a] + ".";
       Attn& at = blk.attn[a];
       // stack wq/wk/wv/wg along the output dim so the four projections run as
-      // one GEMM; y row layout = [q | k | v | g], row stride 4*d
-      at.wqkvg.resize((size_t)4 * kDModel * kDModel);
+      // one GEMM; y row layout = [q | k | v | g], row stride 4*d. Rows are
+      // independent in every payload format, so stacking is concatenation.
       const char* names[4] = {"wq", "wk", "wv", "wg"};
-      for (int p = 0; p < 4; p++) {
-        Linear l = lin(ap + names[p], false);
-        std::memcpy(&at.wqkvg[(size_t)p * kDModel * kDModel], l.w,
-                    (size_t)kDModel * kDModel * 4);
+      Weight parts[4];
+      for (int p = 0; p < 4; p++) parts[p] = weight(ap + names[p]);
+      const WType wt = parts[0].type;
+      for (int p = 1; p < 4; p++)
+        if (parts[p].type != wt)
+          throw std::runtime_error(ap + ": mixed weight dtypes in qkvg");
+      at.wqkvg.type = wt;
+      at.wqkvg.out = 4 * kDModel;
+      at.wqkvg.in = kDModel;
+      if (wt == WType::F32) {
+        at.wqkvg_f32.resize((size_t)4 * kDModel * kDModel);
+        for (int p = 0; p < 4; p++)
+          std::memcpy(&at.wqkvg_f32[(size_t)p * kDModel * kDModel],
+                      parts[p].f32, (size_t)kDModel * kDModel * 4);
+        at.wqkvg.f32 = at.wqkvg_f32.data();
+      } else {
+        const size_t rb = row_bytes(wt, kDModel) * kDModel;   // per matrix
+        const size_t sb = scale_bytes(wt, kDModel) * kDModel;
+        at.wqkvg_q.resize(4 * rb);
+        at.wqkvg_s.resize(4 * sb);
+        for (int p = 0; p < 4; p++) {
+          std::memcpy(&at.wqkvg_q[p * rb], parts[p].q, rb);
+          if (sb) std::memcpy(&at.wqkvg_s[p * sb], parts[p].qs, sb);
+        }
+        at.wqkvg.q = at.wqkvg_q.data();
+        at.wqkvg.qs = sb ? at.wqkvg_s.data() : nullptr;
       }
-      at.wo = lin(ap + "wo", false);
+      at.wo = weight(ap + "wo");
       at.q_norm = T(ap + "q_norm.scale").data.data();
       at.k_norm = T(ap + "k_norm.scale").data.data();
       at.head_scale = T(ap + "scale").data.data();  // [1,8,1,1] contiguous
       blk.norm[a] = T(pre + "norms." + kAttnName[a] + ".scale").data.data();
     }
     blk.norm[3] = T(pre + "norms.ffn.scale").data.data();
-    blk.w1 = lin(pre + "ffn.w1", false);
-    blk.w2 = lin(pre + "ffn.w2", false);
-    blk.w3 = lin(pre + "ffn.w3", false);
+    blk.w1 = weight(pre + "ffn.w1");
+    blk.w2 = weight(pre + "ffn.w2");
+    blk.w3 = weight(pre + "ffn.w3");
   }
   m.norm_out = T("norm_out.scale").data.data();
   m.dec_number = lin("dec_dict.number", true);
@@ -202,48 +278,9 @@ Model Model::load(const std::string& path) {
 // ---------------------------------------------------------------------------
 namespace {
 
-// y[rows,out] = x[rows,in] @ W^T (+ b). Row-major, Accelerate sgemm.
-void matmul(const float* x, const Linear& l, float* y, int rows) {
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, rows, l.out, l.in, 1.0f,
-              x, l.in, l.w, l.in, 0.0f, y, l.out);
-  if (l.b) {
-    for (int r = 0; r < rows; r++)
-      vDSP_vadd(y + (size_t)r * l.out, 1, l.b, 1, y + (size_t)r * l.out, 1, l.out);
-  }
-}
-
-// out = rmsnorm(x) * scale, fp32, row of length n.
-inline void rmsnorm(const float* x, const float* scale, float* out, int n) {
-  float ss = 0.f;
-  for (int i = 0; i < n; i++) ss += x[i] * x[i];
-  float inv = 1.0f / std::sqrt(ss / n + kEps);
-  for (int i = 0; i < n; i++) out[i] = x[i] * inv * scale[i];
-}
-
-inline float sigmoidf(float v) { return 1.0f / (1.0f + std::exp(-v)); }
-
-// Query-groups for masked attention: every query in a group attends to the
-// same key list, so scores/output are computed as small per-head GEMMs over
-// query tiles instead of streaming key-by-key per query.
-struct Groups {
-  std::vector<int> q;            // flattened query idxs (sorted positions)
-  std::vector<int> qoff{0};      // per group
-  std::vector<int> k;            // flattened key idxs (shared by the group)
-  std::vector<int> koff{0};
-  int n() const { return (int)qoff.size() - 1; }
-  void add(const std::vector<int>& qs, const std::vector<int>& ks) {
-    q.insert(q.end(), qs.begin(), qs.end());
-    k.insert(k.end(), ks.begin(), ks.end());
-    qoff.push_back((int)q.size());
-    koff.push_back((int)k.size());
-  }
-};
-
-constexpr int kQTile = 64;       // queries per attention work item
-
 struct Scratch {                 // per-worker attention buffers, reused
   std::vector<float> qb, kb, vb, sc, ob, tmp;
-  float denom[kQTile];
+  float denom[detail::kQTile];
 };
 
 // Persistent thread pool: workers park on a condition variable between jobs
@@ -326,16 +363,156 @@ class Pool {
   bool stop_ = false;
 };
 
+// y[rows,out] = x[rows,in] @ W^T (+ b). Accelerate sgemm is internally
+// threaded; the portable GEMM is parallelized here over row chunks.
+void matmul(const float* x, const Linear& l, float* y, int rows) {
+#if RT_ACCELERATE
+  math::gemm_nt(x, l.w, y, rows, l.out, l.in, l.in, l.in, l.out);
+#else
+  constexpr int kChunk = 32;
+  int chunks = (rows + kChunk - 1) / kChunk;
+  Pool::get().run(Pool::get().size(), chunks, [&](int, int c) {
+    int r0 = c * kChunk, r1 = std::min(r0 + kChunk, rows);
+    math::gemm_nt(x + (size_t)r0 * l.in, l.w, y + (size_t)r0 * l.out, r1 - r0,
+                  l.out, l.in, l.in, l.in, l.out);
+  });
+#endif
+  if (l.b) {
+    for (int r = 0; r < rows; r++)
+      math::vadd(y + (size_t)r * l.out, l.b, y + (size_t)r * l.out, l.out);
+  }
+}
+
+#ifdef RT_SDOT
+// True int8 throughput for Q8 weights: activations are quantized per row
+// (absmax/127, like llama.cpp's Q8_0 activations), then y = (sx*sw) *
+// (xq . wq) with the int8 dot products running on the NEON sdot units
+// (vdotq_s32: 16 MACs/instruction). Weight rows stream from DRAM as int8 —
+// half the traffic of the fp16 path, a quarter of fp32 — and the fp32
+// weights never exist at all. Loop order keeps a 4-row weight strip in L1
+// across a 16-row activation block.
+void matmul_q8_sdot(const float* x, const Weight& w, float* y, int rows) {
+  const int K = w.in;                       // 512/2048: multiples of 16
+  std::vector<int8_t> xq((size_t)rows * K);
+  std::vector<float> sx(rows);
+  Pool::get().run(Pool::get().size(), rows, [&](int, int r) {
+    const float* xr = x + (size_t)r * K;
+    float amax = 0.f;
+    for (int k = 0; k < K; k++) amax = std::max(amax, std::fabs(xr[k]));
+    const float s = amax > 0.f ? amax / 127.f : 1.f;
+    sx[r] = s;
+    const float inv = 1.f / s;
+    int8_t* q = &xq[(size_t)r * K];
+    for (int k = 0; k < K; k++) q[k] = (int8_t)lrintf(xr[k] * inv);
+  });
+  const float* sw = reinterpret_cast<const float*>(w.qs);
+  const int8_t* wq = reinterpret_cast<const int8_t*>(w.q);
+  constexpr int kNTile = 32, kRBlk = 16;
+  const int tiles = (w.out + kNTile - 1) / kNTile;
+  Pool::get().run(Pool::get().size(), tiles, [&](int, int t) {
+    const int n0 = t * kNTile, n1 = std::min(n0 + kNTile, w.out);
+    for (int r0 = 0; r0 < rows; r0 += kRBlk) {
+      const int r1 = std::min(r0 + kRBlk, rows);
+      for (int n = n0; n < n1; n += 4) {
+        const int8_t* w0 = wq + (size_t)n * K;
+        const int8_t* w1 = w0 + K;
+        const int8_t* w2 = w1 + K;
+        const int8_t* w3 = w2 + K;
+        for (int r = r0; r < r1; r++) {
+          const int8_t* xr = &xq[(size_t)r * K];
+          int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0;
+          for (int k = 0; k < K; k += 16) {
+            int8x16_t xv = vld1q_s8(xr + k);
+            a0 = vdotq_s32(a0, xv, vld1q_s8(w0 + k));
+            a1 = vdotq_s32(a1, xv, vld1q_s8(w1 + k));
+            a2 = vdotq_s32(a2, xv, vld1q_s8(w2 + k));
+            a3 = vdotq_s32(a3, xv, vld1q_s8(w3 + k));
+          }
+          float* yr = y + (size_t)r * w.out + n;
+          const float sr = sx[r];
+          yr[0] = sr * sw[n] * (float)vaddvq_s32(a0);
+          yr[1] = sr * sw[n + 1] * (float)vaddvq_s32(a1);
+          yr[2] = sr * sw[n + 2] * (float)vaddvq_s32(a2);
+          yr[3] = sr * sw[n + 3] * (float)vaddvq_s32(a3);
+        }
+      }
+    }
+  });
+}
+#endif
+
+// y[rows,out] = x[rows,in] @ W^T for a quantization-aware Weight.
+// F32 delegates to the plain GEMM. Q8 on ARM runs the int8 sdot kernel
+// (int8 activations x int8 weights). Other quantized types stay resident:
+// each worker dequantizes a 64-output-row tile of W into a per-thread fp32
+// scratch (hot in L1/L2) and runs the GEMM for that column stripe of y —
+// DRAM weight traffic is the quantized payload, the fp32 tile never leaves
+// cache. Tiles are independent, so they parallelize on the pool.
+void matmul_w(const float* x, const Weight& w, float* y, int rows) {
+  if (w.type == WType::F32) {
+    Linear l{w.f32, nullptr, w.out, w.in};
+    matmul(x, l, y, rows);
+    return;
+  }
+#ifdef RT_SDOT
+  if (w.type == WType::Q8 && w.out % 4 == 0 && w.in % 16 == 0) {
+    matmul_q8_sdot(x, w, y, rows);
+    return;
+  }
+#endif
+  constexpr int kTile = 64;
+  const int tiles = (w.out + kTile - 1) / kTile;
+  const size_t rb = row_bytes(w.type, w.in);
+  const size_t sb = scale_bytes(w.type, w.in);
+  Pool::get().run(Pool::get().size(), tiles, [&](int, int t) {
+    thread_local std::vector<float> scratch;
+    if (scratch.size() < (size_t)kTile * w.in)
+      scratch.resize((size_t)kTile * w.in);
+    const int n0 = t * kTile, n1 = std::min(n0 + kTile, w.out);
+    for (int n = n0; n < n1; n++) {
+      float* dst = &scratch[(size_t)(n - n0) * w.in];
+      const uint8_t* q = w.q + (size_t)n * rb;
+      switch (w.type) {
+        case WType::F16: dequant_row_f16(q, dst, w.in); break;
+        case WType::Q8: dequant_row_q8(q, w.qs + (size_t)n * sb, dst, w.in); break;
+        default: dequant_row_q4(q, w.qs + (size_t)n * sb, dst, w.in); break;
+      }
+    }
+    math::gemm_nt(x, scratch.data(), y + n0, rows, n1 - n0, w.in, w.in, w.in,
+                  w.out);
+  });
+}
+
+// out = rmsnorm(x) * scale, fp32, row of length n.
+inline void rmsnorm(const float* x, const float* scale, float* out, int n) {
+  float ss = 0.f;
+  for (int i = 0; i < n; i++) ss += x[i] * x[i];
+  float inv = 1.0f / std::sqrt(ss / n + kEps);
+  for (int i = 0; i < n; i++) out[i] = x[i] * inv * scale[i];
+}
+
 }  // namespace
 
+namespace detail {
+
+float bf16_round(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  uint32_t lsb = (u >> 16) & 1;
+  u += 0x7fffu + lsb;
+  u &= 0xffff0000u;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
 // ---------------------------------------------------------------------------
-// forward
+// batch preparation (device-independent, always on CPU)
 // ---------------------------------------------------------------------------
-Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_taps) {
+Prepared prepare(const Model& m, const Batch& batch, Output& out,
+                 bool debug_taps) {
   const int B = batch.B, S = batch.S, D = kDModel;
-  if (n_threads <= 0)
-    n_threads = std::max(1u, std::thread::hardware_concurrency());
-  Output out;
+  Prepared prep;
+  prep.B = B; prep.S = S;
   out.B = B; out.S = S;
   out.sort_idxs.resize((size_t)B * S);
   out.sorted_is_target.resize((size_t)B * S);
@@ -345,7 +522,9 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
   std::vector<int64_t> node((size_t)B * S), colid((size_t)B * S), tabid((size_t)B * S),
       sem((size_t)B * S);
   std::vector<int64_t> f2p((size_t)B * S * kMaxF2p);
-  std::vector<uint8_t> pad((size_t)B * S), tgt((size_t)B * S);
+  std::vector<uint8_t> tgt((size_t)B * S);
+  std::vector<uint8_t>& pad = prep.pad;
+  pad.resize((size_t)B * S);
   std::vector<float> numv((size_t)B * S), datv((size_t)B * S), boolv((size_t)B * S);
   std::vector<float> textv((size_t)B * S * kDText), colv((size_t)B * S * kDText);
   for (int b = 0; b < B; b++) {
@@ -381,7 +560,10 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
   // ---- build query-groups for the three attention types -------------------
   // (queries sharing a key list are grouped so attention runs as GEMMs;
   //  every non-pad token lands in exactly one group per type)
-  std::vector<Groups> g_col(B), g_feat(B), g_nbr(B);
+  prep.g_col.resize(B); prep.g_feat.resize(B); prep.g_nbr.resize(B);
+  std::vector<Groups>& g_col = prep.g_col;
+  std::vector<Groups>& g_feat = prep.g_feat;
+  std::vector<Groups>& g_nbr = prep.g_nbr;
   for (int b = 0; b < B; b++) {
     const size_t base = (size_t)b * S;
     std::unordered_map<int64_t, std::vector<int>> by_coltab, by_node, nbr_of;
@@ -441,22 +623,26 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
   }
 
   // ---- attention work items: (batch row, group, query tile) ---------------
-  struct Work { int b, g, q0, q1; };
-  auto tiles = [&](const std::vector<Groups>& gs) {
-    std::vector<Work> w;
+  auto tiles = [&](const std::vector<Groups>& gs, std::vector<Work>& w) {
     for (int b = 0; b < B; b++)
       for (int gi = 0; gi < gs[b].n(); gi++) {
         int nq = gs[b].qoff[gi + 1] - gs[b].qoff[gi];
+        int nk = gs[b].koff[gi + 1] - gs[b].koff[gi];
+        // log(clamp_min(bf16(count),1)) — mirrors kv_sizes.bfloat16() upstream
+        float logkv = std::log(std::max(bf16_round((float)nk), 1.0f));
         for (int q0 = 0; q0 < nq; q0 += kQTile)
-          w.push_back({b, gi, q0, std::min(q0 + kQTile, nq)});
+          w.push_back({b, gi, q0, std::min(q0 + kQTile, nq), logkv});
       }
-    return w;
   };
-  const std::vector<Work> work[3] = {tiles(g_col), tiles(g_feat), tiles(g_nbr)};
+  tiles(g_col, prep.work[0]);
+  tiles(g_feat, prep.work[1]);
+  tiles(g_nbr, prep.work[2]);
 
   // ---- embeddings ---------------------------------------------------------
   const size_t BS = (size_t)B * S;
-  std::vector<float> x(BS * D, 0.f), tmp(BS * D);
+  prep.x.assign(BS * D, 0.f);
+  std::vector<float>& x = prep.x;
+  std::vector<float> tmp(BS * D);
   // col-name embedding for every non-pad token
   matmul(colv.data(), m.enc_col_name, tmp.data(), (int)BS);
   for (size_t i = 0; i < BS; i++) {
@@ -483,15 +669,27 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
       if (pad[i] || sem[i] != t) continue;
       if (!tgt[i]) {
         rmsnorm(&tmp[i * D], m.norm_enc[t], row, D);
-        vDSP_vadd(&x[i * D], 1, row, 1, &x[i * D], 1, D);
+        math::vadd(&x[i * D], row, &x[i * D], D);
       } else {
-        vDSP_vadd(&x[i * D], 1, m.mask_emb[t], 1, &x[i * D], 1, D);
+        math::vadd(&x[i * D], m.mask_emb[t], &x[i * D], D);
       }
     }
   }
   if (debug_taps) out.x_embed = x;
+  return prep;
+}
 
-  // ---- transformer blocks -------------------------------------------------
+// ---------------------------------------------------------------------------
+// CPU backend: transformer blocks + output head
+// ---------------------------------------------------------------------------
+void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
+                    bool debug_taps) {
+  const int B = prep.B, S = prep.S, D = kDModel;
+  if (n_threads <= 0)
+    n_threads = std::max(1u, std::thread::hardware_concurrency());
+  const size_t BS = (size_t)B * S;
+  std::vector<float>& x = prep.x;
+
   constexpr int C4 = 4 * kDModel;      // qkvg row stride; q|k|v|g at 0,D,2D,3D
   std::vector<float> xn(BS * D), qkvg(BS * (size_t)C4), att(BS * D), proj(BS * D);
   std::vector<float> ffa(BS * kDFF), ffb(BS * kDFF);
@@ -506,12 +704,11 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
     const Block& blk = m.blocks[blk_i];
     for (int a = 0; a < 3; a++) {
       const Attn& at = blk.attn[a];
-      const auto& gs = a == 0 ? g_col : a == 1 ? g_feat : g_nbr;
-      const auto& wl = work[a];
+      const auto& gs = a == 0 ? prep.g_col : a == 1 ? prep.g_feat : prep.g_nbr;
+      const auto& wl = prep.work[a];
       // pre-norm
       for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], blk.norm[a], &xn[i * D], D);
-      Linear fused{at.wqkvg.data(), nullptr, C4, D};
-      matmul(xn.data(), fused, qkvg.data(), (int)BS);
+      matmul_w(xn.data(), at.wqkvg, qkvg.data(), (int)BS);
       // K-norm depends only on the key token — apply once per (token, head)
       // instead of per (query, key) pair inside the attention loop.
       parallel_for((int)BS, [&](int, int i) {
@@ -544,8 +741,7 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
           sp.qb.resize((size_t)kQTile * D);
           sp.ob.resize((size_t)kQTile * D);
         }
-        // log(clamp_min(bf16(count),1)) — mirrors kv_sizes.bfloat16() upstream
-        const float logkv = std::log(std::max(bf16_round((float)nk), 1.0f));
+        const float logkv = W.logkv;
         for (int j = 0; j < nk; j++) {        // gather K/V rows (K pre-normed)
           const float* src = &qkvg[(rb + ks[j]) * C4];
           std::memcpy(&sp.kb[(size_t)j * D], src + D, D * 4);
@@ -562,26 +758,21 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
           }
         }
         for (int h = 0; h < kHeads; h++) {
-          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, tq, nk, kHeadDim,
-                      1.0f, sp.qb.data() + h * kHeadDim, D,
-                      sp.kb.data() + h * kHeadDim, D, 0.0f, sp.sc.data(), nk);
+          math::gemm_nt(sp.qb.data() + h * kHeadDim, sp.kb.data() + h * kHeadDim,
+                        sp.sc.data(), tq, nk, kHeadDim, D, D, nk);
           for (int r = 0; r < tq; r++) {      // stable two-pass softmax rows
             float* srow = &sp.sc[(size_t)r * nk];
-            float mx;
-            vDSP_maxv(srow, 1, &mx, nk);
-            mx = -mx;
-            vDSP_vsadd(srow, 1, &mx, srow, 1, nk);
-            int cnt = nk;
-            vvexpf(srow, srow, &cnt);
-            vDSP_sve(srow, 1, &sp.denom[r], nk);
+            float mx = math::maxv(srow, nk);
+            math::vsadd(srow, -mx, srow, nk);
+            math::vexp_inplace(srow, nk);
+            sp.denom[r] = math::sum(srow, nk);
           }
-          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, tq, kHeadDim,
-                      nk, 1.0f, sp.sc.data(), nk, sp.vb.data() + h * kHeadDim,
-                      D, 0.0f, sp.ob.data() + h * kHeadDim, D);
+          math::gemm_nn(sp.sc.data(), sp.vb.data() + h * kHeadDim,
+                        sp.ob.data() + h * kHeadDim, tq, kHeadDim, nk, nk, D, D);
           for (int r = 0; r < tq; r++) {      // normalize after the PV GEMM
             float inv = 1.0f / sp.denom[r];
-            vDSP_vsmul(&sp.ob[(size_t)r * D + h * kHeadDim], 1, &inv,
-                       &sp.ob[(size_t)r * D + h * kHeadDim], 1, kHeadDim);
+            math::vsmul(&sp.ob[(size_t)r * D + h * kHeadDim], inv,
+                        &sp.ob[(size_t)r * D + h * kHeadDim], kHeadDim);
           }
         }
         // gate = 2*sigmoid(wg(xn)) elementwise, applied on scatter:
@@ -592,50 +783,110 @@ Output forward(const Model& m, const Batch& batch, int n_threads, bool debug_tap
           const float* grow = &qkvg[i * C4 + 3 * D];
           const float* src = &sp.ob[(size_t)r * D];
           float* dst = &att[i * D];
-          int cnt = D;
-          float one = 1.0f, two = 2.0f;
-          vDSP_vneg(grow, 1, sp.tmp.data(), 1, D);
-          vvexpf(sp.tmp.data(), sp.tmp.data(), &cnt);
-          vDSP_vsadd(sp.tmp.data(), 1, &one, sp.tmp.data(), 1, D);
-          vDSP_vdiv(sp.tmp.data(), 1, src, 1, dst, 1, D);
-          vDSP_vsmul(dst, 1, &two, dst, 1, D);
+          math::vneg(grow, sp.tmp.data(), D);
+          math::vexp_inplace(sp.tmp.data(), D);
+          math::vsadd(sp.tmp.data(), 1.0f, sp.tmp.data(), D);
+          math::vdiv(src, sp.tmp.data(), dst, D);
+          math::vsmul(dst, 2.0f, dst, D);
         }
       });
-      matmul(att.data(), at.wo, proj.data(), (int)BS);
-      vDSP_vadd(x.data(), 1, proj.data(), 1, x.data(), 1, BS * D);
+      matmul_w(att.data(), at.wo, proj.data(), (int)BS);
+      math::vadd(x.data(), proj.data(), x.data(), BS * D);
     }
     // FFN: x += w2( silu(w1 xn) * w3 xn )
     for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], blk.norm[3], &xn[i * D], D);
-    matmul(xn.data(), blk.w1, ffa.data(), (int)BS);
-    matmul(xn.data(), blk.w3, ffb.data(), (int)BS);
+    matmul_w(xn.data(), blk.w1, ffa.data(), (int)BS);
+    matmul_w(xn.data(), blk.w3, ffb.data(), (int)BS);
     // silu(ffa) * ffb per row: silu(x) = x/(1+exp(-x))
     parallel_for((int)BS, [&](int w, int i) {
       Scratch& sp = scratch[w];
       if (sp.tmp.size() < (size_t)kDFF) sp.tmp.resize(kDFF);
       float* fa = &ffa[(size_t)i * kDFF];
-      int cnt = kDFF;
-      float one = 1.0f;
-      vDSP_vneg(fa, 1, sp.tmp.data(), 1, kDFF);
-      vvexpf(sp.tmp.data(), sp.tmp.data(), &cnt);
-      vDSP_vsadd(sp.tmp.data(), 1, &one, sp.tmp.data(), 1, kDFF);
-      vDSP_vdiv(sp.tmp.data(), 1, fa, 1, fa, 1, kDFF);
-      vDSP_vmul(fa, 1, &ffb[(size_t)i * kDFF], 1, fa, 1, kDFF);
+      math::vneg(fa, sp.tmp.data(), kDFF);
+      math::vexp_inplace(sp.tmp.data(), kDFF);
+      math::vsadd(sp.tmp.data(), 1.0f, sp.tmp.data(), kDFF);
+      math::vdiv(fa, sp.tmp.data(), fa, kDFF);
+      math::vmul(fa, &ffb[(size_t)i * kDFF], fa, kDFF);
     });
-    matmul(ffa.data(), blk.w2, proj.data(), (int)BS);
-    vDSP_vadd(x.data(), 1, proj.data(), 1, x.data(), 1, BS * D);
+    matmul_w(ffa.data(), blk.w2, proj.data(), (int)BS);
+    math::vadd(x.data(), proj.data(), x.data(), BS * D);
     if (blk_i == 0 && debug_taps) out.x_block0 = x;
   }
 
   // ---- output norm + number head -----------------------------------------
   for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], m.norm_out, &xn[i * D], D);
   for (size_t i = 0; i < BS; i++) {
-    float acc = m.dec_number.b[0];
-    const float* w = m.dec_number.w;
-    float dot = 0.f;
-    vDSP_dotpr(&xn[i * D], 1, w, 1, &dot, D);
-    out.yhat_number[i] = acc + dot;
+    out.yhat_number[i] =
+        m.dec_number.b[0] + math::dot(&xn[i * D], m.dec_number.w, D);
   }
-  return out;
+}
+
+}  // namespace detail
+
+// ---------------------------------------------------------------------------
+// public entry points / device dispatch
+// ---------------------------------------------------------------------------
+const char* device_name(Device d) {
+  switch (d) {
+    case Device::CPU: return "cpu";
+    case Device::MPS: return "mps";
+    case Device::CUDA: return "cuda";
+  }
+  return "?";
+}
+
+bool device_available(Device d) {
+  switch (d) {
+    case Device::CPU:
+      return true;
+    case Device::MPS:
+#ifdef RT_METAL
+      return detail::metal_available();
+#else
+      return false;
+#endif
+    case Device::CUDA:
+#ifdef RT_CUDA
+      return detail::cuda_available();
+#else
+      return false;
+#endif
+  }
+  return false;
+}
+
+Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
+  Output out;
+  detail::Prepared prep = detail::prepare(m, batch, out, opts.debug_taps);
+  switch (opts.device) {
+    case Device::CPU:
+      detail::run_blocks_cpu(m, prep, out, opts.n_threads, opts.debug_taps);
+      return out;
+    case Device::MPS:
+#ifdef RT_METAL
+      detail::run_blocks_metal(m, prep, out, opts.debug_taps);
+      return out;
+#else
+      break;
+#endif
+    case Device::CUDA:
+#ifdef RT_CUDA
+      detail::run_blocks_cuda(m, prep, out, opts.debug_taps);
+      return out;
+#else
+      break;
+#endif
+  }
+  throw std::runtime_error(std::string("rt: backend not compiled in: ") +
+                           device_name(opts.device));
+}
+
+Output forward(const Model& m, const Batch& batch, int n_threads,
+               bool debug_taps) {
+  ForwardOpts o;
+  o.n_threads = n_threads;
+  o.debug_taps = debug_taps;
+  return forward(m, batch, o);
 }
 
 }  // namespace rt

@@ -23,8 +23,8 @@ PREDICT COUNT(transaction.*) OVER (7 DAYS FOLLOWING) FOR EACH user.user_id WHERE
 PREDICT COUNT(session.*) OVER (7 DAYS FOLLOWING) > 10 OR SUM(transaction.value) OVER (5 DAYS FOLLOWING) > 100 FOR EACH user.user_id
 PREDICT LIST_DISTINCT(transactions.article_id WHERE articles.product_type_name = 'Trousers' AND transactions.price >= 50) OVER (90 DAYS FOLLOWING) FOR EACH user.user_id
 PREDICT SUM(usage.count) OVER (1 DAY FOLLOWING HORIZONS 28) FOR EACH accounts.account_id
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42 ASSUMING users.plan = 'premium'
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH users.user_id
+PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH users.user_id WHERE users.user_id = 42 ASSUMING users.plan = 'premium'
 PREDICT LAST(LOAN.STATUS) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH LOAN.id
 PREDICT LOAN.STATUS IN ('A', 'C') FOR EACH LOAN.id
 PREDICT ARTICLES.DESCRIPTION IS NULL FOR EACH ARTICLES.id
@@ -45,10 +45,10 @@ PREDICT LAST(payments.amount) OVER (90 DAYS FOLLOWING) == 0 FOR EACH order.order
 PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) FOR EACH stores.store_id AS OF :prediction_time RETURN EXPECTED VALUE
 PREDICT SUM(orders.revenue) OVER next_30_days - SUM(orders.cost) OVER next_30_days FOR EACH customers.customer_id WINDOW next_30_days AS (30 DAYS FOLLOWING)
 PREDICT SUM(sales.qty) OVER demand_projection FOR EACH stores.store_id WINDOW demand_projection AS (30 DAYS FOLLOWING HORIZONS 6 STEP 7 DAYS)
-PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) FOR customers.customer_id IN ('C7', 'C9') AS OF :prediction_time RETURN QUANTILES (0.10, 0.50, 0.90)
+PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) FOR EACH customers.customer_id AS OF :prediction_time RETURN QUANTILES (0.10, 0.50, 0.90)
 EXPLAIN PLAN FORMAT TEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id ABLATE TABLE support_tickets RETURN PROBABILITY
 PREDICT COALESCE(SUM(orders.revenue) OVER (30 DAYS FOLLOWING), 0) FOR EACH customers.customer_id RETURN EXPECTED VALUE
 PREDICT CASE WHEN COUNT(orders.*) OVER (30 DAYS FOLLOWING) > 10 THEN 1 ELSE 0 END FOR EACH customers.customer_id
-EXPLAIN CONTEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' AS OF 2026-07-01
+EXPLAIN CONTEXT PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id WHERE customers.customer_id = 'C7' AS OF 2026-07-01
 PREDICT SUM(payments.amount) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id AS OF :t RETURN INTERVAL 90%
 PREDICT GREATEST(SUM(orders.revenue) OVER (30 DAYS FOLLOWING), 0) * 2 FOR EACH customers.customer_id

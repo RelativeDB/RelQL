@@ -37,17 +37,23 @@ int64_t rt_model_num_params(const rt_model* m) {
   return n;
 }
 
-int rt_forward(const rt_model* m, int32_t B, int32_t S,
-               const int64_t* node_idxs, const int64_t* f2p,
-               const int64_t* col_idxs, const int64_t* table_idxs,
-               const uint8_t* is_padding, const int64_t* sem_types,
-               const uint8_t* is_target, const float* number_v,
-               const float* datetime_v, const float* boolean_v,
-               const float* text_v, const float* col_name_v,
-               int32_t n_threads, float* out_target_scores,
-               char* err, size_t errlen) {
+int rt_device_available(int32_t device) {
+  if (device < 0 || device > 2) return 0;
+  return rt::device_available(static_cast<rt::Device>(device)) ? 1 : 0;
+}
+
+int rt_forward_device(const rt_model* m, int32_t B, int32_t S,
+                      const int64_t* node_idxs, const int64_t* f2p,
+                      const int64_t* col_idxs, const int64_t* table_idxs,
+                      const uint8_t* is_padding, const int64_t* sem_types,
+                      const uint8_t* is_target, const float* number_v,
+                      const float* datetime_v, const float* boolean_v,
+                      const float* text_v, const float* col_name_v,
+                      int32_t n_threads, int32_t device,
+                      float* out_target_scores, char* err, size_t errlen) {
   try {
     if (B <= 0 || S <= 0) throw std::runtime_error("B and S must be positive");
+    if (device < 0 || device > 2) throw std::runtime_error("bad device id");
     const size_t BS = (size_t)B * S;
     rt::Batch b;
     b.B = B;
@@ -65,7 +71,11 @@ int rt_forward(const rt_model* m, int32_t B, int32_t S,
     b.text_v.assign(text_v, text_v + BS * rt::kDText);
     b.col_name_v.assign(col_name_v, col_name_v + BS * rt::kDText);
 
-    rt::Output out = rt::forward(m->model, b, n_threads, /*debug_taps=*/false);
+    rt::ForwardOpts opts;
+    opts.device = static_cast<rt::Device>(device);
+    opts.n_threads = n_threads;
+    opts.debug_taps = false;
+    rt::Output out = rt::forward(m->model, b, opts);
     for (int r = 0; r < B; r++) {
       float acc = 0.f;
       for (int s = 0; s < S; s++) {
@@ -79,6 +89,22 @@ int rt_forward(const rt_model* m, int32_t B, int32_t S,
     set_err(err, errlen, e.what());
     return 1;
   }
+}
+
+int rt_forward(const rt_model* m, int32_t B, int32_t S,
+               const int64_t* node_idxs, const int64_t* f2p,
+               const int64_t* col_idxs, const int64_t* table_idxs,
+               const uint8_t* is_padding, const int64_t* sem_types,
+               const uint8_t* is_target, const float* number_v,
+               const float* datetime_v, const float* boolean_v,
+               const float* text_v, const float* col_name_v,
+               int32_t n_threads, float* out_target_scores,
+               char* err, size_t errlen) {
+  return rt_forward_device(m, B, S, node_idxs, f2p, col_idxs, table_idxs,
+                           is_padding, sem_types, is_target, number_v,
+                           datetime_v, boolean_v, text_v, col_name_v,
+                           n_threads, RT_DEVICE_CPU, out_target_scores, err,
+                           errlen);
 }
 
 }  // extern "C"

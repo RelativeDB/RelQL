@@ -7,7 +7,7 @@
   <ellipse cx="252" cy="157" rx="126" ry="50" fill="#fff"/>
 
   <!-- Each database layer drawn as its own shape, separated by white gaps -->
-  <g fill="#166a41">
+  <g fill="#0e4c5a">
     <!-- Top cap -->
     <path d="M126 157A126 50 0 0 1 378 157L378 178c-22 27-71 42-126 42s-104-15-126-42Z"/>
     <!-- Layer 2 -->
@@ -39,14 +39,14 @@
   <path
     d="M174 345 253 282 348 207 399 168"
     fill="none"
-    stroke="#1cc38c"
+    stroke="#2fd4c4"
     stroke-width="16"
     stroke-linecap="round"
     stroke-linejoin="round"
   />
 
   <!-- Node centers -->
-  <g fill="#1cc38c">
+  <g fill="#2fd4c4">
     <circle cx="174" cy="345" r="27"/>
     <circle cx="253" cy="282" r="27"/>
     <circle cx="348" cy="207" r="27"/>
@@ -55,7 +55,7 @@
   <!-- Arrow head -->
   <path
     d="M446 131 380 144 418 192 Z"
-    fill="#1cc38c"
+    fill="#2fd4c4"
     stroke-linejoin="round"
   />
 </svg>

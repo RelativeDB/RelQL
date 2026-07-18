@@ -46,6 +46,15 @@ void rt_model_free(rt_model*);
 /* Number of parameters (for diagnostics). */
 int64_t rt_model_num_params(const rt_model*);
 
+/* Compute devices. CPU is always available; MPS/CUDA require the backend to
+ * be compiled in (macOS / -DRT_CUDA=ON builds) and a usable device. */
+#define RT_DEVICE_CPU 0
+#define RT_DEVICE_MPS 1
+#define RT_DEVICE_CUDA 2
+
+/* 1 if the device can run rt_forward_device, else 0. */
+int rt_device_available(int32_t device);
+
 /* Run the forward pass.
  *
  * out_target_scores: length B. For each batch row, the number-head output
@@ -63,6 +72,19 @@ int rt_forward(const rt_model*, int32_t B, int32_t S,
                const float* text_v, const float* col_name_v,
                int32_t n_threads, float* out_target_scores,
                char* err, size_t errlen);
+
+/* Same as rt_forward but on an explicit device (RT_DEVICE_*). n_threads only
+ * affects the CPU device. GPU forwards on one model are serialized
+ * internally; CPU forwards remain fully reentrant. */
+int rt_forward_device(const rt_model*, int32_t B, int32_t S,
+                      const int64_t* node_idxs, const int64_t* f2p,
+                      const int64_t* col_idxs, const int64_t* table_idxs,
+                      const uint8_t* is_padding, const int64_t* sem_types,
+                      const uint8_t* is_target, const float* number_v,
+                      const float* datetime_v, const float* boolean_v,
+                      const float* text_v, const float* col_name_v,
+                      int32_t n_threads, int32_t device,
+                      float* out_target_scores, char* err, size_t errlen);
 
 #ifdef __cplusplus
 }

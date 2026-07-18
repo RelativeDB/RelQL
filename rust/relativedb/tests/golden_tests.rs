@@ -14,6 +14,12 @@ const B: usize = 5;
 const S: usize = 16;
 const TOL: f32 = 2e-3;
 
+// librt_c's forward runs on a process-global native thread pool that deadlocks
+// under concurrent callers. The two golden tests share this binary (and thus the
+// pool), so serialize them — cargo's default parallel runner would otherwise race
+// them and intermittently hang (no `--test-threads=1` workaround needed).
+static GOLDEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const EXPECTED_CLASSIFICATION: [f32; 5] = [-0.18470, -0.33108, 0.43363, -0.14449, 0.46848];
 const EXPECTED_REGRESSION: [f32; 5] = [-0.27052, -0.41538, 0.39998, -0.30649, 0.26804];
 
@@ -38,6 +44,8 @@ fn read_f32(dir: &Path, name: &str, count: usize) -> Vec<f32> {
 }
 
 fn run_golden(variant: &str, expected: &[f32; 5]) {
+    // Serialize native forward calls across the binary's parallel test threads.
+    let _serial = GOLDEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = testdata_dir();
     if !dir.join("manifest.json").exists() {
         eprintln!("SKIP golden ({variant}): cpp/testdata not found");

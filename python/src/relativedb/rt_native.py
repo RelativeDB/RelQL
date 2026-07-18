@@ -217,16 +217,40 @@ def load_lib(path: Optional[str] = None) -> RtLib:
 # checkpoint URI resolution
 # ---------------------------------------------------------------------------
 
+def _quantized_variant() -> str | None:
+    """RELATIVEDB_RT_QUANTIZED: 1/true/q8 -> q8, q4 -> q4, f16 -> f16."""
+    v = os.environ.get("RELATIVEDB_RT_QUANTIZED", "").lower()
+    if v in ("1", "true", "q8"):
+        return "q8"
+    if v in ("q4", "f16"):
+        return v
+    return None
+
+
+def _pick_model(dirpath: str) -> str:
+    """dir -> model.<variant>.safetensors (from cpp/rt_quantize) when
+    RELATIVEDB_RT_QUANTIZED selects a variant and it is present, else
+    model.safetensors."""
+    v = _quantized_variant()
+    if v:
+        q = os.path.join(dirpath, f"model.{v}.safetensors")
+        if os.path.isfile(q):
+            return q
+    return os.path.join(dirpath, "model.safetensors")
+
+
 def resolve_model_path(uri: str) -> str:
     """Resolve a checkpoint URI to a local ``model.safetensors`` path.
 
     Accepts a filesystem path (file or directory containing
     ``model.safetensors``) or ``hf://org/repo/subdir`` (resolved through
-    huggingface_hub, cache-first)."""
+    huggingface_hub, cache-first). With env ``RELATIVEDB_RT_QUANTIZED=1``,
+    an int8 ``model.q8.safetensors`` sibling is preferred when present
+    (explicit file paths are always used as given)."""
     if os.path.isfile(uri):
         return uri
     if os.path.isdir(uri):
-        p = os.path.join(uri, "model.safetensors")
+        p = _pick_model(uri)
         if os.path.isfile(p):
             return p
         raise RtNativeUnavailableError(
@@ -246,9 +270,12 @@ def resolve_model_path(uri: str) -> str:
                 f"resolving {uri!r} requires huggingface_hub: "
                 f"pip install huggingface_hub") from e
         try:  # cache-first: never hit the network when already downloaded
-            return hf_hub_download(repo_id, filename, local_files_only=True)
+            path = hf_hub_download(repo_id, filename, local_files_only=True)
         except Exception:
-            return hf_hub_download(repo_id, filename)
+            path = hf_hub_download(repo_id, filename)
+        # a quantized sibling lives beside the snapshot file, not in the repo
+        picked = _pick_model(os.path.dirname(path))
+        return picked if os.path.isfile(picked) else path
     raise RtNativeUnavailableError(
         f"cannot resolve model uri {uri!r} (not a path, not hf://)")
 

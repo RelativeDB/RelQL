@@ -172,7 +172,8 @@ def test_execute_without_backend_raises_clear_error(churn_schema, churn_wiring):
     with pytest.raises(ExecutionError, match="requires a model backend"):
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                  "FOR customers.customer_id = 'C7'", anchor_time=T0))
+                  "FOR EACH customers.customer_id",
+            entity_ids=['C7'], anchor_time=T0))
 
 
 def test_for_each_without_scanner_raises():
@@ -193,7 +194,8 @@ def test_for_each_without_scanner_raises():
     # but pinned ids work
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR customers.customer_id = 'C7'", anchor_time=T0))
+              "FOR EACH customers.customer_id",
+        entity_ids=['C7'], anchor_time=T0))
     assert len(res.predictions) == 1
 
 
@@ -227,8 +229,8 @@ def test_return_quantiles_interval_unsupported(churn_schema, churn_wiring):
         with pytest.raises(RtNativeError, match="QUANTILES/INTERVAL"):
             eng.execute(ExecutionInput(
                 query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                      f"FOR customers.customer_id = 'C7' RETURN {ret}",
-                anchor_time=T0))
+                      f"FOR EACH customers.customer_id RETURN {ret}",
+                entity_ids=['C7'], anchor_time=T0))
 
 
 def test_multiclass_ranking_output_unsupported(churn_schema, churn_wiring):
@@ -241,7 +243,8 @@ def test_multiclass_ranking_output_unsupported(churn_schema, churn_wiring):
     with pytest.raises(RtNativeError, match="multiclass"):
         eng.execute(ExecutionInput(
             query="PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) "
-                  "RANK TOP 5 FOR customers.customer_id = 'C7'", anchor_time=T0))
+                  "RANK TOP 5 FOR EACH customers.customer_id",
+            entity_ids=['C7'], anchor_time=T0))
 
 
 def test_return_quantiles_on_boolean_target_rejected(churn_schema, churn_wiring):
@@ -250,8 +253,8 @@ def test_return_quantiles_on_boolean_target_rejected(churn_schema, churn_wiring)
     with pytest.raises(PqlValidationError):
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                  "FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.9)",
-            anchor_time=T0))
+                  "FOR EACH customers.customer_id RETURN QUANTILES (0.1, 0.9)",
+            entity_ids=['C7'], anchor_time=T0))
 
 
 def test_return_probability_on_regression_target_rejected(churn_schema, churn_wiring):
@@ -260,8 +263,8 @@ def test_return_probability_on_regression_target_rejected(churn_schema, churn_wi
     with pytest.raises(PqlValidationError):
         eng.execute(ExecutionInput(
             query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                  "FOR customers.customer_id = 'C7' RETURN PROBABILITY",
-            anchor_time=T0))
+                  "FOR EACH customers.customer_id RETURN PROBABILITY",
+            entity_ids=['C7'], anchor_time=T0))
 
 
 def test_return_quantile_out_of_range_rejected(churn_schema):

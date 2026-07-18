@@ -87,6 +87,46 @@ def test_resolve_model_path_local_and_hf(tmp_path):
         resolve_model_path("gs://nope")
 
 
+def test_resolve_model_path_prefers_quantized_only_when_opted_in(
+        tmp_path, monkeypatch):
+    f = tmp_path / "model.safetensors"
+    q8 = tmp_path / "model.q8.safetensors"
+    q4 = tmp_path / "model.q4.safetensors"
+    f.write_bytes(b"x")
+    q8.write_bytes(b"q")
+    q4.write_bytes(b"q")
+    monkeypatch.delenv("RELATIVEDB_RT_QUANTIZED", raising=False)
+    assert resolve_model_path(str(tmp_path)) == str(f)     # default: fp32
+    monkeypatch.setenv("RELATIVEDB_RT_QUANTIZED", "1")
+    assert resolve_model_path(str(tmp_path)) == str(q8)    # 1 -> q8
+    monkeypatch.setenv("RELATIVEDB_RT_QUANTIZED", "q4")
+    assert resolve_model_path(str(tmp_path)) == str(q4)    # explicit variant
+    assert resolve_model_path(str(f)) == str(f)            # explicit file wins
+    monkeypatch.setenv("RELATIVEDB_RT_QUANTIZED", "f16")   # variant missing
+    assert resolve_model_path(str(tmp_path)) == str(f)
+
+
+# quantized formats: (file variant, score tolerance vs fp32 golden)
+QUANT_TOL = {"q8": 5e-2, "q4": 1e-1, "f16": 5e-3}
+
+
+@pytest.mark.parametrize("variant", ["classification", "regression"])
+@pytest.mark.parametrize("qv", ["q8", "q4", "f16"])
+def test_quantized_checkpoint_scores_track_fp32(variant, qv):
+    """Quantized checkpoints load through the same C ABI (weights stay
+    quantized-resident; kernels dequantize) and score within per-format
+    tolerance of the PyTorch golden scores."""
+    lib = _lib_or_skip()
+    fp32 = _checkpoint_or_skip(variant)
+    q = os.path.join(os.path.dirname(fp32), f"model.{qv}.safetensors")
+    if not os.path.isfile(q):
+        pytest.skip(f"no model.{qv}.safetensors (run cpp/rt_quantize)")
+    batch = _load_golden_batch()
+    scores = lib.load_model(q).forward(**batch)
+    for got, want in zip(scores, GOLDEN_SCORES[variant]):
+        assert abs(float(got) - want) < QUANT_TOL[qv], (variant, qv, scores)
+
+
 # --------------------------------------------------------------------------
 # End-to-end: the README churn scenario, scored by the native RT engine.
 # --------------------------------------------------------------------------
@@ -133,8 +173,8 @@ def test_return_class_emits_hard_label(churn_schema):
     eng = _native_engine(churn_schema)
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR customers.customer_id = 'C7' RETURN CLASS",
-        anchor_time=dt("2026-07-01")))
+              "FOR EACH customers.customer_id RETURN CLASS",
+        entity_ids=['C7'], anchor_time=dt("2026-07-01")))
     pred = res.predictions[0]
     assert pred.predicted_class in ("true", "false")   # hard label at 0.5
     assert pred.probability is None                     # not the score
@@ -146,8 +186,8 @@ def test_return_distribution_two_key_dist(churn_schema):
     eng = _native_engine(churn_schema)
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR customers.customer_id = 'C7' RETURN DISTRIBUTION",
-        anchor_time=dt("2026-07-01")))
+              "FOR EACH customers.customer_id RETURN DISTRIBUTION",
+        entity_ids=['C7'], anchor_time=dt("2026-07-01")))
     pred = res.predictions[0]
     assert set(pred.class_probs) == {"true", "false"}
     assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-9

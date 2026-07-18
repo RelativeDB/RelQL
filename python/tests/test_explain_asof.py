@@ -18,7 +18,7 @@ T0 = dt("2026-07-01")
 CHURN = ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
          "FOR EACH customers.customer_id")
 REG = ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-       "FOR customers.customer_id = 'C7'")
+       "FOR EACH customers.customer_id WHERE customers.customer_id = 'C7'")
 
 
 class SpyBackend:

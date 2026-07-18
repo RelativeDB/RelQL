@@ -67,7 +67,6 @@ class PqlParserTest {
         assertTrue(agg.step().isEmpty());
         assertTrue(agg.hasWindow());
         assertEquals(new ColumnRef("CUSTOMERS", "CUSTOMER_ID"), q.entityKey());
-        assertTrue(q.entityIds().isEmpty());
     }
 
     @Test
@@ -140,17 +139,21 @@ class PqlParserTest {
     }
 
     @Test
-    void parsesEntitySelectors() {
-        ParsedQuery in = Pql.parse(
-                "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)");
-        assertEquals(2, in.entityIds().size());
-        assertEquals(42.0, (Double) in.entityIds().get(0).value());
+    void rejectsPinnedEntitySelector() {
+        // `FOR t.pk = v` / `FOR t.pk IN (...)` were removed; only `FOR EACH t.pk`
+        // is valid. Concrete ids are supplied at execution time.
+        assertThrows(PqlSyntaxException.class, () -> Pql.parse(
+                "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)"));
+        assertThrows(PqlSyntaxException.class, () -> Pql.parse(
+                "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42"));
+    }
 
-        ParsedQuery eq = Pql.parse(
-                "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42 "
-                + "ASSUMING users.plan = 'premium'");
-        assertEquals(1, eq.entityIds().size());
-        assertTrue(eq.assuming().isPresent());
+    @Test
+    void parsesAssumingWithForEach() {
+        ParsedQuery q = Pql.parse(
+                "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH users.user_id "
+                + "WHERE users.user_id = 42 ASSUMING users.plan = 'premium'");
+        assertTrue(q.assuming().isPresent());
     }
 
     @Test
@@ -214,7 +217,7 @@ class PqlParserTest {
     void parsesReturnQuantilesAndInterval() {
         ReturnSpec quantiles = Pql.parse(
                 "PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING) "
-                + "FOR customers.customer_id IN ('C7', 'C9') AS OF :prediction_time "
+                + "FOR EACH customers.customer_id AS OF :prediction_time "
                 + "RETURN QUANTILES (0.10, 0.50, 0.90)").ret().orElseThrow();
         assertEquals(ReturnSpec.Kind.QUANTILES, quantiles.kind());
         assertArrayEquals(new double[] {0.10, 0.50, 0.90}, quantiles.quantiles(), 1e-9);
@@ -285,6 +288,9 @@ class PqlParserTest {
         "PREDICT SUM(TRANSACTIONS.PRICE) OVER (30 DAYS FOLLOWING) FOR EACH CUSTOMERS.CUSTOMER_ID extra garbage",
         "PREDICT SUM(t.c) OVER (30 fortnights FOLLOWING) FOR EACH t.id",                 // bad unit
         "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FORECAST 4 TIMEFRAMES FOR EACH t.id", // FORECAST removed
+        "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id",                            // bare FOR (needs EACH)
+        "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id = 42",                       // pinned selector removed
+        "PREDICT SUM(t.c) OVER (30 DAYS FOLLOWING) FOR t.id IN (1, 2)",                  // IN selector removed
     })
     void malformedQueriesAreRejected(String bad) {
         assertThrows(PqlSyntaxException.class, () -> Pql.parse(bad));

@@ -389,8 +389,6 @@ pub struct ReturnSpec {
 pub struct ParsedQuery {
     pub target: TargetExpr,
     pub entity_key: ColumnRef,
-    /// `FOR t.pk = v | IN (...)`; empty = all.
-    pub entity_ids: Vec<Literal>,
     pub where_: Option<TargetExpr>,
     pub assuming: Option<TargetExpr>,
     pub rank: Option<RankKind>,

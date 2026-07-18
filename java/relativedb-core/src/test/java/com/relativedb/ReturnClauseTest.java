@@ -56,7 +56,7 @@ class ReturnClauseTest {
     void returnClassSetsHardLabel() {
         EntityPrediction p = runOne(
                 "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                + "FOR customers.customer_id = 1 RETURN CLASS");
+                + "FOR EACH customers.customer_id RETURN CLASS");
         assertEquals("true", p.predictedClass().orElseThrow());   // p=0.83 >= 0.5
         assertTrue(p.probability().isEmpty(), "CLASS returns a label, not the score");
     }
@@ -65,7 +65,7 @@ class ReturnClauseTest {
     void returnDistributionGivesTwoEntryClassDistribution() {
         EntityPrediction p = runOne(
                 "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                + "FOR customers.customer_id = 1 RETURN DISTRIBUTION");
+                + "FOR EACH customers.customer_id RETURN DISTRIBUTION");
         Map<String, Double> dist = p.classProbs();
         assertEquals(2, dist.size());
         assertEquals(0.83, dist.get("true"), 1e-9);
@@ -76,7 +76,7 @@ class ReturnClauseTest {
     void returnExpectedValueOnBinaryIsProbability() {
         EntityPrediction p = runOne(
                 "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                + "FOR customers.customer_id = 1 RETURN EXPECTED VALUE");
+                + "FOR EACH customers.customer_id RETURN EXPECTED VALUE");
         assertEquals(0.83, p.value().orElseThrow(), 1e-9);
     }
 
@@ -84,7 +84,7 @@ class ReturnClauseTest {
     void returnQuantilesIsUnsupportedWithoutAQuantileHead() {
         CompletionException e = assertThrows(CompletionException.class, () -> runOne(
                 "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                + "FOR customers.customer_id = 1 RETURN QUANTILES (0.1, 0.5, 0.9)"));
+                + "FOR EACH customers.customer_id RETURN QUANTILES (0.1, 0.5, 0.9)"));
         assertTrue(e.getCause() instanceof UnsupportedOperationException);
         assertTrue(e.getCause().getMessage().contains("quantile/distribution head"),
                 "error should explain the checkpoint lacks a quantile/distribution head");
@@ -94,7 +94,7 @@ class ReturnClauseTest {
     void returnIntervalIsUnsupportedWithoutADistributionHead() {
         CompletionException e = assertThrows(CompletionException.class, () -> runOne(
                 "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                + "FOR customers.customer_id = 1 RETURN INTERVAL 80%"));
+                + "FOR EACH customers.customer_id RETURN INTERVAL 80%"));
         assertTrue(e.getCause() instanceof UnsupportedOperationException);
         assertTrue(e.getCause().getMessage().contains("quantile/distribution head"),
                 "error should explain the checkpoint lacks a quantile/distribution head");
@@ -103,7 +103,7 @@ class ReturnClauseTest {
     @Test
     void defaultOutputUnchangedWhenNoReturnClause() {
         EntityPrediction p = runOne(
-                "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 1");
+                "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id");
         assertEquals(12.5, p.value().orElseThrow(), 1e-9);
         assertTrue(p.predictedClass().isEmpty());
         assertTrue(p.quantiles().isEmpty());

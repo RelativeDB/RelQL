@@ -160,7 +160,7 @@ class ExecutionInput:
     anchor_time: Optional[datetime] = None       # "now"; None = unbounded
     per_entity_anchor: bool = False              # anchor_time="entity" semantics
     context_anchor_time: Optional[datetime] = None  # decouple context "now"
-    entity_ids: Optional[Sequence[Any]] = None   # overrides FOR ... IN (...)
+    entity_ids: Optional[Sequence[Any]] = None   # pins the FOR EACH cohort to these ids
     params: Optional[dict[str, datetime]] = None  # AS OF :name bindings
 
 
@@ -575,15 +575,13 @@ class Engine:
                             input: ExecutionInput) -> list[Any]:
         if input.entity_ids is not None:
             return list(input.entity_ids)
-        if pq.entity_ids:
-            return list(pq.entity_ids)
         sampler = self._sampler()
         ids = sampler.all_ids(pq.entity_key.table)
         if ids is None:
             raise ExecutionError(
                 f"FOR EACH over all {pq.entity_key.table!r} entities needs "
-                f"either explicit entity_ids, a pinned FOR ... IN (...) "
-                f"selector, or a TableScanner wired for the entity table "
+                f"either explicit entity_ids on the execution input, or a "
+                f"TableScanner wired for the entity table "
                 f"(retrievers alone cannot enumerate a table)")
         return ids
 
@@ -683,8 +681,6 @@ class Engine:
         # entity selector
         if input.entity_ids is not None:
             selector = list(input.entity_ids)
-        elif pq.entity_ids:
-            selector = list(pq.entity_ids)
         else:
             selector = "FOR EACH"
         # output form

@@ -70,7 +70,8 @@ class EngineExecuteTest {
                 .modelBackend(fakeBackend)
                 .build();
         PredictionResult r = engine.execute(ExecutionInput.newInput()
-                .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 1")
+                .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id")
+                .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
         assertEquals(TaskType.REGRESSION, r.taskType());
         assertEquals(EntityId.of(1L), r.predictions().get(0).id());
@@ -94,7 +95,8 @@ class EngineExecuteTest {
         RelativeDbEngine engine = RelativeDbEngine.newEngine(SCHEMA, wiring).build();
         CompletionException e = assertThrows(CompletionException.class, () ->
                 engine.execute(ExecutionInput.newInput()
-                        .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 1")
+                        .query("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id")
+                        .entityIds(List.of(1L))
                         .build()).toCompletableFuture().join());
         assertTrue(e.getCause() instanceof IllegalStateException);
         assertTrue(e.getCause().getMessage().contains("hf://stanford-star/rt-j/regression"),

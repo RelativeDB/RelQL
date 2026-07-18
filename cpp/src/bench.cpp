@@ -1,6 +1,6 @@
 // bench.cpp — batching correctness + speed/memory benchmarks for rt.cpp.
 //
-//   ./rt_bench <testdata_dir> <model.safetensors>
+//   ./rt_bench <testdata_dir> <model.safetensors> [--device cpu|mps|cuda]
 //
 // 1. Batching correctness: the golden B=5 batch executed (a) all at once,
 //    (b) one row at a time, (c) with batch rows permuted — per-entity outputs
@@ -180,7 +180,22 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3) { fprintf(stderr, "usage: %s <testdata> <safetensors>\n", argv[0]); return 2; }
+  if (argc < 3) { fprintf(stderr, "usage: %s <testdata> <safetensors> [--device cpu|mps|cuda]\n", argv[0]); return 2; }
+  rt::ForwardOpts opts;
+  opts.debug_taps = false;
+  for (int i = 3; i + 1 < argc; i++) {
+    if (std::string(argv[i]) == "--device") {
+      std::string d = argv[i + 1];
+      opts.device = d == "mps" ? rt::Device::MPS
+                    : d == "cuda" ? rt::Device::CUDA
+                                  : rt::Device::CPU;
+    }
+  }
+  if (!rt::device_available(opts.device)) {
+    fprintf(stderr, "device %s not available\n", rt::device_name(opts.device));
+    return 2;
+  }
+  printf("device: %s\n", rt::device_name(opts.device));
   double rss0 = rss_mb();
   auto t0 = std::chrono::steady_clock::now();
   rt::Model model = rt::Model::load(argv[2]);
@@ -193,20 +208,20 @@ int main(int argc, char** argv) {
 
   // ---- 1. batching correctness -------------------------------------------
   printf("\n== batching correctness ==\n");
-  rt::Output all = rt::forward(model, golden, 0, false);
+  rt::Output all = rt::forward(model, golden, opts);
   double max_dev_single = 0, max_dev_perm = 0;
   for (int r = 0; r < golden.B; r++) {                    // one row at a time
-    rt::Output one = rt::forward(model, take_rows(golden, {r}), 0, false);
+    rt::Output one = rt::forward(model, take_rows(golden, {r}), opts);
     max_dev_single = std::max(max_dev_single,
         std::fabs(target_score(all, r) - target_score(one, 0)));
   }
   std::vector<int> perm = {3, 0, 4, 2, 1};                // permuted batch
-  rt::Output p = rt::forward(model, take_rows(golden, perm), 0, false);
+  rt::Output p = rt::forward(model, take_rows(golden, perm), opts);
   for (int r = 0; r < (int)perm.size(); r++)
     max_dev_perm = std::max(max_dev_perm,
         std::fabs(target_score(all, perm[r]) - target_score(p, r)));
   // batch of duplicates: every copy must produce the identical score
-  rt::Output dup = rt::forward(model, take_rows(golden, {1, 1, 1, 1}), 0, false);
+  rt::Output dup = rt::forward(model, take_rows(golden, {1, 1, 1, 1}), opts);
   double max_dev_dup = 0;
   for (int r = 1; r < 4; r++)
     max_dev_dup = std::max(max_dev_dup,
@@ -219,16 +234,16 @@ int main(int argc, char** argv) {
 
   // ---- 2. speed sweeps ----------------------------------------------------
   auto bench = [&](const Batch& b, int iters) {
-    rt::forward(model, b, 0, false);                      // warm
+    rt::forward(model, b, opts);                      // warm
     auto s0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; i++) rt::forward(model, b, 0, false);
+    for (int i = 0; i < iters; i++) rt::forward(model, b, opts);
     double ms = ms_since(s0) / iters;
     double tok = (double)b.B * b.S / (ms / 1e3);
     printf("B=%-3d S=%-5d  %8.1f ms/fwd   %9.0f tok/s   %6.1f ms/entity\n",
            b.B, b.S, ms, tok, ms / b.B);
   };
   printf("\n== speed: batch-size sweep (golden rows replicated, S=16) ==\n");
-  for (int bs : {1, 5, 20, 80}) {
+  for (int bs : {1, 5, 20, 80, 160, 320, 640, 1280}) {
     std::vector<int> rows(bs);
     for (int i = 0; i < bs; i++) rows[i] = i % golden.B;
     bench(take_rows(golden, rows), bs >= 20 ? 5 : 20);
@@ -237,7 +252,23 @@ int main(int argc, char** argv) {
   bench(synth(1, 256, 1), 10);
   bench(synth(1, 1024, 2), 5);
   bench(synth(1, 2048, 3), 3);
+  bench(synth(1, 4096, 20), 2);
+  bench(synth(1, 8192, 21), 2);
+  printf("\n== speed: big B x S sweep (synthetic relational batches) ==\n");
+  bench(synth(16, 256, 5), 5);
+  bench(synth(64, 256, 6), 3);
+  bench(synth(256, 256, 7), 3);
+  bench(synth(16, 512, 8), 3);
+  bench(synth(64, 512, 9), 3);
   bench(synth(8, 1024, 4), 3);
+  bench(synth(32, 1024, 10), 2);
+  bench(synth(64, 1024, 11), 2);
+  bench(synth(8, 2048, 12), 2);
+  bench(synth(32, 2048, 13), 2);
+  bench(synth(4, 4096, 22), 2);
+  bench(synth(8, 4096, 23), 2);
+  bench(synth(2, 8192, 24), 2);
+  bench(synth(4, 8192, 25), 2);
 
   // ---- 3. memory after the big forward ------------------------------------
   printf("\n== memory after S=2048/B=8 forwards ==\n");

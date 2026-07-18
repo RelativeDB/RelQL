@@ -302,11 +302,37 @@ fn hf_cache_root() -> PathBuf {
     PathBuf::from(home).join(".cache").join("huggingface").join("hub")
 }
 
+/// Env `RELATIVEDB_RT_QUANTIZED` selects a quantized checkpoint variant
+/// (produced by `cpp/rt_quantize`): 1/true/q8 -> "q8", q4 -> "q4",
+/// f16 -> "f16".
+fn quantized_variant() -> Option<&'static str> {
+    match std::env::var("RELATIVEDB_RT_QUANTIZED").ok()?.to_lowercase().as_str() {
+        "1" | "true" | "q8" => Some("q8"),
+        "q4" => Some("q4"),
+        "f16" => Some("f16"),
+        _ => None,
+    }
+}
+
+/// dir -> `model.<variant>.safetensors` when opted in and present, else
+/// `model.safetensors`.
+fn pick_model(dir: &Path) -> PathBuf {
+    if let Some(v) = quantized_variant() {
+        let q = dir.join(format!("model.{v}.safetensors"));
+        if q.is_file() {
+            return q;
+        }
+    }
+    dir.join("model.safetensors")
+}
+
 /// Resolve a checkpoint URI to a local `model.safetensors` path.
 ///
 /// Accepts a filesystem path (file, or directory containing
 /// `model.safetensors`), `file://...`, or `hf://org/repo/subdir` (resolved
-/// against the local HF cache; no network client).
+/// against the local HF cache; no network client). With env
+/// `RELATIVEDB_RT_QUANTIZED=1`, an int8 `model.q8.safetensors` sibling is
+/// preferred when present (explicit file paths are always used as given).
 pub fn resolve_model_path(uri: &str) -> Result<String, RtError> {
     let as_path = |p: &str| -> Option<String> {
         let path = Path::new(p);
@@ -314,7 +340,7 @@ pub fn resolve_model_path(uri: &str) -> Result<String, RtError> {
             return Some(p.to_string());
         }
         if path.is_dir() {
-            let m = path.join("model.safetensors");
+            let m = pick_model(path);
             if m.is_file() {
                 return Some(m.to_string_lossy().into_owned());
             }
@@ -354,7 +380,7 @@ pub fn resolve_model_path(uri: &str) -> Result<String, RtError> {
         if !sub.is_empty() {
             model = model.join(&sub);
         }
-        model = model.join("model.safetensors");
+        model = pick_model(&model);
         if model.is_file() {
             return Ok(model.to_string_lossy().into_owned());
         }
