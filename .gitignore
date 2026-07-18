@@ -4,3 +4,9 @@
 *.duckdb.wal
 .idea/
 runs/
+__pycache__/
+
+# benchmark corpus (downloaded data) and venv
+benchmarks/corpus/
+benchmarks/results/
+.venv-bench/

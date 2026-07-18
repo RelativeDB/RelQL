@@ -1,6 +1,6 @@
 ---
 title: Predict churn
-description: Score churn risk for active customers from DataFrames.
+description: Score churn risk for active customers through your own retrievers.
 ---
 
 # Predict churn
@@ -8,15 +8,16 @@ description: Score churn risk for active customers from DataFrames.
 Goal: for every *currently active* customer, the probability of no activity in
 the next 30 days.
 
-## 1. Load your tables
+## 1. Wire your tables
 
 ```python
 import pandas as pd
 import relativedb
 
-ds = relativedb.from_dataframes(
-    {"users": users, "events": events},
-    links=[("events", "user_id", "users")])
+# Declare `schema`, translate DataFrame records to `relativedb.Row`, and wire
+# entity/link/scanner callbacks. The complete example connector is linked below.
+wiring = relativedb.RetrieverWiring.new_wiring()...build()
+engine = relativedb.Engine(schema, wiring)
 ```
 
 ## 2. Write the query
@@ -33,7 +34,10 @@ WHERE COUNT(events.*, -90, 0, days) > 0
 ## 3. Score as of today
 
 ```python
-df = ds.predict(query, anchor_time=pd.Timestamp.utcnow().normalize())
+result = engine.execute(relativedb.ExecutionInput(
+    query=query, anchor_time=pd.Timestamp.utcnow().to_pydatetime()))
+df = pd.DataFrame({"entity_id": [p.id for p in result.predictions],
+                   "probability": [p.probability for p in result.predictions]})
 df.sort_values("probability", ascending=False).head(20)
 ```
 
@@ -46,7 +50,9 @@ by the `WHERE` clause — they already churned.
   `SUM(usage.minutes, 0, 30, days) < 10` (low usage).
 - Backtest: rerun with a past `anchor_time` and compare against what actually
   happened — the engine guarantees the context is point-in-time correct.
-- Real model: pass `model_backend=relativedb.RtNativeBackend(schema=ds.schema)`
+- Real model: construct the engine with
+  `model_backend=relativedb.RtNativeBackend(schema=schema)`
   ([guide](use-native-backend)).
 
-A complete self-checking version lives at `examples/industry/growth_churn.py`.
+A complete self-checking version lives at `examples/industry/growth_churn.py`;
+its `pandas_connector.py` shows the application-owned connector.

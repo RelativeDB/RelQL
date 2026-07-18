@@ -13,22 +13,30 @@ Predict 90-day churn for every customer, as of July 1.
 <Tabs groupId="lang">
 <TabItem value="python" label="Python">
 
-With pandas, the schema is inferred from your frames (PKs from `*_id` naming,
-time columns from datetime dtypes):
+Declare the schema and wire callbacks over your own storage. If your data is
+in pandas, pandas remains an application dependency:
 
 ```python
 import pandas as pd
-import relativedb
+from relativedb import Engine, ExecutionInput, RetrieverWiring, Row
 
-ds = relativedb.from_dataframes(
-    {"customers": customers, "products": products, "orders": orders},
-    links=[("orders", "customer_id", "customers"),
-           ("orders", "product_id", "products")])
+customer_rows = [Row("customers", r.customer_id, {"age": float(r.age)})
+                 for r in customers.itertuples()]
+by_id = {row.id: row for row in customer_rows}
 
-df = ds.predict(
-    "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
-    anchor_time=pd.Timestamp("2026-07-01"))
-print(df)   # entity_id, probability — one row per customer
+def fetch_customers(table, ids, bound):
+    return [by_id[row_id] for row_id in ids if row_id in by_id]
+
+wiring = (RetrieverWiring.new_wiring()
+    .entities("customers", fetch_customers)
+    .entities("orders", fetch_orders)
+    .default_links(fetch_order_children)
+    .scanner("customers", scan_customers)
+    .build())
+
+result = Engine(schema, wiring).execute(ExecutionInput(
+    query="PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+    anchor_time=pd.Timestamp("2026-07-01").to_pydatetime()))
 ```
 
 </TabItem>

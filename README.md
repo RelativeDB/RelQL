@@ -30,9 +30,9 @@ concepts and behavior:
 
 | Library | Directory | Package / artifact | Notes |
 |---|---|---|---|
-| **Python** | [`python/`](python/) | `relativedb` (pip) | Extra `pandas` layer: `from_dataframes(...)` → `.predict(...)` in two calls |
-| **Java** | [`java/`](java/) | `dev.relativedb:relativedb-core`, `relativedb-rt` (Gradle) | ANTLR-based parser; async (`CompletionStage`) retriever SPI |
-| **Rust** | [`rust/`](rust/) | `relativedb` (crate) | Hand-written parser; deliberately synchronous SPI |
+| **Python** | [`python/`](python/) | `relationdb` (PyPI; import `relativedb`) | Storage-neutral retriever SPI; applications own every connector |
+| **Java** | [`java/`](java/) | `com.relativedb:relationdb`, `relationdb-rt` (Maven Central) | ANTLR-based parser; async (`CompletionStage`) retriever SPI |
+| **Rust** | [`rust/`](rust/) | `relationdb` (crates.io; crate API `relativedb`) | Hand-written parser; deliberately synchronous SPI |
 
 plus a shared native model runtime:
 
@@ -365,35 +365,37 @@ depends only on numpy.
 
 ```bash
 cd python
-pip install -e ".[pandas]"    # extras: [pandas], [rt] (native backend), [dev] (pytest)
+pip install -e "."    # extras: [rt] (native backend), [dev] (pytest)
 ```
 
-### Two-call quickstart: churn from DataFrames
+### Quickstart: wire your own data
 
-The `pandas` layer infers the schema from your frames — primary keys from
-`*_id` naming, value types from dtypes, time columns from datetime columns —
-and wires in-memory retrievers automatically:
+The library has no pandas adapter or bundled connectors. Declare the schema,
+translate records into `Row` objects, and wire retrieval callbacks over the
+storage your application owns:
 
 ```python
-import pandas as pd
-import relativedb
+import pandas as pd  # application dependency, not a relationdb dependency
+from relativedb import Engine, ExecutionInput, RetrieverWiring, Row
 
-ds = relativedb.from_dataframes(
-    {"customers": customers, "products": products, "orders": orders},
-    links=[("orders", "customer_id", "customers"),
-           ("orders", "product_id", "products")])
-
-# churn = "no order in the following 90 days"
-df = ds.predict(
-    "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
-    anchor_time=pd.Timestamp("2026-07-01"))
-print(df)   # entity_id, probability — one row per customer
+customer_rows = [Row("customers", r.customer_id, {"age": float(r.age)})
+                 for r in customers.itertuples()]
+order_rows = [Row("orders", r.order_id, {"qty": float(r.qty),
+                  "order_date": r.order_date.to_pydatetime()},
+                  timestamp=r.order_date.to_pydatetime(),
+                  parents={"customer_id": r.customer_id})
+              for r in orders.itertuples()]
+# Build entity/link/scanner callbacks over these rows (or query your DAO).
+wiring = RetrieverWiring.new_wiring()...build()
+result = Engine(schema, wiring).execute(ExecutionInput(query=query, anchor_time=t0))
+df = pd.DataFrame({"entity_id": [p.id for p in result.predictions],
+                   "probability": [p.probability for p in result.predictions]})
 ```
 
 An order dated after the anchor can never enter context — the engine re-checks
 every row against the temporal bound even if a retriever misbehaves.
 
-### The core, without pandas
+### Schema and retriever API
 
 Explicit schema, and retrievers as plain callables over any storage:
 
@@ -437,10 +439,9 @@ relativedb.validate(pq, schema)   # binds names/types/windows against the schema
 ### Native RT-J backend
 
 ```python
-backend = relativedb.RtNativeBackend(schema=ds.schema)
-df = ds.predict("PREDICT COUNT(orders.*, 0, 90, days) = 0 "
-                "FOR EACH customers.customer_id",
-                anchor_time=t0, model_backend=backend)
+backend = relativedb.RtNativeBackend(schema=schema)
+result = Engine(schema, wiring, model_backend=backend).execute(
+    ExecutionInput(query=query, anchor_time=t0))
 ```
 
 Needs `pip install -e ".[rt]"` (sentence-transformers + huggingface_hub) and
@@ -456,20 +457,20 @@ exposes a single score head).
 ```
 
 Covers the full PQL corpus and rejections, the temporal-leakage guard,
-CSC ≡ retriever context equivalence, model-URI routing, and the
-DataFrames-to-churn path end to end.
+CSC ≡ retriever context equivalence, model-URI routing, and explicit
+retriever wiring end to end.
 
 ---
 
 ## The Java library
 
 Full docs: [`java/README.md`](java/README.md). Requires Java 17+. Gradle
-modules under group `dev.relativedb`:
+Maven publications under group `com.relativedb`:
 
-- **`relativedb-core`** — schema builder, retriever SPI, ANTLR-based PQL
+- **`relationdb`** — schema builder, retriever SPI, ANTLR-based PQL
   parser + semantic validation, context assembly (both sampler modes), model
   SPI.
-- **`relativedb-rt`** — optional JNA binding to `librt_c`:
+- **`relationdb-rt`** — optional JNA binding to `librt_c`:
   `RtNativeBackend implements ModelBackend`.
 
 ```bash
@@ -483,10 +484,10 @@ The retriever SPI is **async** (`CompletionStage`) — retrievers can fan out to
 remote services without blocking the engine:
 
 ```java
-import dev.relativedb.schema.*;
-import dev.relativedb.retrieve.*;
-import dev.relativedb.engine.*;
-import static dev.relativedb.schema.ValueType.*;
+import com.relativedb.schema.*;
+import com.relativedb.retrieve.*;
+import com.relativedb.engine.*;
+import static com.relativedb.schema.ValueType.*;
 
 RelativeDbSchema schema = RelativeDbSchema.newSchema()
     .table(TableDef.newTable("customers").column("age", NUMBER)
@@ -664,7 +665,7 @@ cd examples/industry
 ```
 
 A Java counterpart of the churn example lives at
-[`java/relativedb-core/src/test/java/dev/relativedb/GrowthChurnExampleTest.java`](java/relativedb-core/src/test/java/dev/relativedb/GrowthChurnExampleTest.java).
+[`java/relativedb-core/src/test/java/com/relativedb/GrowthChurnExampleTest.java`](java/relativedb-core/src/test/java/com/relativedb/GrowthChurnExampleTest.java).
 
 ---
 
@@ -706,9 +707,9 @@ Recurring invariant numbers you will see referenced in code and docs:
 relativedb/
 ├── python/                 # Python library (pip package `relativedb`)
 │   ├── src/relativedb/     #   schema, retrieve, pql/, engine, csc, model,
-│   │                       #   pandas_io (from_dataframes), rt_native
+│   │                       #   engine, retriever SPI, rt_native
 │   └── tests/
-├── java/                   # Java library (Gradle, group dev.relativedb)
+├── java/                   # Java library (Gradle, group com.relativedb)
 │   ├── relativedb-core/    #   engine + ANTLR grammar (src/main/antlr/Pql.g4)
 │   └── relativedb-rt/      #   JNA binding to librt_c
 ├── rust/                   # Cargo workspace

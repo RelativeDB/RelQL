@@ -1,6 +1,12 @@
-//! Grammar conformance: the full 44-query corpus parses; malformed input is
-//! rejected; AST spot checks; task-type inference; schema validation.
+//! Grammar conformance, driven through the crate's public `parse()` — which is
+//! now single-sourced on the shared C++ parser (`pql_parse` in `librt_c`). This
+//! exercises the Rust JSON-AST deserialization end to end (the full 44-query
+//! corpus parses; malformed input is rejected; AST spot checks), plus the
+//! Rust-only task-type inference and schema validation the C ABI does not cover.
 //! Mirrors the Python `test_pql_parser.py`.
+//!
+//! Requires `librt_c` to be discoverable (the sibling `cpp/build`, or
+//! `RELATIVEDB_RT_LIB`); it is a hard runtime dependency of the crate.
 
 mod common;
 
@@ -149,7 +155,7 @@ fn word_operators_and_membership() {
         TargetExpr::Condition(c) => assert_eq!(c.op, Operator::NotLike),
         other => panic!("{:?}", other),
     }
-    let pq = parse("PREDICT LOAN.STATUS IS IN ('A', 'C') FOR EACH LOAN.id").unwrap();
+    let pq = parse("PREDICT LOAN.STATUS IN ('A', 'C') FOR EACH LOAN.id").unwrap();
     match pq.target {
         TargetExpr::Condition(c) => {
             assert_eq!(c.op, Operator::In);
@@ -218,6 +224,44 @@ fn date_literal_and_eqeq_alias() {
     let pq = parse("PREDICT LAST(payments.amount, 0, 90, days) == 0 FOR EACH order.order_id WHERE order.location == 'US'").unwrap();
     match pq.target {
         TargetExpr::Condition(c) => assert_eq!(c.op, Operator::Eq),
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn coverage_gap_constructs() {
+    // Aggregation functions and operators the 44-query corpus never exercises —
+    // the ones most at risk of a JSON-AST deserialization gap in the native path.
+    for (q, func) in [
+        ("PREDICT AVG(t.x, 0, 30) FOR EACH e.id", AggFunc::Avg),
+        ("PREDICT MIN(t.x, 0, 30) FOR EACH e.id", AggFunc::Min),
+        ("PREDICT COUNT_DISTINCT(t.x, 0, 30) FOR EACH e.id", AggFunc::CountDistinct),
+    ] {
+        match parse(q).unwrap().target {
+            TargetExpr::Aggregation(a) => assert_eq!(a.func, func, "{}", q),
+            other => panic!("{}: {:?}", q, other),
+        }
+    }
+    match parse("PREDICT FIRST(t.s, 0, 30) = 'A' FOR EACH e.id").unwrap().target {
+        TargetExpr::Condition(c) => match c.left.as_ref() {
+            TargetExpr::Aggregation(a) => assert_eq!(a.func, AggFunc::First),
+            other => panic!("{:?}", other),
+        },
+        other => panic!("{:?}", other),
+    }
+    for (q, op) in [
+        ("PREDICT t.d IS NOT NULL FOR EACH e.id", Operator::IsNotNull),
+        ("PREDICT t.name LIKE '%x%' FOR EACH e.id", Operator::Like),
+        ("PREDICT t.name ENDS WITH 'ing' FOR EACH e.id", Operator::EndsWith),
+    ] {
+        match parse(q).unwrap().target {
+            TargetExpr::Condition(c) => assert_eq!(c.op, op, "{}", q),
+            other => panic!("{}: {:?}", q, other),
+        }
+    }
+    // `!=` in a WHERE clause -> NEQ.
+    match parse("PREDICT SUM(t.x, 0, 30) > 5 FOR EACH e.id WHERE t.a != 3").unwrap().where_.unwrap() {
+        TargetExpr::Condition(c) => assert_eq!(c.op, Operator::Neq),
         other => panic!("{:?}", other),
     }
 }

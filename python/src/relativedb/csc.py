@@ -1,50 +1,42 @@
-"""Materialized in-memory CSC adjacency built from TableScanners.
+"""In-memory CSC adjacency over scanner-provided tables.
 
+The time-bounded "latest <= anchor" children query — the CSC hot path and the
+one non-trivial algorithm here — lives once in the C++ layer (``cpp/src/csc.*``,
+via :mod:`relativedb.csc_native`), shared with the Java and Rust bindings.
+This module keeps only the Python-side bookkeeping: table row storage, the
+id<->dense-index mapping, and the seed/cohort lookups. ``librt_c`` is a hard
+dependency (the same native library the RT-J model and PQL parser require).
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-import numpy as np
-
+from .csc_native import NativeCsc
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import LinkDef, Schema
 
-__all__ = ["CscIndex", "LinkAdjacency"]
-
-_NEG_INF = -math.inf
+__all__ = ["CscIndex"]
 
 
 def _epoch(row: Row) -> float:
-    """Row time as float seconds; static rows sort first (-inf), so they are
+    """Row time as float seconds; static rows sort first (-inf) so they are
     admitted under every temporal bound."""
-    return row.timestamp.timestamp() if row.timestamp is not None else _NEG_INF
-
-
-@dataclass(frozen=True)
-class LinkAdjacency:
-    """CSC arrays for one FK link (child ``from_table`` -> parent ``to_table``).
-
-    ``colptr`` is indexed by parent dense id (length n_parents + 1);
-    ``row[colptr[p]:colptr[p+1]]`` are child dense ids sorted by time asc;
-    ``ts`` holds the matching child timestamps (epoch seconds, -inf if none).
-    """
-
-    link: LinkDef
-    colptr: np.ndarray  # int64, shape (n_parents + 1,)
-    row: np.ndarray     # int64, shape (n_edges,)
-    ts: np.ndarray      # float64, shape (n_edges,)
+    return row.timestamp.timestamp() if row.timestamp is not None else -math.inf
 
 
 class CscIndex:
-    """Snapshot index over scanner-provided tables. Rebuild via a new build()."""
+    """Snapshot index over scanner-provided tables. Rebuild via a new build().
+
+    Per-link adjacency (build + time-bounded children) is delegated to the
+    native ``csc_*`` implementation; dense child ids returned by it index back
+    into this index's own ``rows`` lists.
+    """
 
     def __init__(self) -> None:
         self.rows: dict[str, list[Row]] = {}
         self.dense: dict[str, dict[Any, int]] = {}
-        self.adjacency: dict[LinkDef, LinkAdjacency] = {}
+        self.adjacency: dict[LinkDef, NativeCsc] = {}
 
     @staticmethod
     def build(schema: Schema, wiring: RetrieverWiring,
@@ -59,18 +51,15 @@ class CscIndex:
             idx.adjacency[link] = idx._build_link(link)
         return idx
 
-    def _build_link(self, link: LinkDef) -> LinkAdjacency:
+    def _build_link(self, link: LinkDef) -> NativeCsc:
+        """Extract this link's edges (parent_dense, child_dense, ts) and hand
+        them to the native index; the native side sorts and buckets them."""
         children = self.rows.get(link.from_table, [])
         parent_dense = self.dense.get(link.to_table, {})
         n_parents = len(self.rows.get(link.to_table, []))
-        if not children or not parent_dense:
-            return LinkAdjacency(link,
-                                 np.zeros(n_parents + 1, dtype=np.int64),
-                                 np.empty(0, dtype=np.int64),
-                                 np.empty(0, dtype=np.float64))
-        p_idx: list[int] = []
-        c_idx: list[int] = []
-        c_ts: list[float] = []
+        ep: list[int] = []
+        ec: list[int] = []
+        et: list[float] = []
         for ci, row in enumerate(children):
             pid = row.parents.get(link.fk_column)
             if pid is None:
@@ -78,19 +67,10 @@ class CscIndex:
             pi = parent_dense.get(pid)
             if pi is None:
                 continue  # dangling FK: edge dropped, row still scannable
-            p_idx.append(pi)
-            c_idx.append(ci)
-            c_ts.append(_epoch(row))
-        p = np.asarray(p_idx, dtype=np.int64)
-        c = np.asarray(c_idx, dtype=np.int64)
-        t = np.asarray(c_ts, dtype=np.float64)
-        # sort edges by (parent, time asc) -> per-parent time-sorted buckets
-        order = np.lexsort((t, p))
-        p, c, t = p[order], c[order], t[order]
-        counts = np.bincount(p, minlength=n_parents)
-        colptr = np.zeros(n_parents + 1, dtype=np.int64)
-        np.cumsum(counts, out=colptr[1:])
-        return LinkAdjacency(link, colptr, c, t)
+            ep.append(pi)
+            ec.append(ci)
+            et.append(_epoch(row))
+        return NativeCsc(n_parents, ep, ec, et)
 
     # -- sampler surface ----------------------------------------------------
     def entities(self, table: str, ids: Sequence[Any],
@@ -113,13 +93,10 @@ class CscIndex:
         pi = self.dense.get(link.to_table, {}).get(parent_id)
         if pi is None:
             return []
-        s, e = int(adj.colptr[pi]), int(adj.colptr[pi + 1])
         anchor = (bound.as_of.timestamp() if bound.as_of is not None
                   else math.inf)
-        hi = int(np.searchsorted(adj.ts[s:e], anchor, side="right"))
-        picked = adj.row[s:s + hi][-limit:][::-1] if limit > 0 else adj.row[0:0]
         table_rows = self.rows[link.from_table]
-        return [table_rows[int(ci)] for ci in picked]
+        return [table_rows[ci] for ci in adj.children(pi, anchor, limit)]
 
     def all_ids(self, table: str) -> list[Any]:
         return [r.id for r in self.rows.get(table, [])]

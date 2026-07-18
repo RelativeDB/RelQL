@@ -89,21 +89,6 @@ def test_max_context_cells_budget(churn_schema, churn_wiring):
 # CSC mode
 # ---------------------------------------------------------------------------
 
-def test_csc_arrays_time_sorted(churn_schema, churn_wiring):
-    idx = CscIndex.build(churn_schema, churn_wiring)
-    link = LinkDef("orders", "customer_id", "customers")
-    adj = idx.adjacency[link]
-    assert adj.colptr[-1] == len(adj.row) == 4
-    # per-parent neighbor lists sorted by time ascending
-    import numpy as np
-    for p in range(len(adj.colptr) - 1):
-        s, e = adj.colptr[p], adj.colptr[p + 1]
-        assert np.all(np.diff(adj.ts[s:e]) >= 0)
-    # C7 has 3 order children
-    c7 = idx.dense["customers"]["C7"]
-    assert adj.colptr[c7 + 1] - adj.colptr[c7] == 3
-
-
 def test_csc_children_bound_and_limit(churn_schema, churn_wiring):
     idx = CscIndex.build(churn_schema, churn_wiring)
     link = LinkDef("orders", "customer_id", "customers")

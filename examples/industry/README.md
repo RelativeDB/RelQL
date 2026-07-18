@@ -6,6 +6,10 @@ signal**, runs a PQL query through the full pipeline (parse → validate →
 retriever hop loop → temporal guard → scoring), and **asserts** the
 predictions recover the signal.
 
+The examples import pandas themselves and explicitly declare their schemas.
+`pandas_connector.py` is application-side sample code that translates frames
+to `Row` objects and wires retrievers; it is not shipped in the Python package.
+
 Run with the Python library's venv:
 
 ```bash
@@ -21,7 +25,7 @@ cd relativedb/examples/industry
 | `pzn_buy_it_again.py` | Grocery / personalization | `PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3` | habitual staple ranked #1 per customer (FK ranking via `Row.parents`) |
 
 A Java counterpart of the churn example lives in the test suite:
-`java/relativedb-core/src/test/java/dev/relativedb/GrowthChurnExampleTest.java`
+`java/relativedb-core/src/test/java/com/relativedb/GrowthChurnExampleTest.java`
 (runs with `./gradlew test`), demonstrating the retriever SPI + a
 context-evidence baseline `ModelBackend`.
 

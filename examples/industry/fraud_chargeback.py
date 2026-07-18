@@ -13,7 +13,8 @@ and have none.
 """
 import numpy as np
 import pandas as pd
-import relativedb
+from pandas_connector import predictions_frame, wire_pandas_frames
+from relativedb import Engine, ExecutionInput, LinkDef, Schema, TableDef, ValueType
 
 rng = np.random.default_rng(11)
 ANCHOR = pd.Timestamp("2026-07-01")
@@ -43,14 +44,30 @@ for i in range(n_acct):
 transactions = pd.DataFrame(txn_rows, columns=["txn_id", "account_id", "ts", "amount"])
 chargebacks = pd.DataFrame(cb_rows, columns=["cb_id", "account_id", "ts", "amount"])
 
-ds = relativedb.from_dataframes(
-    {"accounts": accounts, "transactions": transactions, "chargebacks": chargebacks},
-    links=[("transactions", "account_id", "accounts"),
-           ("chargebacks", "account_id", "accounts")])
-
-df = ds.predict(
-    "PREDICT COUNT(chargebacks.*, 0, 60, days) > 0 FOR EACH accounts.account_id",
-    anchor_time=ANCHOR)
+schema = (Schema.new_schema()
+          .table(TableDef.new_table("accounts")
+                 .column("country", ValueType.TEXT)
+                 .column("created_at", ValueType.DATETIME)
+                 .primary_key("account_id").build())
+          .table(TableDef.new_table("transactions")
+                 .column("ts", ValueType.DATETIME)
+                 .column("amount", ValueType.NUMBER)
+                 .primary_key("txn_id").time_column("ts").build())
+          .table(TableDef.new_table("chargebacks")
+                 .column("ts", ValueType.DATETIME)
+                 .column("amount", ValueType.NUMBER)
+                 .primary_key("cb_id").time_column("ts").build())
+          .link(LinkDef("transactions", "account_id", "accounts"))
+          .link(LinkDef("chargebacks", "account_id", "accounts")).build())
+wiring = wire_pandas_frames(schema, {
+    "accounts": accounts, "transactions": transactions,
+    "chargebacks": chargebacks,
+})
+result = Engine(schema, wiring).execute(ExecutionInput(
+    query="PREDICT COUNT(chargebacks.*, 0, 60, days) > 0 "
+          "FOR EACH accounts.account_id",
+    anchor_time=ANCHOR.to_pydatetime()))
+df = predictions_frame(result)
 
 df = df.sort_values("probability", ascending=False).reset_index(drop=True)
 print(df.head(10).to_string())

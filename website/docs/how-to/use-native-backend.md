@@ -29,8 +29,9 @@ against your **local** Hugging Face cache — nothing downloads implicitly.
 **Python** (needs `pip install -e ".[rt]"`):
 
 ```python
-backend = relativedb.RtNativeBackend(schema=ds.schema)
-df = ds.predict(query, anchor_time=t0, model_backend=backend)
+backend = relativedb.RtNativeBackend(schema=schema)
+engine = relativedb.Engine(schema, wiring, model_backend=backend)
+result = engine.execute(relativedb.ExecutionInput(query=query, anchor_time=t0))
 ```
 
 **Java**:

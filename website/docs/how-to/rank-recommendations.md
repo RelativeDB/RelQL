@@ -21,15 +21,12 @@ FOR EACH customers.customer_id
 ## Run it
 
 ```python
-ds = relativedb.from_dataframes(
-    {"customers": customers, "products": products, "orders": orders},
-    links=[("orders", "customer_id", "customers"),
-           ("orders", "product_id", "products")])
-
-df = ds.predict(query, anchor_time=t0)
+result = engine.execute(ExecutionInput(query=query, anchor_time=t0))
+rankings = {p.id: p.ranked for p in result.predictions}
 ```
 
-The result contains a ranked list of product IDs per customer. Note
+Here `engine` is already wired to your application-owned retrievers. The
+result contains a ranked list of product IDs per customer. Note
 `orders.product_id` is an FK — the ranking works over graph edges
 (`Row.parents`), never over ID feature values.
 

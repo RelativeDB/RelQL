@@ -1,14 +1,41 @@
 plugins {
     id 'java-library'
-    id 'antlr'
+    id 'com.vanniktech.maven.publish'
 }
 
 dependencies {
-    antlr 'org.antlr:antlr4:4.13.1'
-    api 'org.antlr:antlr4-runtime:4.13.1'
+    // JNA binds the shared C++ runtime (librt_c), which is the single source of
+    // truth for the PQL parser (and the CSC index). librt_c is a hard runtime
+    // dependency — there is no in-process fallback parser.
+    implementation 'net.java.dev.jna:jna:5.14.0'
 }
 
-generateGrammarSource {
-    outputDirectory = file("${buildDir}/generated-src/antlr/main/dev/relativedb/query/antlr")
-    arguments += ['-package', 'dev.relativedb.query.antlr', '-visitor', '-no-listener']
+mavenPublishing {
+    coordinates('com.relativedb', 'relationdb', project.version.toString())
+
+    pom {
+        name = 'relationdb'
+        description = 'Predictive queries (PQL) over relational data.'
+        inceptionYear = '2026'
+        url = 'https://github.com/henneberger/relativedb'
+        licenses {
+            license {
+                name = 'The Apache License, Version 2.0'
+                url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                distribution = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+            }
+        }
+        developers {
+            developer {
+                id = 'henneberger'
+                name = 'henneberger'
+                url = 'https://github.com/henneberger'
+            }
+        }
+        scm {
+            url = 'https://github.com/henneberger/relativedb'
+            connection = 'scm:git:git://github.com/henneberger/relativedb.git'
+            developerConnection = 'scm:git:ssh://git@github.com/henneberger/relativedb.git'
+        }
+    }
 }

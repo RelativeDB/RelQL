@@ -1,7 +1,7 @@
 //! Schema declaration: tables, columns, links, value types.
 //!
 //! Only *shape* lives here — no URLs, no credentials, no connectors.
-//! Mirrors `dev.relativedb.schema` (Java) / `relativedb.schema` (Python).
+//! Mirrors `com.relativedb.schema` (Java) / `relativedb.schema` (Python).
 
 use std::collections::HashMap;
 use std::fmt;

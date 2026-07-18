@@ -1,6 +1,6 @@
 //! # relativedb — predictive queries (PQL) over your own data
 //!
-//! The Rust peer of the Java (`dev.relativedb.*`) and Python (`relativedb`)
+//! The Rust peer of the Java (`com.relativedb.*`) and Python (`relativedb`)
 //! libraries. GraphQL-style execution: the engine owns the query language,
 //! planning, context assembly, and model routing — all data access goes through
 //! user-defined **retrievers**. No bundled database connectors.
@@ -13,8 +13,9 @@
 //!   [`CohortRetriever`], [`TableScanner`], [`StatsProvider`]), [`Row`],
 //!   [`TemporalBound`], [`RetrieverWiring`]. **Synchronous** SPI (see the
 //!   module docs for the async-vs-sync rationale).
-//! * [`pql`] — a hand-written recursive-descent parser for `Pql.g4`, a typed
-//!   AST, schema-bound validation, and task-type inference.
+//! * [`pql`] — PQL parsing single-sourced on the shared C++ parser (`pql_parse`
+//!   in `librt_c`), a typed AST, schema-bound validation, and task-type
+//!   inference.
 //! * [`engine`] — [`Engine`], [`ExecutionInput`], [`ContextPolicy`],
 //!   [`SamplerMode`], [`PredictionResult`]; the real hop-loop context assembly
 //!   and the CSC in-memory sampler ([`csc`]).
@@ -23,6 +24,7 @@
 //!   C ABI (`librt_c`), plus a precomputed-embeddings [`TextEncoder`].
 
 pub mod csc;
+pub mod csc_native;
 pub mod engine;
 pub mod evaluate;
 pub mod model;

@@ -21,15 +21,13 @@ Timeframe 1 covers days (0, 7], timeframe 2 covers (7, 14], and so on.
 ## Run it
 
 ```python
-ds = relativedb.from_dataframes(
-    {"stores": stores, "sales": sales},
-    links=[("sales", "store_id", "stores")])
-
-df = ds.predict(query, anchor_time=t0)
+result = engine.execute(ExecutionInput(query=query, anchor_time=t0))
+forecasts = {p.id: p.forecast for p in result.predictions}
 ```
 
-The result has one row per store per timeframe. Forecasting routes to the
-regression checkpoint.
+Here `engine` uses the schema and application-owned retrievers wired over your
+store and sales data. The result has one prediction per store with four
+timeframes. Forecasting routes to the regression checkpoint.
 
 ## Notes
 

@@ -13,7 +13,8 @@ the volume of an outlet store.
 """
 import numpy as np
 import pandas as pd
-import relativedb
+from pandas_connector import predictions_frame, wire_pandas_frames
+from relativedb import Engine, ExecutionInput, LinkDef, Schema, TableDef, ValueType
 
 rng = np.random.default_rng(23)
 ANCHOR = pd.Timestamp("2026-07-01")
@@ -34,14 +35,22 @@ for sid, lam in DAILY.items():
                      float(rng.poisson(lam * weekend))))
 sales = pd.DataFrame(rows, columns=["sale_id", "store_id", "ts", "qty"])
 
-ds = relativedb.from_dataframes(
-    {"stores": stores, "sales": sales},
-    links=[("sales", "store_id", "stores")])
-
-df = ds.predict(
-    "PREDICT SUM(sales.qty, 0, 7, days) FORECAST 4 TIMEFRAMES "
-    "FOR EACH stores.store_id",
-    anchor_time=ANCHOR)
+schema = (Schema.new_schema()
+          .table(TableDef.new_table("stores")
+                 .column("sqft", ValueType.NUMBER)
+                 .column("city", ValueType.TEXT)
+                 .primary_key("store_id").build())
+          .table(TableDef.new_table("sales")
+                 .column("ts", ValueType.DATETIME)
+                 .column("qty", ValueType.NUMBER)
+                 .primary_key("sale_id").time_column("ts").build())
+          .link(LinkDef("sales", "store_id", "stores")).build())
+wiring = wire_pandas_frames(schema, {"stores": stores, "sales": sales})
+result = Engine(schema, wiring).execute(ExecutionInput(
+    query="PREDICT SUM(sales.qty, 0, 7, days) FORECAST 4 TIMEFRAMES "
+          "FOR EACH stores.store_id",
+    anchor_time=ANCHOR.to_pydatetime()))
+df = predictions_frame(result)
 
 print(df.to_string())
 

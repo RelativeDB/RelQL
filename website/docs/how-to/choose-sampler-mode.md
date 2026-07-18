@@ -17,8 +17,9 @@ Both modes produce identical contexts. Choose by data locality.
 ## Switching
 
 ```python
-from relativedb import SamplerMode
-df = ds.predict(query, anchor_time=t0, sampler_mode=SamplerMode.CSC)
+from relativedb import Engine, ExecutionInput, SamplerMode
+engine = Engine(schema, wiring, sampler_mode=SamplerMode.CSC)
+result = engine.execute(ExecutionInput(query=query, anchor_time=t0))
 ```
 
 ```java

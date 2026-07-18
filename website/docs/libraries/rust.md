@@ -5,11 +5,11 @@ description: The relativedb Rust crate.
 
 # Rust library
 
-Crate `relativedb` (edition 2021); depends only on `chrono` and `libloading`.
+crates.io package `relationdb` (crate API `relativedb`, edition 2021); depends
+only on `chrono` and `libloading`.
 
 ```bash
-cd rust
-cargo test
+cargo add relationdb
 ```
 
 ## API shape

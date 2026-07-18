@@ -1,7 +1,7 @@
 //! Native RT model backend — scores contexts with the golden-verified C++ RT-J
 //! engine (`librt_c`) instead of the history baseline.
 //!
-//! Three layers, mirroring `relativedb.rt_native` (Python) / `dev.relativedb.rt`
+//! Three layers, mirroring `relativedb.rt_native` (Python) / `com.relativedb.rt`
 //! (Java):
 //!
 //! 1. [`RtLib`] / [`load_lib`] — a `libloading` binding to the C ABI in
@@ -229,7 +229,7 @@ unsafe impl Sync for RtModel {}
 // library discovery
 // ---------------------------------------------------------------------------
 
-fn lib_filename() -> &'static str {
+pub(crate) fn lib_filename() -> &'static str {
     if cfg!(target_os = "macos") {
         "librt_c.dylib"
     } else if cfg!(target_os = "windows") {
@@ -239,7 +239,9 @@ fn lib_filename() -> &'static str {
     }
 }
 
-fn candidate_lib_paths() -> Vec<String> {
+/// Ordered library-discovery candidates shared by every librt_c binding
+/// (`RELATIVEDB_RT_LIB` override first, then the sibling `cpp/build` tree).
+pub(crate) fn candidate_lib_paths() -> Vec<String> {
     let mut cands = Vec::new();
     for var in ["RELATIVEDB_RT_LIB"] {
         if let Ok(v) = std::env::var(var) {

@@ -1,6 +1,10 @@
+plugins {
+    id 'com.vanniktech.maven.publish' version '0.37.0' apply false
+}
+
 subprojects {
-    group = 'dev.relativedb'
-    version = '0.1.0-SNAPSHOT'
+    group = 'com.relativedb'
+    version = '0.1.0'
 
     repositories {
         mavenCentral()

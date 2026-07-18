@@ -13,33 +13,41 @@ semantics.
 Requires Python 3.10+. Core depends only on numpy.
 
 ```bash
-cd python
-pip install -e ".[pandas]"
+pip install relationdb
 ```
 
-Extras: `[pandas]` for the DataFrame convenience layer, `[rt]` for the native
-RT-J backend (sentence-transformers + huggingface_hub), `[dev]` for pytest.
+The core depends only on numpy. Extras: `[rt]` for the native RT-J backend
+(sentence-transformers + huggingface_hub), `[dev]` for pytest. Pandas and
+storage clients belong to your application; relationdb provides no bundled
+connectors. The distribution is `relationdb`, while the Python import remains
+`import relativedb`.
 
 ## Java
 
-Requires Java 17+. Gradle modules under group `dev.relativedb`:
+Requires Java 17+. Maven publications under group `com.relativedb`:
 
-- `relativedb-core` — engine, schema, PQL parser, retriever SPI
-- `relativedb-rt` — optional JNA binding to the native RT-J engine
+- `relationdb` — engine, schema, PQL parser, retriever SPI
+- `relationdb-rt` — optional JNA binding to the native RT-J engine
 
-```bash
-cd java
-./gradlew build
+```kotlin
+dependencies {
+    implementation("com.relativedb:relationdb:0.1.0")
+    // implementation("com.relativedb:relationdb-rt:0.1.0")
+}
 ```
 
 ## Rust
 
-Cargo workspace; the crate depends only on `chrono` and `libloading`.
+The crates.io distribution is `relationdb`; the established Rust crate API is
+`relativedb`. It depends only on `chrono` and `libloading`.
 
 ```bash
-cd rust
-cargo build
+cargo add relationdb
 ```
+
+These registry coordinates are prepared but will not resolve until the first
+release is published. See [Releasing the libraries](../contributing/releases)
+for the manual dry-run workflow and registry setup.
 
 ## Native model engine (optional)
 

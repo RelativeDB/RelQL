@@ -22,6 +22,22 @@ endif()
 add_executable(rt_bench src/bench.cpp)
 target_link_libraries(rt_bench rt)
 
-add_library(rt_c SHARED src/rt_c.cpp)
+add_library(rt_c SHARED src/rt_c.cpp src/pql_c.cpp src/pql.cpp
+                        src/csc_c.cpp src/csc.cpp)
 target_link_libraries(rt_c rt)
+target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)
+
+# Shared PQL parser (C++20 lexer + recursive-descent parser).
+add_library(pql STATIC src/pql.cpp)
+target_include_directories(pql PUBLIC src)
+
+add_executable(pql_test src/test_pql.cpp)
+target_link_libraries(pql_test pql)
+
+# Shared CSC adjacency (time-bounded "latest <= anchor" children query).
+add_library(csc STATIC src/csc.cpp)
+target_include_directories(csc PUBLIC src)
+
+add_executable(csc_test src/test_csc.cpp)
+target_link_libraries(csc_test csc)

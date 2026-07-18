@@ -5,16 +5,18 @@ description: The relativedb Java library.
 
 # Java library
 
-Gradle modules under group `dev.relativedb`; requires Java 17+.
+Maven publications under group `com.relativedb`; requires Java 17+.
 
 | Module | Contents |
 |---|---|
-| `relativedb-core` | Schema builder, retriever SPI, ANTLR-based PQL parser + validation, context assembly (both sampler modes), model SPI |
-| `relativedb-rt` | Optional JNA binding to the native RT-J engine: `RtNativeBackend implements ModelBackend` |
+| `relationdb` | Schema builder, retriever SPI, ANTLR-based PQL parser + validation, context assembly (both sampler modes), model SPI |
+| `relationdb-rt` | Optional JNA binding to the native RT-J engine: `RtNativeBackend implements ModelBackend` |
 
-```bash
-cd java
-./gradlew test
+```kotlin
+dependencies {
+    implementation("com.relativedb:relationdb:0.1.0")
+    // implementation("com.relativedb:relationdb-rt:0.1.0")
+}
 ```
 
 ## API shape
@@ -35,7 +37,7 @@ PredictionResult r = engine.execute(ExecutionInput.newInput()
     .build()).toCompletableFuture().join();
 ```
 
-Key packages: `dev.relativedb.schema`, `.retrieve`, `.query` (entry point
+Key packages: `com.relativedb.schema`, `.retrieve`, `.query` (entry point
 `Pql.parse` / `Pql.validate`), `.engine`, `.model`, `.rt`.
 
 ## Async retriever SPI

@@ -12,8 +12,9 @@ import time
 import numpy as np
 import pandas as pd
 
-import relativedb
-from relativedb import SamplerMode
+from industry.pandas_connector import predictions_frame, wire_pandas_frames
+from relativedb import (Engine, ExecutionInput, LinkDef, SamplerMode, Schema,
+                        TableDef, ValueType)
 
 N_CUSTOMERS = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000
 ORDERS_PER_CUSTOMER = 20
@@ -36,13 +37,22 @@ orders = pd.DataFrame({
 
 QUERY = "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id"
 
-# --- relativedb, CSC sampler -------------------------------------------------
-ds = relativedb.from_dataframes(
-    {"customers": customers, "orders": orders},
-    links=[("orders", "customer_id", "customers")],
-)
+# --- relationdb, with an application-owned pandas connector -----------------
+schema = (Schema.new_schema()
+          .table(TableDef.new_table("customers")
+                 .column("age", ValueType.NUMBER)
+                 .column("signup_date", ValueType.DATETIME)
+                 .primary_key("customer_id").build())
+          .table(TableDef.new_table("orders")
+                 .column("qty", ValueType.NUMBER)
+                 .column("order_date", ValueType.DATETIME)
+                 .primary_key("order_id").time_column("order_date").build())
+          .link(LinkDef("orders", "customer_id", "customers")).build())
+wiring = wire_pandas_frames(schema, {"customers": customers, "orders": orders})
 t0 = time.perf_counter()
-df = ds.predict(QUERY, anchor_time=ANCHOR, sampler_mode=SamplerMode.CSC)
+result = Engine(schema, wiring, sampler_mode=SamplerMode.CSC).execute(
+    ExecutionInput(query=QUERY, anchor_time=ANCHOR.to_pydatetime()))
+df = predictions_frame(result)
 t_relativedb = time.perf_counter() - t0
 
 # --- naive pandas loop -------------------------------------------------------

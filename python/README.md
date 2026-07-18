@@ -6,14 +6,17 @@ routing — all data access goes through **user-defined retrievers** wired to a
 declared schema. There are **no bundled database connectors**: bring
 DataFrames, a DAO, a REST client, anything.
 
-```
-pip install -e ".[pandas]"
+```bash
+pip install relationdb
 ```
 
-Requires Python 3.10+. Core depends only on numpy; pandas is optional (for the
-`from_dataframes` convenience layer).
+Requires Python 3.10+ and depends only on numpy. The distribution is named
+`relationdb`; the established Python import remains `relativedb`. There is no
+pandas adapter or bundled storage connector.
 
-## Quickstart: 90-day churn from DataFrames
+For a source checkout, use `pip install -e .` from this directory.
+
+## Quickstart: 90-day churn from your own DataFrames
 
 The "will customer C7 churn?" scenario: three linked tables, prediction time
 t0 = 2026-07-01.
@@ -41,25 +44,33 @@ orders = pd.DataFrame({
         ["2026-03-10", "2026-05-02", "2026-06-20", "2026-07-05"]),
 })
 
-ds = relativedb.from_dataframes(
-    {"customers": customers, "products": products, "orders": orders},
-    links=[("orders", "customer_id", "customers"),
-           ("orders", "product_id", "products")])
+schema = (relativedb.Schema.new_schema()
+    .table(relativedb.TableDef.new_table("customers")
+        .column("age", relativedb.ValueType.NUMBER)
+        .column("signup_date", relativedb.ValueType.DATETIME)
+        .primary_key("customer_id").build())
+    .table(relativedb.TableDef.new_table("orders")
+        .column("qty", relativedb.ValueType.NUMBER)
+        .column("order_date", relativedb.ValueType.DATETIME)
+        .primary_key("order_id").time_column("order_date").build())
+    .link(relativedb.LinkDef("orders", "customer_id", "customers")).build())
 
-# churn = "no order in the following 90 days"
-df = ds.predict(
-    "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
-    anchor_time=pd.Timestamp("2026-07-01"))
-print(df)          # entity_id, probability — one row per customer
+# Your connector translates DataFrame records into relationdb.Row objects.
+# See examples/industry/pandas_connector.py for a complete implementation.
+wiring = wire_my_dataframes(schema, {"customers": customers, "orders": orders})
+result = relativedb.Engine(schema, wiring).execute(relativedb.ExecutionInput(
+    query="PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+    anchor_time=pd.Timestamp("2026-07-01").to_pydatetime()))
+df = pd.DataFrame({"entity_id": [p.id for p in result.predictions],
+                   "probability": [p.probability for p in result.predictions]})
 ```
 
-Schema is inferred from the frames (PKs from `*_id` naming, value types from
-dtypes, time columns from datetime columns); FK and PK columns never become
-feature cells — they are graph edges (the F17 invariant). Order O4
+The schema and connector explicitly keep FK and PK columns out of feature
+cells—they are graph edges (the F17 invariant). Order O4
 (2026-07-05) is **after** the anchor and can never enter context: the engine
 re-checks every row against the temporal bound even if a retriever misbehaves.
 
-## The core, without pandas
+## The retriever SPI
 
 ```python
 from relativedb import (Schema, TableDef, ColumnDef, LinkDef, ValueType,
@@ -167,10 +178,9 @@ route per `ModelConfig` (`hf://` URIs resolve via huggingface_hub,
 cache-first; local paths work too).
 
 ```python
-backend = relativedb.RtNativeBackend(schema=ds.schema)
-df = ds.predict("PREDICT COUNT(orders.*, 0, 90, days) = 0 "
-                "FOR EACH customers.customer_id",
-                anchor_time=t0, model_backend=backend)
+backend = relativedb.RtNativeBackend(schema=schema)
+result = relativedb.Engine(schema, wiring, model_backend=backend).execute(
+    relativedb.ExecutionInput(query=query, anchor_time=t0))
 ```
 
 Needs `pip install -e ".[rt]"` (sentence-transformers + huggingface_hub) and
@@ -188,4 +198,4 @@ baseline (the C ABI exposes a single score head).
 Covers the full 44-query PQL corpus (plus 20 malformed rejections), the
 temporal-leakage guard (a future row never enters context, even from a buggy
 retriever), CSC/retriever context equivalence, model-URI routing, and the
-DataFrames-to-churn-prediction path end to end.
+explicit retriever-to-churn-prediction path end to end.

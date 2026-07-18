@@ -13,17 +13,11 @@ from .pql import (ParsedQuery, PqlSyntaxError, PqlValidationError, TaskType,
 from .model import (DEFAULT_CLASSIFICATION_MODEL_URI, DEFAULT_EMBEDDING_MODEL,
                     DEFAULT_REGRESSION_MODEL_URI, EmbeddingMismatchError,
                     ModelConfig)
-from .engine import (ContextPolicy, Engine, EntityContext, EntityPrediction,
-                     ExecutionError, ExecutionInput, HistoryBaselineBackend,
-                     ModelBackend, PredictionResult, SamplerMode)
+from .engine import (ContextPolicy, ContextTruncationWarning, Engine,
+                     EntityContext, EntityPrediction, ExecutionError,
+                     ExecutionInput, HistoryBaselineBackend, ModelBackend,
+                     PredictionResult, SamplerMode)
 from .csc import CscIndex
-
-
-def from_dataframes(dataframes, links=(), **kwargs):
-    """Build a Dataset (schema + in-memory retrievers) from pandas frames.
-    See :func:`relativedb.pandas_io.from_dataframes`."""
-    from .pandas_io import from_dataframes as _impl
-    return _impl(dataframes, links, **kwargs)
 
 
 def __getattr__(name):
@@ -46,8 +40,8 @@ __all__ = [
     "DEFAULT_CLASSIFICATION_MODEL_URI", "DEFAULT_REGRESSION_MODEL_URI",
     "DEFAULT_EMBEDDING_MODEL",
     "Engine", "ExecutionInput", "ExecutionError", "ContextPolicy",
+    "ContextTruncationWarning",
     "SamplerMode", "PredictionResult", "EntityPrediction", "EntityContext",
     "ModelBackend", "HistoryBaselineBackend", "CscIndex",
     "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
-    "from_dataframes",
 ]

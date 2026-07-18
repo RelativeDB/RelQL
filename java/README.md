@@ -9,8 +9,8 @@ touches a database**: all data access goes through user-implemented
 
 | Module | What it is |
 |---|---|
-| `relativedb-core` | Schema builder, retriever SPI, ANTLR-based PQL parser + semantic validation, pure-Java context assembly (RETRIEVER and CSC sampler modes), model SPI |
-| `relativedb-rt` | Optional JNA binding to the golden-verified C++ RT inference engine (`librt_c`): `RtNativeBackend implements ModelBackend`, scoring with the real Relational Transformer |
+| `com.relativedb:relationdb` | Schema builder, retriever SPI, ANTLR-based PQL parser + semantic validation, pure-Java context assembly (RETRIEVER and CSC sampler modes), model SPI |
+| `com.relativedb:relationdb-rt` | Optional JNA binding to the golden-verified C++ RT inference engine (`librt_c`): `RtNativeBackend implements ModelBackend`, scoring with the real Relational Transformer |
 
 Requires Java 17+. Build and test:
 
@@ -24,10 +24,10 @@ Declare the graph's *shape* (no URLs, no credentials), wire retrievers over
 whatever storage you have, and execute PQL:
 
 ```java
-import dev.relativedb.schema.*;
-import dev.relativedb.retrieve.*;
-import dev.relativedb.engine.*;
-import static dev.relativedb.schema.ValueType.*;
+import com.relativedb.schema.*;
+import com.relativedb.retrieve.*;
+import com.relativedb.engine.*;
+import static com.relativedb.schema.ValueType.*;
 
 RelativeDbSchema schema = RelativeDbSchema.newSchema()
     .table(TableDef.newTable("customers").column("age", NUMBER)

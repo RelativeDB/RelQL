@@ -126,7 +126,7 @@ def test_inf_bound_and_not():
 def test_word_operators_and_membership():
     pq = parse("PREDICT LAST(LOAN.STATUS, 0, 30) NOT LIKE '%DENIED' FOR EACH LOAN.id")
     assert pq.target.op is Operator.NOT_LIKE
-    pq = parse("PREDICT LOAN.STATUS IS IN ('A', 'C') FOR EACH LOAN.id")
+    pq = parse("PREDICT LOAN.STATUS IN ('A', 'C') FOR EACH LOAN.id")
     assert pq.target.op is Operator.IN and pq.target.right == ("A", "C")
     pq = parse("PREDICT ARTICLES.DESCRIPTION IS NULL FOR EACH ARTICLES.id")
     assert pq.target.op is Operator.IS_NULL

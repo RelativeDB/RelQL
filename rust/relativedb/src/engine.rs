@@ -18,7 +18,7 @@ use crate::csc::CscIndex;
 use crate::evaluate::{eval_bool, eval_value, EvalValue};
 use crate::model::ModelConfig;
 use crate::pql::ast::{ParsedQuery, TaskType, Window};
-use crate::pql::parser::{parse, validate};
+use crate::pql::{parse, validate};
 use crate::retrieve::{EntityId, RetrieverWiring, Row, TemporalBound, Value};
 use crate::schema::{LinkDef, Schema};
 use crate::Error;

@@ -42,6 +42,11 @@ const sidebars: SidebarsConfig = {
         'libraries/cpp',
       ],
     },
+    {
+      type: 'category',
+      label: 'Contributing',
+      items: ['contributing/releases'],
+    },
   ],
 };
 

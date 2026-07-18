@@ -15,6 +15,7 @@ import pytest
 
 from relativedb.rt_native import (RtNativeBackend, RtNativeUnavailableError,
                                 load_lib, resolve_model_path)
+from conftest import churn_rows, dt, in_memory_wiring
 
 TESTDATA = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "..", "cpp", "testdata"))
@@ -90,45 +91,22 @@ def test_resolve_model_path_local_and_hf(tmp_path):
 # End-to-end: the README churn scenario, scored by the native RT engine.
 # --------------------------------------------------------------------------
 
-def test_churn_end_to_end_with_native_backend():
-    pd = pytest.importorskip("pandas")
+def test_churn_end_to_end_with_native_backend(churn_schema):
     pytest.importorskip("sentence_transformers")
     _lib_or_skip()
     _checkpoint_or_skip("classification")
-    import relativedb
+    from relativedb import Engine, ExecutionInput
 
-    customers = pd.DataFrame({
-        "customer_id": ["C1", "C7", "C9"],
-        "age": [34, 52, 27],
-        "signup_date": pd.to_datetime(
-            ["2026-02-10", "2026-01-20", "2026-03-05"]),
-    })
-    products = pd.DataFrame({
-        "product_id": ["P1", "P2", "P3"],
-        "price": [25.0, 90.0, 35.0],
-        "name": ["running shoes", "espresso machine", "yoga mat"],
-    })
-    orders = pd.DataFrame({
-        "order_id": ["O1", "O2", "O3", "O4"],
-        "customer_id": ["C7", "C7", "C1", "C7"],
-        "product_id": ["P2", "P1", "P3", "P3"],
-        "qty": [1, 2, 1, 1],
-        "order_date": pd.to_datetime(
-            ["2026-03-10", "2026-05-02", "2026-06-20", "2026-07-05"]),
-    })
-    ds = relativedb.from_dataframes(
-        {"customers": customers, "products": products, "orders": orders},
-        links=[("orders", "customer_id", "customers"),
-               ("orders", "product_id", "products")])
+    backend = RtNativeBackend(schema=churn_schema)
+    engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                    model_backend=backend)
+    result = engine.execute(ExecutionInput(
+        query="PREDICT COUNT(orders.*, 0, 90, days) = 0 "
+              "FOR EACH customers.customer_id",
+        anchor_time=dt("2026-07-01")))
 
-    backend = RtNativeBackend(schema=ds.schema)
-    df = ds.predict(
-        "PREDICT COUNT(orders.*, 0, 90, days) = 0 "
-        "FOR EACH customers.customer_id",
-        anchor_time=pd.Timestamp("2026-07-01"), model_backend=backend)
-
-    assert set(df["entity_id"]) == {"C1", "C7", "C9"}
-    probs = dict(zip(df["entity_id"], df["probability"]))
+    probs = {p.id: p.probability for p in result.predictions}
+    assert set(probs) == {"C1", "C7", "C9"}
     for p in probs.values():
         assert 0.0 < p < 1.0 and math.isfinite(p)
     # soft ranking check: the long-inactive C9 (only order 2026-01-15-ish era,

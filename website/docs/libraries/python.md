@@ -5,29 +5,33 @@ description: The relativedb Python library.
 
 # Python library
 
-Package `relativedb`. Python 3.10+; core depends only on numpy.
+PyPI distribution `relationdb` (imported as `relativedb`). Python 3.10+; core
+depends only on numpy.
 
 ```bash
-cd python
-pip install -e ".[pandas]"    # extras: [pandas], [rt], [dev]
+pip install relationdb    # extras: [rt], [dev]
 ```
 
-## The pandas layer
+## Bring your own connector
 
-`from_dataframes` infers a schema from your frames (PKs from `*_id` naming,
-value types from dtypes, time columns from datetime columns) and wires
-in-memory retrievers:
+The package deliberately has no pandas adapter, database client, or schema
+inference. Applications translate their records to `Row` and wire retriever
+callbacks. Pandas can still be used entirely in application code:
 
 ```python
-ds = relativedb.from_dataframes(
-    {"customers": customers, "orders": orders},
-    links=[("orders", "customer_id", "customers")])
+import pandas as pd
+from relativedb import Engine, ExecutionInput, RetrieverWiring, Row
 
-df = ds.predict(query, anchor_time=t0)        # DataFrame: entity_id, probability/value
+rows = [Row("customers", r.customer_id, {"age": float(r.age)})
+        for r in customers.itertuples()]
+# Implement entity/link/scanner callbacks over `rows` and your other frames.
+wiring = RetrieverWiring.new_wiring()...build()
+result = Engine(schema, wiring).execute(ExecutionInput(query=query, anchor_time=t0))
+df = pd.DataFrame({"entity_id": [p.id for p in result.predictions]})
 ```
 
-Overrides: `primary_keys={...}`, `time_columns={...}`. Sampler mode and
-context knobs pass through `.predict(...)`.
+The repository’s `examples/industry/pandas_connector.py` is a complete,
+application-owned reference connector—not part of the installed package.
 
 ## The core API
 
@@ -51,5 +55,5 @@ Errors are specific: `PqlSyntaxError`, `PqlValidationError`, `SchemaError`,
 ```
 
 Covers the shared 44-query PQL corpus (+20 rejections), the temporal-leakage
-guard, CSC ≡ retriever equivalence, model routing, and the DataFrames→churn
+guard, CSC ≡ retriever equivalence, model routing, and the retriever→churn
 path end to end.

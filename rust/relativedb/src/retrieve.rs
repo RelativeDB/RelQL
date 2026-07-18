@@ -17,7 +17,7 @@
 //! implementation buffer errors — the engine itself returns [`crate::Result`]
 //! for the parse/validate/wiring/execution errors it owns.
 //!
-//! Mirrors `dev.relativedb.retrieve` (Java) / `relativedb.retrieve` (Python).
+//! Mirrors `com.relativedb.retrieve` (Java) / `relativedb.retrieve` (Python).
 
 use std::collections::HashMap;
 use std::fmt;

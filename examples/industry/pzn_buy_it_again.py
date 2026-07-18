@@ -13,7 +13,8 @@ secondary item (bought monthly), and one-off purchases.
 """
 import numpy as np
 import pandas as pd
-import relativedb
+from pandas_connector import predictions_frame, wire_pandas_frames
+from relativedb import Engine, ExecutionInput, LinkDef, Schema, TableDef, ValueType
 
 rng = np.random.default_rng(42)
 ANCHOR = pd.Timestamp("2026-07-01")
@@ -46,15 +47,28 @@ for cid in staples:
 orders = pd.DataFrame(rows, columns=["order_id", "customer_id", "product_id",
                                      "ts", "qty"])
 
-ds = relativedb.from_dataframes(
-    {"customers": customers, "products": products, "orders": orders},
-    links=[("orders", "customer_id", "customers"),
-           ("orders", "product_id", "products")])
-
-df = ds.predict(
-    "PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3 "
-    "FOR EACH customers.customer_id",
-    anchor_time=ANCHOR)
+schema = (Schema.new_schema()
+          .table(TableDef.new_table("customers")
+                 .column("member_since", ValueType.DATETIME)
+                 .primary_key("customer_id").build())
+          .table(TableDef.new_table("products")
+                 .column("price", ValueType.NUMBER)
+                 .column("category", ValueType.TEXT)
+                 .primary_key("product_id").build())
+          .table(TableDef.new_table("orders")
+                 .column("ts", ValueType.DATETIME)
+                 .column("qty", ValueType.NUMBER)
+                 .primary_key("order_id").time_column("ts").build())
+          .link(LinkDef("orders", "customer_id", "customers"))
+          .link(LinkDef("orders", "product_id", "products")).build())
+wiring = wire_pandas_frames(schema, {
+    "customers": customers, "products": products, "orders": orders,
+})
+result = Engine(schema, wiring).execute(ExecutionInput(
+    query="PREDICT LIST_DISTINCT(orders.product_id, 0, 30, days) RANK TOP 3 "
+          "FOR EACH customers.customer_id",
+    anchor_time=ANCHOR.to_pydatetime()))
+df = predictions_frame(result)
 
 print(df.to_string())
 

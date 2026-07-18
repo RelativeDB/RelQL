@@ -1,8 +1,15 @@
 # relativedb (Rust)
 
 Predictive queries (**PQL**) over your own data — the Rust peer of the Java
-(`dev.relativedb.*`) and Python (`relativedb`) libraries. Same concepts, same
+(`com.relativedb.*`) and Python (`relativedb`) libraries. Same concepts, same
 behavior, idiomatic Rust.
+
+The crates.io package is named `relationdb`; its established crate API remains
+`relativedb`:
+
+```bash
+cargo add relationdb
+```
 
 GraphQL-style execution: the engine owns the query language, planning, context
 assembly, and model routing — **all data access goes through user-defined

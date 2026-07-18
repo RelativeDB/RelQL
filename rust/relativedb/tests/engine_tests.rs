@@ -105,24 +105,6 @@ fn max_context_cells_budget() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn csc_arrays_time_sorted() {
-    let idx = CscIndex::build(&churn_schema(), &churn_wiring()).unwrap();
-    let link = LinkDef::link("orders", "customer_id", "customers");
-    let adj = &idx.adjacency[&link];
-    assert_eq!(*adj.colptr.last().unwrap() as usize, adj.row.len());
-    assert_eq!(adj.row.len(), 4);
-    for p in 0..adj.colptr.len() - 1 {
-        let s = adj.colptr[p] as usize;
-        let e = adj.colptr[p + 1] as usize;
-        for w in s + 1..e {
-            assert!(adj.ts[w] >= adj.ts[w - 1]);
-        }
-    }
-    let c7 = idx.dense["customers"][&EntityId::from("C7")];
-    assert_eq!(adj.colptr[c7 + 1] - adj.colptr[c7], 3);
-}
-
-#[test]
 fn csc_children_bound_and_limit() {
     let idx = CscIndex::build(&churn_schema(), &churn_wiring()).unwrap();
     let link = LinkDef::link("orders", "customer_id", "customers");

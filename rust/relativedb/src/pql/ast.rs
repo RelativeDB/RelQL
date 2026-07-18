@@ -1,6 +1,6 @@
 //! Typed PQL AST + task-type inference.
 //!
-//! Mirrors the `dev.relativedb.query` records (Java) / `relativedb.pql.ast`
+//! Mirrors the `com.relativedb.query` records (Java) / `relativedb.pql.ast`
 //! (Python).
 
 use chrono::{DateTime, Duration, Utc};

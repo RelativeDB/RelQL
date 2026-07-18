@@ -1,8 +1,23 @@
-# rt.cpp — Relational Transformer inference in C++
+# rt.cpp — shared native layer (inference + parser + CSC)
 
 A dependency-light C++20 implementation of **RT-J** (the Stanford Relational
 Transformer successor, `stanford-star/rt-j`), verified bit-for-practical
 against the PyTorch reference. ~700 lines, no torch, no Python at inference.
+
+`librt_c` is the single shared backend for every language binding. Beyond
+inference it now also hosts two components that were previously reimplemented
+per language, so the bindings can delegate instead of diverging:
+
+- **PQL parser** (`src/pql.{hpp,cpp}`, C ABI `pql_parse` in `src/pql_c.h`) —
+  hand-written lexer + recursive-descent parser producing a JSON AST. Test:
+  `./build/pql_test`. Python binding: `relativedb.pql.native`; cross-language
+  equivalence: `python/tests/test_native_parser.py`.
+- **CSC index** (`src/csc.{hpp,cpp}`, C ABI `csc_build`/`csc_children`/`csc_free`
+  in `src/csc_c.h`) — lex-sorted adjacency + binary-searched "latest ≤ anchor"
+  children. Test: `./build/csc_test`. Python binding: `relativedb.csc_native`;
+  equivalence: `python/tests/test_native_csc.py`.
+
+Build all: `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4`.
 
 ## What it implements
 

@@ -1,8 +1,17 @@
-//! Materialized in-memory CSC adjacency built from TableScanners.
+//! In-memory CSC adjacency over scanner-provided tables.
 //!
+//! The time-bounded "latest <= anchor" children query — the CSC hot path and
+//! the one non-trivial algorithm here — lives once in the C++ layer
+//! (`cpp/src/csc.*`, via [`crate::csc_native`]), shared with the Java and Python
+//! bindings. This module keeps only the Rust-side bookkeeping: table row
+//! storage, the id<->dense-index mapping, and the seed/cohort lookups.
+//! `librt_c` is a hard dependency (the same native library the RT-J model and
+//! PQL parser require) — there is no in-language fallback.
 
 use std::collections::HashMap;
 
+use crate::csc_native::NativeCsc;
+use crate::native::RtError;
 use crate::retrieve::{EntityId, RetrieverWiring, Row, TemporalBound};
 use crate::schema::{LinkDef, Schema};
 
@@ -14,22 +23,15 @@ fn epoch(row: &Row) -> f64 {
     }
 }
 
-/// CSC arrays for one FK link (child `from_table` -> parent `to_table`).
-#[derive(Clone, Debug)]
-pub struct LinkAdjacency {
-    pub link: LinkDef,
-    /// indexed by parent dense id (length n_parents + 1)
-    pub colptr: Vec<i64>,
-    /// child dense ids, per-parent blocks sorted by time asc
-    pub row: Vec<i64>,
-    /// matching child timestamps (epoch seconds, -inf if none)
-    pub ts: Vec<f64>,
-}
-
+/// Snapshot index over scanner-provided tables. Rebuild via a new [`build`].
+///
+/// Per-link adjacency (build + time-bounded children) is delegated to the
+/// native `csc_*` implementation; the dense child ids it returns index back
+/// into this index's own [`rows`](Self::rows) lists.
 pub struct CscIndex {
     pub rows: HashMap<String, Vec<Row>>,
     pub dense: HashMap<String, HashMap<EntityId, usize>>,
-    pub adjacency: HashMap<LinkDef, LinkAdjacency>,
+    pub adjacency: HashMap<LinkDef, NativeCsc>,
 }
 
 impl CscIndex {
@@ -62,20 +64,23 @@ impl CscIndex {
             idx.dense.insert(table.name.clone(), dense);
         }
         for link in &schema.links {
-            let adj = idx.build_link(link);
+            let adj = idx.build_link(link)?;
             idx.adjacency.insert(link.clone(), adj);
         }
         Ok(idx)
     }
 
-    fn build_link(&self, link: &LinkDef) -> LinkAdjacency {
+    /// Extract this link's edges `(parent_dense, child_dense, ts)` and hand them
+    /// to the native index; the native side sorts, buckets, and binary-searches.
+    fn build_link(&self, link: &LinkDef) -> Result<NativeCsc, crate::Error> {
         let empty = Vec::new();
         let children = self.rows.get(&link.from_table).unwrap_or(&empty);
         let empty_dense = HashMap::new();
         let parent_dense = self.dense.get(&link.to_table).unwrap_or(&empty_dense);
         let n_parents = self.rows.get(&link.to_table).map(|v| v.len()).unwrap_or(0);
-        // (parent dense id, child dense id, child ts)
-        let mut edges: Vec<(usize, usize, f64)> = Vec::new();
+        let mut edge_parent: Vec<i64> = Vec::new();
+        let mut edge_child: Vec<i64> = Vec::new();
+        let mut edge_ts: Vec<f64> = Vec::new();
         for (ci, row) in children.iter().enumerate() {
             let pid = match row.get_parent(&link.fk_column) {
                 Some(p) => p,
@@ -85,25 +90,13 @@ impl CscIndex {
                 Some(&pi) => pi,
                 None => continue, // dangling FK: edge dropped, row still scannable
             };
-            edges.push((pi, ci, epoch(row)));
+            edge_parent.push(pi as i64);
+            edge_child.push(ci as i64);
+            edge_ts.push(epoch(row));
         }
-        // stable sort by (parent, time asc)
-        edges.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        let mut colptr = vec![0i64; n_parents + 1];
-        let mut rows_arr = Vec::with_capacity(edges.len());
-        let mut ts_arr = Vec::with_capacity(edges.len());
-        for (pi, ci, t) in &edges {
-            colptr[pi + 1] += 1;
-            rows_arr.push(*ci as i64);
-            ts_arr.push(*t);
-        }
-        for k in 1..colptr.len() {
-            colptr[k] += colptr[k - 1];
-        }
-        LinkAdjacency { link: link.clone(), colptr, row: rows_arr, ts: ts_arr }
+        NativeCsc::new(n_parents as i64, &edge_parent, &edge_child, &edge_ts).map_err(|e| {
+            crate::Error::Rt(RtError::Native(format!("csc_build for link {:?}: {}", link, e)))
+        })
     }
 
     pub fn entities(&self, table: &str, ids: &[EntityId], bound: &TemporalBound) -> Vec<Row> {
@@ -123,7 +116,8 @@ impl CscIndex {
         out
     }
 
-    /// Latest `limit` children with time <= bound, newest-first.
+    /// Latest `limit` children with time <= bound, newest-first. Delegated to
+    /// the native index; the dense ids it returns index back into `rows`.
     pub fn children(
         &self,
         link: &LinkDef,
@@ -139,21 +133,16 @@ impl CscIndex {
             Some(&pi) => pi,
             None => return Vec::new(),
         };
-        let s = adj.colptr[pi] as usize;
-        let e = adj.colptr[pi + 1] as usize;
-        let anchor = bound.as_of.map(|t| t.timestamp() as f64
-            + t.timestamp_subsec_nanos() as f64 / 1e9)
+        let anchor = bound
+            .as_of
+            .map(|t| t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1e9)
             .unwrap_or(f64::INFINITY);
-        // searchsorted(ts[s..e], anchor, side="right") = count of ts <= anchor
-        let block = &adj.ts[s..e];
-        let hi = block.partition_point(|&x| x <= anchor);
-        if limit == 0 {
-            return Vec::new();
-        }
         let table_rows = &self.rows[&link.from_table];
-        let start = s + hi.saturating_sub(limit);
-        let picked = &adj.row[start..s + hi];
-        picked.iter().rev().map(|&ci| table_rows[ci as usize].clone()).collect()
+        let limit = limit.min(i32::MAX as usize) as i32;
+        adj.children(pi as i64, anchor, limit)
+            .into_iter()
+            .map(|ci| table_rows[ci as usize].clone())
+            .collect()
     }
 
     pub fn all_ids(&self, table: &str) -> Vec<EntityId> {

@@ -37,7 +37,7 @@ PREDICT SUM(TRANSACTIONS.PRICE, 0, 30) FOR EACH CUSTOMERS.CUSTOMER_ID WHERE (use
 PREDICT SUM(usage.count, 0, 12, weeks) FOR EACH accounts.account_id
 PREDICT COUNT(events.*, 0, 6, hours) > 0 FOR EACH sensors.sensor_id
 PREDICT SUM(metrics.value, 0, 90, seconds) FOR EACH devices.device_id
-PREDICT LOAN.STATUS IS IN ('A', 'C') FOR EACH LOAN.id
+PREDICT LOAN.STATUS IN ('A', 'C') FOR EACH LOAN.id
 PREDICT ARTICLES.DESCRIPTION NOT CONTAINS 'refurbished' FOR EACH ARTICLES.id
 PREDICT MAX(target.value, 0, 1, days) FORECAST 4 TIMEFRAMES FOR EACH entity.customer_id
 PREDICT SUM(transactions.value, 15, 45, days) > 100 FOR EACH customers.customer_id WHERE customers.location NOT IN ('ALASKA', 'HAWAII')

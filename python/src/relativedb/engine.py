@@ -12,6 +12,7 @@ retriever must not leak the future into context).
 """
 from __future__ import annotations
 
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -31,11 +32,22 @@ __all__ = [
     "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
     "EntityPrediction", "PredictionResult", "ModelBackend",
     "HistoryBaselineBackend", "Engine", "ExecutionError",
+    "ContextTruncationWarning",
 ]
+
+# Aggregations whose value grows with the number of rows in the window, and so
+# are biased low when the fanout cap drops children. (FIRST/LAST/MIN/MAX and
+# the DISTINCT/LIST variants are far less sensitive to a dropped tail.)
+_COUNTING_AGGS = frozenset({AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG})
 
 
 class ExecutionError(RuntimeError):
     pass
+
+
+class ContextTruncationWarning(UserWarning):
+    """A windowed COUNT/SUM/AVG was computed over a fanout-truncated context,
+    biasing the aggregate low. Raise ContextPolicy limits to silence."""
 
 
 class SamplerMode(Enum):
@@ -91,6 +103,8 @@ class EntityContext:
     entity_id: Any
     anchor: Optional[datetime]
     rows: list[Row] = field(default_factory=list)
+    truncated_children: int = 0     # children dropped by the fanout cap (F-trunc)
+    hit_cell_budget: bool = False   # assembly stopped on max_context_cells
 
     @property
     def row_keys(self) -> set[tuple[str, Any]]:
@@ -129,28 +143,7 @@ class PredictionResult:
     task_type: TaskType
     predictions: tuple[EntityPrediction, ...]
     model_uri: str = ""
-
-    def to_dataframe(self):
-        import pandas as pd
-
-        recs = []
-        for p in self.predictions:
-            rec: dict[str, Any] = {"entity_id": p.id}
-            if p.value is not None:
-                rec["value"] = p.value
-            if p.probability is not None:
-                rec["probability"] = p.probability
-            if p.class_probs:
-                rec["predicted_class"] = max(p.class_probs, key=p.class_probs.get)
-                for k, v in p.class_probs.items():
-                    rec[f"prob_{k}"] = v
-            if p.ranked:
-                rec["ranked"] = list(p.ranked)
-            if p.forecast:
-                rec["forecast"] = list(p.forecast)
-            recs.append(rec)
-        return pd.DataFrame.from_records(recs)
-
+    stats: dict = field(default_factory=dict)   # context-assembly diagnostics
 
 class ModelBackend(Protocol):
     """Anything that can score assembled contexts. The built-in
@@ -303,12 +296,19 @@ class Engine:
             # children: width-bounded, newest-first
             for row in frontier:
                 for link in self.schema.links_to(row.table):
-                    kids = sampler.children(link, row.id, bound, fanout)
+                    # request one extra so we can *detect* (not just silently
+                    # apply) truncation: if the sampler returns more than the
+                    # fanout, a windowed COUNT/SUM over this context is biased
+                    # low. Surfaced via ctx.truncated_children (F-trunc).
+                    kids = sampler.children(link, row.id, bound, fanout + 1)
                     kids = [k for k in kids if bound.admits_row(k)]
+                    if len(kids) > fanout:
+                        ctx.truncated_children += len(kids) - fanout
                     if policy.prefer_latest:
                         kids.sort(key=_newest_first_key)
                     next_frontier += admit(kids[:fanout])
                 if ctx.cell_count >= policy.max_context_cells:
+                    ctx.hit_cell_budget = True
                     break
             frontier = next_frontier
             if not frontier:
@@ -333,11 +333,42 @@ class Engine:
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
                 continue
             contexts.append(ctx)
+        stats = self._collect_stats(pq, task_type, contexts)
         preds = self.model_backend.score(pq, task_type, contexts, model_uri,
                                          self.model_config)
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
-                                model_uri=model_uri)
+                                model_uri=model_uri, stats=stats)
+
+    def _collect_stats(self, pq: ParsedQuery, task_type: TaskType,
+                       contexts: list[EntityContext]) -> dict:
+        """Surface silent context truncation. A windowed COUNT/SUM whose
+        window can hold more rows than the fanout cap is biased low when
+        ``truncated_children`` is nonzero — previously invisible to callers."""
+        # truncated_children counts *truncation events* (child-expansions that
+        # hit the cap); the true number of dropped rows is unknown and larger,
+        # since detection only requests one past the cap. So we report affected
+        # entities, not a false-precision drop total.
+        n_trunc = sum(1 for c in contexts if c.truncated_children)
+        stats = {
+            "entities_scored": len(contexts),
+            "contexts_truncated": n_trunc,
+            "truncation_events": sum(c.truncated_children for c in contexts),
+            "contexts_hit_cell_budget": sum(1 for c in contexts if c.hit_cell_budget),
+            "fanout_per_hop": self.context_policy.fanout_at(0),
+        }
+        # Truncation only distorts *count-like* aggregates (COUNT/SUM/AVG over a
+        # window). Warn once per execute when it actually bites those.
+        windowed = any(a.window is not None and a.func in _COUNTING_AGGS
+                       for a in pq.target_aggregations)
+        if n_trunc and windowed:
+            warnings.warn(
+                f"context truncation: {n_trunc}/{len(contexts)} entities hit "
+                f"the fanout cap ({stats['fanout_per_hop']}); windowed "
+                f"COUNT/SUM/AVG in this query are biased low for them. Raise "
+                f"ContextPolicy.bfs_width/fanouts or max_context_cells.",
+                ContextTruncationWarning, stacklevel=2)
+        return stats
 
     def _where_ok(self, pq: ParsedQuery, ctx: EntityContext,
                   entity_table: str) -> bool:
