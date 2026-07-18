@@ -9,7 +9,7 @@ Maven publications under group `com.relativedb`; requires Java 17+.
 
 | Module | Contents |
 |---|---|
-| `relationdb` | Schema builder, retriever SPI, ANTLR-based RelQL parser + validation, context assembly (both sampler modes), model SPI |
+| `relationdb` | Schema builder, retriever SPI, RelQL parser (native `librt_c`) + validation, context assembly (both sampler modes), model SPI |
 | `relationdb-rt` | Optional JNA binding to the native RT-J engine: `RtNativeBackend implements ModelBackend` |
 
 ```kotlin

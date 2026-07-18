@@ -30,9 +30,8 @@ anchor time?*
   [task type](reference/task-types) (classification, regression, ranking,
   forecasting), which selects the model checkpoint and output form.
 
-One grammar, three
-verified implementations (ANTLR in Java; recursive descent in Python and
-Rust), all tested against a shared 44-query corpus.
+One grammar, single-sourced in a C++ parser and decoded by the Python, Java,
+and Rust bindings — all tested against a shared 54-query corpus.
 
 ## Learn it
 

@@ -54,6 +54,6 @@ Errors are specific: `PqlSyntaxError`, `PqlValidationError`, `SchemaError`,
 .venv/bin/python -m pytest
 ```
 
-Covers the shared 44-query RelQL corpus (+20 rejections), the temporal-leakage
+Covers the shared 54-query RelQL corpus (+20 rejections), the temporal-leakage
 guard, CSC ≡ retriever equivalence, model routing, and the retriever→churn
 path end to end.

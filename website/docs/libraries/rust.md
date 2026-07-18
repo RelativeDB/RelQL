@@ -29,8 +29,8 @@ let result = engine.execute(
     ExecutionInput::query("PREDICT ...").anchor_time(t0))?;
 ```
 
-Modules: `schema`, `retrieve`, `pql` (hand-written recursive-descent parser,
-no ANTLR runtime), `engine`, `model`, `native`, `csc`. Errors surface through
+Modules: `schema`, `retrieve`, `pql` (decodes the shared native `librt_c`
+parser's JSON AST), `engine`, `model`, `native`, `csc`. Errors surface through
 `relativedb::Result` / `relativedb::Error`.
 
 ## Design decision: synchronous SPI
@@ -50,5 +50,5 @@ RELATIVEDB_RT_LIB=../cpp/build/librt_c.dylib \
   cargo test --test golden_tests -- --nocapture
 ```
 
-The shared 44-query RelQL corpus lives in this crate
+The shared 54-query RelQL corpus lives in this crate
 (`tests/data/examples.pql`) and is exercised by all three languages.

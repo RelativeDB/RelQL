@@ -5,7 +5,7 @@ description: Real queries from the shared test corpus, by use case.
 
 # Cookbook
 
-Copy-paste starting points, drawn from the shared 44-query test corpus.
+Copy-paste starting points, drawn from the shared 54-query test corpus.
 
 ## Churn (binary classification)
 

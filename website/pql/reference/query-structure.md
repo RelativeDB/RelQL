@@ -8,20 +8,19 @@ description: Clauses, keywords, and identifiers.
 Clause order is significant:
 
 ```sql
-[EXPLAIN [PLAN|CONTEXT|ANALYZE|ABLATION] [FORMAT TEXT|JSON]]  -- optional: inspect, don't (necessarily) run
+[EXPLAIN [PLAN|CONTEXT|ANALYZE] [FORMAT TEXT|JSON]]  -- optional: inspect, don't (necessarily) run
 PREDICT   <target> [CLASSIFY | RANK TOP <k>]   -- required: what to predict
 FOR [EACH] <entity_table>.<pkey>               -- required: the population
           [= <literal> | IN (<list>)]          --   ...or explicit entities
 [WHERE     <condition>]                        -- optional: entity filter (past-facing)
 [ASSUMING  <condition>]                        -- optional: counterfactual
 [AS OF     <anchor>]                           -- optional: bind the anchor time
-[ABLATE TABLE <name>]                          -- optional: drop a table from context
 [RETURN    <return_spec>]                       -- optional: choose the output form
 [WINDOW    <name> AS (<window_spec>)]           -- optional, repeatable: named frames
 ```
 
-The **trailing clauses** — `WHERE`, `ASSUMING`, `AS OF`, `ABLATE TABLE`,
-`RETURN`, `WINDOW` — may appear in any order after `FOR`. Each may appear at
+The **trailing clauses** — `WHERE`, `ASSUMING`, `AS OF`, `RETURN`, `WINDOW` —
+may appear in any order after `FOR`. Each may appear at
 most once, except `WINDOW`, which repeats (one per named frame).
 
 There is no `FORECAST N TIMEFRAMES` clause. To forecast, give the target's
@@ -45,10 +44,10 @@ multi-horizon window *implies* [forecasting](task-types). See
 - **`ASSUMING <condition>`** — a counterfactual assumption, parsed and
   validated and carried on the query (not yet applied to context assembly).
 - **`AS OF <anchor>`** — binds the anchor time (the instant `NOW` and every
-  frame are measured from). The anchor is a parameter (`:prediction_time`), a
-  `DATE` literal (`2026-07-01`), or `NOW`.
-- **`ABLATE TABLE <name>`** — removes a table from assembled context, for
-  measuring its contribution.
+  frame are measured from). The anchor is a `DATE` literal (`2026-07-01`), a
+  parameter (`:prediction_time`, bound at execution time), or `NOW`. A `DATE`
+  or bound parameter takes precedence over the execution anchor; `NOW` (or no
+  `AS OF`) uses the execution anchor.
 - **`RETURN <return_spec>`** — selects the output form (see below).
 - **`WINDOW <name> AS (<window_spec>)`** — declares a reusable named frame,
   referenced elsewhere as `OVER <name>`. Declared exactly once; referencing an
@@ -70,23 +69,30 @@ AS OF :t
 RETURN INTERVAL 90%
 ```
 
-## EXPLAIN — inspect without running
+## EXPLAIN — inspect without (necessarily) running
 
-An `EXPLAIN` prefix asks the engine to describe what it *would* do:
+An `EXPLAIN` prefix asks the engine to describe what it *would* do. The engine's
+`explain()` entry point returns a result you can render as text or JSON
+(`FORMAT TEXT | JSON`):
 
 ```
-EXPLAIN [PLAN | CONTEXT | ANALYZE | ABLATION] [FORMAT TEXT | JSON]
+EXPLAIN [PLAN | CONTEXT | ANALYZE] [FORMAT TEXT | JSON]
 ```
 
-Bare `EXPLAIN` means `EXPLAIN PLAN` and does **not** invoke the model.
-`CONTEXT` shows the assembled context, `ANALYZE` and `ABLATION` run the model
-and report timing / table contributions.
+- **`PLAN`** — the default (bare `EXPLAIN` == `EXPLAIN PLAN`). Describes the
+  query from parsing and validation alone: the normalized target, inferred task
+  type, entity selector, resolved output form, each aggregation's normalized
+  window, and the resolved anchor source. Does **not** assemble context or
+  invoke the model.
+- **`CONTEXT`** — additionally assembles the per-entity context and reports
+  row/cell counts, links traversed, time ranges, and rows dropped by the
+  temporal bound. Does **not** score the model.
+- **`ANALYZE`** — assembles and scores, returning the predictions with the plan.
 
 ```sql
 EXPLAIN PLAN FORMAT TEXT
 PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING)
 FOR EACH customers.customer_id
-ABLATE TABLE support_tickets
 RETURN PROBABILITY
 ```
 

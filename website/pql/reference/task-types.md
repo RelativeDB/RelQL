@@ -23,6 +23,11 @@ selects the model checkpoint and the output form — you never declare it.
 family routes to `hf://stanford-star/rt-j/classification` and
 regression/forecasting to `hf://stanford-star/rt-j/regression`.
 
+The output column above is the *logical* form each task produces. The built-in
+history baseline produces all of them; the native RT-J backend currently serves
+binary-classification and regression heads, so multiclass and ranking targets
+fall back to the baseline (see [Model backends](/docs/concepts/model-backends)).
+
 ## Checking a query
 
 Every library exposes the inference without executing:
