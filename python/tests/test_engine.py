@@ -199,6 +199,85 @@ def _make_schema():
             .build())
 
 
+# ---------------------------------------------------------------------------
+# RETURN clause execution (contract §3)
+# ---------------------------------------------------------------------------
+
+def _predict_one(schema, wiring, pql, eid="C7"):
+    eng = Engine(schema, wiring)
+    res = eng.execute(ExecutionInput(query=pql, anchor_time=T0))
+    preds = {p.id: p for p in res.predictions}
+    return res, preds[eid]
+
+
+def test_return_class_emits_hard_label(churn_schema, churn_wiring):
+    _, pred = _predict_one(
+        churn_schema, churn_wiring,
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+        "FOR customers.customer_id = 'C7' RETURN CLASS")
+    assert pred.predicted_class in ("true", "false")
+    assert pred.probability is None            # not the score
+    assert not pred.class_probs
+
+
+def test_return_distribution_two_key_dist(churn_schema, churn_wiring):
+    _, pred = _predict_one(
+        churn_schema, churn_wiring,
+        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+        "FOR customers.customer_id = 'C7' RETURN DISTRIBUTION")
+    assert set(pred.class_probs) == {"true", "false"}
+    assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-9
+
+
+def test_return_quantiles_three_entries_ordered(churn_schema, churn_wiring):
+    _, pred = _predict_one(
+        churn_schema, churn_wiring,
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
+        "FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.5, 0.9)")
+    assert set(pred.quantiles) == {0.1, 0.5, 0.9}
+    q10, q50, q90 = pred.quantiles[0.1], pred.quantiles[0.5], pred.quantiles[0.9]
+    assert q10 <= q50 <= q90
+
+
+def test_return_interval_lo_le_hi(churn_schema, churn_wiring):
+    _, pred = _predict_one(
+        churn_schema, churn_wiring,
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
+        "FOR customers.customer_id = 'C7' RETURN INTERVAL 80%")
+    assert pred.interval is not None
+    lo, hi = pred.interval
+    assert lo <= hi
+
+
+def test_return_quantiles_on_boolean_target_rejected(churn_schema, churn_wiring):
+    from relativedb import PqlValidationError
+    eng = Engine(churn_schema, churn_wiring)
+    with pytest.raises(PqlValidationError):
+        eng.execute(ExecutionInput(
+            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+                  "FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.9)",
+            anchor_time=T0))
+
+
+def test_return_probability_on_regression_target_rejected(churn_schema, churn_wiring):
+    from relativedb import PqlValidationError
+    eng = Engine(churn_schema, churn_wiring)
+    with pytest.raises(PqlValidationError):
+        eng.execute(ExecutionInput(
+            query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
+                  "FOR customers.customer_id = 'C7' RETURN PROBABILITY",
+            anchor_time=T0))
+
+
+def test_return_quantile_out_of_range_rejected(churn_schema):
+    from relativedb import PqlValidationError
+    from relativedb.pql.parser import validate
+    with pytest.raises(PqlValidationError):
+        validate("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
+                 "FOR EACH customers.customer_id RETURN QUANTILES (0.0, 0.9)",
+                 churn_schema)
+
+
 def test_model_config_defaults_and_routing():
     cfg = ModelConfig.defaults()
     assert cfg.classification_model_uri == "hf://stanford-star/rt-j/classification"

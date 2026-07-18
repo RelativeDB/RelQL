@@ -221,6 +221,91 @@ fn for_each_without_scanner_raises() {
     assert_eq!(res.predictions.len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// RETURN clause: output shaping + validation
+// ---------------------------------------------------------------------------
+
+fn run_c7(pql: &str) -> EntityPrediction {
+    let mut eng = Engine::new(churn_schema(), churn_wiring());
+    let res = eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap();
+    assert_eq!(res.predictions.len(), 1);
+    res.predictions.into_iter().next().unwrap()
+}
+
+#[test]
+fn return_class_sets_predicted_class() {
+    let p = run_c7(
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN CLASS",
+    );
+    let cls = p.predicted_class.expect("predicted_class set");
+    assert!(cls == "true" || cls == "false", "hard label, got {:?}", cls);
+}
+
+#[test]
+fn return_distribution_two_entries_sum_one() {
+    let p = run_c7(
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN DISTRIBUTION",
+    );
+    assert_eq!(p.class_probs.len(), 2);
+    let keys: std::collections::HashSet<&str> =
+        p.class_probs.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["true", "false"].into_iter().collect());
+    let sum: f64 = p.class_probs.iter().map(|(_, v)| v).sum();
+    assert!((sum - 1.0).abs() < 1e-9, "class_probs sum to 1, got {}", sum);
+}
+
+#[test]
+fn return_quantiles_three_monotonic() {
+    let p = run_c7(
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN QUANTILES (0.1, 0.5, 0.9)",
+    );
+    assert_eq!(p.quantiles.len(), 3);
+    let qs: Vec<f64> = p.quantiles.iter().map(|(q, _)| *q).collect();
+    assert_eq!(qs, vec![0.1, 0.5, 0.9]);
+    let vs: Vec<f64> = p.quantiles.iter().map(|(_, v)| *v).collect();
+    assert!(vs[0] <= vs[1] && vs[1] <= vs[2], "monotonic, got {:?}", vs);
+}
+
+#[test]
+fn return_interval_lo_le_hi() {
+    let p = run_c7(
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN INTERVAL 80%",
+    );
+    let (lo, hi) = p.interval.expect("interval set");
+    assert!(lo <= hi, "lo <= hi, got ({}, {})", lo, hi);
+}
+
+#[test]
+fn return_default_unchanged() {
+    // No RETURN: binary target still reports probability, nothing else.
+    let p = run_c7(
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7'",
+    );
+    assert!(p.probability.is_some());
+    assert!(p.predicted_class.is_none());
+    assert!(p.class_probs.is_empty());
+    assert!(p.quantiles.is_empty());
+    assert!(p.interval.is_none());
+}
+
+#[test]
+fn return_quantiles_on_boolean_target_rejected() {
+    let pq = relativedb::parse(
+        "PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN QUANTILES (0.5)",
+    )
+    .unwrap();
+    assert!(relativedb::validate(&pq, &churn_schema()).is_err());
+}
+
+#[test]
+fn return_probability_on_regression_target_rejected() {
+    let pq = relativedb::parse(
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR customers.customer_id = 'C7' RETURN PROBABILITY",
+    )
+    .unwrap();
+    assert!(relativedb::validate(&pq, &churn_schema()).is_err());
+}
+
 #[test]
 fn model_config_defaults_and_routing() {
     let cfg = ModelConfig::defaults();

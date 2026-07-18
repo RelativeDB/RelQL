@@ -126,6 +126,56 @@ class PqlValidationTest {
         assertEquals(ReturnSpec.Kind.EXPECTED_VALUE, vq.query().ret().orElseThrow().kind());
     }
 
+    // ---- RETURN compatibility with the inferred task -------------------
+
+    @Test
+    void quantilesOnBooleanTargetRejected() {
+        PqlValidationException e = assertThrows(PqlValidationException.class, () -> Pql.validate(
+                "PREDICT COUNT(transactions.*) OVER (90 DAYS FOLLOWING) = 0 "
+                + "FOR EACH customers.customer_id RETURN QUANTILES (0.1, 0.5, 0.9)", SCHEMA));
+        assertTrue(e.getMessage().contains("QUANTILES"));
+        assertTrue(e.getMessage().contains("BINARY_CLASSIFICATION"));
+    }
+
+    @Test
+    void probabilityOnRegressionTargetRejected() {
+        PqlValidationException e = assertThrows(PqlValidationException.class, () -> Pql.validate(
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) "
+                + "FOR EACH customers.customer_id RETURN PROBABILITY", SCHEMA));
+        assertTrue(e.getMessage().contains("PROBABILITY"));
+        assertTrue(e.getMessage().contains("REGRESSION"));
+    }
+
+    @Test
+    void compatibleReturnsAreAccepted() {
+        assertDoesNotThrow(() -> Pql.validate(
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) "
+                + "FOR EACH customers.customer_id RETURN QUANTILES (0.1, 0.5, 0.9)", SCHEMA));
+        assertDoesNotThrow(() -> Pql.validate(
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) "
+                + "FOR EACH customers.customer_id RETURN INTERVAL 80%", SCHEMA));
+        assertDoesNotThrow(() -> Pql.validate(
+                "PREDICT COUNT(transactions.*) OVER (90 DAYS FOLLOWING) = 0 "
+                + "FOR EACH customers.customer_id RETURN CLASS", SCHEMA));
+        assertDoesNotThrow(() -> Pql.validate(
+                "PREDICT customers.industry FOR EACH customers.customer_id RETURN DISTRIBUTION", SCHEMA));
+    }
+
+    @Test
+    void quantilesOutOfRangeRejected() {
+        PqlValidationException e = assertThrows(PqlValidationException.class, () -> Pql.validate(
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) "
+                + "FOR EACH customers.customer_id RETURN QUANTILES (0, 0.5, 1)", SCHEMA));
+        assertTrue(e.getMessage().contains("(0, 1)"));
+    }
+
+    @Test
+    void intervalOutOfRangeRejected() {
+        assertThrows(PqlValidationException.class, () -> Pql.validate(
+                "PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) "
+                + "FOR EACH customers.customer_id RETURN INTERVAL 100%", SCHEMA));
+    }
+
     @Test
     void explainAndAblateDoNotThrow() {
         assertDoesNotThrow(() -> Pql.validate(

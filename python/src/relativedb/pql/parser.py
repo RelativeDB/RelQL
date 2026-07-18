@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .ast import (Arith, Case, ColumnRef, Condition, Func, Lit, LogicalOp,
-                  Not, ParsedQuery)
+                  Not, ParsedQuery, TaskType)
 
 __all__ = ["parse", "validate", "PqlSyntaxError", "PqlValidationError",
            "ValidatedQuery"]
@@ -143,4 +143,46 @@ def validate(query, schema) -> ValidatedQuery:
                 raise PqlValidationError(
                     f"HORIZONS > 1 is only allowed on the PREDICT target, "
                     f"not in {clause_name}")
-    return ValidatedQuery(pq, pq.task_type(schema))
+    task = pq.task_type(schema)
+    if pq.ret is not None:
+        _validate_return(pq.ret, task)
+    return ValidatedQuery(pq, task)
+
+
+# RETURN kind -> inferred task types it is compatible with (contract §1).
+_RETURN_COMPATIBILITY = {
+    "EXPECTED_VALUE": {TaskType.REGRESSION, TaskType.FORECASTING,
+                       TaskType.BINARY_CLASSIFICATION},
+    "PROBABILITY": {TaskType.BINARY_CLASSIFICATION},
+    "CLASS": {TaskType.BINARY_CLASSIFICATION,
+              TaskType.MULTICLASS_CLASSIFICATION},
+    "DISTRIBUTION": {TaskType.BINARY_CLASSIFICATION,
+                     TaskType.MULTICLASS_CLASSIFICATION},
+    "QUANTILES": {TaskType.REGRESSION, TaskType.FORECASTING},
+    "INTERVAL": {TaskType.REGRESSION, TaskType.FORECASTING},
+    "MULTILABEL": {TaskType.MULTILABEL_RANKING},
+    "MULTICLASS": {TaskType.MULTICLASS_CLASSIFICATION},
+}
+
+
+def _validate_return(ret, task: TaskType) -> None:
+    """Enforce the RETURN compatibility matrix (contract §1) against the
+    inferred task type, plus quantile/interval range checks."""
+    allowed = _RETURN_COMPATIBILITY.get(ret.kind)
+    if allowed is None:
+        raise PqlValidationError(f"unknown RETURN kind {ret.kind!r}")
+    if task not in allowed:
+        allowed_names = ", ".join(sorted(t.value for t in allowed))
+        raise PqlValidationError(
+            f"RETURN {ret.kind} is not compatible with inferred task "
+            f"{task.value!r} (allowed tasks: {allowed_names})")
+    if ret.kind == "QUANTILES":
+        for q in ret.quantiles:
+            if not (0.0 < q < 1.0):
+                raise PqlValidationError(
+                    f"RETURN QUANTILES: quantile {q} must be in (0, 1)")
+    if ret.kind == "INTERVAL":
+        pct = ret.interval
+        if pct is None or not (0 < pct < 100):
+            raise PqlValidationError(
+                f"RETURN INTERVAL: percent {pct} must be in (0, 100)")

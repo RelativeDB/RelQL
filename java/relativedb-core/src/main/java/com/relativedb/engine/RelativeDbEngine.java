@@ -23,7 +23,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.OptionalDouble;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -135,18 +134,21 @@ public final class RelativeDbEngine {
         List<PredictionResult.EntityPrediction> predictions = new ArrayList<>(ids.size());
         for (EntityId id : ids) {
             TemporalBound entityBound = bound;
+            Instant effectiveAnchor = contextAnchor;
             if (input.perEntityAnchor()) {
-                entityBound = contextSource(bound)
+                Optional<Instant> entityTime = contextSource(bound)
                         .byIds(entityTable, List.of(id), TemporalBound.unbounded()).stream()
-                        .findFirst().flatMap(Row::timestamp)
-                        .map(TemporalBound::atOrBefore)
-                        .orElse(bound);
+                        .findFirst().flatMap(Row::timestamp);
+                if (entityTime.isPresent()) {
+                    effectiveAnchor = entityTime.get();
+                    entityBound = TemporalBound.atOrBefore(effectiveAnchor);
+                }
             }
             ContextGraph context = assembleContext(entityTable, id, entityBound);
             TokenBatch batch = toTokenBatch(context);
             instrumentation.onModelInvoked(id, batch.size());
             ModelOutput out = resolved.score(batch, taskType).toCompletableFuture().join();
-            predictions.add(decode(id, taskType, out));
+            predictions.add(decode(id, taskType, out, vq.query(), context, effectiveAnchor));
         }
         return new PredictionResult(taskType, predictions);
     }
@@ -246,32 +248,11 @@ public final class RelativeDbEngine {
     //  Output decoding
     // ------------------------------------------------------------------
 
-    private PredictionResult.EntityPrediction decode(EntityId id, TaskType taskType, ModelOutput out) {
-        return switch (taskType) {
-            case REGRESSION -> new PredictionResult.EntityPrediction(id,
-                    OptionalDouble.of(out.value()), OptionalDouble.empty(), Map.of(), List.of(), List.of());
-            case BINARY_CLASSIFICATION -> new PredictionResult.EntityPrediction(id,
-                    OptionalDouble.empty(), OptionalDouble.of(out.probability()), Map.of(), List.of(), List.of());
-            case MULTICLASS_CLASSIFICATION -> new PredictionResult.EntityPrediction(id,
-                    OptionalDouble.empty(), OptionalDouble.empty(), out.classProbs(), List.of(), List.of());
-            case MULTILABEL_RANKING -> {
-                List<PredictionResult.RankedItem> ranked = out.rankedScores().entrySet().stream()
-                        .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                        .map(e -> new PredictionResult.RankedItem(e.getKey(), e.getValue()))
-                        .toList();
-                yield new PredictionResult.EntityPrediction(id,
-                        OptionalDouble.empty(), OptionalDouble.empty(), Map.of(), ranked, List.of());
-            }
-            case FORECASTING -> {
-                List<PredictionResult.TimeframeValue> forecast = new ArrayList<>();
-                for (int i = 0; i < out.forecastValues().size(); i++) {
-                    forecast.add(new PredictionResult.TimeframeValue(i + 1, out.forecastValues().get(i)));
-                }
-                yield new PredictionResult.EntityPrediction(id,
-                        OptionalDouble.empty(), OptionalDouble.empty(), Map.of(), List.of(),
-                        List.copyOf(forecast));
-            }
-        };
+    private final ReturnShaper returnShaper = new ReturnShaper();
+
+    private PredictionResult.EntityPrediction decode(EntityId id, TaskType taskType, ModelOutput out,
+            com.relativedb.query.ParsedQuery query, ContextGraph context, Instant anchor) {
+        return returnShaper.shape(id, taskType, out, query, context, anchor);
     }
 
     private static final class BuilderImpl implements Builder {

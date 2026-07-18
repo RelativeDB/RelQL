@@ -177,7 +177,60 @@ pub fn validate(query: &ParsedQuery, schema: &Schema) -> Result<ValidatedQuery, 
         reject_multi_horizon(a, "ASSUMING")?;
     }
     let task_type = query.task_type(Some(schema));
+    if let Some(ret) = &query.ret {
+        validate_return(ret, task_type)?;
+    }
     Ok(ValidatedQuery { query: query.clone(), task_type })
+}
+
+/// Enforce the RETURN/task compatibility matrix (RETURN execution contract §1).
+fn validate_return(
+    ret: &super::ast::ReturnSpec,
+    task: super::ast::TaskType,
+) -> Result<(), ValidationError> {
+    use super::ast::TaskType::*;
+    let allowed: &[super::ast::TaskType] = match ret.kind.as_str() {
+        "EXPECTED_VALUE" => &[Regression, Forecasting, BinaryClassification],
+        "PROBABILITY" => &[BinaryClassification],
+        "CLASS" => &[BinaryClassification, MulticlassClassification],
+        "DISTRIBUTION" => &[BinaryClassification, MulticlassClassification],
+        "QUANTILES" => &[Regression, Forecasting],
+        "INTERVAL" => &[Regression, Forecasting],
+        "MULTILABEL" => &[MultilabelRanking],
+        "MULTICLASS" => &[MulticlassClassification],
+        other => {
+            return Err(ValidationError(format!(
+                "unknown RETURN kind {:?}",
+                other
+            )))
+        }
+    };
+    if !allowed.contains(&task) {
+        return Err(ValidationError(format!(
+            "RETURN {} is not compatible with the inferred task type {:?}",
+            ret.kind, task
+        )));
+    }
+    if ret.kind == "QUANTILES" {
+        for &q in &ret.quantiles {
+            if !(q > 0.0 && q < 1.0) {
+                return Err(ValidationError(format!(
+                    "RETURN QUANTILES: each quantile must be in (0, 1), got {}",
+                    q
+                )));
+            }
+        }
+    }
+    if ret.kind == "INTERVAL" {
+        let pct = ret.interval.unwrap_or(0);
+        if !(pct > 0 && pct < 100) {
+            return Err(ValidationError(format!(
+                "RETURN INTERVAL: percent must be in (0, 100), got {}",
+                pct
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convenience: parse a string (via the shared native parser) then validate.

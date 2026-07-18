@@ -136,6 +136,9 @@ class EntityPrediction:
     class_probs: dict[str, float] = field(default_factory=dict)
     ranked: tuple = ()                            # RANK TOP K
     forecast: tuple = ()                          # FORECAST N
+    predicted_class: Optional[str] = None         # RETURN CLASS hard label
+    quantiles: dict[float, float] = field(default_factory=dict)  # RETURN QUANTILES
+    interval: Optional[tuple[float, float]] = None  # RETURN INTERVAL (lo, hi)
 
 
 @dataclass(frozen=True)
@@ -433,31 +436,96 @@ class HistoryBaselineBackend:
         window = next((a.window for a in aggs if a.window is not None), None)
         span = window.span() if window is not None else None
 
+        ret = query.ret
+        ret_kind = ret.kind if ret is not None else None
+
         if task_type is TaskType.FORECASTING:
             base = self._history_mean(query, rows_by_table, cells, ctx.anchor, span)
             n = query.num_forecasts or 1
+            forecast = tuple([base] * n)
+            # Forecasting keeps its series; RETURN QUANTILES/INTERVAL/EXPECTED
+            # shape the summary value/quantiles/interval alongside it.
+            if ret_kind in ("QUANTILES", "INTERVAL"):
+                values = self._history_values(query, rows_by_table, cells,
+                                              ctx.anchor, span)
+                return EntityPrediction(
+                    ctx.entity_id, value=base, forecast=forecast,
+                    quantiles=self._quantiles_for(ret, values),
+                    interval=self._interval_for(ret, values))
             return EntityPrediction(ctx.entity_id, value=base,
-                                    forecast=tuple([base] * n))
+                                    forecast=forecast)
         if task_type is TaskType.MULTILABEL_RANKING:
             return self._rank(query, rows_by_table, ctx)
         if task_type is TaskType.BINARY_CLASSIFICATION:
             p = self._history_prob(query, rows_by_table, cells, ctx.anchor, span)
+            if ret_kind == "CLASS":
+                # Hard decision (threshold at 0.5), not the score.
+                label = "true" if p >= 0.5 else "false"
+                return EntityPrediction(ctx.entity_id, predicted_class=label)
+            if ret_kind == "DISTRIBUTION":
+                return EntityPrediction(
+                    ctx.entity_id,
+                    class_probs={"true": p, "false": 1.0 - p})
+            if ret_kind == "EXPECTED_VALUE":
+                # Expected value of the 0/1 indicator is p.
+                return EntityPrediction(ctx.entity_id, value=p)
+            # PROBABILITY (explicit) or default.
             return EntityPrediction(ctx.entity_id, probability=p)
         if task_type is TaskType.MULTICLASS_CLASSIFICATION:
             v = self._latest_value(query, rows_by_table, cells, ctx.anchor, span)
             if v is None:
                 return EntityPrediction(ctx.entity_id)
+            if ret_kind == "CLASS":
+                return EntityPrediction(ctx.entity_id, predicted_class=str(v))
+            # DISTRIBUTION / MULTICLASS / default: the degenerate distribution.
             return EntityPrediction(ctx.entity_id, class_probs={str(v): 1.0})
         # regression
         v = self._history_mean(query, rows_by_table, cells, ctx.anchor, span)
+        if ret_kind in ("QUANTILES", "INTERVAL"):
+            values = self._history_values(query, rows_by_table, cells,
+                                          ctx.anchor, span)
+            return EntityPrediction(
+                ctx.entity_id, value=v,
+                quantiles=self._quantiles_for(ret, values),
+                interval=self._interval_for(ret, values))
         return EntityPrediction(ctx.entity_id, value=v)
+
+    def _quantiles_for(self, ret, values: list[float]) -> dict[float, float]:
+        if ret is None or ret.kind != "QUANTILES" or not values:
+            return {}
+        return {float(q): self._empirical_quantile(values, float(q))
+                for q in ret.quantiles}
+
+    def _interval_for(self, ret, values: list[float]):
+        if ret is None or ret.kind != "INTERVAL" or not values:
+            return None
+        pct = ret.interval or 0
+        lo = (1.0 - pct / 100.0) / 2.0
+        hi = 1.0 - lo
+        return (self._empirical_quantile(values, lo),
+                self._empirical_quantile(values, hi))
+
+    @staticmethod
+    def _empirical_quantile(values: list[float], q: float) -> float:
+        """Linear-interpolation empirical quantile (numpy "linear" semantics),
+        pure Python."""
+        xs = sorted(values)
+        n = len(xs)
+        if n == 1:
+            return xs[0]
+        idx = q * (n - 1)
+        lo = int(idx)              # floor
+        hi = min(lo + 1, n - 1)    # ceil, clamped
+        frac = idx - lo
+        return xs[lo] + (xs[hi] - xs[lo]) * frac
 
     def _pseudo_anchors(self, anchor: Optional[datetime], span) -> list[Optional[datetime]]:
         if anchor is None or span is None:
             return [anchor]
         return [anchor - span * k for k in range(1, self.num_history_windows + 1)]
 
-    def _history_mean(self, query, rows_by_table, cells, anchor, span) -> Optional[float]:
+    def _history_values(self, query, rows_by_table, cells, anchor, span) -> list[float]:
+        """Per-pseudo-anchor numeric target evaluations (bools -> 0.0/1.0)."""
         vals = []
         for pa in self._pseudo_anchors(anchor, span):
             v = eval_value(query.target, rows_by_table, cells, pa)
@@ -465,6 +533,10 @@ class HistoryBaselineBackend:
                 v = 1.0 if v else 0.0
             if isinstance(v, (int, float)):
                 vals.append(float(v))
+        return vals
+
+    def _history_mean(self, query, rows_by_table, cells, anchor, span) -> Optional[float]:
+        vals = self._history_values(query, rows_by_table, cells, anchor, span)
         return sum(vals) / len(vals) if vals else None
 
     def _history_prob(self, query, rows_by_table, cells, anchor, span) -> float:

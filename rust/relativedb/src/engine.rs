@@ -171,6 +171,12 @@ pub struct EntityPrediction {
     pub class_probs: Vec<(String, f64)>,
     pub ranked: Vec<RankedItem>,
     pub forecast: Vec<f64>,
+    /// The hard label for `RETURN CLASS`.
+    pub predicted_class: Option<String>,
+    /// Ordered `(q, value)` pairs for `RETURN QUANTILES`.
+    pub quantiles: Vec<(f64, f64)>,
+    /// `(lower, upper)` for `RETURN INTERVAL`.
+    pub interval: Option<(f64, f64)>,
 }
 
 impl EntityPrediction {
@@ -182,6 +188,9 @@ impl EntityPrediction {
             class_probs: Vec::new(),
             ranked: Vec::new(),
             forecast: Vec::new(),
+            predicted_class: None,
+            quantiles: Vec::new(),
+            interval: None,
         }
     }
 }
@@ -626,6 +635,25 @@ impl HistoryBaselineBackend {
         }
     }
 
+    /// The per-pseudo-anchor numeric history values of the target expression.
+    fn history_values(
+        &self,
+        query: &ParsedQuery,
+        rows_by_table: &HashMap<String, Vec<Row>>,
+        cells: &[(String, Value)],
+        anchor: Option<DateTime<Utc>>,
+        span: Option<chrono::Duration>,
+    ) -> Vec<f64> {
+        let mut vals = Vec::new();
+        for pa in self.pseudo_anchors(anchor, span) {
+            let v = eval_value(&query.target, rows_by_table, cells, pa);
+            if let Some(n) = v.as_number() {
+                vals.push(n);
+            }
+        }
+        vals
+    }
+
     fn history_mean(
         &self,
         query: &ParsedQuery,
@@ -634,13 +662,7 @@ impl HistoryBaselineBackend {
         anchor: Option<DateTime<Utc>>,
         span: Option<chrono::Duration>,
     ) -> Option<f64> {
-        let mut vals = Vec::new();
-        for pa in self.pseudo_anchors(anchor, span) {
-            let v = eval_value(&query.target, rows_by_table, cells, pa);
-            if let Some(n) = v.as_number() {
-                vals.push(n);
-            }
-        }
+        let vals = self.history_values(query, rows_by_table, cells, anchor, span);
         if vals.is_empty() {
             None
         } else {
@@ -693,7 +715,7 @@ impl HistoryBaselineBackend {
             query.target_aggregations().iter().find_map(|a| a.window);
         let span = window.and_then(|w| w.span());
 
-        match task_type {
+        let mut p = match task_type {
             TaskType::Forecasting => {
                 let base = self.history_mean(query, &rows_by_table, &cells, ctx.anchor, span);
                 let n = query.num_forecasts.unwrap_or(1).max(1) as usize;
@@ -725,6 +747,101 @@ impl HistoryBaselineBackend {
                 p.value = v;
                 p
             }
+        };
+
+        // RETURN shaping: the default (no RETURN) output above is unchanged.
+        if let Some(ret) = &query.ret {
+            self.apply_return(
+                ret,
+                query,
+                task_type,
+                &rows_by_table,
+                &cells,
+                ctx.anchor,
+                span,
+                &mut p,
+            );
+        }
+        p
+    }
+
+    /// Shape `p` for an explicit `RETURN <kind>`, reusing the same history-window
+    /// machinery as the default output (see the RETURN execution contract §3).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_return(
+        &self,
+        ret: &crate::pql::ast::ReturnSpec,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        rows_by_table: &HashMap<String, Vec<Row>>,
+        cells: &[(String, Value)],
+        anchor: Option<DateTime<Utc>>,
+        span: Option<chrono::Duration>,
+        p: &mut EntityPrediction,
+    ) {
+        match ret.kind.as_str() {
+            "EXPECTED_VALUE" => match task_type {
+                TaskType::BinaryClassification => {
+                    let prob = self.history_prob(query, rows_by_table, cells, anchor, span);
+                    p.value = Some(prob);
+                }
+                // regression/forecasting: value = history mean (already set for
+                // both above; forecasting keeps its forecast series).
+                _ => {}
+            },
+            // PROBABILITY (binary): probability is already the default.
+            "PROBABILITY" => {}
+            "CLASS" => match task_type {
+                TaskType::BinaryClassification => {
+                    let prob = p
+                        .probability
+                        .unwrap_or_else(|| self.history_prob(query, rows_by_table, cells, anchor, span));
+                    p.predicted_class =
+                        Some(if prob >= 0.5 { "true".into() } else { "false".into() });
+                }
+                TaskType::MulticlassClassification => {
+                    let v = self.latest_value(query, rows_by_table, cells, anchor, span);
+                    if !matches!(v, EvalValue::Null) {
+                        p.predicted_class = Some(eval_value_to_key(&v));
+                    }
+                }
+                _ => {}
+            },
+            "DISTRIBUTION" => match task_type {
+                TaskType::BinaryClassification => {
+                    let prob = p
+                        .probability
+                        .unwrap_or_else(|| self.history_prob(query, rows_by_table, cells, anchor, span));
+                    p.class_probs = vec![("true".into(), prob), ("false".into(), 1.0 - prob)];
+                }
+                // multiclass: class_probs already holds the distribution.
+                _ => {}
+            },
+            "QUANTILES" => {
+                let vals = self.history_values(query, rows_by_table, cells, anchor, span);
+                if !vals.is_empty() {
+                    p.quantiles = ret
+                        .quantiles
+                        .iter()
+                        .map(|&q| (q, empirical_quantile(&vals, q)))
+                        .collect();
+                }
+            }
+            "INTERVAL" => {
+                let vals = self.history_values(query, rows_by_table, cells, anchor, span);
+                if !vals.is_empty() {
+                    let pct = ret.interval.unwrap_or(0) as f64;
+                    let lo = (1.0 - pct / 100.0) / 2.0;
+                    let hi = 1.0 - lo;
+                    p.interval = Some((
+                        empirical_quantile(&vals, lo),
+                        empirical_quantile(&vals, hi),
+                    ));
+                }
+            }
+            // MULTILABEL -> ranking output (already in `ranked`).
+            // MULTICLASS -> multiclass class_probs (already set).
+            _ => {}
         }
     }
 
@@ -787,6 +904,24 @@ impl ModelBackend for HistoryBaselineBackend {
     ) -> Result<Vec<EntityPrediction>, Error> {
         Ok(contexts.iter().map(|c| self.score_one(query, task_type, c)).collect())
     }
+}
+
+/// Empirical quantile of `sample` at `q in [0,1]` using linear interpolation on
+/// the sorted sample (numpy.quantile / percentile "linear" semantics).
+fn empirical_quantile(sample: &[f64], q: f64) -> f64 {
+    debug_assert!(!sample.is_empty());
+    let mut xs: Vec<f64> = sample.to_vec();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q = q.clamp(0.0, 1.0);
+    let n = xs.len();
+    if n == 1 {
+        return xs[0];
+    }
+    let idx = q * (n - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil() as usize;
+    let frac = idx - lo as f64;
+    xs[lo] + (xs[hi] - xs[lo]) * frac
 }
 
 fn value_to_eval(v: &Value) -> EvalValue {

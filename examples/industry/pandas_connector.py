@@ -78,5 +78,11 @@ def predictions_frame(result):
             record["ranked"] = list(prediction.ranked)
         if prediction.forecast:
             record["forecast"] = list(prediction.forecast)
+        if getattr(prediction, "predicted_class", None) is not None:
+            record["predicted_class"] = prediction.predicted_class
+        if getattr(prediction, "quantiles", None):
+            record["quantiles"] = dict(prediction.quantiles)
+        if getattr(prediction, "interval", None) is not None:
+            record["interval"] = tuple(prediction.interval)
         records.append(record)
     return pd.DataFrame.from_records(records)

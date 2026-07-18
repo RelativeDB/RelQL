@@ -69,7 +69,49 @@ final class SemanticValidator {
             throw new PqlValidationException("forecast horizon count must be >= 1");
         }
 
-        return inferTaskType(q, temporalTarget);
+        TaskType taskType = inferTaskType(q, temporalTarget);
+        q.ret().ifPresent(r -> validateReturn(r, taskType));
+        return taskType;
+    }
+
+    // ------------------------------------------------------------------
+    //  RETURN <output> compatibility with the inferred task
+    // ------------------------------------------------------------------
+
+    private void validateReturn(ReturnSpec ret, TaskType task) {
+        if (!allowsReturn(ret.kind(), task)) {
+            throw new PqlValidationException("RETURN " + ret.kind()
+                    + " is not compatible with the inferred task type " + task);
+        }
+        if (ret.kind() == ReturnSpec.Kind.QUANTILES) {
+            for (double q : ret.quantiles()) {
+                if (!(q > 0.0 && q < 1.0)) {
+                    throw new PqlValidationException(
+                            "RETURN QUANTILES requires each quantile in (0, 1), got " + q);
+                }
+            }
+        }
+        if (ret.kind() == ReturnSpec.Kind.INTERVAL) {
+            int pct = ret.interval().orElseThrow(() -> new PqlValidationException(
+                    "RETURN INTERVAL requires a percent"));
+            if (!(pct > 0 && pct < 100)) {
+                throw new PqlValidationException(
+                        "RETURN INTERVAL requires a percent in (0, 100), got " + pct);
+            }
+        }
+    }
+
+    private static boolean allowsReturn(ReturnSpec.Kind kind, TaskType task) {
+        return switch (kind) {
+            case EXPECTED_VALUE -> task == TaskType.REGRESSION || task == TaskType.FORECASTING
+                    || task == TaskType.BINARY_CLASSIFICATION;
+            case PROBABILITY -> task == TaskType.BINARY_CLASSIFICATION;
+            case CLASS, DISTRIBUTION -> task == TaskType.BINARY_CLASSIFICATION
+                    || task == TaskType.MULTICLASS_CLASSIFICATION;
+            case QUANTILES, INTERVAL -> task == TaskType.REGRESSION || task == TaskType.FORECASTING;
+            case MULTILABEL -> task == TaskType.MULTILABEL_RANKING;
+            case MULTICLASS -> task == TaskType.MULTICLASS_CLASSIFICATION;
+        };
     }
 
     // ------------------------------------------------------------------
