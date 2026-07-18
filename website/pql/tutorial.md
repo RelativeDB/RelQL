@@ -29,7 +29,7 @@ Compare the aggregate to a literal and the task becomes **binary
 classification** — the result is a probability:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id
 ```
 
 "Will this customer place zero orders in the next 90 days?" — churn.
@@ -40,9 +40,9 @@ PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer
 (`PRECEDING`), so this restricts to customers active in the last 90 days:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
 FOR EACH customers.customer_id
-WHERE COUNT(orders.*) OVER (90 DAYS PRECEDING) > 0
+WHERE EXISTS(orders.*) OVER (90 DAYS PRECEDING)
 ```
 
 Static attributes work too: `WHERE customers.age >= 18`.
@@ -52,7 +52,7 @@ Static attributes work too: `WHERE customers.age >= 18`.
 Replace `FOR EACH` with an explicit selection:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR customers.customer_id IN ('C7', 'C9')
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR customers.customer_id IN ('C7', 'C9')
 ```
 
 ## Step 5: filter the aggregated rows
@@ -93,7 +93,7 @@ FOR EACH customers.customer_id
 `ASSUMING` states a counterfactual condition carried with the query:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
 FOR customers.customer_id = 'C7'
 ASSUMING customers.plan = 'premium'
 ```

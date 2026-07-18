@@ -14,8 +14,8 @@ const config: Config = {
   url: 'https://relql.com',
   baseUrl: '/',
 
-  organizationName: 'relativedb',
-  projectName: 'relativedb',
+  organizationName: 'RelativeDB',
+  projectName: 'RelQL',
 
   onBrokenLinks: 'throw',
 
@@ -68,7 +68,7 @@ const config: Config = {
           activeBaseRegex: '/pql/',
         },
         {
-          href: 'https://github.com/henneberger/relativedb',
+          href: 'https://github.com/RelativeDB/RelQL',
           position: 'right',
           className: 'header-github-link',
           'aria-label': 'GitHub repository',
@@ -89,9 +89,9 @@ const config: Config = {
         {
           title: 'Community',
           items: [
-            {label: 'GitHub', href: 'https://github.com/henneberger/relativedb'},
-            {label: 'Issues', href: 'https://github.com/henneberger/relativedb/issues'},
-            {label: 'Discussions', href: 'https://github.com/henneberger/relativedb/discussions'},
+            {label: 'GitHub', href: 'https://github.com/RelativeDB/RelQL'},
+            {label: 'Issues', href: 'https://github.com/RelativeDB/RelQL/issues'},
+            {label: 'Discussions', href: 'https://github.com/RelativeDB/RelQL/discussions'},
           ],
         },
         {

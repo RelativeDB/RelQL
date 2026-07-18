@@ -19,8 +19,8 @@ cd relativedb/examples/industry
 
 | Example | Industry | RelQL pattern | Checks |
 |---|---|---|---|
-| `growth_churn.py` | Subscription / streaming | `PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0 … WHERE COUNT(events.*) OVER (90 DAYS PRECEDING) > 0` | fading users score ≫ engaged; long-inactive users excluded by WHERE |
-| `fraud_chargeback.py` | Payments | `PREDICT COUNT(chargebacks.*) OVER (60 DAYS FOLLOWING) > 0` | all 8 planted abuser accounts recovered in top-8; clean accounts ≈ 0 |
+| `growth_churn.py` | Subscription / streaming | `PREDICT NOT EXISTS(events.*) OVER (30 DAYS FOLLOWING) … WHERE EXISTS(events.*) OVER (90 DAYS PRECEDING)` | fading users score ≫ engaged; long-inactive users excluded by WHERE |
+| `fraud_chargeback.py` | Payments | `PREDICT EXISTS(chargebacks.*) OVER (60 DAYS FOLLOWING)` | all 8 planted abuser accounts recovered in top-8; clean accounts ≈ 0 |
 | `bizops_demand_forecast.py` | Retail | `PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)` | 4 horizons/store; flagship ≫ outlet; plausible weekly magnitude |
 | `pzn_buy_it_again.py` | Grocery / personalization | `PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 3` | habitual staple ranked #1 per customer (FK ranking via `Row.parents`) |
 

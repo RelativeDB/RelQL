@@ -26,7 +26,7 @@ Define churn in the target; restrict the population to active users in
 `WHERE` (past-facing window):
 
 ```sql
-PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(events.*) OVER (30 DAYS FOLLOWING)
 FOR EACH users.user_id
 WHERE EXISTS(events.*) OVER (90 DAYS PRECEDING)
 ```
@@ -50,7 +50,7 @@ by the `WHERE` clause — they already churned.
 
 ## Variations
 
-- Different definition: `COUNT(orders.*) OVER (60 DAYS FOLLOWING) = 0` (no
+- Different definition: `NOT EXISTS(orders.*) OVER (60 DAYS FOLLOWING)` (no
   purchase) or `SUM(usage.minutes) OVER (30 DAYS FOLLOWING) < 10` (low usage).
 - Backtest: rerun with a past `anchor_time` and compare against what actually
   happened — the engine guarantees the context is point-in-time correct.

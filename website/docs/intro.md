@@ -12,7 +12,7 @@ declare the shape of your tables and links, wire small **retriever** callbacks
 over your existing storage, and write a predictive query:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id
 ```
 
 That's 90-day churn for every customer — no feature engineering, no training

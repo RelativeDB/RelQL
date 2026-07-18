@@ -22,7 +22,7 @@ function Hero() {
           training pipeline, no temporal leakage.
         </p>
         <CodeBlock language="sql" className={styles.heroCode}>
-          {`PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0\nFOR EACH customers.customer_id`}
+          {`PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)\nFOR EACH customers.customer_id`}
         </CodeBlock>
         <p className={styles.heroCaption}>
           “For every customer, the probability they place zero orders in the
@@ -38,7 +38,7 @@ function Hero() {
         </div>
         <div className={styles.social}>
           <iframe
-            src="https://ghbtns.com/github-btn.html?user=henneberger&repo=relativedb&type=star&count=true&size=large"
+            src="https://ghbtns.com/github-btn.html?user=RelativeDB&repo=RelQL&type=star&count=true&size=large"
             frameBorder="0"
             scrolling="0"
             width="140"
@@ -46,12 +46,12 @@ function Hero() {
             title="Star relativedb on GitHub"
           />
           <iframe
-            src="https://ghbtns.com/github-btn.html?user=henneberger&type=follow&count=true&size=large"
+            src="https://ghbtns.com/github-btn.html?user=RelativeDB&type=follow&count=true&size=large"
             frameBorder="0"
             scrolling="0"
             width="230"
             height="30"
-            title="Follow henneberger on GitHub"
+            title="Follow RelativeDB on GitHub"
           />
         </div>
       </div>

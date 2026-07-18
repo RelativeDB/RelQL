@@ -17,7 +17,7 @@ mavenPublishing {
         name = 'relationdb'
         description = 'Predictive queries (RelQL) over relational data.'
         inceptionYear = '2026'
-        url = 'https://github.com/henneberger/relativedb'
+        url = 'https://github.com/RelativeDB/RelQL'
         licenses {
             license {
                 name = 'The Apache License, Version 2.0'
@@ -33,9 +33,9 @@ mavenPublishing {
             }
         }
         scm {
-            url = 'https://github.com/henneberger/relativedb'
-            connection = 'scm:git:git://github.com/henneberger/relativedb.git'
-            developerConnection = 'scm:git:ssh://git@github.com/henneberger/relativedb.git'
+            url = 'https://github.com/RelativeDB/RelQL'
+            connection = 'scm:git:git://github.com/RelativeDB/RelQL.git'
+            developerConnection = 'scm:git:ssh://git@github.com/RelativeDB/RelQL.git'
         }
     }
 }

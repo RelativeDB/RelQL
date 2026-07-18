@@ -35,7 +35,7 @@ orders = pd.DataFrame({
     "order_date": ANCHOR - pd.to_timedelta(rng.integers(0, 720, n_orders), unit="D"),
 })
 
-QUERY = "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id"
+QUERY = "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id"
 
 # --- relationdb, with an application-owned pandas connector -----------------
 schema = (Schema.new_schema()

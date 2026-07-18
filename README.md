@@ -8,7 +8,7 @@ whatever storage you already have, and ask questions about the **future** in
 **RelQL** — a SQL-flavored Predictive Query Language:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
 FOR EACH customers.customer_id
 ```
 
@@ -31,8 +31,8 @@ concepts and behavior:
 | Library | Directory | Package / artifact | Notes |
 |---|---|---|---|
 | **Python** | [`python/`](python/) | `relationdb` (PyPI; import `relativedb`) | Storage-neutral retriever SPI; applications own every connector |
-| **Java** | [`java/`](java/) | `com.relativedb:relationdb`, `relationdb-rt` (Maven Central) | ANTLR-based parser; async (`CompletionStage`) retriever SPI |
-| **Rust** | [`rust/`](rust/) | `relationdb` (crates.io; crate API `relativedb`) | Hand-written parser; deliberately synchronous SPI |
+| **Java** | [`java/`](java/) | `com.relativedb:relationdb`, `relationdb-rt` (Maven Central) | Shared native (`librt_c`) parser; async (`CompletionStage`) retriever SPI |
+| **Rust** | [`rust/`](rust/) | `relationdb` (crates.io; crate API `relativedb`) | Shared native (`librt_c`) parser; deliberately synchronous SPI |
 
 plus a shared native model runtime:
 
@@ -120,7 +120,7 @@ missing) data, per entity, as of a point in time"*:
 | **Revenue** | Customer spend over the next quarter (LTV slice)? | `PREDICT SUM(transactions.price) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id` |
 | **Credit / risk** | Will this loan avoid denial? | `PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH loan.id` |
 | **Data quality** | Is this static attribute missing/predictable? | `PREDICT articles.description IS NULL FOR EACH articles.id` |
-| **What-if** | Would this user churn *if* they were on premium? | `PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42 ASSUMING users.plan = 'premium'` |
+| **What-if** | Would this user churn *if* they were on premium? | `PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id = 42 ASSUMING users.plan = 'premium'` |
 
 Four of these are implemented end-to-end (with planted signal and assertions)
 in [`examples/industry/`](examples/industry/).
@@ -378,9 +378,9 @@ Real queries from the shared test corpus:
 ```sql
 PREDICT SUM(transactions.price) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id
 
-PREDICT COUNT(transactions.*) OVER (30 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(transactions.*) OVER (30 DAYS FOLLOWING)
 FOR EACH customers.customer_id
-WHERE COUNT(transactions.*) OVER (90 DAYS PRECEDING) > 0
+WHERE EXISTS(transactions.*) OVER (90 DAYS PRECEDING)
 
 PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING) RANK TOP 12
 FOR EACH customers.customer_id
@@ -388,9 +388,9 @@ FOR EACH customers.customer_id
 PREDICT SUM(usage.count) OVER (1 DAY FOLLOWING HORIZONS 28)
 FOR EACH accounts.account_id
 
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id IN (42, 123)
 
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id = 42
 ASSUMING users.plan = 'premium'
 
 PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH loan.id
@@ -483,7 +483,7 @@ wiring = (RetrieverWiring.new_wiring()
 
 engine = Engine(schema, wiring)
 result = engine.execute(ExecutionInput(
-    query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR customers.customer_id = 'C7'",
+    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR customers.customer_id = 'C7'",
     anchor_time=t0))
 ```
 
@@ -526,7 +526,7 @@ retriever wiring end to end.
 Full docs: [`java/README.md`](java/README.md). Requires Java 17+. Gradle
 Maven publications under group `com.relativedb`:
 
-- **`relationdb`** — schema builder, retriever SPI, ANTLR-based RelQL
+- **`relationdb`** — schema builder, retriever SPI, native (`librt_c`) RelQL
   parser + semantic validation, context assembly (both sampler modes), model
   SPI.
 - **`relationdb-rt`** — optional JNA binding to `librt_c`:
@@ -569,7 +569,7 @@ RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
     .build();
 
 PredictionResult churn = engine.execute(ExecutionInput.newInput()
-    .query("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
+    .query("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id")
     .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
     .entityIds(List.of(42L))
     .build()).toCompletableFuture().join();
@@ -650,7 +650,7 @@ let wiring = RetrieverWiring::new_wiring()
 let mut engine = Engine::new(schema, wiring);
 let result = engine.execute(
     ExecutionInput::query(
-        "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id")
+        "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id")
     .anchor_time(anchor),
 )?;
 
@@ -769,7 +769,7 @@ relativedb/
 │   │                       #   engine, retriever SPI, rt_native
 │   └── tests/
 ├── java/                   # Java library (Gradle, group com.relativedb)
-│   ├── relativedb-core/    #   engine + ANTLR grammar (src/main/antlr/Pql.g4)
+│   ├── relativedb-core/    #   engine + RelQL binding (native librt_c parser)
 │   └── relativedb-rt/      #   JNA binding to librt_c
 ├── rust/                   # Cargo workspace
 │   └── relativedb/         #   the `relativedb` crate (+ shared RelQL corpus in tests/data/)

@@ -45,7 +45,7 @@ movie.title CONTAINS 'Star'
 
 ```sql
 -- entity filter mixing a static attribute and a past-facing aggregation
-WHERE customers.age >= 18 AND COUNT(orders.*) OVER (90 DAYS PRECEDING) > 0
+WHERE customers.age >= 18 AND EXISTS(orders.*) OVER (90 DAYS PRECEDING)
 
 -- predicate target: multiclass-style question on a status column
 PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FOR EACH loan.id

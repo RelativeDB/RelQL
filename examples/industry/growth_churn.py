@@ -4,9 +4,9 @@ Predict users unlikely to be
 active in the next 30 days, restricted to users who WERE active in the last
 90 (no point re-engaging users who already left).
 
-    PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0
+    PREDICT NOT EXISTS(events.*) OVER (30 DAYS FOLLOWING)
     FOR EACH users.user_id
-    WHERE COUNT(events.*) OVER (90 DAYS PRECEDING) > 0
+    WHERE EXISTS(events.*) OVER (90 DAYS PRECEDING)
 
 Synthetic data plants the signal: "engaged" users stream weekly right up to
 the anchor; "fading" users stopped ~6 weeks ago.
@@ -58,9 +58,9 @@ schema = (Schema.new_schema()
           .link(LinkDef("events", "user_id", "users")).build())
 wiring = wire_pandas_frames(schema, {"users": users, "events": events})
 result = Engine(schema, wiring).execute(ExecutionInput(
-    query="PREDICT COUNT(events.*) OVER (30 DAYS FOLLOWING) = 0 "
+    query="PREDICT NOT EXISTS(events.*) OVER (30 DAYS FOLLOWING) "
           "FOR EACH users.user_id "
-          "WHERE COUNT(events.*) OVER (90 DAYS PRECEDING) > 0",
+          "WHERE EXISTS(events.*) OVER (90 DAYS PRECEDING)",
     anchor_time=ANCHOR.to_pydatetime()))
 df = predictions_frame(result)
 

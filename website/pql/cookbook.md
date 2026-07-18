@@ -10,12 +10,12 @@ Copy-paste starting points, drawn from the shared 44-query test corpus.
 ## Churn (binary classification)
 
 ```sql
-PREDICT COUNT(transactions.*) OVER (30 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(transactions.*) OVER (30 DAYS FOLLOWING)
 FOR EACH customers.customer_id
-WHERE COUNT(transactions.*) OVER (90 DAYS PRECEDING) > 0
+WHERE EXISTS(transactions.*) OVER (90 DAYS PRECEDING)
 ```
 
-Or state the same active-in-the-last-90-days filter with an existence test:
+Add `RETURN PROBABILITY` to get calibrated scores instead of the default output:
 
 ```sql
 PREDICT NOT EXISTS(transactions.*) OVER (30 DAYS FOLLOWING)
@@ -50,13 +50,13 @@ per day.
 ## Specific entities
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id IN (42, 123)
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id IN (42, 123)
 ```
 
 ## Counterfactual
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR users.user_id = 42
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR users.user_id = 42
 ASSUMING users.plan = 'premium'
 ```
 

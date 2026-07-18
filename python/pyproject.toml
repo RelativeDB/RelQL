@@ -15,9 +15,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://relativedb.com"
-Repository = "https://github.com/henneberger/relativedb"
-Issues = "https://github.com/henneberger/relativedb/issues"
+Homepage = "https://relql.com"
+Repository = "https://github.com/RelativeDB/RelQL"
+Issues = "https://github.com/RelativeDB/RelQL/issues"
 
 [project.optional-dependencies]
 rt = ["sentence-transformers>=3.0", "huggingface_hub>=0.23"]

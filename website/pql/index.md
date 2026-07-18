@@ -12,7 +12,7 @@ RelQL expresses predictions the way SQL expresses lookups. One statement names a
 **anchor-relative time window**:
 
 ```sql
-PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0
+PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
 FOR EACH customers.customer_id
 ```
 
