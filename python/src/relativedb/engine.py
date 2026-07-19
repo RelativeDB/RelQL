@@ -36,7 +36,7 @@ __all__ = [
     "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
     "EntityPrediction", "PredictionResult", "ExplainResult", "ModelBackend",
     "Engine", "ExecutionError",
-    "ContextTruncationWarning",
+    "ContextTruncationWarning", "AssumptionNotAppliedWarning",
 ]
 
 # Aggregations whose value grows with the number of rows in the window, and so
@@ -154,6 +154,86 @@ def _pinned_ids(where: Any, entity_key: ColumnRef) -> Optional[list[Any]]:
     return None
 
 
+def _assumptions(expr: Any) -> list[tuple[str, str, Any]]:
+    """The `(table, column, value)` assignments an ASSUMING clause states.
+
+    Only shapes with one concrete answer qualify: `column = literal`, and those
+    joined by AND. An inequality, an `IN`, an `OR`/`NOT`, or an aggregate
+    condition constrains the world without saying what it *is* — there is no
+    single context that satisfies it — so those raise rather than being quietly
+    dropped.
+    """
+    if isinstance(expr, LogicalOp) and expr.op is BoolOp.AND:
+        return _assumptions(expr.left) + _assumptions(expr.right)
+    if (isinstance(expr, Condition) and expr.op is Operator.EQ
+            and isinstance(expr.left, ColumnRef)
+            and expr.left.column != "*"
+            and expr.right_expr is None
+            and not isinstance(expr.right, tuple)):
+        return [(expr.left.table, expr.left.column, expr.right)]
+    raise ExecutionError(
+        f"ASSUMING {_expr_str(expr)!r} cannot be applied: a counterfactual "
+        f"must assign concrete values — `column = literal`, optionally joined "
+        f"by AND. Inequalities, IN, OR/NOT and aggregate conditions describe a "
+        f"set of possible worlds rather than one, so the engine cannot build "
+        f"the context they imply.")
+
+
+def _assuming_plan(expr: Any) -> Optional[str]:
+    """How EXPLAIN renders the counterfactual. EXPLAIN must describe any query
+    that parses, so an inapplicable clause is reported, not raised."""
+    if expr is None:
+        return None
+    try:
+        return ", ".join(f"{t}.{c} := {_lit_str(v)}"
+                         for t, c, v in _assumptions(expr))
+    except ExecutionError:
+        return "cannot be applied (see warnings)"
+
+
+def _apply_assumptions(assignments: list[tuple[str, str, Any]],
+                       ctx: "EntityContext") -> "EntityContext":
+    """A copy of ``ctx`` in which the assumed values hold.
+
+    Every context row of an assigned table gets the new cell value — assuming
+    `orders.status = 'shipped'` means *these* orders are shipped. Rows are
+    replaced rather than mutated: retrievers and the CSC index hand out shared
+    Row objects, so writing through one would corrupt every other entity's
+    context.
+    """
+    if not assignments:
+        return ctx
+    by_table: dict[str, dict[str, Any]] = {}
+    for table, col, value in assignments:
+        by_table.setdefault(table, {})[col] = value
+    rows = [replace(r, cells={**r.cells, **by_table[r.table]})
+            if r.table in by_table else r
+            for r in ctx.rows]
+    return EntityContext(entity_id=ctx.entity_id, anchor=ctx.anchor, rows=rows,
+                         truncated_children=ctx.truncated_children,
+                         hit_cell_budget=ctx.hit_cell_budget)
+
+
+def _warn_inert_assumptions(assignments: list[tuple[str, str, Any]],
+                            contexts: list["EntityContext"]) -> None:
+    """An assumption about a table that never appears in any context changes
+    nothing. That is the failure ASSUMING used to have wholesale, so say it."""
+    if not assignments or not contexts:
+        return
+    present = {r.table for c in contexts for r in c.rows}
+    missing = sorted({t for t, _, _ in assignments} - present)
+    if missing:
+        warnings.warn(
+            f"ASSUMING has no effect on {', '.join(repr(t) for t in missing)}: "
+            f"no rows of that table are in the assembled context, so the "
+            f"assumption changes nothing that reaches the model",
+            AssumptionNotAppliedWarning, stacklevel=3)
+
+
+class AssumptionNotAppliedWarning(UserWarning):
+    """An ASSUMING assignment targeted a table absent from the context."""
+
+
 class ExecutionError(RuntimeError):
     pass
 
@@ -252,8 +332,6 @@ class EntityPrediction:
     ranked: tuple = ()                            # RANK TOP K
     forecast: tuple = ()                          # FORECAST N
     predicted_class: Optional[str] = None         # RETURN CLASS hard label
-    quantiles: dict[float, float] = field(default_factory=dict)  # RETURN QUANTILES
-    interval: Optional[tuple[float, float]] = None  # RETURN INTERVAL (lo, hi)
 
 
 @dataclass(frozen=True)
@@ -273,8 +351,6 @@ def _pred_to_dict(p: "EntityPrediction") -> dict:
         "ranked": list(p.ranked),
         "forecast": list(p.forecast),
         "predicted_class": p.predicted_class,
-        "quantiles": {str(k): v for k, v in p.quantiles.items()},
-        "interval": list(p.interval) if p.interval is not None else None,
     }
 
 
@@ -327,7 +403,7 @@ class ExplainResult:
             f"  where:     {'present' if p.get('where_present') else 'none'}")
         lines.append(
             f"  assuming:  "
-            f"{'carried, not applied' if p.get('assuming_present') else 'none'}")
+            f"{p.get('assuming') or 'none'}")
         windows = p.get("windows", [])
         if windows:
             lines.append("  windows:")
@@ -573,13 +649,17 @@ class Engine:
         model_uri = self.model_config.model_uri_for(task_type)
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, input)
+        assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
         contexts: list[EntityContext] = []
         for eid in ids:
             anchor = self._anchor_for(entity_table, eid, input)
             ctx = self.assemble_context(entity_table, eid, anchor)
+            # WHERE selects who to score and is factual; the counterfactual is
+            # applied afterwards, to the context that actually gets scored.
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
                 continue
-            contexts.append(ctx)
+            contexts.append(_apply_assumptions(assumed, ctx))
+        _warn_inert_assumptions(assumed, contexts)
         stats = self._collect_stats(pq, task_type, contexts)
         preds = self._require_backend().score(pq, task_type, contexts,
                                               model_uri, self.model_config)
@@ -928,7 +1008,11 @@ class Engine:
 
         warnings_: list[str] = []
         if pq.assuming is not None:
-            warnings_.append("ASSUMING clause carried, not applied")
+            # surfaces as an error at execute() if it cannot be applied
+            try:
+                _assumptions(pq.assuming)
+            except ExecutionError as e:
+                warnings_.append(str(e))
 
         return {
             "target": _expr_str(pq.target),
@@ -942,6 +1026,7 @@ class Engine:
             "windows": windows,
             "where_present": pq.where is not None,
             "assuming_present": pq.assuming is not None,
+            "assuming": _assuming_plan(pq.assuming),
             "as_of": as_of,
             "ablations": [{"table": a.name, "note": "declared, not applied"}
                           for a in pq.ablations],
@@ -972,13 +1057,14 @@ class Engine:
         eff_input = replace(input, anchor_time=effective)
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, eff_input)
+        assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
         contexts: list[EntityContext] = []
         for eid in ids:
             anchor = self._anchor_for(entity_table, eid, eff_input)
             ctx = self.assemble_context(entity_table, eid, anchor)
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
                 continue
-            contexts.append(ctx)
+            contexts.append(_apply_assumptions(assumed, ctx))
 
         tables: dict[str, dict] = {}
         links_traversed = 0

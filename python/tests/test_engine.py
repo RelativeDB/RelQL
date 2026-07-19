@@ -254,19 +254,6 @@ def _make_schema():
 # RETURN clause execution (contract §3)
 # ---------------------------------------------------------------------------
 
-def test_return_quantiles_interval_unsupported(churn_schema, churn_wiring):
-    """QUANTILES / INTERVAL parse+validate fine, but a single point-head
-    checkpoint exposes no empirical distribution — execution raises. (The fake
-    history-window quantile computation was deleted with the baseline.)"""
-    from relativedb.rt_native import RtNativeBackend, RtNativeError
-    eng = Engine(churn_schema, churn_wiring,
-                 model_backend=RtNativeBackend(schema=churn_schema))
-    for ret in ("QUANTILES (0.1, 0.5, 0.9)", "INTERVAL 80%"):
-        with pytest.raises(RtNativeError, match="QUANTILES/INTERVAL"):
-            eng.execute(ExecutionInput(
-                query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                      f"FROM customers WHERE customers.customer_id IN :ids RETURN {ret}",
-                params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_ranking_over_non_fk_column_rejected(churn_schema, churn_wiring):
@@ -284,14 +271,6 @@ def test_ranking_over_non_fk_column_rejected(churn_schema, churn_wiring):
             params={"ids": ['C7']}, anchor_time=T0))
 
 
-def test_return_quantiles_on_boolean_target_rejected(churn_schema, churn_wiring):
-    from relativedb import RelqlValidationError
-    eng = Engine(churn_schema, churn_wiring)
-    with pytest.raises(RelqlValidationError):
-        eng.execute(ExecutionInput(
-            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                  "FROM customers WHERE customers.customer_id IN :ids RETURN QUANTILES (0.1, 0.9)",
-            params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_return_probability_on_regression_target_rejected(churn_schema, churn_wiring):
@@ -304,13 +283,6 @@ def test_return_probability_on_regression_target_rejected(churn_schema, churn_wi
             params={"ids": ['C7']}, anchor_time=T0))
 
 
-def test_return_quantile_out_of_range_rejected(churn_schema):
-    from relativedb import RelqlValidationError
-    from relativedb.relql.parser import validate
-    with pytest.raises(RelqlValidationError):
-        validate("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                 "FROM customers WHERE customers.customer_id IN :ids RETURN QUANTILES (0.0, 0.9)",
-                 churn_schema)
 
 
 def test_model_config_defaults_and_routing():
@@ -336,3 +308,114 @@ def test_model_config_unified_uri_and_embedding_check():
     relaxed = ModelConfig(allow_embedding_mismatch=True)
     relaxed.check_checkpoint_embedding("all-mpnet-base-v2")  # no raise
     cfg.check_checkpoint_embedding("all-MiniLM-L12-v2")      # match ok
+
+
+# ---------------------------------------------------------------------------
+# ASSUMING — counterfactual applied to the assembled context
+# ---------------------------------------------------------------------------
+
+def _assuming_schema():
+    from relativedb import LinkDef, Schema, TableDef, ValueType
+    return (Schema.new_schema()
+            .table(TableDef.new_table("customers")
+                   .column("age", ValueType.NUMBER)
+                   .column("plan", ValueType.TEXT)
+                   .column("signup_date", ValueType.DATETIME)
+                   .primary_key("customer_id").build())
+            .table(TableDef.new_table("orders")
+                   .column("qty", ValueType.NUMBER)
+                   .column("order_date", ValueType.DATETIME)
+                   .primary_key("order_id").time_column("order_date").build())
+            .link(LinkDef("orders", "customer_id", "customers")).build())
+
+
+BASE_Q = "PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FROM customers"
+
+
+def test_assuming_rewrites_the_scored_context():
+    """The counterfactual must reach the model — a factual and counterfactual
+    run of the same query may not return the same numbers."""
+    schema = _assuming_schema()
+    wiring = in_memory_wiring(churn_rows())
+    eng = Engine(schema, wiring, model_backend=StubBackend())
+    seen = []
+
+    class Capture(StubBackend):
+        def score(self, query, task_type, contexts, model_uri, config):
+            seen.append([c.entity_cells("customers").get("plan")
+                         for c in contexts])
+            return super().score(query, task_type, contexts, model_uri, config)
+
+    eng = Engine(schema, wiring, model_backend=Capture())
+    eng.execute(ExecutionInput(query=BASE_Q, anchor_time=T0))
+    eng.execute(ExecutionInput(query=BASE_Q + " ASSUMING customers.plan = 'premium'",
+                               anchor_time=T0))
+    factual, counterfactual = seen
+    assert set(counterfactual) == {"premium"}
+    assert counterfactual != factual
+
+
+def test_assuming_does_not_mutate_shared_rows():
+    """Rows are shared between entities (and cached by the CSC index); applying
+    an assumption must copy them, never write through."""
+    schema = _assuming_schema()
+    rows = churn_rows()
+    before = [dict(r.cells) for r in rows["customers"]]
+    eng = Engine(schema, in_memory_wiring(rows), model_backend=StubBackend())
+    eng.execute(ExecutionInput(query=BASE_Q + " ASSUMING customers.plan = 'gold'",
+                               anchor_time=T0))
+    assert [dict(r.cells) for r in rows["customers"]] == before
+
+
+@pytest.mark.parametrize("clause", [
+    "customers.age > 30",                                   # inequality
+    "customers.plan IN ('a', 'b')",                         # a set, not a value
+    "customers.plan = 'a' OR customers.plan = 'b'",          # two worlds
+    "COUNT(orders.*) OVER (7 DAYS FOLLOWING) > 2",           # aggregate
+])
+def test_assuming_rejects_conditions_it_cannot_realize(clause):
+    """These describe a set of possible worlds, not one context. Silently
+    ignoring them is what made ASSUMING a no-op; now they raise."""
+    from relativedb import ExecutionError
+    eng = Engine(_assuming_schema(), in_memory_wiring(churn_rows()),
+                 model_backend=StubBackend())
+    with pytest.raises(ExecutionError, match="cannot be applied"):
+        eng.execute(ExecutionInput(query=f"{BASE_Q} ASSUMING {clause}",
+                                   anchor_time=T0))
+
+
+def test_assuming_conjunction_applies_every_assignment():
+    schema = _assuming_schema()
+    seen = []
+
+    class Capture(StubBackend):
+        def score(self, query, task_type, contexts, model_uri, config):
+            seen.append(contexts[0].entity_cells("customers"))
+            return super().score(query, task_type, contexts, model_uri, config)
+
+    eng = Engine(schema, in_memory_wiring(churn_rows()), model_backend=Capture())
+    eng.execute(ExecutionInput(
+        query=BASE_Q + " ASSUMING customers.plan = 'premium' AND customers.age = 99",
+        anchor_time=T0))
+    assert seen[0]["plan"] == "premium" and seen[0]["age"] == 99
+
+
+def test_assuming_on_a_table_absent_from_context_warns():
+    """An assumption that reaches no row changes nothing — the exact silent
+    failure this feature used to have wholesale."""
+    from relativedb import AssumptionNotAppliedWarning, LinkDef, TableDef, ValueType, Schema
+    schema = (Schema.new_schema()
+              .table(TableDef.new_table("customers").column("age", ValueType.NUMBER)
+                     .column("plan", ValueType.TEXT)
+                     .column("signup_date", ValueType.DATETIME)
+                     .primary_key("customer_id").build())
+              .table(TableDef.new_table("orders").column("qty", ValueType.NUMBER)
+                     .column("order_date", ValueType.DATETIME)
+                     .primary_key("order_id").time_column("order_date").build())
+              .table(TableDef.new_table("coupons").column("kind", ValueType.TEXT)
+                     .primary_key("coupon_id").build())
+              .link(LinkDef("orders", "customer_id", "customers")).build())
+    eng = Engine(schema, in_memory_wiring(churn_rows()), model_backend=StubBackend())
+    with pytest.warns(AssumptionNotAppliedWarning, match="coupons"):
+        eng.execute(ExecutionInput(query=BASE_Q + " ASSUMING coupons.kind = 'x'",
+                                   anchor_time=T0))

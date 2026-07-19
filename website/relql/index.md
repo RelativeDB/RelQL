@@ -30,25 +30,6 @@ anchor time?*
   [task type](#task-types) (classification, regression, ranking,
   forecasting), which selects the model checkpoint and output form.
 
-One grammar, single-sourced in a C++ parser and decoded by the Python, Java,
-and Rust bindings — all tested against a shared 67-query corpus.
-
-## How to read this page
-
-This is the whole language in one document.
-
-- New to RelQL? Start with the [tutorial](#relql-tutorial) — it builds a query
-  up clause by clause.
-- Looking something up? Jump to [query structure](#query-structure),
-  [aggregations and windows](#aggregations-and-time-windows),
-  [conditions](#conditions-and-operators), or [task types](#task-types).
-- Want patterns to copy? Go to the [cookbook](#cookbook).
-
-The engine that runs these queries — installation, retrievers, model backends,
-and the language libraries — is documented in
-[the engine guide](/docs/).
-
-
 ## RelQL tutorial
 
 We'll build up a real query step by step, on a two-table schema:
@@ -113,9 +94,6 @@ engine.execute(ExecutionInput(query=q, params={"ids": ["C7", "C9"]}))
 text, so the same query string is reusable across cohorts. A literal list
 (`IN ('C7', 'C9')`) is also valid when the cohort really is fixed.
 
-The engine reads a primary-key predicate as the cohort itself and scores only
-those entities, so a pinned query needs no `TableScanner`.
-
 ### Step 5: filter the aggregated rows
 
 Aggregations accept an inline row filter — different from `WHERE`, which
@@ -151,7 +129,8 @@ FROM customers
 
 ### Step 8: ask "what if"
 
-`ASSUMING` states a counterfactual condition carried with the query:
+`ASSUMING` states a counterfactual — the engine rewrites the assembled context
+so the assumption holds, then scores that instead of the real one:
 
 ```sql
 PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
@@ -161,7 +140,14 @@ ASSUMING customers.plan = 'premium'
 ```
 
 :::note
-`ASSUMING` is parsed and validated but not yet applied to assembled context.
+An assumption must assign a concrete value: `column = literal`, optionally
+joined by `AND`. Inequalities, `IN`, `OR`/`NOT` and aggregate conditions
+describe a *set* of possible worlds rather than one, so there is no single
+context the engine can build — those raise at execution rather than being
+quietly ignored.
+
+Difference the counterfactual against the factual run (same query without
+`ASSUMING`) to estimate an intervention's effect.
 :::
 
 ### What you've learned
@@ -190,117 +176,6 @@ PREDICT   <target> [CLASSIFY]                  -- required: what to predict
 The **trailing clauses** — `WHERE`, `ASSUMING`, `AS OF`, `RETURN`, `WINDOW` —
 may appear in any order after `FROM`. Each may appear at
 most once, except `WINDOW`, which repeats (one per named frame).
-
-There is no `FORECAST N TIMEFRAMES` clause. To forecast, give the target's
-window multiple horizons (`... OVER (7 DAYS FOLLOWING HORIZONS 4)`); a
-multi-horizon window *implies* [forecasting](#task-types). See
-[Aggregations & windows](#aggregations-and-time-windows).
-
-### Clauses
-
-- **`PREDICT <target>`** — a static column reference
-  (`customers.age`, `articles.description IS NULL`), an
-  [aggregation](#aggregations-and-time-windows) over linked rows in an `OVER` frame, or a
-  richer expression (arithmetic, `CASE WHEN … END`, `COALESCE`, column-to-column
-  comparison), optionally compared to a literal. `CLASSIFY` is a target
-  directive; ranking is a frame directive, `OVER (… RANK TOP k)` (see
-  [task types](#task-types)).
-- **`FROM <table> [[AS] <alias>]`** — names the population. The primary key
-  comes from the schema, so you write the table, not the key. An alias lets the
-  rest of the query use the short name (`FROM customers c … c.plan`).
-  Enumerating every entity requires a `TableScanner`; to score a specific
-  subset, constrain the key in `WHERE` — `WHERE table.pk IN :ids`. The engine
-  reads that as the cohort and scores only those entities, so a pinned query
-  needs no scanner.
-
-  `FROM` may be omitted when the target names exactly one table and is not an
-  aggregation — then the population is that table:
-
-  ```sql
-  PREDICT issues.label WHERE issues.label IS NULL   -- population: issues
-  ```
-
-  An aggregate target names a *linked* table rather than the population, so it
-  always needs an explicit `FROM`.
-- **Column references** — `table.column`, `alias.column`, or a bare `column`,
-  which binds to the population:
-
-  ```sql
-  PREDICT label FROM issues WHERE label IS NULL     -- both are issues.label
-  ```
-- **`WHERE <condition>`** — filters the population using static attributes
-  and past-facing aggregations. See [Conditions](#conditions-and-operators).
-- **`ASSUMING <condition>`** — a counterfactual assumption, parsed and
-  validated and carried on the query (not yet applied to context assembly).
-- **`AS OF <anchor>`** — binds the anchor time (the instant `NOW` and every
-  frame are measured from). The anchor is a `DATE` literal (`2026-07-01`), a
-  parameter (`:prediction_time`, bound at execution time), or `NOW`. A `DATE`
-  or bound parameter takes precedence over the execution anchor; `NOW` (or no
-  `AS OF`) uses the execution anchor.
-- **`RETURN <return_spec>`** — selects the output form (see below).
-- **`WINDOW <name> AS (<window_spec>)`** — declares a reusable named frame,
-  referenced elsewhere as `OVER <name>`. Declared exactly once; referencing an
-  undeclared name is an error. See [Aggregations & windows](#aggregations-and-time-windows).
-
-### RETURN — output form
-
-`RETURN` overrides the default output implied by the task type:
-
-```
-EXPECTED VALUE | PROBABILITY | CLASS | DISTRIBUTION
-| QUANTILES (<num>, ...) | INTERVAL <int> [%] | MULTILABEL | MULTICLASS
-```
-
-```sql
-PREDICT SUM(payments.amount) OVER (30 DAYS FOLLOWING)
-FROM customers
-AS OF :t
-RETURN INTERVAL 90%
-```
-
-### EXPLAIN — inspect without (necessarily) running
-
-An `EXPLAIN` prefix asks the engine to describe what it *would* do. The engine's
-`explain()` entry point returns a result you can render as text or JSON
-(`FORMAT TEXT | JSON`):
-
-```
-EXPLAIN [PLAN | CONTEXT | ANALYZE] [FORMAT TEXT | JSON]
-```
-
-- **`PLAN`** — the default (bare `EXPLAIN` == `EXPLAIN PLAN`). Describes the
-  query from parsing and validation alone: the normalized target, inferred task
-  type, entity selector, resolved output form, each aggregation's normalized
-  window, and the resolved anchor source. Does **not** assemble context or
-  invoke the model.
-- **`CONTEXT`** — additionally assembles the per-entity context and reports
-  row/cell counts, links traversed, time ranges, and rows dropped by the
-  temporal bound. Does **not** score the model.
-- **`ANALYZE`** — assembles and scores, returning the predictions with the plan.
-
-```sql
-EXPLAIN PLAN FORMAT TEXT
-PREDICT EXISTS(orders.*) OVER (30 DAYS FOLLOWING)
-FROM customers
-RETURN PROBABILITY
-```
-
-### Lexical rules
-
-- Keywords are **case-insensitive**: `PREDICT`, `OVER`, `FOLLOWING`,
-  `PRECEDING`, `RANGE`, `BETWEEN`, `HORIZONS`, `STEP`, `WINDOW`, `AS OF`,
-  `RETURN`, `EXPLAIN`, `FROM`, `WHERE`, `ASSUMING`, `CLASSIFY`, `RANK`,
-  `TOP`.
-- Aggregation and condition words (`COUNT`, `SUM`, `AND`, `LIKE`, ...) are
-  **soft keywords** — still usable as column names (`usage.count` parses). In
-  the `FROM` alias slot the clause words (`AS`, `WHERE`, `ASSUMING`, `ABLATE`,
-  `RETURN`, `WINDOW`) are not treated as aliases.
-- Column references are `table.column`, `alias.column`, or a bare `column`
-  bound to the population; `table.*` counts rows.
-- Literals: numbers, `'quoted strings'`, booleans, `DATE`s (`2026-07-01`).
-  Frame bounds use `UNBOUNDED PRECEDING` for all history.
-- Comments are supported.
-
 
 ## Aggregations and time windows
 
@@ -525,34 +400,6 @@ selects the model checkpoint and the output form — you never declare it.
 | `LIST_DISTINCT(...) OVER (... RANK TOP K)` | ranking | ranked ID list |
 | any target whose window has `HORIZONS > 1` | forecasting | value per horizon |
 
-### Model routing
-
-`ModelConfig` maps task types to checkpoints — by default the classification
-family routes to `hf://stanford-star/rt-j/classification` and
-regression/forecasting to `hf://stanford-star/rt-j/regression`.
-
-The output column above is the *logical* form each task produces. The RT-J
-backend (`RtNativeBackend`) is the only scoring path. It executes **binary
-classification**, **regression**, **multiclass classification**, and
-**ranking**. Multiclass reuses the checkpoint's text head: the masked target
-cell is predicted as a 384-d embedding and matched by cosine similarity to the
-class labels' `all-MiniLM-L12-v2` embeddings, returning a predicted class plus
-approximate class probabilities (a softmax over the cosine scores — the argmax
-is the reference-exact class, the probabilities are an uncalibrated
-approximation, not a trained softmax head). Ranking scores each candidate parent
-ID with the existence head and returns the top *k*. `RETURN QUANTILES`/`INTERVAL`
-remain unsupported — the checkpoint has no variance/quantile head — and raise a
-clear error (see [Model backends](/docs/#model-backends)).
-
-### Checking a query
-
-Every library exposes the inference without executing:
-
-```python
-pq = relativedb.parse("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FROM customers")
-pq.task_type()    # TaskType.REGRESSION
-```
-
 
 ## Cookbook
 
@@ -645,14 +492,14 @@ FROM customers
 WHERE customers.location NOT IN ('ALASKA', 'HAWAII')
 ```
 
-### As-of a fixed anchor, with quantiles
+### As-of a fixed anchor
 
 ```sql
 PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING)
 FROM customers
-WHERE customers.customer_id IN ('C7', 'C9')
+WHERE customers.customer_id IN :ids
 AS OF :prediction_time
-RETURN QUANTILES (0.10, 0.50, 0.90)
+RETURN EXPECTED VALUE
 ```
 
 ### Reusable named window

@@ -14,10 +14,11 @@ from .relql import (MissingParameterError, ParsedQuery, RelqlSyntaxError,
 from .model import (DEFAULT_CLASSIFICATION_MODEL_URI, DEFAULT_EMBEDDING_MODEL,
                     DEFAULT_REGRESSION_MODEL_URI, EmbeddingMismatchError,
                     ModelConfig)
-from .engine import (ContextPolicy, ContextTruncationWarning, Engine,
-                     EntityContext, EntityPrediction, ExecutionError,
-                     ExecutionInput, ExplainResult,
-                     ModelBackend, PredictionResult, SamplerMode)
+from .engine import (AssumptionNotAppliedWarning, ContextPolicy,
+                     ContextTruncationWarning, Engine, EntityContext,
+                     EntityPrediction, ExecutionError, ExecutionInput,
+                     ExplainResult, ModelBackend, PredictionResult,
+                     SamplerMode)
 from .csc import CscIndex
 
 
@@ -42,7 +43,7 @@ __all__ = [
     "DEFAULT_CLASSIFICATION_MODEL_URI", "DEFAULT_REGRESSION_MODEL_URI",
     "DEFAULT_EMBEDDING_MODEL",
     "Engine", "ExecutionInput", "ExecutionError", "ContextPolicy",
-    "ContextTruncationWarning",
+    "ContextTruncationWarning", "AssumptionNotAppliedWarning",
     "SamplerMode", "PredictionResult", "ExplainResult",
     "EntityPrediction", "EntityContext",
     "ModelBackend", "CscIndex",

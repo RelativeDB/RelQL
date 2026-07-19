@@ -170,16 +170,12 @@ struct Ablation {
 };
 
 enum class ReturnKind {
-  EXPECTED_VALUE, PROBABILITY, CLASS, DISTRIBUTION, QUANTILES, INTERVAL,
-  MULTILABEL, MULTICLASS
+  EXPECTED_VALUE, PROBABILITY, CLASS, DISTRIBUTION, MULTILABEL, MULTICLASS
 };
 
 struct ReturnSpec {
   bool present = false;
   ReturnKind kind = ReturnKind::EXPECTED_VALUE;
-  std::vector<double> quantiles;
-  bool has_interval = false;
-  long long interval = 0;
 };
 
 struct ParsedQuery {

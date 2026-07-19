@@ -605,29 +605,20 @@ class Parser {
       q.ret.kind = ReturnKind::MULTILABEL;
     } else if (k == "MULTICLASS") {
       q.ret.kind = ReturnKind::MULTICLASS;
-    } else if (k == "QUANTILES") {
-      q.ret.kind = ReturnKind::QUANTILES;
-      expect("(", "'(' after QUANTILES");
-      q.ret.quantiles.push_back(parseNumber());
-      while (accept(",")) q.ret.quantiles.push_back(parseNumber());
-      expect(")", "')' to close QUANTILES");
-    } else if (k == "INTERVAL") {
-      q.ret.kind = ReturnKind::INTERVAL;
-      Token iv = expect("INT", "an integer percent after INTERVAL");
-      q.ret.has_interval = true;
-      q.ret.interval = iv.ival;
-      accept("%");  // optional percent sign
+    } else if (k == "QUANTILES" || k == "INTERVAL") {
+      // Removed from the language: the checkpoint has a single point head and
+      // exposes no empirical distribution, so these could never execute. Named
+      // explicitly because queries written against the old grammar are out
+      // there and deserve better than "unexpected token".
+      syntaxError("RETURN " + k + " is not supported: the model exposes a "
+                  "single point estimate, not a distribution. Use RETURN "
+                  "EXPECTED VALUE for a regression target.",
+                  t.pos, text_);
     } else {
       syntaxError("expected a RETURN output type, found " + k, t.pos, text_);
     }
   }
 
-  double parseNumber() {
-    Token t = next();
-    if (t.kind == "INT") return (double)t.ival;
-    if (t.kind == "FLOAT") return t.dval;
-    syntaxError("expected a number, found " + t.kind, t.pos, text_);
-  }
 
   void parseWindowDecl(ParsedQuery& q) {
     std::string name = parseName("a window name after WINDOW");
@@ -1493,8 +1484,6 @@ const char* returnKindName(ReturnKind k) {
     case ReturnKind::PROBABILITY: return "PROBABILITY";
     case ReturnKind::CLASS: return "CLASS";
     case ReturnKind::DISTRIBUTION: return "DISTRIBUTION";
-    case ReturnKind::QUANTILES: return "QUANTILES";
-    case ReturnKind::INTERVAL: return "INTERVAL";
     case ReturnKind::MULTILABEL: return "MULTILABEL";
     case ReturnKind::MULTICLASS: return "MULTICLASS";
   }
@@ -1788,16 +1777,7 @@ std::string to_json(const ParsedQuery& q) {
   if (q.ret.present) {
     out += "{\"kind\":\"";
     out += returnKindName(q.ret.kind);
-    out += "\",\"quantiles\":[";
-    for (size_t k = 0; k < q.ret.quantiles.size(); k++) {
-      if (k) out += ",";
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "%g", q.ret.quantiles[k]);
-      out += buf;
-    }
-    out += "],\"interval\":";
-    out += q.ret.has_interval ? std::to_string(q.ret.interval) : "null";
-    out += "}";
+    out += "\"}";
   } else {
     out += "null";
   }

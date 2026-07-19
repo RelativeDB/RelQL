@@ -363,9 +363,8 @@ class Ablation:
 
 @dataclass(frozen=True)
 class ReturnSpec:
-    kind: str                     # EXPECTED_VALUE | PROBABILITY | CLASS | ...
-    quantiles: tuple = ()         # for QUANTILES
-    interval: Optional[int] = None  # for INTERVAL <int>%
+    kind: str                     # EXPECTED_VALUE | PROBABILITY | CLASS |
+                                  # DISTRIBUTION | MULTILABEL | MULTICLASS
 
 
 @dataclass(frozen=True)

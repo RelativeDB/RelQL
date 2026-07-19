@@ -667,8 +667,6 @@ class RtNativeBackend:
     (CONTRACT.md §2). Ranking scores each candidate parent id's existence
     context through the number head and takes the top-k (§3). Both need a
     ``wiring`` with a ``TableScanner`` to enumerate the class/candidate domain.
-    ``RETURN QUANTILES/INTERVAL`` still raise — a single point head exposes no
-    empirical distribution.
     """
 
     def __init__(self, *, schema: Optional[Schema] = None,
@@ -716,12 +714,6 @@ class RtNativeBackend:
               config: ModelConfig) -> list[EntityPrediction]:
         ret = query.ret
         ret_kind = ret.kind if ret is not None else None
-        # A single point head exposes no empirical distribution — these RETURN
-        # forms need a quantile/distribution head the checkpoint does not have.
-        if ret_kind in ("QUANTILES", "INTERVAL"):
-            raise RtNativeError(
-                "RETURN QUANTILES/INTERVAL requires a quantile/distribution "
-                "head the current checkpoint does not expose")
         if not contexts:
             return []
         if task_type is TaskType.MULTICLASS_CLASSIFICATION:

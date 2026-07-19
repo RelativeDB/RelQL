@@ -271,12 +271,21 @@ def test_case_target():
 def test_return_specs():
     pq = parse("PREDICT SUM(orders.amount) OVER (RANGE BETWEEN 15 DAYS FOLLOWING "
                "AND 45 DAYS FOLLOWING) FROM customers "
-               "AS OF :prediction_time RETURN QUANTILES (0.10, 0.50, 0.90)")
-    assert pq.ret.kind == "QUANTILES"
-    assert pq.ret.quantiles == (0.10, 0.50, 0.90)
-    pq = parse("PREDICT SUM(payments.amount) OVER (30 DAYS FOLLOWING) "
-               "FROM customers AS OF :t RETURN INTERVAL 90%")
-    assert pq.ret.kind == "INTERVAL" and pq.ret.interval == 90
+               "AS OF :prediction_time RETURN EXPECTED VALUE")
+    assert pq.ret.kind == "EXPECTED_VALUE"
+    pq = parse("PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0 "
+               "FROM customers RETURN PROBABILITY")
+    assert pq.ret.kind == "PROBABILITY"
+
+
+@pytest.mark.parametrize("clause", ["QUANTILES (0.1, 0.9)", "INTERVAL 90%"])
+def test_return_quantiles_and_interval_are_removed(clause):
+    """They never executed — a single point head exposes no distribution — so
+    they are out of the grammar. The error names them rather than reporting an
+    unexpected token, because queries written against the old grammar exist."""
+    with pytest.raises(RelqlSyntaxError, match="not supported"):
+        parse(f"PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
+              f"FROM customers RETURN {clause}")
 
 
 def test_as_of_variants():
@@ -338,10 +347,10 @@ def test_alias_resolves_to_its_table():
 
 def test_alias_slot_does_not_swallow_a_clause_keyword():
     pq = parse("PREDICT SUM(payments.amount) OVER (30 DAYS FOLLOWING) "
-               "FROM customers AS OF :t RETURN INTERVAL 90%")
+               "FROM customers AS OF :t RETURN EXPECTED VALUE")
     assert pq.entity_key.table == "customers"
     assert pq.as_of == AsOf("param", "t")
-    assert pq.ret.interval == 90
+    assert pq.ret.kind == "EXPECTED_VALUE"
 
 
 def test_implied_frame_direction_follows_the_clause():

@@ -84,6 +84,8 @@ int main(int argc, char** argv) {
       "PREDICT LIST_DISTINCT(t.a) OVER (30 DAYS FOLLOWING RANK TOP -1) FROM e",
       "PREDICT LIST_DISTINCT(t.a) OVER (30 DAYS FOLLOWING) RANK TOP 12 FROM e",
       "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FROM e EXTRA JUNK",
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FROM e RETURN QUANTILES (0.1)",
+      "PREDICT SUM(t.x) OVER (30 DAYS FOLLOWING) FROM e RETURN INTERVAL 90%",
       "PREDICT a.x = b.y",       // no FROM, target spans two tables
       "PREDICT 1 > 0",           // no FROM, target names no table
   };

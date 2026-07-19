@@ -12,6 +12,8 @@ license = "Apache-2.0"
 authors = [{ name = "relationdb contributors" }]
 dependencies = [
     "numpy>=1.24",
+    "sentence-transformers>=3.0",
+    "huggingface_hub>=0.23"
 ]
 
 [project.urls]
@@ -20,7 +22,6 @@ Repository = "https://github.com/RelativeDB/RelQL"
 Issues = "https://github.com/RelativeDB/RelQL/issues"
 
 [project.optional-dependencies]
-rt = ["sentence-transformers>=3.0", "huggingface_hub>=0.23"]
 dev = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

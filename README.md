@@ -15,16 +15,12 @@ FROM customers
 *"For every customer, what is the probability they place zero orders"*.
 
 ## The model
-Relational Transformers work by pretraining a 22m parameter model on relational data for prediction and classifications tasks. This method has been shown to scale, and remarkably, shows the emergence of zero-shot ability on novel tasks.
+Relational Transformers work by utilizing a pretrained 22m parameter model from over 650 databases of relational data for prediction and classifications tasks. This method has been shown to scale, and remarkably, shows the emergence of zero-shot ability on novel tasks.
 
 | Resource | Description | Date      |
 | --- | --- |-----------|
 | [stanford-star/relational-transformer](https://github.com/stanford-star/relational-transformer) | RT-J: Large-Scale Pretraining of Relational Transformers for Context-Efficient Predictions — code, in progress | Jul 2026  |
 | [Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data](https://arxiv.org/abs/2510.06377) | Paper (arXiv:2510.06377) | Oct, 2025 |
-
-# Docs
-
-Read the [RelQL book](https://relql.com/docs/).
 
 # Appetizer
 
@@ -67,8 +63,10 @@ PREDICT SUM(orders.revenue) OVER w - SUM(orders.cost) OVER w
 FROM customers
 WINDOW w AS (30 DAYS FOLLOWING)
 ```
----
 
+# Docs
+
+Read the [RelQL book](https://relql.com/docs/).
 
 ### Checkpoints
 
@@ -120,139 +118,3 @@ result = engine.execute(ExecutionInput(
 ```
 
 </details>
-
-## The Java library
-
-```xml
-<!-- Maven -->
-<dependency>
-  <groupId>com.relativedb</groupId>
-  <artifactId>relativedb</artifactId>
-  <version>0.1.0</version>
-</dependency>
-```
-
-```groovy
-// Gradle
-implementation("com.relativedb:relativedb:0.1.0")
-```
-
-<details>
-<summary><b>Quickstart</b></summary>
-
-```java
-import com.relativedb.schema.*;
-import com.relativedb.retrieve.*;
-import com.relativedb.engine.*;
-import static com.relativedb.schema.ValueType.*;
-
-RelativeDbSchema schema = RelativeDbSchema.newSchema()
-    .table(TableDef.newTable("customers").column("age", NUMBER)
-        .column("signup_date", DATETIME).primaryKey("customer_id").build())
-    .table(TableDef.newTable("orders").column("qty", NUMBER)
-        .column("order_date", DATETIME).primaryKey("order_id")
-        .timeColumn("order_date").build())
-    .link(LinkDef.link("orders", "customer_id", "customers"))
-    .build();
-
-RetrieverWiring wiring = RetrieverWiring.newWiring()
-    .entities("customers", (table, ids, bound) -> customerDao.byIds(ids))
-    .entities("orders",    (table, ids, bound) -> orderDao.byIds(ids, bound))
-    .defaultLinks((link, parent, bound, limit) ->
-        orderDao.recentByCustomer(parent, bound.asOf().orElse(Instant.MAX), limit))
-    .build();
-
-RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
-    .modelBackend(new RtNativeBackend(schema))   // required; the RT-J relational model
-    .build();
-
-PredictionResult churn = engine.execute(ExecutionInput.newInput()
-    .query("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
-         + "WHERE customers.customer_id IN :ids")
-    .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
-    .param("ids", List.of(42L))
-    .build()).toCompletableFuture().join();
-```
-
-</details>
-
-## The Rust library
-
-```bash
-cargo add relativedb
-```
-
-```toml
-# Cargo.toml
-[dependencies]
-relativedb = "0.1.0"
-```
-
-<details>
-<summary><b>Quickstart</b></summary>
-
-```rust
-use relativedb::{
-    Engine, EntityId, ExecutionInput, LinkDef, RetrieverWiring, Row, RtNativeBackend,
-    Schema, TableDef, TemporalBound, ValueType,
-};
-
-let schema = Schema::new_schema()
-    .table(TableDef::new_table("customers")
-        .column("age", ValueType::Number)
-        .column("signup_date", ValueType::Datetime)
-        .primary_key("customer_id").build())
-    .table(TableDef::new_table("orders")
-        .column("qty", ValueType::Number)
-        .column("order_date", ValueType::Datetime)
-        .primary_key("order_id").time_column("order_date").build())
-    .link(LinkDef::link("orders", "customer_id", "customers"))
-    .build();
-
-let wiring = RetrieverWiring::new_wiring()
-    .entities("customers", move |_t: &str, ids: &[EntityId], _b: &TemporalBound| {
-        customers.iter().filter(|r| ids.contains(&r.id)).cloned().collect()
-    })
-    .default_links(move |link: &LinkDef, pid: &EntityId, b: &TemporalBound, limit: usize| {
-        let mut kids: Vec<Row> = orders.iter()
-            .filter(|r| r.get_parent(&link.fk_column) == Some(pid) && b.admits_row(r))
-            .cloned().collect();
-        kids.sort_by(|a, x| x.timestamp.cmp(&a.timestamp));
-        kids.truncate(limit);
-        kids
-    })
-    .scanner("customers", move |_t: &str, _b: &TemporalBound| cust_scan.clone())
-    .build();
-
-// Scoring requires a model backend; RtNativeBackend runs the RT-J relational model.
-let mut engine = Engine::new(schema, wiring).model_backend(RtNativeBackend::new(&schema)?);
-let result = engine.execute(
-    ExecutionInput::query(
-        "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers")
-    .anchor_time(anchor),
-)?;
-
-assert_eq!(result.task_type, relativedb::TaskType::BinaryClassification);
-for p in &result.predictions {
-    println!("{} churn probability = {:?}", p.id, p.probability);
-}
-```
-
-</details>
-
-## Design invariants
-
-Recurring invariant numbers you will see referenced in code and docs:
-
-- **F24** — the engine re-validates every retriever-returned row against the
-  `TemporalBound` and drops violations; temporal safety does not depend on
-  retriever correctness.
-- **F65** — "self labels": the entity's own past target outcomes are computed
-  over trailing windows and included as in-context examples for the model.
-- **F13/F14** — text cells and `"<column> of <table>"` schema phrases embed
-  with the pinned MiniLM encoder.
-- **F52** — booleans route through the number head (`bool_as_num`).
-
-## License
-
-Apache-2.0 (declared by each package manifest).

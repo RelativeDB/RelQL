@@ -173,8 +173,7 @@ def _as_of(o: Optional[dict]) -> Optional[AsOf]:
 def _ret(o: Optional[dict]) -> Optional[ReturnSpec]:
     if not o:
         return None
-    return ReturnSpec(o["kind"], tuple(o.get("quantiles", ())),
-                      o.get("interval"))
+    return ReturnSpec(o["kind"])
 
 
 def _query_from_json(o: dict, text: str) -> ParsedQuery:
