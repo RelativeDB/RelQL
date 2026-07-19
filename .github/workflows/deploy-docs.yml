@@ -11,6 +11,11 @@ name: Deploy docs
 # The role needs s3:ListBucket + s3:PutObject/DeleteObject on the bucket, and
 # cloudfront:CreateInvalidation on the distribution. Prefer OIDC over stored
 # access keys: no long-lived credentials live in the repository.
+#
+# The role's trust policy pins the OIDC subject to this repository on main.
+# GitHub issues this repository's tokens under an immutable id prefix, so the
+# subject reads repo:RelativeDB@306372328/RelQL@1304571083:ref:refs/heads/main;
+# the plain owner/repo form alone is not enough and the assume-role call fails.
 
 on:
   push:
@@ -41,9 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: website/package-lock.json
 
@@ -67,7 +72,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: github.event_name == 'push' || inputs.publish
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
