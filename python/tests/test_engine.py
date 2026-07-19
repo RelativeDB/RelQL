@@ -233,14 +233,16 @@ def test_return_quantiles_interval_unsupported(churn_schema, churn_wiring):
                 entity_ids=['C7'], anchor_time=T0))
 
 
-def test_multiclass_ranking_output_unsupported(churn_schema, churn_wiring):
-    """The single-score C ABI cannot express multiclass / ranking heads; the
-    native backend raises rather than falling back to a fake scorer. (Raised
-    before the checkpoint is loaded, so this runs offline.)"""
+def test_ranking_over_non_fk_column_rejected(churn_schema, churn_wiring):
+    """Ranking (LIST_DISTINCT ... RANK) is supported, but only over a real
+    foreign-key column that names a parent table; ``orders.qty`` is an ordinary
+    feature column, so ranking over it is a clear error. (Raised before the
+    checkpoint is loaded, so this runs offline.)"""
     from relativedb.rt_native import RtNativeBackend, RtNativeError
     eng = Engine(churn_schema, churn_wiring,
-                 model_backend=RtNativeBackend(schema=churn_schema))
-    with pytest.raises(RtNativeError, match="multiclass"):
+                 model_backend=RtNativeBackend(schema=churn_schema,
+                                               wiring=churn_wiring))
+    with pytest.raises(RtNativeError, match="foreign-key"):
         eng.execute(ExecutionInput(
             query="PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) "
                   "RANK TOP 5 FOR EACH customers.customer_id",

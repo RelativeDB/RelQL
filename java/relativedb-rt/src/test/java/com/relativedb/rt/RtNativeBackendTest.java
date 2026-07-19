@@ -36,7 +36,10 @@ class RtNativeBackendTest {
 
     private static PrecomputedEncoder fixedEncoder() {
         Map<String, float[]> table = new HashMap<>();
-        for (String key : new String[] { "age", "signup_date", "plan", "qty", "churned", "premium" }) {
+        for (String key : new String[] { "age", "signup_date", "plan", "qty", "churned", "premium",
+                // col_name_v schema phrases ("<column> of <table>").
+                "age of customers", "signup_date of customers", "plan of customers",
+                "qty of orders", "churned of customers" }) {
             table.put(key, fixedVector(key));
         }
         return new PrecomputedEncoder(table);

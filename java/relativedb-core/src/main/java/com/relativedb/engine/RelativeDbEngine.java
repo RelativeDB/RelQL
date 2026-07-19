@@ -25,7 +25,6 @@ import com.relativedb.query.ValidatedQuery;
 import com.relativedb.retrieve.EntityId;
 import com.relativedb.retrieve.RetrieverWiring;
 import com.relativedb.retrieve.Row;
-import com.relativedb.retrieve.StatsProvider;
 import com.relativedb.retrieve.TemporalBound;
 import com.relativedb.schema.RelativeDbSchema;
 import com.relativedb.schema.TableDef;
@@ -161,6 +160,14 @@ public final class RelativeDbEngine {
 
         ModelBackend resolved = resolveBackend(taskType);
 
+        // Class-label domain (multiclass) and candidate pool (ranking) are
+        // query-global under the temporal bound — enumerated once and shared
+        // across entities. (Contract §2.5 / §3.1.)
+        List<String> classLabels = taskType == TaskType.MULTICLASS_CLASSIFICATION
+                ? multiclassLabels(vq, bound) : List.of();
+        List<Row> rankCandidates = taskType == TaskType.MULTILABEL_RANKING
+                ? rankCandidateRows(vq, bound) : List.of();
+
         List<PredictionResult.EntityPrediction> predictions = new ArrayList<>(ids.size());
         for (EntityId id : ids) {
             TemporalBound entityBound = bound;
@@ -175,12 +182,151 @@ public final class RelativeDbEngine {
                 }
             }
             ContextGraph context = assembleContext(entityTable, id, entityBound);
-            TokenBatch batch = toTokenBatch(context);
-            instrumentation.onModelInvoked(id, batch.size());
-            ModelOutput out = resolved.score(batch, taskType).toCompletableFuture().join();
+            ModelOutput out = switch (taskType) {
+                case MULTICLASS_CLASSIFICATION -> {
+                    TokenBatch batch = buildBatch(context, effectiveAnchor, taskType);
+                    instrumentation.onModelInvoked(id, batch.size());
+                    yield resolved.classifyMulticlass(batch, classLabels, taskType);
+                }
+                case MULTILABEL_RANKING -> {
+                    List<String> candidateIds = new ArrayList<>(rankCandidates.size());
+                    for (Row candidate : rankCandidates) {
+                        candidateIds.add(String.valueOf(candidate.id().raw()));
+                    }
+                    List<TokenBatch> batches =
+                            buildRankingBatches(context, effectiveAnchor, rankCandidates, taskType);
+                    instrumentation.onModelInvoked(id, batches.isEmpty() ? 0 : batches.get(0).size());
+                    ModelOutput scored = resolved.rankCandidates(batches, candidateIds, taskType);
+                    yield truncateRanking(scored, vq.query().topK());
+                }
+                default -> {
+                    TokenBatch batch = buildBatch(context, effectiveAnchor, taskType);
+                    instrumentation.onModelInvoked(id, batch.size());
+                    yield resolved.score(batch, taskType).toCompletableFuture().join();
+                }
+            };
             predictions.add(decode(id, taskType, out, vq.query()));
         }
         return new PredictionResult(taskType, predictions);
+    }
+
+    // ------------------------------------------------------------------
+    //  Multiclass class-domain & ranking candidate enumeration
+    // ------------------------------------------------------------------
+
+    /** Cap on distinct class labels / ranking candidates (contract §2.5 / §3.1). */
+    static final int MAX_MULTICLASS_CLASSES = 1000;
+    static final int MAX_RANK_CANDIDATES = 1000;
+
+    /**
+     * The distinct observed values of the target categorical column, temporally
+     * bounded, sorted lexicographically (UTF-8 byte order, ascending) and capped
+     * at {@link #MAX_MULTICLASS_CLASSES}. Requires a {@link com.relativedb.retrieve.TableScanner}
+     * over the target's table.
+     */
+    private List<String> multiclassLabels(ValidatedQuery vq, TemporalBound bound) {
+        ColumnRef target = categoricalTargetColumn(vq.query().target());
+        var scanner = wiring.scanner(target.table()).orElseThrow(() ->
+                new IllegalStateException("multiclass classification of '" + target
+                        + "' requires a TableScanner over table '" + target.table()
+                        + "' to enumerate the class-label domain"));
+        java.util.TreeSet<String> distinct = new java.util.TreeSet<>(RelativeDbEngine::compareUtf8);
+        for (Row row : drain(scanner.scan(target.table(), bound))) {
+            if (!row.timestamp().map(bound::admits).orElse(true)) continue;
+            Object v = row.cells().get(target.column());
+            if (v != null) distinct.add(String.valueOf(v));
+        }
+        List<String> labels = new ArrayList<>(distinct);
+        return labels.size() > MAX_MULTICLASS_CLASSES
+                ? labels.subList(0, MAX_MULTICLASS_CLASSES) : labels;
+    }
+
+    /**
+     * The distinct rows of the parent table referenced by {@code LIST_DISTINCT(table.fk)},
+     * temporally bounded, deduplicated by id, sorted (numeric ascending if the id
+     * type is integral, else lexicographic UTF-8 ascending on the stringified id)
+     * and capped at {@link #MAX_RANK_CANDIDATES}. Requires a
+     * {@link com.relativedb.retrieve.TableScanner} over the parent table.
+     */
+    private List<Row> rankCandidateRows(ValidatedQuery vq, TemporalBound bound) {
+        if (!(vq.query().target() instanceof Aggregation agg)) {
+            throw new IllegalStateException("ranking target must be LIST_DISTINCT(table.fk), got "
+                    + vq.query().target());
+        }
+        ColumnRef fk = agg.column();
+        String parentTable = schema.linksFrom(fk.table()).stream()
+                .filter(l -> l.fkColumn().equals(fk.column()))
+                .map(com.relativedb.schema.LinkDef::toTable)
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("ranking target '" + fk
+                        + "' is not a declared foreign key of table '" + fk.table() + "'"));
+        var scanner = wiring.scanner(parentTable).orElseThrow(() ->
+                new IllegalStateException("ranking requires a TableScanner over the parent table '"
+                        + parentTable + "' to enumerate link candidates"));
+        Map<EntityId, Row> byId = new LinkedHashMap<>();
+        for (Row row : drain(scanner.scan(parentTable, bound))) {
+            if (!row.timestamp().map(bound::admits).orElse(true)) continue;
+            byId.putIfAbsent(row.id(), row);
+        }
+        List<Row> candidates = new ArrayList<>(byId.values());
+        boolean integral = candidates.stream().allMatch(r -> isIntegral(r.id().raw()));
+        candidates.sort(integral
+                ? java.util.Comparator.comparing(r -> ((Number) r.id().raw()).longValue())
+                : (x, y) -> compareUtf8(String.valueOf(x.id().raw()), String.valueOf(y.id().raw())));
+        return candidates.size() > MAX_RANK_CANDIDATES
+                ? candidates.subList(0, MAX_RANK_CANDIDATES) : candidates;
+    }
+
+    /** Apply {@code RANK TOP k}: keep the first {@code k} of the already-ranked map. */
+    private static ModelOutput truncateRanking(ModelOutput scored, java.util.OptionalInt topK) {
+        Map<String, Double> ranked = scored.rankedScores();
+        int k = topK.orElse(ranked.size());
+        if (k >= ranked.size()) return scored;
+        Map<String, Double> kept = new LinkedHashMap<>();
+        for (var e : ranked.entrySet()) {
+            if (kept.size() >= k) break;
+            kept.put(e.getKey(), e.getValue());
+        }
+        return ModelOutput.ranking(kept);
+    }
+
+    private static ColumnRef categoricalTargetColumn(TargetExpr target) {
+        if (target instanceof ColumnRef c) return c;
+        if (target instanceof Aggregation agg) return agg.column();
+        throw new IllegalStateException("multiclass target is not a categorical column: " + target);
+    }
+
+    private static boolean isIntegral(Object raw) {
+        return raw instanceof Long || raw instanceof Integer
+                || raw instanceof Short || raw instanceof Byte
+                || raw instanceof java.math.BigInteger;
+    }
+
+    /** Lexicographic comparison by UTF-8 bytes (unsigned) — identical across bindings. */
+    static int compareUtf8(String a, String b) {
+        byte[] x = a.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] y = b.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int n = Math.min(x.length, y.length);
+        for (int i = 0; i < n; i++) {
+            int cx = x[i] & 0xFF, cy = y[i] & 0xFF;
+            if (cx != cy) return Integer.compare(cx, cy);
+        }
+        return Integer.compare(x.length, y.length);
+    }
+
+    private static List<Row> drain(java.util.concurrent.Flow.Publisher<Row> publisher) {
+        List<Row> rows = new ArrayList<>();
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        publisher.subscribe(new java.util.concurrent.Flow.Subscriber<>() {
+            @Override public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
+                s.request(Long.MAX_VALUE);
+            }
+            @Override public void onNext(Row row) { rows.add(row); }
+            @Override public void onError(Throwable t) { done.completeExceptionally(t); }
+            @Override public void onComplete() { done.complete(null); }
+        });
+        done.join();
+        return rows;
     }
 
     // ------------------------------------------------------------------
@@ -573,52 +719,247 @@ public final class RelativeDbEngine {
 
     // ------------------------------------------------------------------
     //  Token batch construction (one token per cell, F10)
+    //
+    //  Parity with the Python (rt_native._build_ctx_seq/_normalize) and Rust
+    //  (native.rs build_ctx_seq) bindings. Every entity's sequence carries a
+    //  SYNTHETIC masked target token — a "task" row ("__target__") with a masked
+    //  `label` cell wired to the entity node — which is the ONLY target token
+    //  (the seed entity's own feature cells are ordinary, non-target features).
+    //  Without it a cell-less entity table (e.g. MovieLens `users`) would emit
+    //  no target token and every candidate would score sigmoid(0)=0.5, producing
+    //  the degenerate enumeration-order ranking.
     // ------------------------------------------------------------------
 
-    private TokenBatch toTokenBatch(ContextGraph context) {
-        StatsProvider stats = wiring.stats().orElse(null);
-        TokenBatch.Builder batch = TokenBatch.newBatch();
-        Map<String, Integer> rowIds = new HashMap<>();
-        for (Row row : context.rows()) {
-            rowIds.putIfAbsent(row.table() + " " + row.id().raw(), rowIds.size());
+    /** Shared cross-binding synthetic-task constants (identical in Python & Rust). */
+    private static final String TASK_TABLE = "task";
+    private static final String TASK_TIME_COL = "timestamp";
+    private static final String TASK_LABEL_COL = "label";
+    private static final String TARGET_ROW_KEY = "__target__";
+
+    /** A raw (pre-normalization) token: {@code value} is Double/Boolean/Instant/String, or null for the masked target. */
+    private static final class RawTok {
+        final int node;
+        List<Integer> parents;
+        final String col;
+        final String table;
+        final ValueType sem;
+        final Object value;
+        final boolean target;
+        RawTok(int node, List<Integer> parents, String col, String table,
+               ValueType sem, Object value, boolean target) {
+            this.node = node; this.parents = parents; this.col = col; this.table = table;
+            this.sem = sem; this.value = value; this.target = target;
         }
-        for (Row row : context.rows()) {
-            int rowId = rowIds.get(row.table() + " " + row.id().raw());
-            List<Integer> parentIds = new ArrayList<>();
-            for (var e : row.parents().entrySet()) {
-                schema.linksFrom(row.table()).stream()
-                        .filter(l -> l.fkColumn().equals(e.getKey()))
-                        .findFirst()
-                        .map(l -> rowIds.get(l.toTable() + " " + e.getValue().raw()))
-                        .filter(Objects::nonNull)
-                        .ifPresent(parentIds::add);
+        RawTok copy() {
+            return new RawTok(node, new ArrayList<>(parents), col, table, sem, value, target);
+        }
+    }
+
+    /** One entity's assembled raw sequence plus the handles ranking needs to rewire the target f2p. */
+    private static final class BaseSeq {
+        final List<RawTok> toks = new ArrayList<>();
+        final Map<String, Integer> nodeOf = new LinkedHashMap<>();
+        int entityNode;
+        int tgtLabelIdx;
+    }
+
+    private static String nodeKey(String table, Object raw) { return table + " " + raw; }
+
+    private static int nodeId(BaseSeq b, String table, Object raw) {
+        return b.nodeOf.computeIfAbsent(nodeKey(table, raw), k -> b.nodeOf.size());
+    }
+
+    /** Prefer the schema-declared type; else infer the sem-type from the value (nulls/unsupported -> no token). */
+    private static ValueType semOf(Object v, ValueType declared) {
+        if (declared != null) return declared;
+        if (v instanceof Boolean) return ValueType.BOOLEAN;
+        if (v instanceof Number) return ValueType.NUMBER;
+        if (v instanceof Instant) return ValueType.DATETIME;
+        if (v instanceof String) return ValueType.TEXT;
+        return null;
+    }
+
+    /**
+     * Assemble one entity's context into a raw token sequence with the synthetic
+     * masked target token (Python {@code _build_ctx_seq}). {@code targetSem} is
+     * TEXT for multiclass (the masked-TEXT target cell, §2.1), NUMBER otherwise.
+     *
+     * <p>Self-label history (F65) is not emitted: the Java engine has no target
+     * evaluator, and for the ranking target ({@code LIST_DISTINCT(...)}) both the
+     * Python and Rust bindings gather ZERO self-labels anyway, so parity holds on
+     * the ranking path. (Binary/regression self-labels remain a documented gap.)
+     */
+    private BaseSeq buildBaseSeq(ContextGraph context, Instant anchor, ValueType targetSem) {
+        BaseSeq b = new BaseSeq();
+        // Context rows claim node ids first so f2p links resolve in any order.
+        for (Row r : context.rows()) nodeId(b, r.table(), r.id().raw());
+        b.entityNode = nodeId(b, context.seedTable(), context.seedId().raw());
+
+        // -- the synthetic target task row (masked label) --
+        int tgtNode = nodeId(b, TASK_TABLE, TARGET_ROW_KEY);
+        if (anchor != null) {
+            b.toks.add(new RawTok(tgtNode, new ArrayList<>(List.of(b.entityNode)),
+                    TASK_TIME_COL, TASK_TABLE, ValueType.DATETIME, anchor, false));
+        }
+        b.tgtLabelIdx = b.toks.size();
+        b.toks.add(new RawTok(tgtNode, new ArrayList<>(List.of(b.entityNode)),
+                TASK_LABEL_COL, TASK_TABLE, targetSem, null, true));
+
+        // -- one token per feature cell of every context row (none are targets) --
+        for (Row r : context.rows()) {
+            List<Integer> parents = resolveParentNodes(b, r);
+            int rnode = b.nodeOf.get(nodeKey(r.table(), r.id().raw()));
+            emitFeatureCells(b.toks, r, rnode, parents);
+        }
+        return b;
+    }
+
+    /** Resolve a row's declared FK edges to the context node ids (dropping dangling/undeclared ones). */
+    private List<Integer> resolveParentNodes(BaseSeq b, Row row) {
+        List<Integer> parents = new ArrayList<>();
+        for (var e : row.parents().entrySet()) {
+            schema.linksFrom(row.table()).stream()
+                    .filter(l -> l.fkColumn().equals(e.getKey()))
+                    .findFirst()
+                    .map(l -> b.nodeOf.get(nodeKey(l.toTable(), e.getValue().raw())))
+                    .filter(Objects::nonNull)
+                    .ifPresent(parents::add);
+        }
+        return parents;
+    }
+
+    /** Emit one raw token per feature cell of {@code row}, all non-target. */
+    private void emitFeatureCells(List<RawTok> out, Row row, int node, List<Integer> parents) {
+        TableDef table = schema.table(row.table()).orElse(null);
+        for (var cell : row.cells().entrySet()) {
+            ValueType declared = table == null ? null
+                    : table.column(cell.getKey()).map(com.relativedb.schema.ColumnDef::type).orElse(null);
+            ValueType sem = semOf(cell.getValue(), declared);
+            if (sem == null) continue;
+            out.add(new RawTok(node, parents, cell.getKey(), row.table(), sem, cell.getValue(), false));
+        }
+    }
+
+    /** Score/multiclass path: one entity, one normalized token batch. */
+    private TokenBatch buildBatch(ContextGraph context, Instant anchor, TaskType taskType) {
+        ValueType targetSem = taskType == TaskType.MULTICLASS_CLASSIFICATION
+                ? ValueType.TEXT : ValueType.NUMBER;
+        BaseSeq b = buildBaseSeq(context, anchor, targetSem);
+        return normalizeToBatches(List.of(b.toks), 0.0, 1.0).get(0);
+    }
+
+    /**
+     * Ranking path (§3.2): one existence context per candidate. Each candidate's
+     * feature cells are emitted (as a fresh node when the candidate isn't already
+     * a context row) and the candidate node is wired into the synthetic target
+     * label cell's f2p alongside the entity node — the per-candidate link the
+     * model scores. All candidate sequences are normalized together (batch-internal
+     * stats, label stats fixed to 0/1) exactly as Python's {@code _score_ranking}.
+     */
+    private List<TokenBatch> buildRankingBatches(ContextGraph context, Instant anchor,
+                                                 List<Row> candidates, TaskType taskType) {
+        BaseSeq b = buildBaseSeq(context, anchor, ValueType.NUMBER);
+        List<List<RawTok>> seqs = new ArrayList<>(candidates.size());
+        for (Row cand : candidates) {
+            List<RawTok> seq = new ArrayList<>(b.toks.size() + 4);
+            for (RawTok t : b.toks) seq.add(t.copy());
+            Integer existing = b.nodeOf.get(nodeKey(cand.table(), cand.id().raw()));
+            int candNode;
+            if (existing == null) {
+                candNode = b.nodeOf.size();   // fresh node id (per-candidate, not shared)
+                TableDef ct = schema.table(cand.table()).orElse(null);
+                for (var cell : cand.cells().entrySet()) {
+                    ValueType declared = ct == null ? null
+                            : ct.column(cell.getKey()).map(com.relativedb.schema.ColumnDef::type).orElse(null);
+                    ValueType sem = semOf(cell.getValue(), declared);
+                    if (sem == null) continue;
+                    seq.add(new RawTok(candNode, List.of(), cell.getKey(), cand.table(),
+                            sem, cell.getValue(), false));
+                }
+            } else {
+                candNode = existing;
             }
-            boolean isSeed = row.table().equals(context.seedTable()) && row.id().equals(context.seedId());
-            TableDef table = schema.table(row.table()).orElse(null);
-            for (var cell : row.cells().entrySet()) {
-                ValueType type = table == null ? null
-                        : table.column(cell.getKey()).map(com.relativedb.schema.ColumnDef::type).orElse(null);
-                Object v = cell.getValue();
-                if (v instanceof Double d) {
-                    double norm = stats != null
-                            ? stats.numericStats(row.table(), cell.getKey()).normalize(d) : d;
-                    batch.numeric(rowId, parentIds, row.table(), cell.getKey(),
-                            type != null ? type : ValueType.NUMBER, norm, isSeed);
-                } else if (v instanceof Boolean b) {
-                    batch.numeric(rowId, parentIds, row.table(), cell.getKey(),
-                            ValueType.BOOLEAN, b ? 1.0 : 0.0, isSeed);
-                } else if (v instanceof Instant t) {
-                    double norm = stats != null ? stats.datetimeStats().normalize(t)
-                            : t.getEpochSecond();
-                    batch.numeric(rowId, parentIds, row.table(), cell.getKey(),
-                            ValueType.DATETIME, norm, isSeed);
-                } else {
-                    batch.text(rowId, parentIds, row.table(), cell.getKey(),
-                            String.valueOf(v), isSeed);
+            seq.get(b.tgtLabelIdx).parents = new ArrayList<>(List.of(b.entityNode, candNode));
+            seqs.add(seq);
+        }
+        return normalizeToBatches(seqs, 0.0, 1.0);
+    }
+
+    private static double asNumber(Object v) {
+        if (v instanceof Boolean bool) return bool ? 1.0 : 0.0;
+        return ((Number) v).doubleValue();
+    }
+
+    /** Fractional days since the epoch (Python {@code _days}: {@code timestamp()/86400}). */
+    private static double days(Instant t) {
+        return (t.getEpochSecond() + t.getNano() / 1_000_000_000.0) / 86400.0;
+    }
+
+    /** Population mean and (std + 1e-8), matching numpy {@code std(ddof=0)}. */
+    private static double[] meanStd(List<Double> vals) {
+        double mu = 0.0;
+        for (double v : vals) mu += v;
+        mu /= vals.size();
+        double var = 0.0;
+        for (double v : vals) var += (v - mu) * (v - mu);
+        var /= vals.size();
+        return new double[] { mu, Math.sqrt(var) + 1e-8 };
+    }
+
+    /**
+     * Normalize raw sequences into token batches (Python {@code _normalize}):
+     * numbers/booleans z-scored per (column,table) over the batch's in-context
+     * values; datetimes share one global stat (fractional days); the task label
+     * column uses {@code (labelMu,labelSd)}; the masked target cell -> 0.0.
+     */
+    private List<TokenBatch> normalizeToBatches(List<List<RawTok>> seqs,
+                                                double labelMu, double labelSd) {
+        Map<String, List<Double>> numVals = new HashMap<>();
+        List<Double> dtVals = new ArrayList<>();
+        for (List<RawTok> seq : seqs) {
+            for (RawTok t : seq) {
+                if (t.target || t.value == null) continue;
+                if (t.sem == ValueType.DATETIME) {
+                    dtVals.add(days((Instant) t.value));
+                } else if (t.sem == ValueType.NUMBER || t.sem == ValueType.BOOLEAN) {
+                    numVals.computeIfAbsent(nodeKey(t.col, t.table), k -> new ArrayList<>())
+                            .add(asNumber(t.value));
                 }
             }
         }
-        return batch.build();
+        Map<String, double[]> stats = new HashMap<>();
+        numVals.forEach((k, vals) -> stats.put(k, meanStd(vals)));
+        stats.put(nodeKey(TASK_LABEL_COL, TASK_TABLE), new double[] { labelMu, labelSd });
+        double[] dt = dtVals.isEmpty() ? new double[] { 0.0, 1.0 } : meanStd(dtVals);
+
+        List<TokenBatch> out = new ArrayList<>(seqs.size());
+        for (List<RawTok> seq : seqs) {
+            TokenBatch.Builder batch = TokenBatch.newBatch();
+            for (RawTok t : seq) {
+                if (t.target) {
+                    if (t.sem == ValueType.TEXT) {
+                        batch.text(t.node, t.parents, t.table, t.col, null, true);
+                    } else {
+                        batch.numeric(t.node, t.parents, t.table, t.col, ValueType.NUMBER, 0.0, true);
+                    }
+                    continue;
+                }
+                switch (t.sem) {
+                    case TEXT -> batch.text(t.node, t.parents, t.table, t.col,
+                            String.valueOf(t.value), false);
+                    case DATETIME -> batch.numeric(t.node, t.parents, t.table, t.col,
+                            ValueType.DATETIME, (days((Instant) t.value) - dt[0]) / dt[1], false);
+                    case NUMBER, BOOLEAN -> {
+                        double[] s = stats.get(nodeKey(t.col, t.table));
+                        double x = asNumber(t.value);
+                        double norm = s == null ? x : (x - s[0]) / s[1];
+                        batch.numeric(t.node, t.parents, t.table, t.col, t.sem, norm, false);
+                    }
+                }
+            }
+            out.add(batch.build());
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------

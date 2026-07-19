@@ -43,9 +43,15 @@ class ExplainAsOfTest {
         return RelativeDbEngine.newEngine(SCHEMA, wiring).modelBackend(spyBackend).build();
     }
 
-    private boolean batchHasOrderQty(double qty) {
+    // Feature values are now z-scored batch-internally (parity with the Python
+    // binding), so the raw qty is no longer present in the token batch — the same
+    // is true of Python's batch. The temporal-filtering invariant these tests
+    // check is therefore expressed as the count of admitted orders tokens
+    // (orders has exactly one feature cell, qty), which pins which order rows
+    // survived the anchor bound.
+    private long orderTokenCount() {
         return spyBackend.lastBatch.get().tokens().stream()
-                .anyMatch(t -> t.table().equals("orders") && t.normalizedValue() == qty);
+                .filter(t -> t.table().equals("orders")).count();
     }
 
     // ------------------------------------------------------------------
@@ -61,8 +67,8 @@ class ExplainAsOfTest {
                 .anchorTime(Instant.parse("2026-09-01T00:00:00Z"))
                 .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
-        assertTrue(batchHasOrderQty(2.0), "early order (before AS OF date) must reach the model");
-        assertFalse(batchHasOrderQty(9.0), "late order (after AS OF date) must be excluded");
+        assertEquals(1, orderTokenCount(),
+                "only the early order (before AS OF date) reaches the model; the late order is excluded");
     }
 
     @Test
@@ -74,7 +80,8 @@ class ExplainAsOfTest {
                 .anchorTime(Instant.parse("2026-09-01T00:00:00Z"))
                 .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
-        assertTrue(batchHasOrderQty(9.0), "AS OF NOW must behave like the execution anchor");
+        assertEquals(2, orderTokenCount(),
+                "AS OF NOW admits both orders (execution-anchor behavior)");
     }
 
     @Test
@@ -86,8 +93,8 @@ class ExplainAsOfTest {
                 .params(Map.of("t", Instant.parse("2026-07-01T00:00:00Z")))
                 .entityIds(List.of(1L))
                 .build()).toCompletableFuture().join();
-        assertTrue(batchHasOrderQty(2.0));
-        assertFalse(batchHasOrderQty(9.0), "bound param anchor must exclude the late order");
+        assertEquals(1, orderTokenCount(),
+                "bound param anchor admits only the early order; the late order is excluded");
     }
 
     @Test

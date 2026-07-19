@@ -17,7 +17,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use crate::csc::CscIndex;
 use crate::evaluate::eval_bool;
 use crate::model::ModelConfig;
-use crate::pql::ast::{ParsedQuery, TargetExpr, TaskType, TimeUnit};
+use crate::pql::ast::{AggFunc, ColumnRef, ParsedQuery, TargetExpr, TaskType, TimeUnit};
 use crate::pql::{parse, validate};
 use crate::retrieve::{EntityId, RetrieverWiring, Row, TemporalBound, Value};
 use crate::schema::{LinkDef, Schema};
@@ -215,6 +215,22 @@ pub struct PredictionResult {
     pub model_uri: String,
 }
 
+/// Query-level auxiliary data a backend needs beyond the per-entity contexts,
+/// enumerated once by the engine from its wired scanners (so the class domain /
+/// ranking candidates are identical across bindings — see `CONTRACT.md`
+/// §2.5/§3.1). Empty for binary/regression/forecasting.
+#[derive(Clone, Debug, Default)]
+pub struct ScoringAux {
+    /// MULTICLASS: distinct target-column class strings, temporally bounded,
+    /// lexicographic UTF-8 ascending, capped at `MAX_MULTICLASS_CLASSES`.
+    pub class_domain: Vec<String>,
+    /// RANKING: candidate parent rows (distinct ids), temporally bounded,
+    /// numeric-or-lexicographic ascending, capped at `MAX_RANK_CANDIDATES`.
+    pub rank_candidates: Vec<Row>,
+    /// RANKING: the referenced parent table `P` (None when not a ranking query).
+    pub rank_parent_table: Option<String>,
+}
+
 /// Anything that can score assembled contexts. Real backends (e.g.
 /// [`crate::native::RtNativeBackend`]) load the checkpoint at `model_uri`
 /// (routed by task type). There is no built-in model-free scorer.
@@ -226,6 +242,7 @@ pub trait ModelBackend {
         contexts: &[EntityContext],
         model_uri: &str,
         config: &ModelConfig,
+        aux: &ScoringAux,
     ) -> Result<Vec<EntityPrediction>, Error>;
 }
 
@@ -287,6 +304,26 @@ impl<'a> Sampler<'a> {
                 }
             }
             Sampler::Csc(idx) => Some(idx.all_ids(table)),
+        }
+    }
+
+    /// Every row of `table` at-or-before `bound` (with feature cells), or `None`
+    /// when no scanner is wired for it. Used to enumerate the multiclass class
+    /// domain / ranking parent candidates.
+    fn scan_rows(&self, table: &str, bound: &TemporalBound) -> Option<Vec<Row>> {
+        match self {
+            Sampler::Retriever { wiring, .. } => {
+                if wiring.scanners.contains_key(table) {
+                    let s = wiring.table_scanner(table).ok()?;
+                    Some(s.scan(table, bound))
+                } else {
+                    None
+                }
+            }
+            Sampler::Csc(idx) => {
+                let ids = idx.all_ids(table);
+                Some(idx.entities(table, &ids, bound))
+            }
         }
     }
 }
@@ -541,19 +578,29 @@ impl Engine {
         // AS OF: bind the effective anchor before any assembly.
         let eff_input = self.effective_input(&pq, &input)?;
         let contexts = self.assemble_all(&pq, &eff_input)?;
-        let preds = self.score_contexts(&pq, task_type, &model_uri, &contexts)?;
+        let preds = self.score_contexts(
+            &pq,
+            task_type,
+            &model_uri,
+            &contexts,
+            eff_input.anchor_time,
+        )?;
         Ok(PredictionResult { task_type, predictions: preds, model_uri })
     }
 
     /// Score assembled contexts with the configured backend, then apply any
     /// explicit `RETURN` output shaping. Errors when no backend is set.
+    /// `anchor` is the effective (AS OF-bound) query anchor used to enumerate
+    /// the multiclass class domain / ranking candidates.
     fn score_contexts(
         &mut self,
         pq: &ParsedQuery,
         task_type: TaskType,
         model_uri: &str,
         contexts: &[EntityContext],
+        anchor: Option<DateTime<Utc>>,
     ) -> Result<Vec<EntityPrediction>, Error> {
+        let aux = self.scoring_aux(pq, task_type, anchor)?;
         let backend = self.model_backend.as_mut().ok_or_else(|| {
             Error::Execution(ExecutionError(
                 "Engine requires a model backend (e.g. RtNativeBackend); there is no \
@@ -561,13 +608,113 @@ impl Engine {
                     .into(),
             ))
         })?;
-        let mut preds = backend.score(pq, task_type, contexts, model_uri, &self.model_config)?;
+        let mut preds =
+            backend.score(pq, task_type, contexts, model_uri, &self.model_config, &aux)?;
         if let Some(ret) = &pq.ret {
             for p in &mut preds {
                 apply_return_shaping(ret, task_type, p)?;
             }
         }
         Ok(preds)
+    }
+
+    /// Enumerate the query-level auxiliary data (multiclass class domain /
+    /// ranking parent candidates) from the wired scanners under the effective
+    /// temporal bound. Empty for binary/regression/forecasting. See
+    /// `CONTRACT.md` §2.5/§3.1 — the ordering and caps must match every binding.
+    fn scoring_aux(
+        &self,
+        pq: &ParsedQuery,
+        task_type: TaskType,
+        anchor: Option<DateTime<Utc>>,
+    ) -> Result<ScoringAux, Error> {
+        let bound = match anchor {
+            Some(a) => TemporalBound::at_or_before(a),
+            None => TemporalBound::unbounded(),
+        };
+        let mut aux = ScoringAux::default();
+        match task_type {
+            TaskType::MulticlassClassification => {
+                let col = multiclass_target_column(&pq.target).ok_or_else(|| {
+                    Error::Execution(ExecutionError(
+                        "multiclass classification target has no resolvable categorical column"
+                            .into(),
+                    ))
+                })?;
+                let rows = self.sampler().scan_rows(&col.table, &bound).ok_or_else(|| {
+                    Error::Execution(ExecutionError(format!(
+                        "multiclass classification requires a TableScanner over the target \
+                         table {:?} to enumerate its class domain",
+                        col.table
+                    )))
+                })?;
+                // distinct non-null values, sorted lexicographic UTF-8 ascending
+                // (BTreeSet), capped at MAX_MULTICLASS_CLASSES.
+                let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                for r in &rows {
+                    if !bound.admits_row(r) {
+                        continue; // defensive: leaky scanner must not leak future
+                    }
+                    if let Some(v) = r.get_cell(&col.column) {
+                        set.insert(value_to_class_string(v));
+                    }
+                }
+                aux.class_domain =
+                    set.into_iter().take(crate::native::MAX_MULTICLASS_CLASSES).collect();
+            }
+            TaskType::MultilabelRanking => {
+                let col = ranking_fk_column(&pq.target).ok_or_else(|| {
+                    Error::Execution(ExecutionError(
+                        "ranking target is not a LIST_DISTINCT over a foreign-key column".into(),
+                    ))
+                })?;
+                let parent = self
+                    .schema
+                    .links_from(&col.table)
+                    .iter()
+                    .find(|l| l.fk_column == col.column)
+                    .map(|l| l.to_table.clone())
+                    .ok_or_else(|| {
+                        Error::Execution(ExecutionError(format!(
+                            "ranking target {}.{} is not a foreign key to any parent table \
+                             (no schema link defines it)",
+                            col.table, col.column
+                        )))
+                    })?;
+                let rows = self.sampler().scan_rows(&parent, &bound).ok_or_else(|| {
+                    Error::Execution(ExecutionError(format!(
+                        "ranking requires a TableScanner over the FK's parent table {:?}",
+                        parent
+                    )))
+                })?;
+                // distinct parent ids (keep the full row), sorted numeric-or-
+                // lexicographic ascending, capped at MAX_RANK_CANDIDATES.
+                let mut seen: HashSet<EntityId> = HashSet::new();
+                let mut cands: Vec<Row> = Vec::new();
+                for r in rows {
+                    if !bound.admits_row(&r) {
+                        continue;
+                    }
+                    if seen.insert(r.id.clone()) {
+                        cands.push(r);
+                    }
+                }
+                let all_int = cands.iter().all(|r| matches!(r.id, EntityId::Int(_)));
+                if all_int {
+                    cands.sort_by_key(|r| match &r.id {
+                        EntityId::Int(i) => *i,
+                        EntityId::Str(_) => 0,
+                    });
+                } else {
+                    cands.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
+                }
+                cands.truncate(crate::native::MAX_RANK_CANDIDATES);
+                aux.rank_candidates = cands;
+                aux.rank_parent_table = Some(parent);
+            }
+            _ => {}
+        }
+        Ok(aux)
     }
 
     /// Resolve, assemble and WHERE-filter the per-entity contexts. `input`'s
@@ -1075,7 +1222,13 @@ impl Engine {
                 let model_uri = self.model_config.model_uri_for(task_type).to_string();
                 let contexts = self.assemble_all(&pq, &eff_input)?;
                 result.context = Some(self.context_stats(&contexts, eff_input.anchor_time));
-                let preds = self.score_contexts(&pq, task_type, &model_uri, &contexts)?;
+                let preds = self.score_contexts(
+                    &pq,
+                    task_type,
+                    &model_uri,
+                    &contexts,
+                    eff_input.anchor_time,
+                )?;
                 result.predictions =
                     Some(PredictionResult { task_type, predictions: preds, model_uri });
             }
@@ -1264,6 +1417,45 @@ impl Engine {
             }
         }
         n
+    }
+}
+
+/// The categorical column a MULTICLASS target classifies: a bare column ref, or
+/// the column of a `FIRST`/`LAST` (or any) aggregation.
+fn multiclass_target_column(target: &TargetExpr) -> Option<ColumnRef> {
+    match target {
+        TargetExpr::ColumnRef(c) => Some(c.clone()),
+        TargetExpr::Aggregation(a) => Some(a.column.clone()),
+        _ => target.aggregations().first().map(|a| a.column.clone()),
+    }
+}
+
+/// The foreign-key column named by a `LIST_DISTINCT(table.fk)` ranking target.
+fn ranking_fk_column(target: &TargetExpr) -> Option<ColumnRef> {
+    match target {
+        TargetExpr::Aggregation(a) if a.func == AggFunc::ListDistinct => Some(a.column.clone()),
+        _ => target
+            .aggregations()
+            .into_iter()
+            .find(|a| a.func == AggFunc::ListDistinct)
+            .map(|a| a.column.clone()),
+    }
+}
+
+/// Stringify a cell value as a class label (categorical values are Text; other
+/// types are stringified canonically so the domain is stable across bindings).
+fn value_to_class_string(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        Value::Number(n) => {
+            if n.fract() == 0.0 {
+                format!("{}", *n as i64)
+            } else {
+                format!("{}", n)
+            }
+        }
+        Value::Boolean(b) => format!("{}", b),
+        Value::Datetime(d) => d.to_rfc3339(),
     }
 }
 

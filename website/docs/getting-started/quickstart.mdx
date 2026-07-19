@@ -115,9 +115,11 @@ let result = engine.execute(
 Scoring runs through the RT-J relational foundation model via `RtNativeBackend`
 — there is no model-free default, and the engine errors without a backend. See
 [Use the native backend](../how-to/use-native-backend) for building `librt_c`
-and fetching the checkpoint. The current single-head checkpoint supports binary
-classification and regression; multiclass, ranking, and `RETURN
-QUANTILES`/`INTERVAL` are not supported.
+and fetching the checkpoint. The checkpoint executes binary classification,
+regression, multiclass classification (a predicted class plus approximate
+probabilities, via the text head's cosine match to the class labels' MiniLM
+embeddings), and ranking (top-k via per-candidate existence scoring). `RETURN
+QUANTILES`/`INTERVAL` are still not supported.
 :::
 
 ## Next steps

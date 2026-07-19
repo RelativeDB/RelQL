@@ -73,6 +73,30 @@ int rt_forward(const rt_model*, int32_t B, int32_t S,
                int32_t n_threads, float* out_target_scores,
                char* err, size_t errlen);
 
+/* Extended forward: adds the TEXT decoder head output at the target cell.
+ *
+ * Identical to rt_forward in every respect (CPU device; out_target_scores is
+ * bit-for-bit the same number-head output), with one extra trailing output:
+ *
+ *   out_target_text: length B*384, or NULL. For each batch row, the dec_dict.text
+ *     head output (384-d predicted MiniLM-L12-v2 embedding) summed over that
+ *     row's target positions — the SAME target-cell selection rt_forward uses
+ *     for the number head. Rows with no target yield all-zeros. The head applies
+ *     the model's norm_out RMSNorm then the text Linear, exactly as the number
+ *     head does. NOT L2-normalized — the caller normalizes before matching.
+ *
+ * When out_target_text is NULL this behaves byte-identically to rt_forward.
+ * Returns 0 on success, nonzero on error (message in err). */
+int rt_forward_ex(const rt_model*, int32_t B, int32_t S,
+                  const int64_t* node_idxs, const int64_t* f2p,
+                  const int64_t* col_idxs, const int64_t* table_idxs,
+                  const uint8_t* is_padding, const int64_t* sem_types,
+                  const uint8_t* is_target, const float* number_v,
+                  const float* datetime_v, const float* boolean_v,
+                  const float* text_v, const float* col_name_v,
+                  int32_t n_threads, float* out_target_scores,
+                  float* out_target_text, char* err, size_t errlen);
+
 /* Same as rt_forward but on an explicit device (RT_DEVICE_*). n_threads only
  * affects the CPU device. GPU forwards on one model are serialized
  * internally; CPU forwards remain fully reentrant. */

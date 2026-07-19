@@ -27,11 +27,17 @@ with in-context label statistics.
 
 ### Supported output types
 
-The current single-score-head checkpoint supports **binary classification**
-and **regression**. `RETURN CLASS`, `RETURN DISTRIBUTION`, `RETURN
-PROBABILITY`, and `RETURN EXPECTED VALUE` work. **Multiclass**, **ranking**,
-and `RETURN QUANTILES` / `RETURN INTERVAL` are **not** supported by this
-checkpoint and raise a clear error.
+The checkpoint executes **binary classification**, **regression**,
+**multiclass classification**, and **ranking**. `RETURN CLASS`, `RETURN
+DISTRIBUTION`, `RETURN PROBABILITY`, and `RETURN EXPECTED VALUE` work.
+Multiclass reuses the checkpoint's **text head**: the masked target cell is
+decoded to a 384-dim embedding and matched by cosine similarity to the class
+labels' MiniLM embeddings, yielding a predicted class plus approximate,
+uncalibrated class probabilities (a softmax over the cosine scores — the argmax
+is reference-exact). Ranking scores each candidate parent ID with the existence
+head, sigmoids it, and returns the top *k*. `RETURN QUANTILES` / `RETURN
+INTERVAL` are **not** supported — the checkpoint has no variance/quantile head —
+and raise a clear error.
 
 ## Checkpoint routing
 

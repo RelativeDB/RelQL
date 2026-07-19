@@ -191,3 +191,86 @@ def test_return_distribution_two_key_dist(churn_schema):
     pred = res.predictions[0]
     assert set(pred.class_probs) == {"true", "false"}
     assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-9
+
+
+# --------------------------------------------------------------------------
+# Multiclass classification & ranking, end-to-end through the native engine.
+# Both enumerate their domain via the wired TableScanner (CONTRACT.md §2/§3).
+# --------------------------------------------------------------------------
+
+def _native_engine_with_wiring(schema):
+    pytest.importorskip("sentence_transformers")
+    _lib_or_skip()
+    _checkpoint_or_skip("classification")
+    from relativedb import Engine
+    wiring = in_memory_wiring(churn_rows())
+    return Engine(schema, wiring,
+                  model_backend=RtNativeBackend(schema=schema, wiring=wiring))
+
+
+def test_multiclass_classification_end_to_end(churn_schema):
+    """FIRST(products.name) -> masked TEXT target -> rt_forward_ex text head ->
+    cosine vs the L2-normed MiniLM label embeddings. class_probs is a full,
+    normalized distribution over the distinct product names."""
+    from relativedb import ExecutionInput
+    eng = _native_engine_with_wiring(churn_schema)
+    res = eng.execute(ExecutionInput(
+        query="PREDICT FIRST(products.name) FOR EACH customers.customer_id",
+        anchor_time=dt("2026-07-01")))
+    assert res.task_type.name == "MULTICLASS_CLASSIFICATION"
+    assert res.model_uri == "hf://stanford-star/rt-j/classification"
+    labels = {"espresso machine", "running shoes", "yoga mat"}
+    assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
+    for p in res.predictions:
+        assert set(p.class_probs) == labels                 # full K-way domain
+        assert abs(sum(p.class_probs.values()) - 1.0) < 1e-6
+        assert all(0.0 <= v <= 1.0 for v in p.class_probs.values())
+        assert p.predicted_class in labels
+        # argmax must agree with the class_probs argmax (both are cosine order)
+        top = max(p.class_probs, key=p.class_probs.get)
+        assert p.predicted_class == top
+
+
+def test_multiclass_return_class_and_distribution(churn_schema):
+    from relativedb import ExecutionInput
+    eng = _native_engine_with_wiring(churn_schema)
+    for ret in ("CLASS", "DISTRIBUTION"):
+        res = eng.execute(ExecutionInput(
+            query="PREDICT FIRST(products.name) "
+                  f"FOR EACH customers.customer_id RETURN {ret}",
+            entity_ids=["C7"], anchor_time=dt("2026-07-01")))
+        pred = res.predictions[0]
+        assert pred.predicted_class in {"espresso machine", "running shoes",
+                                        "yoga mat"}
+        assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-6
+
+
+def test_ranking_end_to_end_top_k(churn_schema):
+    """LIST_DISTINCT(orders.product_id) RANK TOP 2 -> per-candidate existence
+    contexts over the products (parent) ids -> sigmoid -> top-k ids."""
+    from relativedb import ExecutionInput
+    eng = _native_engine_with_wiring(churn_schema)
+    res = eng.execute(ExecutionInput(
+        query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) "
+              "RANK TOP 2 FOR EACH customers.customer_id",
+        anchor_time=dt("2026-07-01")))
+    assert res.task_type.name == "MULTILABEL_RANKING"
+    all_products = {"P1", "P2", "P3"}
+    assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
+    for p in res.predictions:
+        assert isinstance(p.ranked, tuple)
+        assert 1 <= len(p.ranked) <= 2                      # top-k, k=2
+        assert len(set(p.ranked)) == len(p.ranked)          # no duplicates
+        assert set(p.ranked) <= all_products                # real parent ids
+
+
+def test_ranking_top_k_clamped_to_candidate_count(churn_schema):
+    """k larger than the candidate pool yields at most #candidates ids (3)."""
+    from relativedb import ExecutionInput
+    eng = _native_engine_with_wiring(churn_schema)
+    res = eng.execute(ExecutionInput(
+        query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) "
+              "RANK TOP 25 FOR EACH customers.customer_id",
+        entity_ids=["C7"], anchor_time=dt("2026-07-01")))
+    ranked = res.predictions[0].ranked
+    assert len(ranked) == 3 and set(ranked) == {"P1", "P2", "P3"}

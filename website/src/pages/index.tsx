@@ -63,7 +63,7 @@ function Hero() {
           />
         </div>
         <ClaudeDemo />
-        
+
       </div>
     </header>
   );
@@ -109,7 +109,7 @@ function ClaudeDemo() {
       <div className={styles.claudeBody}>
         {/* 1. install the plugin from the marketplace */}
         <span className={styles.claudeLabel}>Install the plugin</span>
-        <CopyCommand prompt=">" lines={['/plugin marketplace add RelativeDB/RelQL']} />
+        <CopyCommand prompt=">" lines={['/plugin marketplace add RelativeDB/RelQL-cc']} />
         <CopyCommand prompt=">" lines={['/plugin install RelQL@RelQL']} />
 
         {/* 2. ask with the /relql command */}
@@ -239,10 +239,7 @@ function ComparisonMatrix() {
     <figure className={styles.compareFigure}>
       <div className={styles.compareScroll}>
         <table className={styles.compareTable}>
-          <caption className={styles.compareCaption}>
-            One pretrained model covers what today takes three different
-            toolchains — no single alternative gets everything.
-          </caption>
+
           <thead>
             <tr>
               <th scope="col" className={styles.compareCorner}>
@@ -321,9 +318,8 @@ function RelationalTransformers() {
           A transformer normally attends over word tokens. A{' '}
           <strong>relational transformer</strong> attends over a small subgraph
           of your database: each token is one cell, and attention is masked
-          along the structure that relates cells. No positional encodings, the
-          schema <em>is</em> the structure. Pretrained across many schemas, it
-          predicts <strong>in-context</strong> — the engine assembles the
+          along the structure that relates cells. Pretrained across many schemas, it
+          predicts <strong>in-context</strong>. The engine assembles the
           entity, its neighborhood, and a few labeled examples, and the model
           fills in the masked target in one forward pass. The relational
           analogue of prompting an LLM, in a 22M-parameter model that scales.

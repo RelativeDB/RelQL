@@ -24,11 +24,17 @@ family routes to `hf://stanford-star/rt-j/classification` and
 regression/forecasting to `hf://stanford-star/rt-j/regression`.
 
 The output column above is the *logical* form each task produces. The RT-J
-backend (`RtNativeBackend`) is the only scoring path, and its current
-single-head checkpoint serves **binary-classification** and **regression**.
-Multiclass and ranking targets — and `RETURN QUANTILES`/`INTERVAL` — are not
-supported by this checkpoint and raise a clear error (see
-[Model backends](/docs/concepts/model-backends)).
+backend (`RtNativeBackend`) is the only scoring path. It executes **binary
+classification**, **regression**, **multiclass classification**, and
+**ranking**. Multiclass reuses the checkpoint's text head: the masked target
+cell is predicted as a 384-d embedding and matched by cosine similarity to the
+class labels' `all-MiniLM-L12-v2` embeddings, returning a predicted class plus
+approximate class probabilities (a softmax over the cosine scores — the argmax
+is the reference-exact class, the probabilities are an uncalibrated
+approximation, not a trained softmax head). Ranking scores each candidate parent
+ID with the existence head and returns the top *k*. `RETURN QUANTILES`/`INTERVAL`
+remain unsupported — the checkpoint has no variance/quantile head — and raise a
+clear error (see [Model backends](/docs/concepts/model-backends)).
 
 ## Checking a query
 

@@ -217,10 +217,27 @@ Reading the numbers:
   pre-norm. On the M3 Pro q8 improved from 17.1→12.9 ms at `5×16` and
   268→188 ms at `1×1024`; `1×2048` is 376 ms (previously 453 ms). Weights
   remain quantized-resident throughout.
-- **fp32 stays fastest on the GPU** because MPS's `MPSMatrixMultiplication`
-  is a more tuned kernel than the custom `qgemm`; the quantized kernels trade
-  a little speed for the memory win. On CPU the dequant tiles are free (all
-  paths hit the same Accelerate GEMM), so f16/q8 even edge ahead of fp32.
+- **The fp32 path also avoids residual and launch overhead.** CPU fp32 lets
+  Accelerate accumulate `wo`/`w2` directly into the residual (`beta=1`) and
+  parallelizes RMSNorm in 16-row chunks once there are at least 256 rows. On
+  the M3 Pro this moved `5×16` from about 26.9→26.4 ms and `1×1024` from
+  200→187 ms. MPS uploads a stacked `[w1; w3]` for fp32 and issues one wide
+  FFN input GEMM per block; `5×16` moved from about 9.31→9.09 ms while
+  `1×1024` remained effectively flat (153.4→152.9 ms).
+- **fp16 now uses native mixed-type MPS GEMM**: activations and results stay
+  fp32 while weights remain fp16-resident, and the stacked `[w1; w3]` launch
+  is shared with fp32. This cut `1×1024` MPS from 191.7→150.3 ms; the final
+  `1×2048` sweep was 287.9 ms. **Q4 stages both nibbles with one thread per
+  packed byte**, halving its weight/scale staging work; controlled A/B runs
+  moved MPS `1×1024` from 193.0→187.7 ms and `1×2048` from 384.1→373.5 ms.
+  On CPU, fp16/q4 use 128-output-row dequant/GEMM tiles once the activation
+  panel reaches 256 rows (64 below that): controlled long-context A/B gains
+  were 3–5%, with final `1×1024`/`1×2048` sweeps of 159/325 ms for fp16 and
+  165/332 ms for q4.
+- **Native MPS GEMM stays fastest on the GPU**: fp32 and mixed fp16 now run
+  there, while q8/q4 use the custom `qgemm` and trade some speed for their
+  larger memory reduction. On CPU, tiled dequantization feeds the same
+  Accelerate SGEMM, so the compact formats remain competitive with fp32.
 - **Flash split-K** cut single-row long-context MPS latency: `1×2048` fp32
   is now 317 ms (was 416 ms pre-flash) and `1×1024` is 135 ms (was 158 ms) —
   the big reverse-FK key lists are streamed by `nk/256` parallel threadgroups
@@ -229,6 +246,37 @@ Reading the numbers:
 - **MPS wins on batch/width** (`80×16`: 63 ms vs 219 ms fp32, 3.5×); single
   `1×16` inference carries ~7 ms fixed command-buffer overhead, so CPU is
   competitive there.
+
+### Rejected experiment: direct BNNS fp16 on CPU
+
+We tested removing the CPU fp16→fp32 weight-tile expansion entirely by
+submitting each projection to Apple's `BNNSMatMul` as fp32 activations ×
+resident fp16 weights → fp32 output. The prototype used one full GEMM per
+projection, cached workspace requirements by shape, reused one thread-local
+workspace allocation, and retained the tiled Accelerate SGEMM as a fallback.
+It passed the fp16 golden test with the same accumulated model error as the
+existing path.
+
+Controlled full-forward A/B results on the M3 Pro were:
+
+| B×S | tiled fp16→fp32 + SGEMM | direct BNNS | BNNS change |
+|---|---:|---:|---:|
+| 1×1024 | 160.2 ms | 171.1 ms | +6.8% |
+| 1×2048 | 321.7 ms | 352.3 ms | +9.5% |
+| 1×4096 | 702.1 ms | 780.0 ms | +11.1% |
+| 1×8192 | 1741.5 ms | 1893.9 ms | +8.8% |
+| 8×1024 | 1154.8 ms | 1317.1 ms | +14.1% |
+| 8×2048 | 2487.8 ms | 2739.1 ms | +10.1% |
+
+Peak RSS in the complete sweep also increased from 1550 MB to 1724 MB. A
+persistent `BNNSFilterCreateLayerFullyConnected` prototype produced
+essentially the same standalone GEMM times, so retaining a BNNS filter did
+not recover the loss. The likely cause is BNNS mixed-type preparation and
+workspace overhead outweighing the explicit expansion, while the current
+path parallelizes independent output tiles and feeds highly tuned SGEMM.
+
+Decision: do not ship the BNNS route on M3 Pro. The experimental code was
+removed; the tiled 128-output-row fp16 expansion remains the CPU default.
 
 ## Scope / next steps
 

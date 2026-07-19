@@ -168,6 +168,7 @@ impl ModelBackend for RecordingBackend {
         contexts: &[relativedb::EntityContext],
         model_uri: &str,
         _config: &ModelConfig,
+        _aux: &relativedb::engine::ScoringAux,
     ) -> Result<Vec<EntityPrediction>, relativedb::Error> {
         self.calls.lock().unwrap().push((task_type, model_uri.to_string()));
         Ok(contexts.iter().map(|c| EntityPrediction::new(c.entity_id.clone())).collect())
@@ -183,7 +184,7 @@ fn engine_routes_model_uri_by_task_type() {
         ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id", TaskType::Regression, "hf://stanford-star/rt-j/regression"),
         ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id", TaskType::BinaryClassification, "hf://stanford-star/rt-j/classification"),
         ("PREDICT SUM(orders.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) FOR EACH customers.customer_id", TaskType::Forecasting, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) RANK TOP 5 FOR EACH customers.customer_id", TaskType::MultilabelRanking, "hf://stanford-star/rt-j/classification"),
+        ("PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) RANK TOP 5 FOR EACH customers.customer_id", TaskType::MultilabelRanking, "hf://stanford-star/rt-j/classification"),
     ];
     for (pql, expect_task, expect_uri) in cases {
         let res = eng.execute(ExecutionInput::query(pql).anchor_time(t0())).unwrap();
@@ -354,6 +355,7 @@ impl ModelBackend for SpyBackend {
         contexts: &[relativedb::EntityContext],
         _model_uri: &str,
         _config: &ModelConfig,
+        _aux: &relativedb::engine::ScoringAux,
     ) -> Result<Vec<EntityPrediction>, relativedb::Error> {
         *self.calls.lock().unwrap() += 1;
         Ok(contexts.iter().map(|c| EntityPrediction::new(c.entity_id.clone())).collect())

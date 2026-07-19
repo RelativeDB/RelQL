@@ -114,6 +114,7 @@ struct Model {
   Block blocks[kBlocks];
   const float* norm_out = nullptr;
   Linear dec_number;                   // classification score head (bool_as_num)
+  Linear dec_text;                     // text head [384,512] -> predicted MiniLM emb
 
   // Lazily-created per-device state (weight uploads, pipelines, streams),
   // indexed by Device. Created on first forward for that device; shared by
@@ -143,6 +144,10 @@ struct Batch {                         // pre-sort order, mirrors rt/data.py
 struct Output {
   int B = 0, S = 0;
   std::vector<float> yhat_number;      // [B,S]  post-sort order
+  // Text head output [B,S,384], post-sort order. Empty unless
+  // ForwardOpts::want_text_head; only target positions are populated (others
+  // left 0) — the ABI only reads the target cell. CPU device only.
+  std::vector<float> yhat_text;
   std::vector<uint8_t> sorted_is_target;  // [B,S]
   std::vector<int64_t> sort_idxs;      // [B,S]
   std::vector<float> x_embed;          // [B,S,d] debug tap (block-0 input)
@@ -153,6 +158,7 @@ struct ForwardOpts {
   Device device = Device::CPU;
   int n_threads = 0;                   // <=0: hardware concurrency (CPU only)
   bool debug_taps = true;              // fill x_embed/x_block0 (off for bench)
+  bool want_text_head = false;         // also fill Output::yhat_text (CPU only)
 };
 
 Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts);

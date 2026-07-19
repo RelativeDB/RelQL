@@ -55,6 +55,56 @@ public final class RtModel implements AutoCloseable {
                            float[] datetimeV, float[] booleanV,
                            float[] textV, float[] colNameV,
                            int nThreads) {
+        checkShapes(b, s, nodeIdxs, f2p, colIdxs, tableIdxs, isPadding, semTypes,
+            isTarget, numberV, datetimeV, booleanV, textV, colNameV);
+        float[] out = new float[b];
+        byte[] err = new byte[ERR_LEN];
+        int rc = lib.rt_forward(alive(), b, s, nodeIdxs, f2p, colIdxs, tableIdxs,
+            isPadding, semTypes, isTarget, numberV, datetimeV, booleanV,
+            textV, colNameV, nThreads, out, err, err.length);
+        if (rc != 0) {
+            throw new RtException("rt_forward failed (rc=" + rc + "): " + cstr(err));
+        }
+        return out;
+    }
+
+    /**
+     * Extended forward via {@code rt_forward_ex}: runs the same pass as
+     * {@link #forward} but also returns the TEXT decoder head output — the
+     * per-batch-row 384-d predicted embedding summed over that row's target
+     * cell(s), as a {@code B*384} flat array (row-major). NOT L2-normalized.
+     * {@code out_target_scores} (the number head) is computed but discarded here
+     * — multiclass decoding only needs the text head.
+     */
+    public float[] forwardTargetText(int b, int s,
+                                     long[] nodeIdxs, long[] f2p,
+                                     long[] colIdxs, long[] tableIdxs,
+                                     byte[] isPadding, long[] semTypes,
+                                     byte[] isTarget, float[] numberV,
+                                     float[] datetimeV, float[] booleanV,
+                                     float[] textV, float[] colNameV,
+                                     int nThreads) {
+        checkShapes(b, s, nodeIdxs, f2p, colIdxs, tableIdxs, isPadding, semTypes,
+            isTarget, numberV, datetimeV, booleanV, textV, colNameV);
+        float[] scores = new float[b];
+        float[] text = new float[b * 384];
+        byte[] err = new byte[ERR_LEN];
+        int rc = lib.rt_forward_ex(alive(), b, s, nodeIdxs, f2p, colIdxs, tableIdxs,
+            isPadding, semTypes, isTarget, numberV, datetimeV, booleanV,
+            textV, colNameV, nThreads, scores, text, err, err.length);
+        if (rc != 0) {
+            throw new RtException("rt_forward_ex failed (rc=" + rc + "): " + cstr(err));
+        }
+        return text;
+    }
+
+    private static void checkShapes(int b, int s,
+                                    long[] nodeIdxs, long[] f2p,
+                                    long[] colIdxs, long[] tableIdxs,
+                                    byte[] isPadding, long[] semTypes,
+                                    byte[] isTarget, float[] numberV,
+                                    float[] datetimeV, float[] booleanV,
+                                    float[] textV, float[] colNameV) {
         check("node_idxs", nodeIdxs.length, b * s);
         check("f2p", f2p.length, b * s * 5);
         check("col_idxs", colIdxs.length, b * s);
@@ -67,15 +117,6 @@ public final class RtModel implements AutoCloseable {
         check("boolean_v", booleanV.length, b * s);
         check("text_v", textV.length, b * s * 384);
         check("col_name_v", colNameV.length, b * s * 384);
-        float[] out = new float[b];
-        byte[] err = new byte[ERR_LEN];
-        int rc = lib.rt_forward(alive(), b, s, nodeIdxs, f2p, colIdxs, tableIdxs,
-            isPadding, semTypes, isTarget, numberV, datetimeV, booleanV,
-            textV, colNameV, nThreads, out, err, err.length);
-        if (rc != 0) {
-            throw new RtException("rt_forward failed (rc=" + rc + "): " + cstr(err));
-        }
-        return out;
     }
 
     @Override

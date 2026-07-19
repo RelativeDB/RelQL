@@ -24,17 +24,27 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use libloading::Library;
 
-use crate::engine::{EntityContext, EntityPrediction, ModelBackend};
+use crate::engine::{EntityContext, EntityPrediction, ModelBackend, ScoringAux};
 use crate::engine::ExecutionError;
 use crate::evaluate::{eval_bool, eval_value, EvalValue};
 use crate::model::ModelConfig;
 use crate::pql::ast::{ParsedQuery, TaskType};
-use crate::retrieve::Value;
+use crate::retrieve::{Row, Value};
 use crate::schema::{Schema, ValueType};
 use crate::Error;
 
 pub const D_TEXT: usize = 384;
 pub const MAX_F2P: usize = 5;
+
+/// Shared contract constants — MUST be byte-identical across the Python, Rust
+/// and Java bindings (see `CONTRACT.md` §2/§3).
+///
+/// * [`T_SOFTMAX`] — temperature for multiclass `class_probs = softmax(cos/T)`.
+/// * [`MAX_MULTICLASS_CLASSES`] — cap on the enumerated class domain.
+/// * [`MAX_RANK_CANDIDATES`] — cap on the enumerated ranking candidate ids.
+pub const T_SOFTMAX: f64 = 0.1;
+pub const MAX_MULTICLASS_CLASSES: usize = 1000;
+pub const MAX_RANK_CANDIDATES: usize = 1000;
 
 const SEM_NUMBER: i64 = 0;
 const SEM_TEXT: i64 = 1;
@@ -88,6 +98,30 @@ type ForwardFn = unsafe extern "C" fn(
     *mut c_char,
     usize,
 ) -> i32;
+/// `rt_forward_ex`: identical to [`ForwardFn`] plus a trailing nullable
+/// `out_target_text` (`B*384` — the text-head output at each row's target cell).
+type ForwardExFn = unsafe extern "C" fn(
+    *const c_void,
+    i32,
+    i32,
+    *const i64, // node
+    *const i64, // f2p
+    *const i64, // col
+    *const i64, // table
+    *const u8,  // is_padding
+    *const i64, // sem
+    *const u8,  // is_target
+    *const f32, // number
+    *const f32, // datetime
+    *const f32, // boolean
+    *const f32, // text
+    *const f32, // col_name
+    i32,        // n_threads
+    *mut f32,   // out_target_scores  [B]
+    *mut f32,   // out_target_text    [B*384] or NULL
+    *mut c_char,
+    usize,
+) -> i32;
 
 /// A loaded `librt_c` with bound signatures (see `cpp/src/rt_c.h`).
 pub struct RtLib {
@@ -96,6 +130,7 @@ pub struct RtLib {
     free: FreeFn,
     num_params: NumParamsFn,
     forward: ForwardFn,
+    forward_ex: ForwardExFn,
     pub path: String,
 }
 
@@ -117,7 +152,18 @@ impl RtLib {
             let forward: ForwardFn = *lib
                 .get(b"rt_forward\0")
                 .map_err(|e| RtError::Unavailable(format!("rt_forward: {}", e)))?;
-            Ok(Arc::new(RtLib { _lib: lib, load, free, num_params, forward, path: path.to_string() }))
+            let forward_ex: ForwardExFn = *lib
+                .get(b"rt_forward_ex\0")
+                .map_err(|e| RtError::Unavailable(format!("rt_forward_ex: {}", e)))?;
+            Ok(Arc::new(RtLib {
+                _lib: lib,
+                load,
+                free,
+                num_params,
+                forward,
+                forward_ex,
+                path: path.to_string(),
+            }))
         }
     }
 
@@ -210,6 +256,71 @@ impl RtModel {
             return Err(RtError::Native(format!("rt_forward failed ({}): {}", rc, cstr_message(&err))));
         }
         Ok(out)
+    }
+
+    /// Like [`RtModel::forward`], but also returns the **text head** output
+    /// (`B*384`, row-major) summed over each row's target cell(s) — the
+    /// approximate MiniLM embedding used for multiclass nearest-neighbor decode
+    /// (see `CONTRACT.md` §1/§2). Not L2-normalized. Returns `(scores, text)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ex(
+        &self,
+        b: i32,
+        s: i32,
+        node_idxs: &[i64],
+        f2p: &[i64],
+        col_idxs: &[i64],
+        table_idxs: &[i64],
+        is_padding: &[u8],
+        sem_types: &[i64],
+        is_target: &[u8],
+        number_v: &[f32],
+        datetime_v: &[f32],
+        boolean_v: &[f32],
+        text_v: &[f32],
+        col_name_v: &[f32],
+        n_threads: i32,
+    ) -> Result<(Vec<f32>, Vec<f32>), RtError> {
+        let n = (b as usize) * (s as usize);
+        assert_eq!(node_idxs.len(), n);
+        assert_eq!(f2p.len(), n * MAX_F2P);
+        assert_eq!(text_v.len(), n * D_TEXT);
+        assert_eq!(col_name_v.len(), n * D_TEXT);
+        let mut out = vec![0f32; b as usize];
+        let mut out_text = vec![0f32; (b as usize) * D_TEXT];
+        let mut err = vec![0i8; 512];
+        let rc = unsafe {
+            (self.lib.forward_ex)(
+                self.handle,
+                b,
+                s,
+                node_idxs.as_ptr(),
+                f2p.as_ptr(),
+                col_idxs.as_ptr(),
+                table_idxs.as_ptr(),
+                is_padding.as_ptr(),
+                sem_types.as_ptr(),
+                is_target.as_ptr(),
+                number_v.as_ptr(),
+                datetime_v.as_ptr(),
+                boolean_v.as_ptr(),
+                text_v.as_ptr(),
+                col_name_v.as_ptr(),
+                n_threads,
+                out.as_mut_ptr(),
+                out_text.as_mut_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(RtError::Native(format!(
+                "rt_forward_ex failed ({}): {}",
+                rc,
+                cstr_message(&err)
+            )));
+        }
+        Ok((out, out_text))
     }
 }
 
@@ -552,13 +663,9 @@ impl RtNativeBackend {
         out
     }
 
-    fn build_sequences(
-        &self,
-        query: &ParsedQuery,
-        task_type: TaskType,
-        contexts: &[EntityContext],
-    ) -> (Vec<Vec<Tok>>, f64, f64) {
-        let entity_table = &query.entity_key.table;
+    /// `table -> (fk_column -> parent_table)` from the schema (empty when
+    /// schema-less; parents then resolve by unique id match within the context).
+    fn fk_to_parent(&self) -> HashMap<String, HashMap<String, String>> {
         let mut fk_to_parent: HashMap<String, HashMap<String, String>> = HashMap::new();
         if let Some(schema) = &self.schema {
             for t in &schema.tables {
@@ -570,142 +677,234 @@ impl RtNativeBackend {
                 fk_to_parent.insert(t.name.clone(), m);
             }
         }
+        fk_to_parent
+    }
 
-        let mut seqs: Vec<Vec<Tok>> = Vec::new();
-        let mut all_labels: Vec<f64> = Vec::new();
-        for ctx in contexts {
-            let mut seq: Vec<Tok> = Vec::new();
-            // node id assignment: rows first, then synthetic task nodes
-            let mut node_of: HashMap<(String, String), i64> = HashMap::new();
-            let mut next_node = 0i64;
-            let node = |key: (String, String), next: &mut i64, map: &mut HashMap<(String, String), i64>| -> i64 {
-                *map.entry(key).or_insert_with(|| {
-                    let n = *next;
-                    *next += 1;
-                    n
-                })
-            };
-            // rows claim node ids first (by (table, id-string))
-            for r in &ctx.rows {
-                let key = (r.table.clone(), r.id.to_string());
-                node(key, &mut next_node, &mut node_of);
-            }
-            // id -> row keys (for schema-less parent linking)
-            let mut by_id: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            for r in &ctx.rows {
-                by_id.entry(r.id.to_string()).or_default().push((r.table.clone(), r.id.to_string()));
-            }
+    /// Build ONE RT token sequence for `ctx`.
+    ///
+    /// * `target_text` — when true the masked target label cell is a TEXT cell
+    ///   (multiclass, §2.1); otherwise a NUMBER cell (binary/regression/rank).
+    /// * `link_parent` — when set (ranking, §3.2) that parent row is added to
+    ///   the graph and its node is wired into the target task cell's `f2p`, so
+    ///   the model scores *"does a link with `fk = link_parent.id` exist?"*.
+    ///
+    /// Self-label outcomes are appended to `all_labels` for batch stats.
+    #[allow(clippy::too_many_arguments)]
+    fn build_seq(
+        &self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        ctx: &EntityContext,
+        fk_to_parent: &HashMap<String, HashMap<String, String>>,
+        target_text: bool,
+        link_parent: Option<&Row>,
+        all_labels: &mut Vec<f64>,
+    ) -> Vec<Tok> {
+        let entity_table = &query.entity_key.table;
+        let mut seq: Vec<Tok> = Vec::new();
+        let mut node_of: HashMap<(String, String), i64> = HashMap::new();
+        let mut next_node = 0i64;
+        let node = |key: (String, String), next: &mut i64, map: &mut HashMap<(String, String), i64>| -> i64 {
+            *map.entry(key).or_insert_with(|| {
+                let n = *next;
+                *next += 1;
+                n
+            })
+        };
 
-            let entity_node = node(
-                (entity_table.clone(), ctx.entity_id.to_string()),
-                &mut next_node,
-                &mut node_of,
-            );
-
-            // target task row (masked label)
-            let tgt_node = node((TASK_TABLE.into(), "__target__".into()), &mut next_node, &mut node_of);
-            if let Some(anchor) = ctx.anchor {
-                seq.push(Tok {
-                    node: tgt_node,
-                    f2p: pad_parents(&[entity_node]),
-                    col: (TASK_TIME_COL.into(), TASK_TABLE.into()),
-                    table: TASK_TABLE.into(),
-                    sem: SEM_DATETIME,
-                    is_tgt: false,
-                    raw: RawVal::Date(anchor),
-                });
+        // Rows for this sequence: context rows, plus the ranking candidate
+        // parent (when it is not already present in the context).
+        let mut rows: Vec<&Row> = ctx.rows.iter().collect();
+        if let Some(p) = link_parent {
+            if !ctx.rows.iter().any(|r| r.table == p.table && r.id == p.id) {
+                rows.push(p);
             }
+        }
+
+        // rows claim node ids first (by (table, id-string))
+        for r in &rows {
+            node((r.table.clone(), r.id.to_string()), &mut next_node, &mut node_of);
+        }
+        // id -> row keys (for schema-less parent linking)
+        let mut by_id: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for r in &rows {
+            by_id.entry(r.id.to_string()).or_default().push((r.table.clone(), r.id.to_string()));
+        }
+
+        let entity_node =
+            node((entity_table.clone(), ctx.entity_id.to_string()), &mut next_node, &mut node_of);
+
+        // target task row (masked label). For ranking, the candidate parent's
+        // node joins the entity node in the target cell's f2p.
+        let tgt_node = node((TASK_TABLE.into(), "__target__".into()), &mut next_node, &mut node_of);
+        let tgt_parents: Vec<i64> = match link_parent {
+            Some(p) => {
+                let cn = node_of[&(p.table.clone(), p.id.to_string())];
+                vec![entity_node, cn]
+            }
+            None => vec![entity_node],
+        };
+        if let Some(anchor) = ctx.anchor {
             seq.push(Tok {
                 node: tgt_node,
+                f2p: pad_parents(&tgt_parents),
+                col: (TASK_TIME_COL.into(), TASK_TABLE.into()),
+                table: TASK_TABLE.into(),
+                sem: SEM_DATETIME,
+                is_tgt: false,
+                raw: RawVal::Date(anchor),
+            });
+        }
+        seq.push(Tok {
+            node: tgt_node,
+            f2p: pad_parents(&tgt_parents),
+            col: (TASK_LABEL_COL.into(), TASK_TABLE.into()),
+            table: TASK_TABLE.into(),
+            sem: if target_text { SEM_TEXT } else { SEM_NUMBER },
+            is_tgt: true,
+            raw: RawVal::Mask,
+        });
+
+        // past outcomes (self labels, F65)
+        for (ts, label) in self.self_labels(query, task_type, ctx) {
+            let hnode = node((TASK_TABLE.into(), ts.to_rfc3339()), &mut next_node, &mut node_of);
+            seq.push(Tok {
+                node: hnode,
                 f2p: pad_parents(&[entity_node]),
                 col: (TASK_LABEL_COL.into(), TASK_TABLE.into()),
                 table: TASK_TABLE.into(),
                 sem: SEM_NUMBER,
-                is_tgt: true,
-                raw: RawVal::Mask,
+                is_tgt: false,
+                raw: RawVal::Num(label),
             });
-
-            // past outcomes (self labels, F65)
-            for (ts, label) in self.self_labels(query, task_type, ctx) {
-                let hnode = node((TASK_TABLE.into(), ts.to_rfc3339()), &mut next_node, &mut node_of);
-                seq.push(Tok {
-                    node: hnode,
-                    f2p: pad_parents(&[entity_node]),
-                    col: (TASK_LABEL_COL.into(), TASK_TABLE.into()),
-                    table: TASK_TABLE.into(),
-                    sem: SEM_NUMBER,
-                    is_tgt: false,
-                    raw: RawVal::Num(label),
-                });
-                seq.push(Tok {
-                    node: hnode,
-                    f2p: pad_parents(&[entity_node]),
-                    col: (TASK_TIME_COL.into(), TASK_TABLE.into()),
-                    table: TASK_TABLE.into(),
-                    sem: SEM_DATETIME,
-                    is_tgt: false,
-                    raw: RawVal::Date(ts),
-                });
-                all_labels.push(label);
-            }
-
-            // one token per feature cell
-            for r in &ctx.rows {
-                let mut parents: Vec<i64> = Vec::new();
-                for (fk, pid) in &r.parents {
-                    if let Some(ptable) = fk_to_parent.get(&r.table).and_then(|m| m.get(fk)) {
-                        let pkey = (ptable.clone(), pid.to_string());
-                        if let Some(&pn) = node_of.get(&pkey) {
-                            parents.push(pn);
-                        }
-                        continue;
-                    }
-                    // no schema: link by unique id match within the context
-                    if let Some(cands) = by_id.get(&pid.to_string()) {
-                        if cands.len() == 1 {
-                            if let Some(&pn) = node_of.get(&cands[0]) {
-                                parents.push(pn);
-                            }
-                        }
-                    }
-                }
-                let rnode = node_of[&(r.table.clone(), r.id.to_string())];
-                for (col, v) in &r.cells {
-                    if seq.len() >= self.max_seq_len {
-                        break;
-                    }
-                    let sem = self.sem_for_cell(&r.table, col, v);
-                    let raw = match v {
-                        Value::Number(n) => RawVal::Num(*n),
-                        Value::Boolean(b) => RawVal::Bool(*b),
-                        Value::Datetime(d) => RawVal::Date(*d),
-                        Value::Text(s) => RawVal::Text(s.clone()),
-                    };
-                    seq.push(Tok {
-                        node: rnode,
-                        f2p: pad_parents(&parents),
-                        col: (col.clone(), r.table.clone()),
-                        table: r.table.clone(),
-                        sem,
-                        is_tgt: false,
-                        raw,
-                    });
-                }
-            }
-            seqs.push(seq);
+            seq.push(Tok {
+                node: hnode,
+                f2p: pad_parents(&[entity_node]),
+                col: (TASK_TIME_COL.into(), TASK_TABLE.into()),
+                table: TASK_TABLE.into(),
+                sem: SEM_DATETIME,
+                is_tgt: false,
+                raw: RawVal::Date(ts),
+            });
+            all_labels.push(label);
         }
 
+        // one token per feature cell
+        for r in &rows {
+            let mut parents: Vec<i64> = Vec::new();
+            for (fk, pid) in &r.parents {
+                if let Some(ptable) = fk_to_parent.get(&r.table).and_then(|m| m.get(fk)) {
+                    let pkey = (ptable.clone(), pid.to_string());
+                    if let Some(&pn) = node_of.get(&pkey) {
+                        parents.push(pn);
+                    }
+                    continue;
+                }
+                // no schema: link by unique id match within the context
+                if let Some(cands) = by_id.get(&pid.to_string()) {
+                    if cands.len() == 1 {
+                        if let Some(&pn) = node_of.get(&cands[0]) {
+                            parents.push(pn);
+                        }
+                    }
+                }
+            }
+            let rnode = node_of[&(r.table.clone(), r.id.to_string())];
+            for (col, v) in &r.cells {
+                if seq.len() >= self.max_seq_len {
+                    break;
+                }
+                let sem = self.sem_for_cell(&r.table, col, v);
+                let raw = match v {
+                    Value::Number(n) => RawVal::Num(*n),
+                    Value::Boolean(b) => RawVal::Bool(*b),
+                    Value::Datetime(d) => RawVal::Date(*d),
+                    Value::Text(s) => RawVal::Text(s.clone()),
+                };
+                seq.push(Tok {
+                    node: rnode,
+                    f2p: pad_parents(&parents),
+                    col: (col.clone(), r.table.clone()),
+                    table: r.table.clone(),
+                    sem,
+                    is_tgt: false,
+                    raw,
+                });
+            }
+        }
+        seq
+    }
+
+    fn build_sequences(
+        &self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        contexts: &[EntityContext],
+    ) -> (Vec<Vec<Tok>>, f64, f64) {
+        self.build_sequences_ex(query, task_type, contexts, false)
+    }
+
+    /// [`Self::build_sequences`] with control over the target cell type
+    /// (`target_text` = masked TEXT target for multiclass).
+    fn build_sequences_ex(
+        &self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        contexts: &[EntityContext],
+        target_text: bool,
+    ) -> (Vec<Vec<Tok>>, f64, f64) {
+        let fk_to_parent = self.fk_to_parent();
+        let mut seqs: Vec<Vec<Tok>> = Vec::new();
+        let mut all_labels: Vec<f64> = Vec::new();
+        for ctx in contexts {
+            let seq = self.build_seq(
+                query,
+                task_type,
+                ctx,
+                &fk_to_parent,
+                target_text,
+                None,
+                &mut all_labels,
+            );
+            seqs.push(seq);
+        }
         let (label_mu, label_sd) = mean_std(&all_labels);
         (seqs, label_mu, label_sd)
     }
 
-    fn forward(
-        &mut self,
-        model_uri: &str,
-        seqs: &[Vec<Tok>],
-        label_mu: f64,
-        label_sd: f64,
-    ) -> Result<Vec<f32>, Error> {
+    /// One sequence per ranking candidate for a single entity `ctx` (§3.2): each
+    /// row scores whether a link to that candidate parent exists.
+    fn build_ranking_sequences(
+        &self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        ctx: &EntityContext,
+        candidates: &[Row],
+    ) -> (Vec<Vec<Tok>>, f64, f64) {
+        let fk_to_parent = self.fk_to_parent();
+        let mut seqs: Vec<Vec<Tok>> = Vec::new();
+        let mut all_labels: Vec<f64> = Vec::new();
+        for cand in candidates {
+            let seq = self.build_seq(
+                query,
+                task_type,
+                ctx,
+                &fk_to_parent,
+                false,
+                Some(cand),
+                &mut all_labels,
+            );
+            seqs.push(seq);
+        }
+        let (label_mu, label_sd) = mean_std(&all_labels);
+        (seqs, label_mu, label_sd)
+    }
+
+    /// Collate RAW PRE-SORT sequences into the flat `[B*S]` arrays the C ABI
+    /// consumes (z-scoring numbers/booleans per (col,table), datetimes globally,
+    /// embedding text + schema phrases). Shared by [`Self::forward`] and
+    /// [`Self::forward_text`].
+    fn collate(&self, seqs: &[Vec<Tok>], label_mu: f64, label_sd: f64) -> Collated {
         // per-(col,table) numeric stats + global datetime stats
         let mut num_vals: HashMap<(String, String), Vec<f64>> = HashMap::new();
         let mut dt_vals: Vec<f64> = Vec::new();
@@ -772,8 +971,11 @@ impl RtNativeBackend {
                 }
 
                 if tok.is_tgt {
-                    number_v[idx] = 0.0;
-                    sem_types[idx] = SEM_NUMBER;
+                    // Honor the declared target sem: masked NUMBER target
+                    // (binary/regression/rank) vs masked TEXT target
+                    // (multiclass). The model substitutes its learned mask
+                    // embedding, so the value channels stay zero.
+                    sem_types[idx] = tok.sem;
                     continue;
                 }
                 match &tok.raw {
@@ -807,17 +1009,82 @@ impl RtNativeBackend {
             }
         }
 
+        Collated {
+            b,
+            s,
+            node_idxs,
+            f2p,
+            col_idxs,
+            table_idxs,
+            is_padding,
+            sem_types,
+            is_target,
+            number_v,
+            datetime_v,
+            boolean_v,
+            text_v,
+            col_name_v,
+        }
+    }
+
+    /// Collate + one forward pass → per-row number-head target score `[B]`.
+    fn forward(
+        &mut self,
+        model_uri: &str,
+        seqs: &[Vec<Tok>],
+        label_mu: f64,
+        label_sd: f64,
+    ) -> Result<Vec<f32>, Error> {
+        let c = self.collate(seqs, label_mu, label_sd);
         let n_threads = self.n_threads;
         let model = self.model_for(model_uri)?;
-        let scores = model
+        model
             .forward(
-                b, s, &node_idxs, &f2p, &col_idxs, &table_idxs, &is_padding, &sem_types,
-                &is_target, &number_v, &datetime_v, &boolean_v, &text_v, &col_name_v,
-                n_threads,
+                c.b, c.s, &c.node_idxs, &c.f2p, &c.col_idxs, &c.table_idxs, &c.is_padding,
+                &c.sem_types, &c.is_target, &c.number_v, &c.datetime_v, &c.boolean_v, &c.text_v,
+                &c.col_name_v, n_threads,
             )
-            .map_err(Error::from)?;
-        Ok(scores)
+            .map_err(Error::from)
     }
+
+    /// Collate + one `rt_forward_ex` pass → `(number-head scores [B], text-head
+    /// embeddings [B*384])`. Used by the multiclass decode (§2).
+    fn forward_text(
+        &mut self,
+        model_uri: &str,
+        seqs: &[Vec<Tok>],
+        label_mu: f64,
+        label_sd: f64,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        let c = self.collate(seqs, label_mu, label_sd);
+        let n_threads = self.n_threads;
+        let model = self.model_for(model_uri)?;
+        model
+            .forward_ex(
+                c.b, c.s, &c.node_idxs, &c.f2p, &c.col_idxs, &c.table_idxs, &c.is_padding,
+                &c.sem_types, &c.is_target, &c.number_v, &c.datetime_v, &c.boolean_v, &c.text_v,
+                &c.col_name_v, n_threads,
+            )
+            .map_err(Error::from)
+    }
+}
+
+/// The flat RAW PRE-SORT `[B*S]` arrays for one native forward pass.
+struct Collated {
+    b: i32,
+    s: i32,
+    node_idxs: Vec<i64>,
+    f2p: Vec<i64>,
+    col_idxs: Vec<i64>,
+    table_idxs: Vec<i64>,
+    is_padding: Vec<u8>,
+    sem_types: Vec<i64>,
+    is_target: Vec<u8>,
+    number_v: Vec<f32>,
+    datetime_v: Vec<f32>,
+    boolean_v: Vec<f32>,
+    text_v: Vec<f32>,
+    col_name_v: Vec<f32>,
 }
 
 fn pad_parents(parents: &[i64]) -> [i64; MAX_F2P] {
@@ -837,6 +1104,116 @@ fn mean_std(vals: &[f64]) -> (f64, f64) {
     (mu, var.sqrt() + 1e-8)
 }
 
+impl RtNativeBackend {
+    /// MULTICLASS decode (§2): masked TEXT target cell → `rt_forward_ex` →
+    /// L2-normalize the predicted 384-d embedding → cosine vs the L2-normalized
+    /// class-label embeddings → argmax class + `softmax(cos / T_SOFTMAX)`.
+    fn score_multiclass(
+        &mut self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        contexts: &[EntityContext],
+        model_uri: &str,
+        aux: &ScoringAux,
+    ) -> Result<Vec<EntityPrediction>, Error> {
+        let classes = &aux.class_domain;
+        if classes.is_empty() {
+            return Err(Error::Execution(ExecutionError(
+                "multiclass classification found no class labels: the target categorical \
+                 column has no distinct values under the query's temporal bound (or no \
+                 TableScanner is wired for its table)"
+                    .into(),
+            )));
+        }
+        // Embed each class label once with the pinned encoder, then L2-normalize
+        // (normalize_embeddings=True). Cached per call — labels are fixed.
+        let label_embs: Vec<Vec<f32>> =
+            classes.iter().map(|c| l2_normalize(&self.encoder.encode(c))).collect();
+
+        let (seqs, label_mu, label_sd) =
+            self.build_sequences_ex(query, task_type, contexts, true);
+        let (_scores, text) = self.forward_text(model_uri, &seqs, label_mu, label_sd)?;
+
+        let mut preds = Vec::new();
+        for (r, ctx) in contexts.iter().enumerate() {
+            let pred = l2_normalize(&text[r * D_TEXT..r * D_TEXT + D_TEXT]);
+            // cosine similarity to each class = dot of unit vectors
+            let sims: Vec<f64> =
+                label_embs.iter().map(|e| dot(&pred, e) as f64).collect();
+            // argmax (ties → lowest class index, per §2.6)
+            let mut best = 0usize;
+            for k in 1..sims.len() {
+                if sims[k] > sims[best] {
+                    best = k;
+                }
+            }
+            // softmax(cos / T) with log-sum-exp stabilization
+            let logits: Vec<f64> = sims.iter().map(|s| s / T_SOFTMAX).collect();
+            let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = logits.iter().map(|l| (l - max_logit).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            let mut p = EntityPrediction::new(ctx.entity_id.clone());
+            p.predicted_class = Some(classes[best].clone());
+            p.class_probs = classes
+                .iter()
+                .zip(exps.iter())
+                .map(|(c, e)| (c.clone(), e / sum))
+                .collect();
+            preds.push(p);
+        }
+        Ok(preds)
+    }
+
+    /// RANKING decode (§3): for each entity, one existence context per candidate
+    /// parent id → `rt_forward` → sigmoid → sort desc → top-k stringified ids.
+    fn score_ranking(
+        &mut self,
+        query: &ParsedQuery,
+        task_type: TaskType,
+        contexts: &[EntityContext],
+        model_uri: &str,
+        aux: &ScoringAux,
+    ) -> Result<Vec<EntityPrediction>, Error> {
+        if aux.rank_parent_table.is_none() {
+            return Err(Error::Execution(ExecutionError(
+                "ranking requires a foreign-key target referencing a parent table with a \
+                 wired TableScanner"
+                    .into(),
+            )));
+        }
+        let candidates = &aux.rank_candidates;
+        let k = query.top_k.unwrap_or(1).max(1) as usize;
+
+        let mut preds = Vec::new();
+        for ctx in contexts {
+            let mut p = EntityPrediction::new(ctx.entity_id.clone());
+            if candidates.is_empty() {
+                preds.push(p);
+                continue;
+            }
+            let (seqs, label_mu, label_sd) =
+                self.build_ranking_sequences(query, task_type, ctx, candidates);
+            let scores = self.forward(model_uri, &seqs, label_mu, label_sd)?;
+            // (candidate index, prob); sort by prob desc, ties → candidate order
+            let mut ranked: Vec<(usize, f64)> = scores
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, 1.0 / (1.0 + (-(*s as f64)).exp())))
+                .collect();
+            ranked.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            });
+            p.ranked = ranked
+                .into_iter()
+                .take(k)
+                .map(|(i, _)| candidates[i].id.to_string())
+                .collect();
+            preds.push(p);
+        }
+        Ok(preds)
+    }
+}
+
 impl ModelBackend for RtNativeBackend {
     fn score(
         &mut self,
@@ -845,19 +1222,19 @@ impl ModelBackend for RtNativeBackend {
         contexts: &[EntityContext],
         model_uri: &str,
         _config: &ModelConfig,
+        aux: &ScoringAux,
     ) -> Result<Vec<EntityPrediction>, Error> {
-        // The single-number score head cannot express a class/label set.
-        if matches!(
-            task_type,
-            TaskType::MulticlassClassification | TaskType::MultilabelRanking
-        ) {
-            return Err(Error::Execution(ExecutionError(
-                "the checkpoint's single score head cannot produce multiclass / ranking output"
-                    .into(),
-            )));
-        }
         if contexts.is_empty() {
             return Ok(Vec::new());
+        }
+        match task_type {
+            TaskType::MulticlassClassification => {
+                return self.score_multiclass(query, task_type, contexts, model_uri, aux);
+            }
+            TaskType::MultilabelRanking => {
+                return self.score_ranking(query, task_type, contexts, model_uri, aux);
+            }
+            _ => {}
         }
         let (seqs, label_mu, label_sd) = self.build_sequences(query, task_type, contexts);
         let scores = self.forward(model_uri, &seqs, label_mu, label_sd)?;
@@ -879,4 +1256,17 @@ impl ModelBackend for RtNativeBackend {
         }
         Ok(preds)
     }
+}
+
+/// L2-normalize a vector: `v / (‖v‖ + 1e-8)` (the `+1e-8` epsilon is mandatory
+/// and identical across bindings — `text_autocomplete.py:65`).
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let norm = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>()).sqrt();
+    let inv = 1.0 / (norm + 1e-8);
+    v.iter().map(|x| (*x as f64 * inv) as f32).collect()
+}
+
+/// Dot product of two equal-length vectors (cosine of unit vectors).
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }

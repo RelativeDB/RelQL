@@ -42,4 +42,24 @@ public interface RtC extends Library {
                    float[] textV, float[] colNameV,
                    int nThreads, float[] outTargetScores,
                    byte[] err, long errlen);
+
+    /**
+     * Extended forward: identical to {@link #rt_forward} plus one trailing
+     * nullable output {@code outTargetText} of length {@code B*384} — the TEXT
+     * decoder head (approximate MiniLM-L12-v2 embedding) summed over each row's
+     * target cell(s), using the SAME target-cell selection as the number head.
+     * NOT L2-normalized (the caller normalizes before matching). When
+     * {@code outTargetText} is {@code null} this is byte-identical to
+     * {@link #rt_forward}. {@code outTargetScores} (length B) is the same
+     * number-head output {@code rt_forward} returns. Returns 0 on success.
+     */
+    int rt_forward_ex(Pointer model, int b, int s,
+                      long[] nodeIdxs, long[] f2p,
+                      long[] colIdxs, long[] tableIdxs,
+                      byte[] isPadding, long[] semTypes,
+                      byte[] isTarget, float[] numberV,
+                      float[] datetimeV, float[] booleanV,
+                      float[] textV, float[] colNameV,
+                      int nThreads, float[] outTargetScores,
+                      float[] outTargetText, byte[] err, long errlen);
 }

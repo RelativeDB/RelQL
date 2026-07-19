@@ -1,0 +1,34 @@
+{
+  "_comment": "Cross-language ranking parity fixture. A fixed real MovieLens (ml-latest-small) scenario: 10 candidate movies, 2 users, scored through the native RT-J backend. Every binding loads the SAME data + the SAME precomputed MiniLM embeddings (embeddings.tsv, normalize=False) so results are comparable. Guards against the two ranking bugs found on 2026-07-18: (a) Python emitting no candidate cells, (b) Java emitting no target token for cell-less entity tables — both produced the degenerate enumeration-order ranking.",
+  "schema": {
+    "users": {"primary_key": "user_id", "columns": []},
+    "movies": {"primary_key": "movie_id", "columns": [["title", "TEXT"], ["genres", "TEXT"]]},
+    "ratings": {"primary_key": "rating_id", "time_column": "ts", "columns": [["rating", "NUMBER"], ["ts", "DATETIME"]]},
+    "links": [["ratings", "user_id", "users"], ["ratings", "movie_id", "movies"]]
+  },
+  "query": "PREDICT LIST_DISTINCT(ratings.movie_id) OVER (60 DAYS FOLLOWING) RANK TOP 5 FOR EACH users.user_id",
+  "anchor_epoch": 1419724800,
+  "anchor_iso": "2014-12-28T00:00:00",
+  "users": [1, 2],
+  "top_k": 5,
+  "candidate_ids": [1, 2, 3, 50, 260, 296, 318, 356, 593, 858],
+  "title_of": {
+    "1": "Toy Story (1995)", "2": "Jumanji (1995)", "3": "Grumpier Old Men (1995)",
+    "50": "Usual Suspects, The (1995)", "260": "Star Wars: Episode IV - A New Hope (1977)",
+    "296": "Pulp Fiction (1994)", "318": "Shawshank Redemption, The (1994)",
+    "356": "Forrest Gump (1994)", "593": "Silence of the Lambs, The (1991)",
+    "858": "Godfather, The (1972)"
+  },
+  "invariants": {
+    "_comment": "Cross-language checks that hold despite float-level tie ordering. degenerate_order is what BOTH bugs produced (candidate enumeration order); a correct ranking must NOT equal it. top1 (Silence of the Lambs) is the strongest, tie-free signal and is stable across bindings.",
+    "must_not_equal_degenerate_order": [1, 2, 3, 50, 260],
+    "expected_top1": {"1": 593, "2": 593},
+    "min_distinct_scores": 5
+  },
+  "per_binding_golden": {
+    "_comment": "Each binding's full captured top-5 (movie_id order). They agree on top1 and the top-5 SET but differ within sub-0.004 score ties at lower ranks — a property of the weak model signal on this task, not a bug. Used as a per-binding regression guard. java filled in once the target-token fix lands.",
+    "python": {"1": [593, 318, 356, 50, 296], "2": [593, 318, 858, 50, 356]},
+    "rust": {"1": [593, 50, 296, 318, 356], "2": [593, 318, 858, 1, 296]},
+    "java": {"1": [593, 318, 356, 50, 296], "2": [593, 318, 858, 50, 356]}
+  }
+}

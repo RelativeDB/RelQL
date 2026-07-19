@@ -319,6 +319,7 @@ Model Model::load(const std::string& path) {
   }
   m.norm_out = T("norm_out.scale").data.data();
   m.dec_number = lin("dec_dict.number", true);
+  m.dec_text = lin("dec_dict.text", true);   // [384,512] weight, [384] bias
   return m;
 }
 
@@ -681,12 +682,13 @@ bool matmul_q8_pair(const float* x, const Weight& w0, float* y0,
 // scratch (hot in L1/L2) and runs the GEMM for that column stripe of y —
 // DRAM weight traffic is the quantized payload, the fp32 tile never leaves
 // cache. Tiles are independent, so they parallelize on the pool.
-void matmul_w(const float* x, const Weight& w, float* y, int rows) {
+void matmul_w(const float* x, const Weight& w, float* y, int rows,
+              float beta = 0.f) {
   if (w.type == WType::F32) {
-    Linear l{w.f32, nullptr, w.out, w.in};
-    matmul(x, l, y, rows);
+    math::gemm_nt(x, w.f32, y, rows, w.out, w.in, w.in, w.in, w.out, beta);
     return;
   }
+  assert(beta == 0.f);
 #ifdef RT_SDOT
   if (w.type == WType::Q8 && cpu_has_i8mm() && w.out % 8 == 0 && w.in % 8 == 0) {
     matmul_q8_smmla(x, w, y, rows);         // i8mm (weights packed lazily)
@@ -697,15 +699,18 @@ void matmul_w(const float* x, const Weight& w, float* y, int rows) {
     return;
   }
 #endif
-  constexpr int kTile = 64;
-  const int tiles = (w.out + kTile - 1) / kTile;
+  // Wider output tiles amortize dequantization and BLAS submission once the
+  // activation panel is large; keep more independent stripes for latency
+  // shapes where a wide GEMM cannot make use of them.
+  const int tile = rows >= 256 ? 128 : 64;
+  const int tiles = (w.out + tile - 1) / tile;
   const size_t rb = row_bytes(w.type, w.in);
   const size_t sb = scale_bytes(w.type, w.in);
   Pool::get().run(Pool::get().size(), tiles, [&](int, int t) {
     thread_local std::vector<float> scratch;
-    if (scratch.size() < (size_t)kTile * w.in)
-      scratch.resize((size_t)kTile * w.in);
-    const int n0 = t * kTile, n1 = std::min(n0 + kTile, w.out);
+    if (scratch.size() < (size_t)tile * w.in)
+      scratch.resize((size_t)tile * w.in);
+    const int n0 = t * tile, n1 = std::min(n0 + tile, w.out);
     for (int n = n0; n < n1; n++) {
       float* dst = &scratch[(size_t)(n - n0) * w.in];
       const uint8_t* q = w.q + (size_t)n * rb;
@@ -920,7 +925,7 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
 // CPU backend: transformer blocks + output head
 // ---------------------------------------------------------------------------
 void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
-                    bool debug_taps) {
+                    bool debug_taps, bool want_text_head) {
   const int B = prep.B, S = prep.S, D = kDModel;
   if (n_threads <= 0)
     n_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -935,6 +940,22 @@ void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
     std::function<void(int, int)> f = fn;
     Pool::get().run(n_threads, total, f);
   };
+  auto norm_rows = [&](const float* in, const float* scale, float* dst,
+                       size_t rows) {
+    constexpr int kChunk = 16;
+    if (rows < 256) {
+      for (size_t i = 0; i < rows; i++)
+        rmsnorm(in + i * D, scale, dst + i * D, D);
+      return;
+    }
+    const int chunks = ((int)rows + kChunk - 1) / kChunk;
+    parallel_for(chunks, [&](int, int c) {
+      const size_t r0 = (size_t)c * kChunk;
+      const size_t r1 = std::min(r0 + kChunk, rows);
+      for (size_t i = r0; i < r1; i++)
+        rmsnorm(in + i * D, scale, dst + i * D, D);
+    });
+  };
   std::vector<Scratch> scratch(std::min(n_threads, Pool::get().size()));
 
   for (int blk_i = 0; blk_i < kBlocks; blk_i++) {
@@ -944,7 +965,7 @@ void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
       const auto& gs = a == 0 ? prep.g_col : a == 1 ? prep.g_feat : prep.g_nbr;
       const auto& wl = prep.work[a];
       // pre-norm
-      for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], blk.norm[a], &xn[i * D], D);
+      norm_rows(x.data(), blk.norm[a], xn.data(), BS);
       matmul_w(xn.data(), at.wqkvg, qkvg.data(), (int)BS);
       // K-norm depends only on the key token — apply once per (token, head)
       // instead of per (query, key) pair inside the attention loop.
@@ -1027,11 +1048,15 @@ void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
           math::vsmul(dst, 2.0f, dst, D);
         }
       });
-      matmul_w(att.data(), at.wo, proj.data(), (int)BS);
-      math::vadd(x.data(), proj.data(), x.data(), BS * D);
+      if (at.wo.type == WType::F32) {
+        matmul_w(att.data(), at.wo, x.data(), (int)BS, 1.f);
+      } else {
+        matmul_w(att.data(), at.wo, proj.data(), (int)BS);
+        math::vadd(x.data(), proj.data(), x.data(), BS * D);
+      }
     }
     // FFN: x += w2( silu(w1 xn) * w3 xn )
-    for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], blk.norm[3], &xn[i * D], D);
+    norm_rows(x.data(), blk.norm[3], xn.data(), BS);
 #ifdef RT_SDOT
     if (!matmul_q8_pair(xn.data(), blk.w1, ffa.data(), blk.w3, ffb.data(),
                         (int)BS))
@@ -1051,16 +1076,34 @@ void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
       math::vdiv(fa, sp.tmp.data(), fa, kDFF);
       math::vmul(fa, &ffb[(size_t)i * kDFF], fa, kDFF);
     });
-    matmul_w(ffa.data(), blk.w2, proj.data(), (int)BS);
-    math::vadd(x.data(), proj.data(), x.data(), BS * D);
+    if (blk.w2.type == WType::F32) {
+      matmul_w(ffa.data(), blk.w2, x.data(), (int)BS, 1.f);
+    } else {
+      matmul_w(ffa.data(), blk.w2, proj.data(), (int)BS);
+      math::vadd(x.data(), proj.data(), x.data(), BS * D);
+    }
     if (blk_i == 0 && debug_taps) out.x_block0 = x;
   }
 
   // ---- output norm + number head -----------------------------------------
-  for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], m.norm_out, &xn[i * D], D);
+  norm_rows(x.data(), m.norm_out, xn.data(), BS);
   for (size_t i = 0; i < BS; i++) {
     out.yhat_number[i] =
         m.dec_number.b[0] + math::dot(&xn[i * D], m.dec_number.w, D);
+  }
+
+  // ---- text head (additive; mirrors number head: norm_out then Linear) ----
+  // Same norm_out(x) input the number head consumes; only the target cells are
+  // populated (all the ABI reads), the rest stay 0. dec_text.w is [384,512],
+  // row d begins at d*D.
+  if (want_text_head) {
+    out.yhat_text.assign(BS * (size_t)kDText, 0.f);
+    for (size_t i = 0; i < BS; i++) {
+      if (!out.sorted_is_target[i]) continue;
+      float* dst = &out.yhat_text[i * kDText];
+      for (int d = 0; d < kDText; d++)
+        dst[d] = m.dec_text.b[d] + math::dot(&xn[i * D], &m.dec_text.w[(size_t)d * D], D);
+    }
   }
 }
 
@@ -1103,7 +1146,8 @@ Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
   detail::Prepared prep = detail::prepare(m, batch, out, opts.debug_taps);
   switch (opts.device) {
     case Device::CPU:
-      detail::run_blocks_cpu(m, prep, out, opts.n_threads, opts.debug_taps);
+      detail::run_blocks_cpu(m, prep, out, opts.n_threads, opts.debug_taps,
+                             opts.want_text_head);
       return out;
     case Device::MPS:
 #ifdef RT_METAL

@@ -39,7 +39,8 @@ import numpy as np
 from .engine import EntityContext, EntityPrediction, ModelBackend
 from .evaluate import eval_bool, eval_value
 from .model import ModelConfig
-from .pql.ast import ParsedQuery, TaskType
+from .pql.ast import Aggregation, ColumnRef, ParsedQuery, TaskType
+from .retrieve import RetrieverWiring, TemporalBound
 from .schema import Schema, ValueType
 
 __all__ = ["RtNativeUnavailableError", "RtNativeError", "RtLib", "RtModel",
@@ -49,6 +50,12 @@ D_TEXT = 384
 MAX_F2P = 5
 # SemType enum from cpp/src/rt.hpp
 SEM_NUMBER, SEM_TEXT, SEM_DATETIME, SEM_BOOLEAN = 0, 1, 2, 3
+
+# Shared contract constants — must be byte-for-byte identical across the
+# Python / Rust / Java bindings (CONTRACT.md §5).
+MAX_MULTICLASS_CLASSES = 1000   # cap on the multiclass label domain
+MAX_RANK_CANDIDATES = 1000      # cap on the ranking parent-id candidate set
+T_SOFTMAX = 0.1                 # multiclass class_probs softmax temperature
 
 _SEM_OF_VALUE_TYPE = {
     ValueType.NUMBER: SEM_NUMBER,
@@ -117,6 +124,17 @@ class RtLib:
             f32p, f32p, f32p, f32p, f32p,    # number, datetime, boolean, text, col_name
             ctypes.c_int32, f32p,            # n_threads, out_target_scores
             ctypes.c_char_p, ctypes.c_size_t]
+        # rt_forward_ex: rt_forward + a trailing B*384 out_target_text buffer
+        # (the dec_dict.text head output at each row's target cell). We always
+        # pass a real buffer (multiclass); the NULL case keeps calling rt_forward.
+        lib.rt_forward_ex.restype = ctypes.c_int
+        lib.rt_forward_ex.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            f64p, f64p, f64p, f64p,          # node, f2p, col, table
+            u8p, f64p, u8p,                  # is_padding, sem_types, is_target
+            f32p, f32p, f32p, f32p, f32p,    # number, datetime, boolean, text, col_name
+            ctypes.c_int32, f32p, f32p,      # n_threads, out_scores, out_target_text
+            ctypes.c_char_p, ctypes.c_size_t]
 
     def load_model(self, safetensors_path: str) -> "RtModel":
         err = ctypes.create_string_buffer(512)
@@ -141,24 +159,33 @@ class RtModel:
     def num_params(self) -> int:
         return int(self._native._lib.rt_model_num_params(self._handle))
 
+    @staticmethod
+    def _prep(node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+              is_target, number_v, datetime_v, boolean_v, text_v, col_name_v):
+        node_idxs = np.ascontiguousarray(node_idxs, np.int64)
+        B, S = node_idxs.shape
+        return (B, S, node_idxs,
+                np.ascontiguousarray(f2p, np.int64).reshape(B, S, MAX_F2P),
+                np.ascontiguousarray(col_idxs, np.int64).reshape(B, S),
+                np.ascontiguousarray(table_idxs, np.int64).reshape(B, S),
+                np.ascontiguousarray(is_padding, np.uint8).reshape(B, S),
+                np.ascontiguousarray(sem_types, np.int64).reshape(B, S),
+                np.ascontiguousarray(is_target, np.uint8).reshape(B, S),
+                np.ascontiguousarray(number_v, np.float32).reshape(B, S),
+                np.ascontiguousarray(datetime_v, np.float32).reshape(B, S),
+                np.ascontiguousarray(boolean_v, np.float32).reshape(B, S),
+                np.ascontiguousarray(text_v, np.float32).reshape(B, S, D_TEXT),
+                np.ascontiguousarray(col_name_v, np.float32).reshape(B, S, D_TEXT))
+
     def forward(self, *, node_idxs, f2p, col_idxs, table_idxs, is_padding,
                 sem_types, is_target, number_v, datetime_v, boolean_v,
                 text_v, col_name_v, n_threads: int = 0) -> np.ndarray:
         """Raw PRE-sort arrays in (see rt_c.h) -> per-row target score [B]."""
-        node_idxs = np.ascontiguousarray(node_idxs, np.int64)
-        B, S = node_idxs.shape
-        f2p = np.ascontiguousarray(f2p, np.int64).reshape(B, S, MAX_F2P)
-        col_idxs = np.ascontiguousarray(col_idxs, np.int64).reshape(B, S)
-        table_idxs = np.ascontiguousarray(table_idxs, np.int64).reshape(B, S)
-        is_padding = np.ascontiguousarray(is_padding, np.uint8).reshape(B, S)
-        sem_types = np.ascontiguousarray(sem_types, np.int64).reshape(B, S)
-        is_target = np.ascontiguousarray(is_target, np.uint8).reshape(B, S)
-        number_v = np.ascontiguousarray(number_v, np.float32).reshape(B, S)
-        datetime_v = np.ascontiguousarray(datetime_v, np.float32).reshape(B, S)
-        boolean_v = np.ascontiguousarray(boolean_v, np.float32).reshape(B, S)
-        text_v = np.ascontiguousarray(text_v, np.float32).reshape(B, S, D_TEXT)
-        col_name_v = np.ascontiguousarray(col_name_v,
-                                          np.float32).reshape(B, S, D_TEXT)
+        (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+         is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
+         ) = self._prep(node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                        sem_types, is_target, number_v, datetime_v, boolean_v,
+                        text_v, col_name_v)
         out = np.zeros(B, np.float32)
         err = ctypes.create_string_buffer(512)
         rc = self._native._lib.rt_forward(
@@ -170,6 +197,32 @@ class RtModel:
                 f"rt_forward failed ({rc}): "
                 f"{err.value.decode('utf-8', 'replace')}")
         return out
+
+    def forward_ex(self, *, node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                   sem_types, is_target, number_v, datetime_v, boolean_v,
+                   text_v, col_name_v, n_threads: int = 0
+                   ) -> tuple[np.ndarray, np.ndarray]:
+        """As :meth:`forward`, but also returns the TEXT decoder-head output at
+        each row's target cell: ``(scores[B], target_text[B, 384])`` (rt_c.h
+        ``rt_forward_ex``). ``target_text`` is NOT L2-normalized."""
+        (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+         is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
+         ) = self._prep(node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                        sem_types, is_target, number_v, datetime_v, boolean_v,
+                        text_v, col_name_v)
+        out = np.zeros(B, np.float32)
+        out_text = np.zeros((B, D_TEXT), np.float32)
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_forward_ex(
+            self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+            is_padding, sem_types, is_target, number_v, datetime_v,
+            boolean_v, text_v, col_name_v, int(n_threads), out, out_text,
+            err, len(err))
+        if rc != 0:
+            raise RtNativeError(
+                f"rt_forward_ex failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return out, out_text
 
     def close(self) -> None:
         if self._handle:
@@ -292,6 +345,7 @@ class TextEmbedder:
         self.model_name = model_name
         self._model = None
         self._cache: dict[str, np.ndarray] = {}
+        self._cache_norm: dict[str, np.ndarray] = {}
 
     def _load(self):
         if self._model is None:
@@ -306,14 +360,20 @@ class TextEmbedder:
                 f"sentence-transformers/{self.model_name}")
         return self._model
 
-    def encode(self, texts: Sequence[str]) -> list[np.ndarray]:
-        missing = [t for t in dict.fromkeys(texts) if t not in self._cache]
+    def encode(self, texts: Sequence[str], *,
+               normalize: bool = False) -> list[np.ndarray]:
+        """Mean-pooled MiniLM embeddings, cached. ``normalize=True`` returns
+        L2-normalized (unit) vectors via SBERT ``normalize_embeddings=True``
+        (a separate cache) — used for multiclass class-label embeddings; the
+        default (un-normalized) matches training for text CELL values."""
+        cache = self._cache_norm if normalize else self._cache
+        missing = [t for t in dict.fromkeys(texts) if t not in cache]
         if missing:
-            embs = self._load().encode(missing, normalize_embeddings=False,
+            embs = self._load().encode(missing, normalize_embeddings=normalize,
                                        show_progress_bar=False)
             for t, e in zip(missing, embs):
-                self._cache[t] = np.asarray(e, np.float32)
-        return [self._cache[t] for t in texts]
+                cache[t] = np.asarray(e, np.float32)
+        return [cache[t] for t in texts]
 
     def encode_one(self, text: str) -> np.ndarray:
         return self.encode([text])[0]
@@ -371,6 +431,19 @@ class _Seq:
     def __len__(self) -> int:
         return len(self.node)
 
+    def clone(self) -> "_Seq":
+        """A deep-enough copy: independent lists so per-candidate ranking rows
+        can diverge (target-cell f2p) and normalize their own values."""
+        s = _Seq()
+        s.node = list(self.node)
+        s.f2p = [list(x) for x in self.f2p]
+        s.col = list(self.col)
+        s.tab = list(self.tab)
+        s.sem = list(self.sem)
+        s.is_tgt = list(self.is_tgt)
+        s.value = list(self.value)
+        return s
+
 
 class RtNativeBackend:
     """A real :class:`~relativedb.engine.ModelBackend` over the C++ RT engine.
@@ -395,18 +468,26 @@ class RtNativeBackend:
 
     Classification scores are logits -> sigmoid -> probability; regression
     scores are normalized -> denormalized with the in-context label stats.
-    Multiclass classification and ranking need heads the single-score C ABI
-    does not expose; they raise a clear error. ``RETURN QUANTILES/INTERVAL``
-    likewise raise — a single point head exposes no empirical distribution.
+
+    Multiclass classification masks the target cell as TEXT, reads the text
+    decoder head via ``rt_forward_ex``, and nearest-neighbor-decodes it against
+    L2-normalized MiniLM embeddings of the distinct target-column values
+    (CONTRACT.md §2). Ranking scores each candidate parent id's existence
+    context through the number head and takes the top-k (§3). Both need a
+    ``wiring`` with a ``TableScanner`` to enumerate the class/candidate domain.
+    ``RETURN QUANTILES/INTERVAL`` still raise — a single point head exposes no
+    empirical distribution.
     """
 
     def __init__(self, *, schema: Optional[Schema] = None,
+                 wiring: Optional[RetrieverWiring] = None,
                  lib_path: Optional[str] = None,
                  embedder: Optional[TextEmbedder] = None,
                  n_threads: int = 0,
                  num_history_windows: int = 3,
                  max_seq_len: int = 1024):
         self.schema = schema
+        self.wiring = wiring
         self._lib_path = lib_path
         self.embedder = embedder or TextEmbedder()
         self.n_threads = n_threads
@@ -433,13 +514,12 @@ class RtNativeBackend:
             raise RtNativeError(
                 "RETURN QUANTILES/INTERVAL requires a quantile/distribution "
                 "head the current checkpoint does not expose")
-        if task_type in (TaskType.MULTICLASS_CLASSIFICATION,
-                         TaskType.MULTILABEL_RANKING):
-            raise RtNativeError(
-                "the checkpoint's single score head cannot produce multiclass "
-                "/ ranking output")
         if not contexts:
             return []
+        if task_type is TaskType.MULTICLASS_CLASSIFICATION:
+            return self._score_multiclass(query, contexts, model_uri)
+        if task_type is TaskType.MULTILABEL_RANKING:
+            return self._score_ranking(query, contexts, model_uri)
         model = self._model_for(model_uri)
         seqs, label_mu, label_sd = self._build_sequences(query, task_type,
                                                          contexts)
@@ -514,75 +594,92 @@ class RtNativeBackend:
             out.append((pa, v))
         return out
 
-    def _build_sequences(self, query: ParsedQuery, task_type: TaskType,
-                         contexts: list[EntityContext]
-                         ) -> tuple[list[_Seq], float, float]:
-        entity_table = query.entity_key.table
-        fk_to_parent: dict[str, dict[str, str]] = {}
-        if self.schema is not None:
-            fk_to_parent = {t.name: {l.fk_column: l.to_table
-                                     for l in self.schema.links_from(t.name)}
-                            for t in self.schema.tables}
+    def _fk_to_parent(self) -> dict[str, dict[str, str]]:
+        if self.schema is None:
+            return {}
+        return {t.name: {l.fk_column: l.to_table
+                         for l in self.schema.links_from(t.name)}
+                for t in self.schema.tables}
 
+    def _build_ctx_seq(self, query: ParsedQuery, task_type: TaskType,
+                       ctx: EntityContext, fk_to_parent: dict, all_labels: list,
+                       *, target_sem: int = SEM_NUMBER
+                       ) -> tuple[_Seq, dict, int, int]:
+        """Assemble one entity's context into a token sequence. Returns
+        ``(seq, node_of, entity_node, tgt_idx)``. ``target_sem`` overrides the
+        masked target cell's sem-type (SEM_TEXT for multiclass, §2.1); ``tgt_idx``
+        is that cell's position (used by ranking to rewire its f2p, §3.2)."""
+        entity_table = query.entity_key.table
+        seq = _Seq()
+        node_of: dict[tuple[str, Any], int] = {}
+
+        def node(key: tuple[str, Any]) -> int:
+            if key not in node_of:
+                node_of[key] = len(node_of)
+            return node_of[key]
+
+        # rows first claim node ids so f2p links resolve in any order
+        for r in ctx.rows:
+            node(r.key)
+        by_id: dict[Any, list[tuple[str, Any]]] = {}
+        for r in ctx.rows:
+            by_id.setdefault(r.id, []).append(r.key)
+
+        entity_node = node((entity_table, ctx.entity_id))
+
+        # -- the target task row (masked label) --
+        tgt_node = node((_TASK_TABLE, "__target__"))
+        if ctx.anchor is not None:
+            seq.add(tgt_node, [entity_node], _TASK_TIME_COL, _TASK_TABLE,
+                    SEM_DATETIME, ctx.anchor)
+        tgt_idx = len(seq)
+        seq.add(tgt_node, [entity_node], _TASK_LABEL_COL, _TASK_TABLE,
+                target_sem, None, target=True)
+
+        # -- past outcomes of the same task (self labels, F65) --
+        for ts, label in self._self_labels(query, task_type, ctx):
+            hnode = node((_TASK_TABLE, ts))
+            seq.add(hnode, [entity_node], _TASK_LABEL_COL, _TASK_TABLE,
+                    SEM_NUMBER, label)
+            seq.add(hnode, [entity_node], _TASK_TIME_COL, _TASK_TABLE,
+                    SEM_DATETIME, ts)
+            all_labels.append(label)
+
+        # -- one token per feature cell of every context row --
+        for r in ctx.rows:
+            parents: list[int] = []
+            for fk, pid in r.parents.items():
+                ptable = fk_to_parent.get(r.table, {}).get(fk)
+                if ptable is not None:
+                    pkey = (ptable, pid)
+                    if pkey in node_of:
+                        parents.append(node_of[pkey])
+                    continue
+                # no schema: link by unique id match within the context
+                cands = by_id.get(pid, [])
+                if len(cands) == 1:
+                    parents.append(node_of[cands[0]])
+            rnode = node_of[r.key]
+            for col, v in r.cells.items():
+                if len(seq) >= self.max_seq_len:
+                    break
+                sem = self._sem_for_cell(r.table, col, v)
+                if sem is None:
+                    continue
+                seq.add(rnode, parents, col, r.table, sem, v)
+        return seq, node_of, entity_node, tgt_idx
+
+    def _build_sequences(self, query: ParsedQuery, task_type: TaskType,
+                         contexts: list[EntityContext], *,
+                         target_sem: int = SEM_NUMBER
+                         ) -> tuple[list[_Seq], float, float]:
+        fk_to_parent = self._fk_to_parent()
         seqs: list[_Seq] = []
         all_labels: list[float] = []
         for ctx in contexts:
-            seq = _Seq()
-            node_of: dict[tuple[str, Any], int] = {}
-
-            def node(key: tuple[str, Any]) -> int:
-                if key not in node_of:
-                    node_of[key] = len(node_of)
-                return node_of[key]
-
-            # rows first claim node ids so f2p links resolve in any order
-            for r in ctx.rows:
-                node(r.key)
-            by_id: dict[Any, list[tuple[str, Any]]] = {}
-            for r in ctx.rows:
-                by_id.setdefault(r.id, []).append(r.key)
-
-            entity_node = node((entity_table, ctx.entity_id))
-
-            # -- the target task row (masked label) --
-            tgt_node = node((_TASK_TABLE, "__target__"))
-            if ctx.anchor is not None:
-                seq.add(tgt_node, [entity_node], _TASK_TIME_COL, _TASK_TABLE,
-                        SEM_DATETIME, ctx.anchor)
-            seq.add(tgt_node, [entity_node], _TASK_LABEL_COL, _TASK_TABLE,
-                    SEM_NUMBER, None, target=True)
-
-            # -- past outcomes of the same task (self labels, F65) --
-            for ts, label in self._self_labels(query, task_type, ctx):
-                hnode = node((_TASK_TABLE, ts))
-                seq.add(hnode, [entity_node], _TASK_LABEL_COL, _TASK_TABLE,
-                        SEM_NUMBER, label)
-                seq.add(hnode, [entity_node], _TASK_TIME_COL, _TASK_TABLE,
-                        SEM_DATETIME, ts)
-                all_labels.append(label)
-
-            # -- one token per feature cell of every context row --
-            for r in ctx.rows:
-                parents: list[int] = []
-                for fk, pid in r.parents.items():
-                    ptable = fk_to_parent.get(r.table, {}).get(fk)
-                    if ptable is not None:
-                        pkey = (ptable, pid)
-                        if pkey in node_of:
-                            parents.append(node_of[pkey])
-                        continue
-                    # no schema: link by unique id match within the context
-                    cands = by_id.get(pid, [])
-                    if len(cands) == 1:
-                        parents.append(node_of[cands[0]])
-                rnode = node_of[r.key]
-                for col, v in r.cells.items():
-                    if len(seq) >= self.max_seq_len:
-                        break
-                    sem = self._sem_for_cell(r.table, col, v)
-                    if sem is None:
-                        continue
-                    seq.add(rnode, parents, col, r.table, sem, v)
+            seq, _, _, _ = self._build_ctx_seq(
+                query, task_type, ctx, fk_to_parent, all_labels,
+                target_sem=target_sem)
             seqs.append(seq)
 
         if all_labels:
@@ -639,7 +736,8 @@ class RtNativeBackend:
                     seq.value[i] = (x - mu) / sd
                 # text values stay as raw strings; embedded at collate
 
-    def _forward(self, model: RtModel, seqs: list[_Seq]) -> np.ndarray:
+    def _forward(self, model: RtModel, seqs: list[_Seq], *,
+                 want_text: bool = False):
         B = len(seqs)
         S = max(1, max(len(s) for s in seqs))
         col_vocab: dict[tuple[str, str], int] = {}
@@ -686,9 +784,171 @@ class RtNativeBackend:
                 else:  # number/boolean -> number channel (bool_as_num, F52)
                     number_v[b, s] = float(v)
                     sem_types[b, s] = SEM_NUMBER
-        return model.forward(
+        kw = dict(
             node_idxs=node_idxs, f2p=f2p, col_idxs=col_idxs,
             table_idxs=table_idxs, is_padding=is_padding,
             sem_types=sem_types, is_target=is_target, number_v=number_v,
             datetime_v=datetime_v, boolean_v=boolean_v, text_v=text_v,
             col_name_v=col_name_v, n_threads=self.n_threads)
+        if want_text:
+            return model.forward_ex(**kw)   # (scores[B], target_text[B, 384])
+        return model.forward(**kw)
+
+    # -- multiclass / ranking domain enumeration ----------------------------
+    def _require_wiring(self, what: str) -> RetrieverWiring:
+        if self.wiring is None:
+            raise RtNativeError(
+                f"{what} requires a wiring with a TableScanner to enumerate "
+                f"the domain; construct RtNativeBackend(schema=..., wiring=...)")
+        return self.wiring
+
+    @staticmethod
+    def _batch_bound(contexts: list[EntityContext]) -> TemporalBound:
+        """The query temporal bound reconstructed from the assembled contexts.
+        Contexts of one execute share the anchor; take the max (most recent)
+        so a shared scan stays 'nothing newer than the anchor' (F24)."""
+        anchors = [c.anchor for c in contexts if c.anchor is not None]
+        if not anchors:
+            return TemporalBound.unbounded()
+        return TemporalBound.at_or_before(max(anchors))
+
+    def _target_column(self, query: ParsedQuery) -> ColumnRef:
+        t = query.target
+        if isinstance(t, ColumnRef):
+            return t
+        if isinstance(t, Aggregation):
+            return t.column
+        raise RtNativeError(
+            "multiclass target must be a categorical column or "
+            "FIRST/LAST(column)")
+
+    def _class_domain(self, table: str, column: str,
+                      bound: TemporalBound) -> list[str]:
+        """Distinct non-null target-column values via the TableScanner, sorted
+        lexicographically (UTF-8 byte order) and capped (§2.5)."""
+        scanner = self._require_wiring("multiclass").scanner(table)
+        seen: set[str] = set()
+        for r in scanner(table, bound):
+            v = r.cells.get(column)
+            if v is not None:
+                seen.add(str(v))
+        labels = sorted(seen, key=lambda s: s.encode("utf-8"))
+        return labels[:MAX_MULTICLASS_CLASSES]
+
+    def _rank_candidates(self, parent_table: str,
+                         bound: TemporalBound) -> list[Row]:
+        """Distinct parent-table candidate *rows* via the TableScanner: deduped
+        by id, sorted (numeric asc if integral else lexicographic UTF-8 asc),
+        capped (§3.1). The full row is kept so its feature cells can be emitted
+        into each candidate's context (§3.2) — an id alone gives the model
+        nothing to tell candidates apart."""
+        scanner = self._require_wiring("ranking").scanner(parent_table)
+        rows_by_id: dict[Any, Row] = {}
+        for r in scanner(parent_table, bound):
+            rows_by_id.setdefault(r.id, r)
+        ids = list(rows_by_id)
+        if ids and all(isinstance(i, int) and not isinstance(i, bool)
+                       for i in ids):
+            ids.sort()
+        else:
+            ids.sort(key=lambda i: str(i).encode("utf-8"))
+        return [rows_by_id[i] for i in ids[:MAX_RANK_CANDIDATES]]
+
+    # -- multiclass (CONTRACT.md §2) ----------------------------------------
+    def _score_multiclass(self, query: ParsedQuery,
+                          contexts: list[EntityContext],
+                          model_uri: str) -> list[EntityPrediction]:
+        model = self._model_for(model_uri)
+        col = self._target_column(query)
+        bound = self._batch_bound(contexts)
+        labels = self._class_domain(col.table, col.column, bound)
+        if not labels:
+            raise RtNativeError(
+                f"multiclass: target column {col} has no observed values "
+                f"at or before the anchor to form a class domain")
+        # L2-normalized MiniLM embeddings of the raw class strings (E[K, 384]).
+        E = np.asarray(self.embedder.encode(labels, normalize=True),
+                       np.float32)
+
+        # masked-TEXT target cell -> text decoder head at each entity's target.
+        seqs, _, _ = self._build_sequences(
+            query, TaskType.MULTICLASS_CLASSIFICATION, contexts,
+            target_sem=SEM_TEXT)
+        _, pred_text = self._forward(model, seqs, want_text=True)
+
+        preds: list[EntityPrediction] = []
+        for ctx, pred in zip(contexts, pred_text):
+            pred = np.asarray(pred, np.float32)
+            pred = pred / (float(np.linalg.norm(pred)) + 1e-8)  # §2.3
+            sims = E @ pred                                     # cosine (§2.6)
+            k_best = int(np.argmax(sims))                       # ties: low idx
+            logits = sims / T_SOFTMAX
+            ex = np.exp(logits - logits.max())                 # log-sum-exp
+            probs = ex / ex.sum()
+            preds.append(EntityPrediction(
+                ctx.entity_id,
+                predicted_class=labels[k_best],
+                class_probs={labels[i]: float(probs[i])
+                             for i in range(len(labels))}))
+        return preds
+
+    # -- ranking (CONTRACT.md §3) -------------------------------------------
+    def _score_ranking(self, query: ParsedQuery,
+                       contexts: list[EntityContext],
+                       model_uri: str) -> list[EntityPrediction]:
+        t = query.target
+        if not isinstance(t, Aggregation):
+            raise RtNativeError(
+                "ranking target must be LIST_DISTINCT(table.fk)")
+        fk_ref = t.column
+        link = None
+        if self.schema is not None:
+            link = next((l for l in self.schema.links_from(fk_ref.table)
+                         if l.fk_column == fk_ref.column), None)
+        if link is None:
+            raise RtNativeError(
+                f"ranking requires LIST_DISTINCT over a foreign-key column: "
+                f"{fk_ref} is not an FK to a parent table")
+        parent_table = link.to_table
+        k = query.top_k or 1
+        bound = self._batch_bound(contexts)
+        candidates = self._rank_candidates(parent_table, bound)
+        if not candidates:
+            raise RtNativeError(
+                f"ranking: parent table {parent_table!r} has no candidate ids "
+                f"at or before the anchor")
+
+        model = self._model_for(model_uri)
+        fk_to_parent = self._fk_to_parent()
+        preds: list[EntityPrediction] = []
+        for ctx in contexts:
+            # one existence context per candidate parent row: attach the
+            # candidate as the masked target cell's parent (§3.2). If the
+            # candidate isn't already a context row, emit its feature cells as a
+            # fresh node so the model can actually tell candidates apart — an
+            # edge to an empty node scores identically for every candidate.
+            all_labels: list[float] = []
+            base, node_of, entity_node, tgt_idx = self._build_ctx_seq(
+                query, TaskType.MULTILABEL_RANKING, ctx, fk_to_parent,
+                all_labels, target_sem=SEM_NUMBER)
+            cand_seqs: list[_Seq] = []
+            for row in candidates:
+                s = base.clone()
+                cnode = node_of.get((parent_table, row.id))
+                if cnode is None:
+                    cnode = len(node_of)          # fresh node for this candidate
+                    for col, v in row.cells.items():
+                        sem = self._sem_for_cell(parent_table, col, v)
+                        if sem is not None:
+                            s.add(cnode, [], col, parent_table, sem, v)
+                s.f2p[tgt_idx] = ([entity_node, cnode]
+                                  + [-1] * MAX_F2P)[:MAX_F2P]
+                cand_seqs.append(s)
+            self._normalize(cand_seqs, 0.0, 1.0)
+            logits = self._forward(model, cand_seqs)
+            probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, np.float64)))
+            order = sorted(range(len(candidates)),
+                           key=lambda i: (-probs[i], i))   # ties: low cand idx
+            ranked = tuple(str(candidates[i].id) for i in order[:k])
+            preds.append(EntityPrediction(ctx.entity_id, ranked=ranked))
+        return preds

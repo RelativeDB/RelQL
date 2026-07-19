@@ -29,6 +29,7 @@ impl ModelBackend for StubBackend {
         contexts: &[EntityContext],
         _model_uri: &str,
         _config: &ModelConfig,
+        _aux: &relativedb::engine::ScoringAux,
     ) -> Result<Vec<EntityPrediction>, Error> {
         let n = query.num_forecasts.unwrap_or(1).max(1) as usize;
         Ok(contexts

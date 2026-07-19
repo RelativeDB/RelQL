@@ -13,9 +13,10 @@
 //    the key list is chunked across independent threadgroups whose partial
 //    online-softmax states are merged, so a single huge reverse-FK group is
 //    no longer one latency-bound key stream
-//  - dense projections: fp32 -> MPSMatrixMultiplication; f16/q8/q4 -> custom
-//    qgemm (adaptive 32/64-row x 32-column tiles, threadgroup-staged
-//    in-register dequant, simdgroup MMA), weights uploaded quantized-resident
+//  - dense projections: fp32/f16 -> MPSMatrixMultiplication (mixed fp32
+//    activations/results with native f16 weights); q8/q4 -> custom qgemm
+//    (adaptive 32/64-row x 32-column tiles, threadgroup-staged in-register
+//    dequant, simdgroup MMA), weights uploaded quantized-resident
 //  - gate_mul / swiglu / head: elementwise gating, SwiGLU, and the fused
 //    output-norm + number-head dot
 // Weights are uploaded once per model (fp32, unified memory); activation and
@@ -94,23 +95,31 @@ kernel void qgemm(device const float* x [[buffer(0)]],
       Xt[r * 33 + c] =
           (m0 + r < args.M) ? x[(ulong)(m0 + r) * K + k0 + c] : 0.0f;
     }
-    for (uint i = tid; i < 32 * 32; i += TM * 4) {       // stage + dequant W
-      uint n = i / 32, kk = i % 32;
-      ulong gn = n0 + n;
-      float v;
-      if (WT == 1) {
-        v = float(((device const half*)w)[gn * K + k0 + kk]);
-      } else if (WT == 2) {
-        v = ((device const float*)ws)[gn] *
-            float(((device const char*)w)[gn * K + k0 + kk]);
-      } else {
+    if (WT == 3) {
+      // One byte contains two adjacent Q4 weights. Have one thread unpack and
+      // dequantize both values, halving payload/scale reads and loop work.
+      for (uint i = tid; i < 32 * 16; i += TM * 4) {
+        uint n = i / 16, p = i % 16;
+        ulong gn = n0 + n;
         device const half* sh =
-            ((device const half*)ws) + (gn * (K >> 5) + ((k0 + kk) >> 5)) * 2;
-        uchar b = w[gn * (K >> 1) + ((k0 + kk) >> 1)];
-        uint nib = (kk & 1) ? (b >> 4) : (b & 0xf);
-        v = float(sh[0]) * float(nib) + float(sh[1]);
+            ((device const half*)ws) + (gn * (K >> 5) + (k0 >> 5)) * 2;
+        uchar b = w[gn * (K >> 1) + (k0 >> 1) + p];
+        float scale = float(sh[0]), bias = float(sh[1]);
+        Wt[n * 33 + 2 * p] = scale * float(b & 0xf) + bias;
+        Wt[n * 33 + 2 * p + 1] = scale * float(b >> 4) + bias;
       }
-      Wt[n * 33 + kk] = v;
+    } else {
+      for (uint i = tid; i < 32 * 32; i += TM * 4) {     // stage + convert W
+        uint n = i / 32, kk = i % 32;
+        ulong gn = n0 + n;
+        float v;
+        if (WT == 1)
+          v = float(((device const half*)w)[gn * K + k0 + kk]);
+        else
+          v = ((device const float*)ws)[gn] *
+              float(((device const char*)w)[gn * K + k0 + kk]);
+        Wt[n * 33 + kk] = v;
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint kk = 0; kk < 32; kk += 8) {
@@ -374,6 +383,17 @@ kernel void swiglu(device float* ffa [[buffer(0)]],
   ffa[gid] = (a / (1.0f + exp(-a))) * ffb[gid];
 }
 
+// SwiGLU from the row-interleaved output of a stacked native-MPS [w1; w3]
+// GEMM. Keeping the two projections together removes one launch per block.
+kernel void swiglu_packed(device const float* ff13 [[buffer(0)]],
+                          device float* ffa [[buffer(1)]],
+                          uint gid [[thread_position_in_grid]]) {
+  ulong token = gid / 2048, d = gid % 2048;
+  device const float* row = ff13 + token * 4096;
+  float a = row[d];
+  ffa[gid] = (a / (1.0f + exp(-a))) * row[2048 + d];
+}
+
 // yhat[row] = dec_b + dot(rmsnorm(x[row]) * norm_scale, dec_w).
 // One simdgroup per row (n = 512).
 kernel void head(device const float* x [[buffer(0)]],
@@ -427,7 +447,7 @@ struct GpuWeight {
 
 struct BlockWeights {
   GpuWeight wqkvg[3], wo[3];           // per attention type (col, feat, nbr)
-  GpuWeight w1, w2, w3;
+  GpuWeight w1, w2, w3, w13;           // w13 = stacked MPS [w1; w3]
   id<MTLBuffer> norm[4];
   id<MTLBuffer> q_norm[3], k_norm[3], head_scale[3];
 };
@@ -441,7 +461,7 @@ struct MetalCtx {
   id<MTLDevice> dev;
   id<MTLCommandQueue> queue;
   id<MTLComputePipelineState> p_rms, p_rms_clear, p_qknorm, p_attn, p_gate;
-  id<MTLComputePipelineState> p_swiglu, p_head;
+  id<MTLComputePipelineState> p_swiglu, p_swiglu_packed, p_head;
   id<MTLComputePipelineState> p_attn_part, p_attn_reduce;
   // Indexed by [WType][overwrite/accumulate][32/64-row tile].
   id<MTLComputePipelineState> p_qgemm[4][2][2];
@@ -451,7 +471,7 @@ struct MetalCtx {
   // GEMM kernel cache: (M, N, K, beta) with transposeRight always true
   std::map<std::tuple<int, int, int, int>, MPSMatrixMultiplication*> gemms;
   // reusable activation / index buffers (grow-on-demand)
-  id<MTLBuffer> x, xn, qkvg, att, ffa, ffb, yhat, tap;
+  id<MTLBuffer> x, xn, qkvg, att, ffa, ffb, ff13, yhat, tap;
   id<MTLBuffer> qidx[3], kidx[3], work[3];
   // flash split-K attention (large key lists): partials + part/reduce work
   id<MTLBuffer> pwork[3], rwork[3], partials;
@@ -516,8 +536,9 @@ MetalCtx* make_ctx(const Model& m) {
   ctx->p_attn_reduce = pipe(@"attn_reduce");
   ctx->p_gate = pipe(@"gate_mul");
   ctx->p_swiglu = pipe(@"swiglu");
+  ctx->p_swiglu_packed = pipe(@"swiglu_packed");
   ctx->p_head = pipe(@"head");
-  for (int wt : {(int)WType::F16, (int)WType::Q8, (int)WType::Q4})
+  for (int wt : {(int)WType::Q8, (int)WType::Q4})
     for (int accumulate = 0; accumulate < 2; accumulate++)
       for (int tile = 0; tile < 2; tile++) {
         MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
@@ -569,9 +590,25 @@ MetalCtx* make_ctx(const Model& m) {
       g.norm[a] = upload(ctx->dev, blk.norm[a], kD);
     }
     g.norm[3] = upload(ctx->dev, blk.norm[3], kD);
-    g.w1 = gw(blk.w1);
     g.w2 = gw(blk.w2);
-    g.w3 = gw(blk.w3);
+    if (blk.w1.type == blk.w3.type &&
+        (blk.w1.type == WType::F32 || blk.w1.type == WType::F16)) {
+      g.w13.type = blk.w1.type;
+      g.w13.out = 2 * kDFF;
+      g.w13.in = kD;
+      const size_t one_bytes = (size_t)kDFF * row_bytes(blk.w1.type, kD);
+      g.w13.w = [ctx->dev newBufferWithLength:2 * one_bytes
+                                      options:MTLResourceStorageModeShared];
+      const void* w1 = blk.w1.type == WType::F32 ? (const void*)blk.w1.f32
+                                                 : (const void*)blk.w1.q;
+      const void* w3 = blk.w3.type == WType::F32 ? (const void*)blk.w3.f32
+                                                 : (const void*)blk.w3.q;
+      std::memcpy(g.w13.w.contents, w1, one_bytes);
+      std::memcpy((char*)g.w13.w.contents + one_bytes, w3, one_bytes);
+    } else {
+      g.w1 = gw(blk.w1);
+      g.w3 = gw(blk.w3);
+    }
   }
   ctx->norm_out = upload(ctx->dev, m.norm_out, kD);
   ctx->dec_w = upload(ctx->dev, m.dec_number.w, kD);
@@ -665,7 +702,10 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     ensure(ctx.dev, ctx.qkvg, BS * (size_t)kC4 * 4);
     ensure(ctx.dev, ctx.att, BS * kD * 4);
     ensure(ctx.dev, ctx.ffa, BS * (size_t)kDFF * 4);
-    ensure(ctx.dev, ctx.ffb, BS * (size_t)kDFF * 4);
+    if (ctx.blk[0].w13.w)
+      ensure(ctx.dev, ctx.ff13, BS * (size_t)(2 * kDFF) * 4);
+    else
+      ensure(ctx.dev, ctx.ffb, BS * (size_t)kDFF * 4);
     ensure(ctx.dev, ctx.yhat, BS * 4);
     if (debug_taps) ensure(ctx.dev, ctx.tap, BS * kD * 4);
     ensure(ctx.dev, ctx.partials, part_max * 4);
@@ -694,7 +734,7 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
 
     auto gemm = [&](id<MTLBuffer> a, id<MTLBuffer> w, id<MTLBuffer> c, int M,
-                    int N, int K, float beta) {
+                    int N, int K, float beta, MPSDataType wtype) {
       auto key = std::make_tuple(M, N, K, (int)beta);
       MPSMatrixMultiplication* __strong& mm = ctx.gemms[key];
       if (!mm)
@@ -706,15 +746,19 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
                                              interiorColumns:K
                                                        alpha:1.0
                                                         beta:beta];
-      auto desc = [&](int r, int cc) {
+      auto desc = [&](int r, int cc, MPSDataType type) {
+        const size_t elem = type == MPSDataTypeFloat16 ? 2 : 4;
         return [MPSMatrixDescriptor matrixDescriptorWithRows:r
                                                      columns:cc
-                                                    rowBytes:(size_t)cc * 4
-                                                    dataType:MPSDataTypeFloat32];
+                                                    rowBytes:(size_t)cc * elem
+                                                    dataType:type];
       };
-      MPSMatrix* A = [[MPSMatrix alloc] initWithBuffer:a descriptor:desc(M, K)];
-      MPSMatrix* W = [[MPSMatrix alloc] initWithBuffer:w descriptor:desc(N, K)];
-      MPSMatrix* C = [[MPSMatrix alloc] initWithBuffer:c descriptor:desc(M, N)];
+      MPSMatrix* A = [[MPSMatrix alloc]
+          initWithBuffer:a descriptor:desc(M, K, MPSDataTypeFloat32)];
+      MPSMatrix* W = [[MPSMatrix alloc] initWithBuffer:w
+                                           descriptor:desc(N, K, wtype)];
+      MPSMatrix* C = [[MPSMatrix alloc]
+          initWithBuffer:c descriptor:desc(M, N, MPSDataTypeFloat32)];
       [mm encodeToCommandBuffer:cb leftMatrix:A rightMatrix:W resultMatrix:C];
     };
 
@@ -736,13 +780,15 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       if (enc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     };
 
-    // Projection dispatch: fp32 weights keep the MPS GEMM; quantized weights
-    // run the custom qgemm (threadgroup-staged in-register dequant + MMA).
+    // Projection dispatch: fp32/f16 use native MPS GEMM (MPS accepts mixed
+    // fp32 activations/results with f16 weights); q8/q4 run custom qgemm.
     auto proj = [&](id<MTLBuffer> a, const GpuWeight& w, id<MTLBuffer> c,
                     int M, float beta) {
-      if (w.type == WType::F32) {
+      if (w.type == WType::F32 || w.type == WType::F16) {
         end_compute();
-        gemm(a, w.w, c, M, w.out, w.in, beta);
+        gemm(a, w.w, c, M, w.out, w.in, beta,
+             w.type == WType::F16 ? MPSDataTypeFloat16
+                                  : MPSDataTypeFloat32);
         return;
       }
       id<MTLComputeCommandEncoder> qenc = compute();
@@ -856,13 +902,22 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       [fenc setBytes:&n length:4 atIndex:3];
       simdrows(ctx.p_rms, BS, fenc);
       buffer_barrier();
-      proj(ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
-      proj(ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
-      buffer_barrier();
-      fenc = compute();
-      [fenc setComputePipelineState:ctx.p_swiglu];
-      [fenc setBuffer:ctx.ffa offset:0 atIndex:0];
-      [fenc setBuffer:ctx.ffb offset:0 atIndex:1];
+      if (gw.w13.w) {
+        proj(ctx.xn, gw.w13, ctx.ff13, (int)BS, 0.f);
+        buffer_barrier();
+        fenc = compute();
+        [fenc setComputePipelineState:ctx.p_swiglu_packed];
+        [fenc setBuffer:ctx.ff13 offset:0 atIndex:0];
+        [fenc setBuffer:ctx.ffa offset:0 atIndex:1];
+      } else {
+        proj(ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
+        proj(ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
+        buffer_barrier();
+        fenc = compute();
+        [fenc setComputePipelineState:ctx.p_swiglu];
+        [fenc setBuffer:ctx.ffa offset:0 atIndex:0];
+        [fenc setBuffer:ctx.ffb offset:0 atIndex:1];
+      }
       [fenc dispatchThreads:MTLSizeMake(BS * kDFF, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       buffer_barrier();

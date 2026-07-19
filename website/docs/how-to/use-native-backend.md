@@ -59,8 +59,14 @@ let engine = Engine::new(schema, wiring)
 - Text cells require MiniLM embeddings: Python computes them with
   sentence-transformers; Java and Rust take a `TextEncoder` (a precomputed
   table works for closed vocabularies).
-- Multiclass, ranking, and `RETURN QUANTILES`/`INTERVAL` are unsupported by the
-  current single-head checkpoint (the C ABI exposes a single score head); they
-  raise a clear error.
+- Multiclass classification executes via the checkpoint's text head (the masked
+  target cell is decoded to a 384-d embedding and matched by cosine to the class
+  labels' MiniLM embeddings), returning a predicted class plus approximate,
+  uncalibrated class probabilities.
+- Ranking (`RANK TOP k`) executes via per-candidate existence scoring: candidate
+  parent IDs are each scored with the existence head, sigmoided, and the top *k*
+  returned.
+- `RETURN QUANTILES`/`INTERVAL` remain unsupported (no variance/quantile head in
+  the checkpoint) and raise a clear error.
 - A missing library or checkpoint raises a clear, actionable error — nothing
   fails silently.

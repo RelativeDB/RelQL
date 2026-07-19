@@ -22,9 +22,9 @@ namespace math {
 
 // C[M,N] = A[M,K] @ B[N,K]^T  (row-major, arbitrary leading dims)
 inline void gemm_nt(const float* a, const float* b, float* c, int M, int N,
-                    int K, int lda, int ldb, int ldc) {
+                    int K, int lda, int ldb, int ldc, float beta = 0.0f) {
   cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, a, lda,
-              b, ldb, 0.0f, c, ldc);
+              b, ldb, beta, c, ldc);
 }
 
 // C[M,N] = A[M,K] @ B[K,N]  (row-major, arbitrary leading dims)
@@ -76,14 +76,19 @@ inline float dot(const float* a, const float* b, size_t n) {
 // operands walk K contiguously, so the compiler vectorizes the FMA chain and
 // the accumulator tile stays in registers across the K loop.
 inline void gemm_nt(const float* a, const float* b, float* c, int M, int N,
-                    int K, int lda, int ldb, int ldc) {
+                    int K, int lda, int ldb, int ldc, float beta = 0.0f) {
   constexpr int MR = 4, NR = 8;
   for (int i0 = 0; i0 < M; i0 += MR) {
     int mi = M - i0 < MR ? M - i0 : MR;
     for (int j0 = 0; j0 < N; j0 += NR) {
       int nj = N - j0 < NR ? N - j0 : NR;
       if (mi == MR && nj == NR) {
-        float acc[MR][NR] = {};
+        float acc[MR][NR];
+        for (int i = 0; i < MR; i++)
+          for (int j = 0; j < NR; j++)
+            acc[i][j] = beta == 0.f
+                            ? 0.f
+                            : beta * c[(size_t)(i0 + i) * ldc + j0 + j];
         const float* a0 = a + (size_t)i0 * lda;
         const float* b0 = b + (size_t)j0 * ldb;
         for (int k = 0; k < K; k++) {
@@ -102,7 +107,9 @@ inline void gemm_nt(const float* a, const float* b, float* c, int M, int N,
           for (int j = 0; j < nj; j++) {
             const float* ar = a + (size_t)(i0 + i) * lda;
             const float* br = b + (size_t)(j0 + j) * ldb;
-            float s = 0.f;
+            float s = beta == 0.f
+                          ? 0.f
+                          : beta * c[(size_t)(i0 + i) * ldc + j0 + j];
             for (int k = 0; k < K; k++) s += ar[k] * br[k];
             c[(size_t)(i0 + i) * ldc + j0 + j] = s;
           }
