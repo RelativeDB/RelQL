@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from .pql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
+from .relql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
                       Func, Lit, LogicalOp, Not, Operator, TargetExpr, Window)
 from .retrieve import Row
 
@@ -46,6 +46,16 @@ def _rows_in_window(rows: list[Row], window: Optional[Window],
             picked.append(r)
     picked.sort(key=lambda r: (r.timestamp is not None, r.timestamp or datetime.min))
     return picked
+
+
+def _cell(row: Row, col: str) -> Any:
+    """A row's value for ``col``, falling back to its foreign keys.
+
+    FK columns are edges rather than cells, but they are legal aggregation
+    subjects — ``LIST_DISTINCT(orders.product_id)`` asks which parents a row
+    points at — so they must be readable here too."""
+    v = row.cells.get(col)
+    return row.parents.get(col) if v is None else v
 
 
 def eval_row_predicate(expr: TargetExpr, row: Row) -> bool:
@@ -114,8 +124,8 @@ def eval_value(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
     if expr.func is AggFunc.COUNT:
         if col == "*":
             return float(len(rows))
-        return float(sum(1 for r in rows if r.cells.get(col) is not None))
-    values = [r.cells.get(col) for r in rows]
+        return float(sum(1 for r in rows if _cell(r, col) is not None))
+    values = [_cell(r, col) for r in rows]
     values = [v for v in values if v is not None] if col != "*" else values
     if expr.func is AggFunc.COUNT_DISTINCT:
         return float(len(set(values)))
@@ -125,6 +135,8 @@ def eval_value(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
             if v not in seen:
                 seen.append(v)
         return seen
+    if expr.func is AggFunc.ARRAY_AGG:
+        return list(values)     # order preserved, duplicates kept
     if expr.func is AggFunc.FIRST:
         return values[0] if values else None
     if expr.func is AggFunc.LAST:

@@ -121,7 +121,7 @@ def test_csc_execute_end_to_end(churn_schema, churn_wiring):
                  model_backend=StubBackend())
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR EACH customers.customer_id",
+              "FROM customers",
         anchor_time=T0))
     assert res.task_type is TaskType.BINARY_CLASSIFICATION
     assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
@@ -145,19 +145,19 @@ def test_engine_routes_model_uri_by_task_type(churn_schema, churn_wiring):
     backend = RecordingBackend()
     eng = Engine(churn_schema, churn_wiring, model_backend=backend)
     cases = [
-        ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FOR EACH customers.customer_id",
+        ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FROM customers",
          TaskType.REGRESSION, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FOR EACH customers.customer_id",
+        ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FROM customers",
          TaskType.BINARY_CLASSIFICATION, "hf://stanford-star/rt-j/classification"),
         ("PREDICT SUM(orders.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) "
-         "FOR EACH customers.customer_id",
+         "FROM customers",
          TaskType.FORECASTING, "hf://stanford-star/rt-j/regression"),
-        ("PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) RANK TOP 5 "
-         "FOR EACH customers.customer_id",
+        ("PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING RANK TOP 5) "
+         "FROM customers",
          TaskType.MULTILABEL_RANKING, "hf://stanford-star/rt-j/classification"),
     ]
-    for pql, expect_task, expect_uri in cases:
-        res = eng.execute(ExecutionInput(query=pql, anchor_time=T0))
+    for relql, expect_task, expect_uri in cases:
+        res = eng.execute(ExecutionInput(query=relql, anchor_time=T0))
         assert res.task_type is expect_task
         assert res.model_uri == expect_uri
     assert [c[1] for c in backend.calls] == [c[2] for c in cases]
@@ -172,12 +172,12 @@ def test_execute_without_backend_raises_clear_error(churn_schema, churn_wiring):
     with pytest.raises(ExecutionError, match="requires a model backend"):
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                  "FOR EACH customers.customer_id",
-            entity_ids=['C7'], anchor_time=T0))
+                  "FROM customers WHERE customers.customer_id IN :ids",
+            params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_for_each_without_scanner_raises():
-    """FOR EACH over all entities needs enumeration; plain retrievers can't."""
+    """Scoring a whole table needs enumeration; plain retrievers can't."""
     from relativedb import ExecutionError, RetrieverWiring
     rows = churn_rows()
     by_id = {t: {r.id: r for r in rs} for t, rs in rows.items()}
@@ -190,13 +190,49 @@ def test_for_each_without_scanner_raises():
     with pytest.raises(ExecutionError):
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                  "FOR EACH customers.customer_id", anchor_time=T0))
+                  "FROM customers", anchor_time=T0))
     # but pinned ids work
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR EACH customers.customer_id",
-        entity_ids=['C7'], anchor_time=T0))
+              "FROM customers WHERE customers.customer_id IN :ids",
+        params={"ids": ['C7']}, anchor_time=T0))
     assert len(res.predictions) == 1
+
+
+def test_pinned_key_selects_the_cohort_without_enumerating(churn_schema):
+    """`WHERE pk IN :ids` is pushed down: the cohort comes from the parameter,
+    so no TableScanner is needed and only those entities are scored."""
+    from relativedb import RetrieverWiring
+    rows = churn_rows()
+    by_id = {t: {r.id: r for r in rs} for t, rs in rows.items()}
+    wiring = (RetrieverWiring.new_wiring()          # no scanner wired
+              .entities("customers", lambda t, ids, b:
+                        [by_id[t][i] for i in ids if i in by_id[t]])
+              .default_links(lambda l, p, b, lim: [])
+              .build())
+    eng = Engine(_make_schema(), wiring, model_backend=StubBackend())
+    res = eng.execute(ExecutionInput(
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+              "FROM customers WHERE customers.customer_id IN :ids",
+        params={"ids": ['C1', 'C7']}, anchor_time=T0))
+    assert {p.id for p in res.predictions} == {'C1', 'C7'}
+
+    # equality pins a single entity
+    res = eng.execute(ExecutionInput(
+        query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+              "FROM customers WHERE customers.customer_id = :id",
+        params={"id": 'C7'}, anchor_time=T0))
+    assert [p.id for p in res.predictions] == ['C7']
+
+
+def test_unsupplied_parameter_is_a_clear_error(churn_schema, churn_wiring):
+    from relativedb import MissingParameterError
+    eng = Engine(churn_schema, churn_wiring, model_backend=StubBackend())
+    with pytest.raises(MissingParameterError, match="ids"):
+        eng.execute(ExecutionInput(
+            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+                  "FROM customers WHERE customers.customer_id IN :ids",
+            anchor_time=T0))
 
 
 def _make_schema():
@@ -229,8 +265,8 @@ def test_return_quantiles_interval_unsupported(churn_schema, churn_wiring):
         with pytest.raises(RtNativeError, match="QUANTILES/INTERVAL"):
             eng.execute(ExecutionInput(
                 query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                      f"FOR EACH customers.customer_id RETURN {ret}",
-                entity_ids=['C7'], anchor_time=T0))
+                      f"FROM customers WHERE customers.customer_id IN :ids RETURN {ret}",
+                params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_ranking_over_non_fk_column_rejected(churn_schema, churn_wiring):
@@ -244,37 +280,36 @@ def test_ranking_over_non_fk_column_rejected(churn_schema, churn_wiring):
                                                wiring=churn_wiring))
     with pytest.raises(RtNativeError, match="foreign-key"):
         eng.execute(ExecutionInput(
-            query="PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING) "
-                  "RANK TOP 5 FOR EACH customers.customer_id",
-            entity_ids=['C7'], anchor_time=T0))
+            query="PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING RANK TOP 5) FROM customers WHERE customers.customer_id IN :ids",
+            params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_return_quantiles_on_boolean_target_rejected(churn_schema, churn_wiring):
-    from relativedb import PqlValidationError
+    from relativedb import RelqlValidationError
     eng = Engine(churn_schema, churn_wiring)
-    with pytest.raises(PqlValidationError):
+    with pytest.raises(RelqlValidationError):
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-                  "FOR EACH customers.customer_id RETURN QUANTILES (0.1, 0.9)",
-            entity_ids=['C7'], anchor_time=T0))
+                  "FROM customers WHERE customers.customer_id IN :ids RETURN QUANTILES (0.1, 0.9)",
+            params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_return_probability_on_regression_target_rejected(churn_schema, churn_wiring):
-    from relativedb import PqlValidationError
+    from relativedb import RelqlValidationError
     eng = Engine(churn_schema, churn_wiring)
-    with pytest.raises(PqlValidationError):
+    with pytest.raises(RelqlValidationError):
         eng.execute(ExecutionInput(
             query="PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                  "FOR EACH customers.customer_id RETURN PROBABILITY",
-            entity_ids=['C7'], anchor_time=T0))
+                  "FROM customers WHERE customers.customer_id IN :ids RETURN PROBABILITY",
+            params={"ids": ['C7']}, anchor_time=T0))
 
 
 def test_return_quantile_out_of_range_rejected(churn_schema):
-    from relativedb import PqlValidationError
-    from relativedb.pql.parser import validate
-    with pytest.raises(PqlValidationError):
+    from relativedb import RelqlValidationError
+    from relativedb.relql.parser import validate
+    with pytest.raises(RelqlValidationError):
         validate("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-                 "FOR EACH customers.customer_id RETURN QUANTILES (0.0, 0.9)",
+                 "FROM customers WHERE customers.customer_id IN :ids RETURN QUANTILES (0.0, 0.9)",
                  churn_schema)
 
 

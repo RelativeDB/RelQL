@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   printf("device: %s\n", rt::device_name(opts.device));
+  opts.want_target_features = opts.device != rt::Device::CUDA;
 
   // Shapes for the demo batch are fixed by the dump (B=5, S=16).
   rt::Batch b;
@@ -121,11 +122,28 @@ int main(int argc, char** argv) {
   Diff d_e = diff(out.x_embed, ref_embed, &pad_sorted, rt::kDModel);
   Diff d_b = diff(out.x_block0, ref_block0, &pad_sorted, rt::kDModel);
   Diff d_y = diff(out.yhat_number, ref_yhat, &pad_sorted, 1);
+  double feature_head_max = 0.0;
+  if (opts.want_target_features) {
+    for (int bb = 0; bb < b.B; bb++) {
+      float score = model.dec_number.b[0];
+      for (int d = 0; d < rt::kDModel; d++)
+        score += out.target_features[(size_t)bb * rt::kDModel + d] *
+                 model.dec_number.w[d];
+      for (int s = 0; s < b.S; s++) {
+        size_t i = (size_t)bb * b.S + s;
+        if (out.sorted_is_target[i])
+          feature_head_max = std::max(feature_head_max,
+                                      std::fabs((double)score - out.yhat_number[i]));
+      }
+    }
+  }
 
   printf("sort mismatches : %d\n", sort_mismatch);
   printf("x_embed    max|Δ| %.3e  mean %.3e\n", d_e.max_abs, d_e.mean_abs);
   printf("x_block0   max|Δ| %.3e  mean %.3e\n", d_b.max_abs, d_b.mean_abs);
   printf("yhat       max|Δ| %.3e  mean %.3e\n", d_y.max_abs, d_y.mean_abs);
+  if (opts.want_target_features)
+    printf("feature/head consistency max|Δ| %.3e\n", feature_head_max);
 
   printf("target scores (cpp vs torch):\n");
   for (int bb = 0; bb < b.B; bb++) {
@@ -137,7 +155,8 @@ int main(int argc, char** argv) {
   }
 
   bool ok = sort_mismatch == 0 && d_e.max_abs < 5e-4 * tol &&
-            d_b.max_abs < 5e-3 * tol && d_y.max_abs < 5e-3 * tol;
+            d_b.max_abs < 5e-3 * tol && d_y.max_abs < 5e-3 * tol &&
+            (!opts.want_target_features || feature_head_max < 1e-4);
   printf(ok ? "GOLDEN TEST PASS\n" : "GOLDEN TEST FAIL\n");
 
   if (bench > 0) {

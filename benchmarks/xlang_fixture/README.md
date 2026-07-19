@@ -16,7 +16,7 @@ two ranking bugs found on **2026-07-18** — see [The bug class](#the-bug-class)
 
 The scenario:
 
-- **Query** — `PREDICT LIST_DISTINCT(ratings.movie_id) OVER (60 DAYS FOLLOWING) RANK TOP 5 FOR EACH users.user_id`
+- **Query** — `PREDICT LIST_DISTINCT(ratings.movie_id) OVER (60 DAYS FOLLOWING) RANK TOP 5 FROM users`
 - **Anchor** — `2014-12-28T00:00:00Z` (`anchor_epoch = 1419724800`)
 - **Users** — `1` and `2`
 - **Candidates** — 10 movies: `[1, 2, 3, 50, 260, 296, 318, 356, 593, 858]`

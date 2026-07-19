@@ -13,7 +13,8 @@ import os
 import numpy as np
 import pytest
 
-from relativedb.rt_native import (RtNativeBackend, RtNativeUnavailableError,
+from relativedb.rt_native import (ContextConnectivityWarning,
+                                  RtNativeBackend, RtNativeUnavailableError,
                                 load_lib, resolve_model_path)
 from conftest import churn_rows, dt, in_memory_wiring
 
@@ -142,7 +143,7 @@ def test_churn_end_to_end_with_native_backend(churn_schema):
                     model_backend=backend)
     result = engine.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR EACH customers.customer_id",
+              "FROM customers",
         anchor_time=dt("2026-07-01")))
 
     probs = {p.id: p.probability for p in result.predictions}
@@ -173,8 +174,8 @@ def test_return_class_emits_hard_label(churn_schema):
     eng = _native_engine(churn_schema)
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR EACH customers.customer_id RETURN CLASS",
-        entity_ids=['C7'], anchor_time=dt("2026-07-01")))
+              "FROM customers WHERE customers.customer_id IN :ids RETURN CLASS",
+        params={"ids": ['C7']}, anchor_time=dt("2026-07-01")))
     pred = res.predictions[0]
     assert pred.predicted_class in ("true", "false")   # hard label at 0.5
     assert pred.probability is None                     # not the score
@@ -186,8 +187,8 @@ def test_return_distribution_two_key_dist(churn_schema):
     eng = _native_engine(churn_schema)
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-              "FOR EACH customers.customer_id RETURN DISTRIBUTION",
-        entity_ids=['C7'], anchor_time=dt("2026-07-01")))
+              "FROM customers WHERE customers.customer_id IN :ids RETURN DISTRIBUTION",
+        params={"ids": ['C7']}, anchor_time=dt("2026-07-01")))
     pred = res.predictions[0]
     assert set(pred.class_probs) == {"true", "false"}
     assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-9
@@ -215,7 +216,7 @@ def test_multiclass_classification_end_to_end(churn_schema):
     from relativedb import ExecutionInput
     eng = _native_engine_with_wiring(churn_schema)
     res = eng.execute(ExecutionInput(
-        query="PREDICT FIRST(products.name) FOR EACH customers.customer_id",
+        query="PREDICT FIRST(products.name) FROM customers",
         anchor_time=dt("2026-07-01")))
     assert res.task_type.name == "MULTICLASS_CLASSIFICATION"
     assert res.model_uri == "hf://stanford-star/rt-j/classification"
@@ -237,8 +238,8 @@ def test_multiclass_return_class_and_distribution(churn_schema):
     for ret in ("CLASS", "DISTRIBUTION"):
         res = eng.execute(ExecutionInput(
             query="PREDICT FIRST(products.name) "
-                  f"FOR EACH customers.customer_id RETURN {ret}",
-            entity_ids=["C7"], anchor_time=dt("2026-07-01")))
+                  f"FROM customers WHERE customers.customer_id IN :ids RETURN {ret}",
+            params={"ids": ["C7"]}, anchor_time=dt("2026-07-01")))
         pred = res.predictions[0]
         assert pred.predicted_class in {"espresso machine", "running shoes",
                                         "yoga mat"}
@@ -251,8 +252,7 @@ def test_ranking_end_to_end_top_k(churn_schema):
     from relativedb import ExecutionInput
     eng = _native_engine_with_wiring(churn_schema)
     res = eng.execute(ExecutionInput(
-        query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) "
-              "RANK TOP 2 FOR EACH customers.customer_id",
+        query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING RANK TOP 2) FROM customers",
         anchor_time=dt("2026-07-01")))
     assert res.task_type.name == "MULTILABEL_RANKING"
     all_products = {"P1", "P2", "P3"}
@@ -269,8 +269,207 @@ def test_ranking_top_k_clamped_to_candidate_count(churn_schema):
     from relativedb import ExecutionInput
     eng = _native_engine_with_wiring(churn_schema)
     res = eng.execute(ExecutionInput(
-        query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING) "
-              "RANK TOP 25 FOR EACH customers.customer_id",
-        entity_ids=["C7"], anchor_time=dt("2026-07-01")))
+        query="PREDICT LIST_DISTINCT(orders.product_id) OVER (30 DAYS FOLLOWING RANK TOP 25) FROM customers WHERE customers.customer_id IN :ids",
+        params={"ids": ["C7"]}, anchor_time=dt("2026-07-01")))
     ranked = res.predictions[0].ranked
     assert len(ranked) == 3 and set(ranked) == {"P1", "P2", "P3"}
+
+
+# ---------------------------------------------------------------------------
+# Context connectivity: a token-less parent row severs the context
+# ---------------------------------------------------------------------------
+
+def _keyless_entity_schema(pk_as_column: bool):
+    """`customers` with no feature columns at all — optionally opting its
+    primary key in as a feature."""
+    from relativedb import LinkDef, Schema, TableDef, ValueType
+    ct = TableDef.new_table("customers")
+    if pk_as_column:
+        ct = ct.column("customer_id", ValueType.TEXT)
+    return (Schema.new_schema()
+            .table(ct.primary_key("customer_id").build())
+            .table(TableDef.new_table("orders")
+                   .column("qty", ValueType.NUMBER)
+                   .column("order_date", ValueType.DATETIME)
+                   .primary_key("order_id").time_column("order_date").build())
+            .link(LinkDef("orders", "customer_id", "customers")).build())
+
+
+def _keyless_rows(pk_as_column: bool):
+    """customers rows carrying NO feature cells (or only the pk), plus orders."""
+    from relativedb import Row
+    cust = [Row("customers", cid,
+                {"customer_id": cid} if pk_as_column else {})
+            for cid in ("C1", "C7")]
+    orders, oid = [], 0
+    for cid, n in (("C1", 2), ("C7", 6)):        # different histories
+        for k in range(n):
+            oid += 1
+            orders.append(Row("orders", f"O{oid}",
+                              {"qty": float(k + 1),
+                               "order_date": dt("2026-06-%02d" % (k + 1))},
+                              timestamp=dt("2026-06-%02d" % (k + 1)),
+                              parents={"customer_id": cid}))
+    return {"customers": cust, "orders": orders}
+
+
+def _seqs_for(schema, warn_record, pk_as_column: bool):
+    """Build model sequences for two customers with different histories."""
+    import warnings
+    from relativedb import Engine
+    from relativedb.relql.ast import TaskType
+    from relativedb.relql.parser import parse, validate
+
+    rows = _keyless_rows(pk_as_column)
+    wiring = in_memory_wiring(rows)
+    backend = RtNativeBackend(schema=schema, wiring=wiring)
+    eng = Engine(schema, wiring, model_backend=backend)
+    pq = validate(parse("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+                        "FROM customers"), schema).query
+    ctxs = [eng.assemble_context("customers", cid, dt("2026-07-01"))
+            for cid in ("C1", "C7")]
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        seqs, _, _ = backend._build_sequences(
+            pq, TaskType.BINARY_CLASSIFICATION, ctxs)
+    warn_record.extend(x for x in w
+                       if x.category is ContextConnectivityWarning)
+    return seqs
+
+
+def test_tokenless_parent_row_warns():
+    """A `customers` row with no feature cells emits no tokens, so the orders
+    hanging off it can never reach the prediction. That must not be silent."""
+    got = []
+    _seqs_for(_keyless_entity_schema(pk_as_column=False), got,
+              pk_as_column=False)
+    assert got, "expected a ContextConnectivityWarning"
+    assert "customers" in str(got[0].message)
+
+
+def test_primary_key_declared_as_column_reconnects_the_context():
+    """Declaring the primary key as a column gives the row a token, which is
+    all the context needs to reach the target — and silences the warning."""
+    got = []
+    seqs = _seqs_for(_keyless_entity_schema(pk_as_column=True), got,
+                     pk_as_column=True)
+    assert not got, f"unexpected warning: {[str(x.message) for x in got]}"
+    # the entity row now contributes a token, so the sequences carry its cell
+    assert any(tab == "customers" for s in seqs for tab in s.tab)
+
+
+def test_schema_allows_a_primary_key_that_is_also_a_column():
+    from relativedb import ValueType
+    t = _keyless_entity_schema(pk_as_column=True).table("customers")
+    assert t.primary_key == "customer_id"
+    assert t.column("customer_id").type is ValueType.TEXT
+
+
+# ---------------------------------------------------------------------------
+# Fine-tuning: Engine.finetune -> FineTunedHead -> RtNativeBackend(head=...)
+# ---------------------------------------------------------------------------
+
+def _metal_or_skip():
+    """Head fitting runs on Metal; scoring a trained head does not."""
+    from relativedb.rt_native import RT_DEVICE_MPS, load_lib
+    if not load_lib().device_available(RT_DEVICE_MPS):
+        pytest.skip("fine-tuning needs a Metal device")
+
+
+def _ft_engine(schema, head=None):
+    from relativedb import Engine
+    wiring = in_memory_wiring(churn_rows())
+    return Engine(schema, wiring,
+                  model_backend=RtNativeBackend(schema=schema, wiring=wiring,
+                                                head=head))
+
+
+FT_ANCHORS = None      # filled in per-test; the fixture's orders span 2026
+
+
+def test_finetune_binary_head_trains_and_round_trips(churn_schema, tmp_path):
+    _lib_or_skip()
+    _metal_or_skip()
+    from relativedb import FineTunedHead
+    eng = _ft_engine(churn_schema)
+    head = eng.finetune(
+        "PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0 FROM customers",
+        [dt("2026-04-01"), dt("2026-05-01"), dt("2026-06-01")],
+        epochs=40, learning_rate=1e-2)
+    assert head.task_name == "binary" and head.n_outputs == 1
+    assert head.final_loss < head.initial_loss      # it actually learned
+    p = tmp_path / "binary_head.safetensors"
+    head.save(str(p))
+    again = FineTunedHead.load(str(p))
+    assert again.task_name == "binary" and again.n_outputs == 1
+
+
+def test_finetuned_head_changes_ranking(churn_schema):
+    """The head must actually be used at scoring time, not merely loadable."""
+    _lib_or_skip()
+    _metal_or_skip()
+    from relativedb import ExecutionInput
+    q = ("PREDICT LIST_DISTINCT(orders.product_id) "
+         "OVER (30 DAYS FOLLOWING RANK TOP 2) FROM customers")
+    base = _ft_engine(churn_schema)
+    before = base.execute(ExecutionInput(query=q, anchor_time=dt("2026-07-01")))
+    head = base.finetune(q, [dt("2026-05-01"), dt("2026-06-01")],
+                         epochs=60, learning_rate=1e-2)
+    assert head.task_name == "ranking"
+    assert head.final_loss < head.initial_loss
+    tuned = _ft_engine(churn_schema, head=head)
+    after = tuned.execute(ExecutionInput(query=q, anchor_time=dt("2026-07-01")))
+    assert ({p.id: p.ranked for p in before.predictions}
+            != {p.id: p.ranked for p in after.predictions})
+
+
+def test_finetune_accepts_explicit_labels(churn_schema):
+    """`labels=` overrides the labels derived from the query's own target."""
+    _lib_or_skip()
+    _metal_or_skip()
+    eng = _ft_engine(churn_schema)
+    anchors = [dt("2026-05-01"), dt("2026-06-01")]
+    given = {(cid, t): float(i % 2)
+             for i, t in enumerate(anchors) for cid in ("C1", "C7", "C9")}
+    head = eng.finetune(
+        "PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0 FROM customers",
+        anchors, labels=given, epochs=30, learning_rate=1e-2)
+    assert head.n_examples == len(given)
+
+
+def test_finetune_needs_the_native_backend(churn_schema):
+    """A stub backend cannot encode frozen features; say so plainly."""
+    from relativedb import Engine, ExecutionError
+    from conftest import StubBackend
+    eng = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                 model_backend=StubBackend())
+    with pytest.raises(ExecutionError, match="native RT backend"):
+        eng.finetune("PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0 "
+                     "FROM customers", [dt("2026-05-01")])
+
+
+def test_fk_columns_are_readable_by_aggregations():
+    """`LIST_DISTINCT(orders.product_id)` aggregates a foreign key, which lives
+    in Row.parents rather than Row.cells — the evaluator must still see it."""
+    from relativedb.evaluate import eval_value
+    from relativedb.relql.ast import (AggFunc, Aggregation, ColumnRef, TimeUnit,
+                                      Window)
+    rows = {"orders": [r for r in churn_rows()["orders"]]}
+    agg = Aggregation(AggFunc.LIST_DISTINCT, ColumnRef("orders", "product_id"),
+                      None, Window(-3650.0, 0.0, TimeUnit.DAYS))
+    got = eval_value(agg, rows, {}, dt("2026-07-01"))
+    assert set(got) == {"P1", "P2", "P3"}
+
+
+def test_finetune_accepts_naive_anchors(churn_schema):
+    """Row timestamps are UTC-aware; a naive training anchor must be coerced,
+    not blow up comparing offset-naive to offset-aware datetimes."""
+    _lib_or_skip()
+    _metal_or_skip()
+    from datetime import datetime as _dt
+    eng = _ft_engine(churn_schema)
+    head = eng.finetune(
+        "PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0 FROM customers",
+        [_dt(2026, 5, 1), _dt(2026, 6, 1)],      # naive on purpose
+        epochs=20, learning_rate=1e-2)
+    assert head.n_examples > 0

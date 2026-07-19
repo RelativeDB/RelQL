@@ -148,7 +148,7 @@ def _rank(engine: Engine, query: str, anchor: datetime,
           users: list[int]) -> dict[int, list[int]]:
     """entity_id -> ranked movie_id list (ints)."""
     res = engine.execute(ExecutionInput(
-        query=query, anchor_time=anchor, entity_ids=users))
+        query=query, anchor_time=anchor, params={"ids": users}))
     assert res.task_type.name == "MULTILABEL_RANKING", res.task_type
     return {int(p.id): [int(x) for x in p.ranked] for p in res.predictions}
 

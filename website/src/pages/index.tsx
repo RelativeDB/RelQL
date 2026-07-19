@@ -30,17 +30,16 @@ function Hero() {
           your storage, and ask questions about the future:
         </p>
         <CodeBlock language="sql" className={styles.heroCode}>
-          {`PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)\nFOR EACH customers.customer_id`}
+          {`PREDICT NOT EXISTS(orders.*)\nFROM customers`}
         </CodeBlock>
         <p className={styles.heroCaption}>
-          “For every customer, the probability they place zero orders in the
-          next 90 days” — churn, as a query.
+          "For every customer, the probability they place zero orders"
         </p>
         <div className={styles.buttons}>
-          <Link className="button button--primary button--lg" to="/docs/getting-started/quickstart">
+          <Link className="button button--primary button--lg" to="/docs/#quickstart">
             Quickstart
           </Link>
-          <Link className="button button--secondary button--lg" to="/pql/">
+          <Link className="button button--secondary button--lg" to="/relql/">
             Learn RelQL
           </Link>
         </div>
@@ -317,11 +316,7 @@ function RelationalTransformers() {
         <p className={styles.sectionLede}>
           A transformer normally attends over word tokens. A{' '}
           <strong>relational transformer</strong> attends over a small subgraph
-          of your database: each token is one cell, and attention is masked
-          along the structure that relates cells. Pretrained across many schemas, it
-          predicts <strong>in-context</strong>. The engine assembles the
-          entity, its neighborhood, and a few labeled examples, and the model
-          fills in the masked target in one forward pass. The relational
+          of your database. The relational
           analogue of prompting an LLM, in a 22M-parameter model that scales.
         </p>
         <ComparisonMatrix />
@@ -329,7 +324,7 @@ function RelationalTransformers() {
           RelativeDB ships RT-J inference as a highly optimized,
           dependency-light C++ engine, with several quantized models for highly
           constrained environments.{' '}
-          <Link to="/docs/concepts/relational-transformers">Read more →</Link>
+          <Link to="/docs/#relational-transformers">Read more →</Link>
         </p>
       </div>
     </section>

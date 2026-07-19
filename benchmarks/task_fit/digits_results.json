@@ -1,0 +1,38 @@
+{
+  "dataset": "sklearn.datasets.load_digits",
+  "not_in_rt_j_recipe": true,
+  "recipe_audit": "no configuration containing 'digits' in recipe_rt_j.txt",
+  "checkpoint": "stanford-star/rt-j@1f552a738a0f8dada8af77db913b2b90511e2f00/classification",
+  "split": {
+    "seed": 1729,
+    "train": 1437,
+    "test": 360,
+    "stratified": true
+  },
+  "device": "Metal",
+  "method": "frozen RT-J backbone + trainable 10x512 linear head",
+  "trainable_parameters": 5130,
+  "epochs": 2000,
+  "learning_rate": 0.003,
+  "weight_decay": 0.0001,
+  "training_loss": {
+    "before": 2.3027501106262207,
+    "after": 0.9278327822685242
+  },
+  "training_seconds": 1.286124792,
+  "before": {
+    "accuracy": 0.1,
+    "macro_f1": 0.01818181818181818,
+    "cross_entropy": 2.3029830302481256,
+    "ranking_mrr": 0.28888778659611997,
+    "ranking_recall_at_3": 0.26666666666666666
+  },
+  "after": {
+    "accuracy": 0.7027777777777777,
+    "macro_f1": 0.6998701327752522,
+    "cross_entropy": 0.9873862836593004,
+    "ranking_mrr": 0.8126069223985891,
+    "ranking_recall_at_3": 0.9138888888888889
+  },
+  "adapter": "benchmarks/task_fit/digits_head.safetensors"
+}

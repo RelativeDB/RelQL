@@ -61,11 +61,12 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
 // Blocks + head on each backend. Consumes prep.x as block-0 input, writes
 // out.yhat_number (+ x_block0 when debug_taps).
 void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
-                    bool debug_taps, bool want_text_head = false);
+                    bool debug_taps, bool want_text_head = false,
+                    bool want_target_features = false);
 #ifdef RT_METAL
 bool metal_available();
 void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
-                      bool debug_taps);
+                      bool debug_taps, bool want_target_features = false);
 #endif
 #ifdef RT_CUDA
 bool cuda_available();

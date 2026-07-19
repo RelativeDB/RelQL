@@ -8,8 +8,9 @@ from .schema import ColumnDef, LinkDef, Schema, SchemaError, TableDef, ValueType
 from .retrieve import (CohortRetriever, EntityRetriever, LinkRetriever, Row,
                        RetrieverWiring, TableScanner, TemporalBound,
                        WiringError)
-from .pql import (ParsedQuery, PqlSyntaxError, PqlValidationError, TaskType,
-                  ValidatedQuery, parse, validate)
+from .relql import (MissingParameterError, ParsedQuery, RelqlSyntaxError,
+                  RelqlValidationError, TaskType, ValidatedQuery, parse,
+                  validate)
 from .model import (DEFAULT_CLASSIFICATION_MODEL_URI, DEFAULT_EMBEDDING_MODEL,
                     DEFAULT_REGRESSION_MODEL_URI, EmbeddingMismatchError,
                     ModelConfig)
@@ -22,7 +23,8 @@ from .csc import CscIndex
 
 def __getattr__(name):
     """Lazy exports with optional runtime deps (librt_c, MiniLM encoder)."""
-    if name in ("RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder"):
+    if name in ("RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
+                "ContextConnectivityWarning", "FineTunedHead", "FineTunedHead"):
         from . import rt_native
         return getattr(rt_native, name)
     raise AttributeError(f"module 'relativedb' has no attribute {name!r}")
@@ -35,7 +37,7 @@ __all__ = [
     "Row", "TemporalBound", "RetrieverWiring", "EntityRetriever",
     "LinkRetriever", "CohortRetriever", "TableScanner", "WiringError",
     "parse", "validate", "ParsedQuery", "ValidatedQuery", "TaskType",
-    "PqlSyntaxError", "PqlValidationError",
+    "RelqlSyntaxError", "RelqlValidationError", "MissingParameterError",
     "ModelConfig", "EmbeddingMismatchError",
     "DEFAULT_CLASSIFICATION_MODEL_URI", "DEFAULT_REGRESSION_MODEL_URI",
     "DEFAULT_EMBEDDING_MODEL",
@@ -45,4 +47,5 @@ __all__ = [
     "EntityPrediction", "EntityContext",
     "ModelBackend", "CscIndex",
     "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
+    "ContextConnectivityWarning",
 ]

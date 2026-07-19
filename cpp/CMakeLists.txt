@@ -14,7 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 option(RT_METAL "Build the Metal/MPS backend (Apple only)" ON)
 option(RT_CUDA "Build the CUDA backend" OFF)
 
-add_library(rt STATIC src/rt.cpp)
+add_library(rt STATIC src/rt.cpp src/rt_train.cpp)
 target_include_directories(rt PUBLIC src)
 
 add_executable(rt_test src/test_golden.cpp)
@@ -24,9 +24,11 @@ if(APPLE)
   target_link_libraries(rt "-framework Accelerate")
   target_compile_definitions(rt PRIVATE ACCELERATE_NEW_LAPACK)
   if(RT_METAL)
-    target_sources(rt PRIVATE src/rt_metal.mm)
+    target_sources(rt PRIVATE src/rt_metal.mm src/rt_train_metal.mm)
     target_compile_definitions(rt PUBLIC RT_METAL)
     set_source_files_properties(src/rt_metal.mm PROPERTIES
+                                COMPILE_OPTIONS "-fobjc-arc")
+    set_source_files_properties(src/rt_train_metal.mm PROPERTIES
                                 COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(rt "-framework Metal"
                              "-framework MetalPerformanceShaders"
@@ -46,22 +48,25 @@ endif()
 add_executable(rt_bench src/bench.cpp)
 target_link_libraries(rt_bench rt)
 
+add_executable(rt_train_test src/test_train.cpp)
+target_link_libraries(rt_train_test rt)
+
 # Checkpoint quantizer: fp32/bf16 safetensors -> int8 per-row (Q8_0-style).
 add_executable(rt_quantize src/quantize.cpp)
 target_link_libraries(rt_quantize rt)
 
-add_library(rt_c SHARED src/rt_c.cpp src/pql_c.cpp src/pql.cpp
+add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
                         src/csc_c.cpp src/csc.cpp)
 target_link_libraries(rt_c rt)
 target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)
 
 # Shared RelQL parser (C++20 lexer + recursive-descent parser).
-add_library(pql STATIC src/pql.cpp)
-target_include_directories(pql PUBLIC src)
+add_library(relql STATIC src/relql.cpp)
+target_include_directories(relql PUBLIC src)
 
-add_executable(pql_test src/test_pql.cpp)
-target_link_libraries(pql_test pql)
+add_executable(relql_test src/test_relql.cpp)
+target_link_libraries(relql_test relql)
 
 # Shared CSC adjacency (time-bounded "latest <= anchor" children query).
 add_library(csc STATIC src/csc.cpp)

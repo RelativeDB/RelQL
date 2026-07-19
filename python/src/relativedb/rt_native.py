@@ -31,6 +31,7 @@ import ctypes
 import math
 import os
 import sys
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
@@ -39,15 +40,25 @@ import numpy as np
 from .engine import EntityContext, EntityPrediction, ModelBackend
 from .evaluate import eval_bool, eval_value
 from .model import ModelConfig
-from .pql.ast import Aggregation, ColumnRef, ParsedQuery, TaskType
+from .relql.ast import Aggregation, ColumnRef, ParsedQuery, TaskType
 from .retrieve import RetrieverWiring, TemporalBound
 from .schema import Schema, ValueType
 
-__all__ = ["RtNativeUnavailableError", "RtNativeError", "RtLib", "RtModel",
-           "TextEmbedder", "RtNativeBackend", "load_lib", "resolve_model_path"]
+__all__ = ["RtNativeUnavailableError", "RtNativeError",
+           "ContextConnectivityWarning", "RtLib", "RtModel",
+           "TextEmbedder", "RtNativeBackend", "FineTunedHead",
+           "load_lib", "resolve_model_path"]
 
 D_TEXT = 384
+D_MODEL = 512                   # frozen-backbone feature width (rt_c.h)
 MAX_F2P = 5
+
+# Compute devices (rt_c.h)
+RT_DEVICE_CPU, RT_DEVICE_MPS, RT_DEVICE_CUDA = 0, 1, 2
+
+# Fine-tune task codes (rt_c.h). These are the wire values the C ABI expects,
+# not the engine's TaskType.
+FT_BINARY, FT_REGRESSION, FT_MULTICLASS, FT_RANKING = 0, 1, 2, 3
 # SemType enum from cpp/src/rt.hpp
 SEM_NUMBER, SEM_TEXT, SEM_DATETIME, SEM_BOOLEAN = 0, 1, 2, 3
 
@@ -56,6 +67,14 @@ SEM_NUMBER, SEM_TEXT, SEM_DATETIME, SEM_BOOLEAN = 0, 1, 2, 3
 MAX_MULTICLASS_CLASSES = 1000   # cap on the multiclass label domain
 MAX_RANK_CANDIDATES = 1000      # cap on the ranking parent-id candidate set
 T_SOFTMAX = 0.1                 # multiclass class_probs softmax temperature
+
+_FT_TASK_OF = {
+    TaskType.BINARY_CLASSIFICATION: FT_BINARY,
+    TaskType.REGRESSION: FT_REGRESSION,
+    TaskType.FORECASTING: FT_REGRESSION,
+    TaskType.MULTICLASS_CLASSIFICATION: FT_MULTICLASS,
+    TaskType.MULTILABEL_RANKING: FT_RANKING,
+}
 
 _SEM_OF_VALUE_TYPE = {
     ValueType.NUMBER: SEM_NUMBER,
@@ -67,6 +86,12 @@ _SEM_OF_VALUE_TYPE = {
 
 class RtNativeUnavailableError(RuntimeError):
     """librt_c (or a runtime dependency) could not be located/loaded."""
+
+
+class ContextConnectivityWarning(UserWarning):
+    """A context row that other rows hang off emits no tokens, so nothing
+    below it can reach the prediction. Declare a feature column on that table
+    — or declare its primary key as a column when the key carries meaning."""
 
 
 class RtNativeError(RuntimeError):
@@ -136,6 +161,56 @@ class RtLib:
             ctypes.c_int32, f32p, f32p,      # n_threads, out_scores, out_target_text
             ctypes.c_char_p, ctypes.c_size_t]
 
+        # ---- frozen-backbone fine-tuning (see rt_c.h) ----------------------
+        # The transformer stays frozen; only a small task head is trained, on
+        # its final target-cell states [N, 512].
+        lib.rt_encode_targets_device.restype = ctypes.c_int
+        lib.rt_encode_targets_device.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            f64p, f64p, f64p, f64p,          # node, f2p, col, table
+            u8p, f64p, u8p,                  # is_padding, sem_types, is_target
+            f32p, f32p, f32p, f32p, f32p,    # number, datetime, boolean, text, col_name
+            ctypes.c_int32, ctypes.c_int32,  # n_threads, device
+            f32p,                            # out_target_features [B, 512]
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_finetune_head_create.restype = ctypes.c_void_p
+        lib.rt_finetune_head_create.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_void_p,                 # class_embeddings or NULL
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_finetune_head_load.restype = ctypes.c_void_p
+        lib.rt_finetune_head_load.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                                              ctypes.c_size_t]
+        lib.rt_finetune_head_free.restype = None
+        lib.rt_finetune_head_free.argtypes = [ctypes.c_void_p]
+        lib.rt_finetune_head_save.restype = ctypes.c_int
+        lib.rt_finetune_head_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                              ctypes.c_char_p, ctypes.c_size_t]
+        i32p = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
+        lib.rt_finetune_head_fit_metal.restype = ctypes.c_int
+        lib.rt_finetune_head_fit_metal.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32,
+            f32p, f32p,                      # features [N,512], labels [N]
+            i32p, ctypes.c_int32,            # group_offsets, n_groups
+            ctypes.c_int32, ctypes.c_float, ctypes.c_float,   # epochs, lr, wd
+            ctypes.POINTER(ctypes.c_float),  # out_initial_loss
+            ctypes.POINTER(ctypes.c_float),  # out_final_loss
+            ctypes.POINTER(ctypes.c_double), # out_seconds
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_finetune_head_predict.restype = ctypes.c_int
+        lib.rt_finetune_head_predict.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, f32p, f32p,
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_finetune_head_outputs.restype = ctypes.c_int32
+        lib.rt_finetune_head_outputs.argtypes = [ctypes.c_void_p]
+        lib.rt_finetune_head_task.restype = ctypes.c_int32
+        lib.rt_finetune_head_task.argtypes = [ctypes.c_void_p]
+        lib.rt_device_available.restype = ctypes.c_int
+        lib.rt_device_available.argtypes = [ctypes.c_int32]
+
+    def device_available(self, device: int) -> bool:
+        return bool(self._lib.rt_device_available(device))
+
     def load_model(self, safetensors_path: str) -> "RtModel":
         err = ctypes.create_string_buffer(512)
         handle = self._lib.rt_model_load(
@@ -145,6 +220,96 @@ class RtLib:
                 f"rt_model_load({safetensors_path!r}) failed: "
                 f"{err.value.decode('utf-8', 'replace')}")
         return RtModel(self, handle, safetensors_path)
+
+
+class FineTunedHead:
+    """A trained task head over the frozen backbone's target-cell features.
+
+    The transformer is never updated; this is the small adapter that replaces
+    the released checkpoint's zero-shot head. Produced by
+    :meth:`~relativedb.engine.Engine.finetune`, persisted with :meth:`save`,
+    and served by passing ``head=`` to :class:`RtNativeBackend`.
+    """
+
+    def __init__(self, lib: "RtLib", handle: int, *, task: int,
+                 initial_loss: Optional[float] = None,
+                 final_loss: Optional[float] = None,
+                 seconds: Optional[float] = None,
+                 n_examples: Optional[int] = None,
+                 classes: Sequence[Any] = ()):
+        self._native = lib
+        self._handle = handle
+        self.task = task
+        self.initial_loss = initial_loss
+        self.final_loss = final_loss
+        self.seconds = seconds
+        self.n_examples = n_examples
+        self.classes = tuple(classes)
+
+    def __del__(self):
+        try:
+            if getattr(self, "_handle", None):
+                self._native._lib.rt_finetune_head_free(self._handle)
+                self._handle = None
+        except Exception:
+            pass
+
+    @property
+    def n_outputs(self) -> int:
+        return int(self._native._lib.rt_finetune_head_outputs(self._handle))
+
+    @property
+    def task_name(self) -> str:
+        return {FT_BINARY: "binary", FT_REGRESSION: "regression",
+                FT_MULTICLASS: "multiclass",
+                FT_RANKING: "ranking"}.get(self.task, "unknown")
+
+    def save(self, path: str) -> str:
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_finetune_head_save(
+            self._handle, str(path).encode("utf-8"), err, len(err))
+        if rc != 0:
+            raise RtNativeError(
+                f"saving the fine-tuned head to {path!r} failed: "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return str(path)
+
+    @staticmethod
+    def load(path: str) -> "FineTunedHead":
+        lib = load_lib()
+        err = ctypes.create_string_buffer(512)
+        handle = lib._lib.rt_finetune_head_load(
+            str(path).encode("utf-8"), err, len(err))
+        if not handle:
+            raise RtNativeError(
+                f"loading a fine-tuned head from {path!r} failed: "
+                f"{err.value.decode('utf-8', 'replace')}")
+        task = int(lib._lib.rt_finetune_head_task(handle))
+        return FineTunedHead(lib, handle, task=task)
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        """Score frozen features ``[N, 512]`` -> logits ``[N, n_outputs]``."""
+        f = np.ascontiguousarray(features, np.float32)
+        if f.ndim != 2 or f.shape[1] != D_MODEL:
+            raise RtNativeError(
+                f"features must be [N, {D_MODEL}], got {f.shape}")
+        n_out = self.n_outputs
+        out = np.zeros(f.shape[0] * n_out, np.float32)
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_finetune_head_predict(
+            self._handle, f.shape[0], f.reshape(-1), out, err, len(err))
+        if rc != 0:
+            raise RtNativeError(
+                f"rt_finetune_head_predict failed: "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return out.reshape(f.shape[0], n_out)
+
+    def __repr__(self) -> str:
+        loss = ""
+        if self.initial_loss is not None and self.final_loss is not None:
+            loss = f" loss {self.initial_loss:.4f}->{self.final_loss:.4f}"
+        n = f" on {self.n_examples} examples" if self.n_examples else ""
+        return f"<FineTunedHead {self.task_name}{n}{loss}>"
 
 
 class RtModel:
@@ -197,6 +362,32 @@ class RtModel:
                 f"rt_forward failed ({rc}): "
                 f"{err.value.decode('utf-8', 'replace')}")
         return out
+
+    def encode_targets(self, *, node_idxs, f2p, col_idxs, table_idxs,
+                       is_padding, sem_types, is_target, number_v, datetime_v,
+                       boolean_v, text_v, col_name_v, n_threads: int = 0,
+                       device: int = RT_DEVICE_CPU) -> np.ndarray:
+        """Frozen-backbone features: the final target-cell state ``[B, 512]``.
+
+        This is what fine-tuning trains on — the transformer is not updated, so
+        every example need only be encoded once."""
+        (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+         is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
+         ) = self._prep(node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                        sem_types, is_target, number_v, datetime_v, boolean_v,
+                        text_v, col_name_v)
+        out = np.zeros(B * D_MODEL, np.float32)
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_encode_targets_device(
+            self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+            is_padding, sem_types, is_target, number_v, datetime_v,
+            boolean_v, text_v, col_name_v, int(n_threads), int(device),
+            out, err, len(err))
+        if rc != 0:
+            raise RtNativeError(
+                f"rt_encode_targets_device failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return out.reshape(B, D_MODEL)
 
     def forward_ex(self, *, node_idxs, f2p, col_idxs, table_idxs, is_padding,
                    sem_types, is_target, number_v, datetime_v, boolean_v,
@@ -451,8 +642,9 @@ class RtNativeBackend:
     Token mapping (mirrors rt/data.py — the arrays are RAW PRE-SORT; the
     native engine sorts and builds its own attention masks):
 
-    * one token per feature cell ``(value, column, table)`` (F10); IDs/FKs are
-      never tokens (F17) — they become the node graph instead;
+    * one token per feature cell ``(value, column, table)`` (F10); FKs become
+      the node graph rather than tokens, as does a primary key the schema has
+      not also declared as a column;
     * every context row is a graph node: tokens of one row share its
       ``node_idx``; ``f2p[token] = node_idxs`` of the row's FK-parent rows
       that are present in the context (up to 5, -1-padded);
@@ -485,7 +677,8 @@ class RtNativeBackend:
                  embedder: Optional[TextEmbedder] = None,
                  n_threads: int = 0,
                  num_history_windows: int = 3,
-                 max_seq_len: int = 1024):
+                 max_seq_len: int = 1024,
+                 head: Optional[Any] = None):
         self.schema = schema
         self.wiring = wiring
         self._lib_path = lib_path
@@ -494,6 +687,21 @@ class RtNativeBackend:
         self.num_history_windows = max(1, num_history_windows)
         self.max_seq_len = max_seq_len
         self._models: dict[str, RtModel] = {}
+        # A fine-tuned head replaces the checkpoint's zero-shot head for the
+        # task it was trained on; every other task still scores zero-shot.
+        if isinstance(head, (str, os.PathLike)):
+            head = FineTunedHead.load(str(head))
+        self.head: Optional[FineTunedHead] = head
+
+    def _head_for(self, task_type: TaskType) -> Optional["FineTunedHead"]:
+        """The fine-tuned head, when it was trained for this task type."""
+        if self.head is None:
+            return None
+        return self.head if _FT_TASK_OF.get(task_type) == self.head.task else None
+
+    def _encode(self, model: RtModel, seqs: list["_Seq"]) -> np.ndarray:
+        """Frozen-backbone features ``[len(seqs), 512]`` for these sequences."""
+        return self._forward(model, seqs, encode=True)
 
     # -- model handles ------------------------------------------------------
     def _model_for(self, model_uri: str) -> RtModel:
@@ -523,7 +731,12 @@ class RtNativeBackend:
         model = self._model_for(model_uri)
         seqs, label_mu, label_sd = self._build_sequences(query, task_type,
                                                          contexts)
-        scores = self._forward(model, seqs)
+        head = self._head_for(task_type)
+        if head is not None:
+            # trained head over the frozen backbone's target-cell features
+            scores = head.predict(self._encode(model, seqs))[:, 0]
+        else:
+            scores = self._forward(model, seqs)
         preds: list[EntityPrediction] = []
         for ctx, s in zip(contexts, scores):
             s = float(s)
@@ -601,6 +814,24 @@ class RtNativeBackend:
                          for l in self.schema.links_from(t.name)}
                 for t in self.schema.tables}
 
+    @staticmethod
+    def _severed_parents(seq: "_Seq", node_of: dict) -> set:
+        """Tables whose rows are referenced as a parent but emit no tokens.
+
+        Attention reaches a row only through its tokens, so a token-less parent
+        is a dead end: everything hanging off it — however much context was
+        assembled — can never influence the prediction."""
+        with_tokens = set(seq.node)
+        table_of_node = {n: key[0] for key, n in node_of.items()}
+        out = set()
+        for parents in seq.f2p:
+            for p in parents:
+                if p >= 0 and p not in with_tokens:
+                    t = table_of_node.get(p)
+                    if t is not None and t != _TASK_TABLE:
+                        out.add(t)
+        return out
+
     def _build_ctx_seq(self, query: ParsedQuery, task_type: TaskType,
                        ctx: EntityContext, fk_to_parent: dict, all_labels: list,
                        *, target_sem: int = SEM_NUMBER
@@ -676,11 +907,22 @@ class RtNativeBackend:
         fk_to_parent = self._fk_to_parent()
         seqs: list[_Seq] = []
         all_labels: list[float] = []
+        severed: set = set()
         for ctx in contexts:
-            seq, _, _, _ = self._build_ctx_seq(
+            seq, node_of, _, _ = self._build_ctx_seq(
                 query, task_type, ctx, fk_to_parent, all_labels,
                 target_sem=target_sem)
+            severed |= self._severed_parents(seq, node_of)
             seqs.append(seq)
+        if severed:
+            tables = ", ".join(sorted(repr(t) for t in severed))
+            warnings.warn(
+                f"context is disconnected: {tables} rows carry no feature "
+                f"cells, so nothing linked through them can reach the "
+                f"prediction and every entity will score alike. Declare a "
+                f"feature column on those tables — or, when the primary key "
+                f"itself carries meaning, declare it as a column too.",
+                ContextConnectivityWarning, stacklevel=4)
 
         if all_labels:
             a = np.asarray(all_labels, float)
@@ -737,7 +979,7 @@ class RtNativeBackend:
                 # text values stay as raw strings; embedded at collate
 
     def _forward(self, model: RtModel, seqs: list[_Seq], *,
-                 want_text: bool = False):
+                 want_text: bool = False, encode: bool = False):
         B = len(seqs)
         S = max(1, max(len(s) for s in seqs))
         col_vocab: dict[tuple[str, str], int] = {}
@@ -790,6 +1032,8 @@ class RtNativeBackend:
             sem_types=sem_types, is_target=is_target, number_v=number_v,
             datetime_v=datetime_v, boolean_v=boolean_v, text_v=text_v,
             col_name_v=col_name_v, n_threads=self.n_threads)
+        if encode:
+            return model.encode_targets(**kw)   # frozen features [B, 512]
         if want_text:
             return model.forward_ex(**kw)   # (scores[B], target_text[B, 384])
         return model.forward(**kw)
@@ -860,6 +1104,9 @@ class RtNativeBackend:
                           model_uri: str) -> list[EntityPrediction]:
         model = self._model_for(model_uri)
         col = self._target_column(query)
+        head = self._head_for(TaskType.MULTICLASS_CLASSIFICATION)
+        if head is not None:
+            return self._score_multiclass_head(query, contexts, model, head)
         bound = self._batch_bound(contexts)
         labels = self._class_domain(col.table, col.column, bound)
         if not labels:
@@ -892,6 +1139,137 @@ class RtNativeBackend:
                              for i in range(len(labels))}))
         return preds
 
+    def _score_multiclass_head(self, query: ParsedQuery,
+                               contexts: list[EntityContext], model: RtModel,
+                               head: "FineTunedHead") -> list[EntityPrediction]:
+        """Multiclass through a trained head: logits over the class list the
+        head was fitted on, rather than nearest-neighbour over MiniLM text."""
+        labels = list(head.classes)
+        if not labels:
+            raise RtNativeError(
+                "the fine-tuned multiclass head carries no class list; "
+                "re-run Engine.finetune to regenerate it")
+        seqs, _, _ = self._build_sequences(
+            query, TaskType.MULTICLASS_CLASSIFICATION, contexts)
+        logits = head.predict(self._encode(model, seqs))
+        preds: list[EntityPrediction] = []
+        for ctx, row in zip(contexts, logits):
+            row = np.asarray(row, np.float32)
+            ex = np.exp(row - row.max())
+            probs = ex / ex.sum()
+            preds.append(EntityPrediction(
+                ctx.entity_id,
+                predicted_class=labels[int(np.argmax(row))],
+                class_probs={labels[i]: float(probs[i])
+                             for i in range(len(labels))}))
+        return preds
+
+    # -- fine-tuning --------------------------------------------------------
+    def fit_head(self, model: RtModel, task_type: TaskType,
+                 features: np.ndarray, labels: np.ndarray,
+                 group_offsets: np.ndarray, n_groups: int, *,
+                 epochs: int = 100, learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 classes: Sequence[Any] = ()) -> "FineTunedHead":
+        """Fit a task head on frozen features ``[N, 512]``.
+
+        Training runs on Metal; inference on the resulting head is plain CPU
+        (``rt_finetune_head_predict``), so a head trained here serves anywhere.
+        """
+        lib = load_lib(self._lib_path)
+        ft_task = _FT_TASK_OF[task_type]
+        if not lib.device_available(RT_DEVICE_MPS):
+            raise RtNativeError(
+                "fine-tuning requires a Metal device (rt_finetune_head_fit_metal); "
+                "this build or machine has none. Scoring is unaffected.")
+        n_outputs = len(classes) if ft_task == FT_MULTICLASS else 1
+
+        class_emb = None
+        emb_ptr = None
+        if ft_task == FT_MULTICLASS and classes:
+            # Seed the head in the checkpoint's own class-embedding basis so it
+            # starts from the zero-shot ordering rather than from nothing.
+            class_emb = np.ascontiguousarray(
+                self.embedder.encode([str(c) for c in classes], normalize=True),
+                np.float32)
+            emb_ptr = class_emb.ctypes.data_as(ctypes.c_void_p)
+
+        err = ctypes.create_string_buffer(512)
+        handle = lib._lib.rt_finetune_head_create(
+            model._handle, ft_task, n_outputs, emb_ptr, err, len(err))
+        if not handle:
+            raise RtNativeError(
+                f"rt_finetune_head_create failed: "
+                f"{err.value.decode('utf-8', 'replace')}")
+
+        f = np.ascontiguousarray(features, np.float32).reshape(-1)
+        y = np.ascontiguousarray(labels, np.float32)
+        go = np.ascontiguousarray(group_offsets, np.int32)
+        i_loss = ctypes.c_float(0.0)
+        f_loss = ctypes.c_float(0.0)
+        secs = ctypes.c_double(0.0)
+        rc = lib._lib.rt_finetune_head_fit_metal(
+            handle, int(y.shape[0]), f, y, go, int(n_groups), int(epochs),
+            float(learning_rate), float(weight_decay),
+            ctypes.byref(i_loss), ctypes.byref(f_loss), ctypes.byref(secs),
+            err, len(err))
+        if rc != 0:
+            lib._lib.rt_finetune_head_free(handle)
+            raise RtNativeError(
+                f"rt_finetune_head_fit_metal failed: "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return FineTunedHead(lib, handle, task=ft_task,
+                             initial_loss=float(i_loss.value),
+                             final_loss=float(f_loss.value),
+                             seconds=float(secs.value),
+                             n_examples=int(y.shape[0]), classes=classes)
+
+    def ranking_parent_table(self, query: ParsedQuery) -> str:
+        """The parent table a ranking query's FK target points at."""
+        t = query.target
+        if not isinstance(t, Aggregation):
+            raise RtNativeError(
+                "ranking target must be LIST_DISTINCT(table.fk) or "
+                "ARRAY_AGG(table.fk)")
+        link = None
+        if self.schema is not None:
+            link = next((l for l in self.schema.links_from(t.column.table)
+                         if l.fk_column == t.column.column), None)
+        if link is None:
+            raise RtNativeError(
+                f"ranking requires LIST_DISTINCT/ARRAY_AGG over a foreign-key "
+                f"column: {t.column} is not an FK to a parent table")
+        return link.to_table
+
+    def candidate_seqs(self, query: ParsedQuery, ctx: EntityContext,
+                       parent_table: str, candidates: list) -> list["_Seq"]:
+        """One existence sequence per candidate parent row (§3.2).
+
+        The candidate is attached as the masked target cell's parent; if it is
+        not already a context row its feature cells are emitted as a fresh
+        node, because an edge to an empty node scores identically for every
+        candidate. Shared by scoring and fine-tuning so the head is trained on
+        exactly the inputs it will later be served."""
+        fk_to_parent = self._fk_to_parent()
+        all_labels: list[float] = []
+        base, node_of, entity_node, tgt_idx = self._build_ctx_seq(
+            query, TaskType.MULTILABEL_RANKING, ctx, fk_to_parent,
+            all_labels, target_sem=SEM_NUMBER)
+        out: list[_Seq] = []
+        for row in candidates:
+            s = base.clone()
+            cnode = node_of.get((parent_table, row.id))
+            if cnode is None:
+                cnode = len(node_of)              # fresh node for this candidate
+                for col, v in row.cells.items():
+                    sem = self._sem_for_cell(parent_table, col, v)
+                    if sem is not None:
+                        s.add(cnode, [], col, parent_table, sem, v)
+            s.f2p[tgt_idx] = ([entity_node, cnode] + [-1] * MAX_F2P)[:MAX_F2P]
+            out.append(s)
+        self._normalize(out, 0.0, 1.0)
+        return out
+
     # -- ranking (CONTRACT.md §3) -------------------------------------------
     def _score_ranking(self, query: ParsedQuery,
                        contexts: list[EntityContext],
@@ -899,7 +1277,8 @@ class RtNativeBackend:
         t = query.target
         if not isinstance(t, Aggregation):
             raise RtNativeError(
-                "ranking target must be LIST_DISTINCT(table.fk)")
+                "ranking target must be LIST_DISTINCT(table.fk) or "
+                "ARRAY_AGG(table.fk)")
         fk_ref = t.column
         link = None
         if self.schema is not None:
@@ -907,7 +1286,8 @@ class RtNativeBackend:
                          if l.fk_column == fk_ref.column), None)
         if link is None:
             raise RtNativeError(
-                f"ranking requires LIST_DISTINCT over a foreign-key column: "
+                f"ranking requires LIST_DISTINCT/ARRAY_AGG over a foreign-key "
+                f"column: "
                 f"{fk_ref} is not an FK to a parent table")
         parent_table = link.to_table
         k = query.top_k or 1
@@ -919,33 +1299,15 @@ class RtNativeBackend:
                 f"at or before the anchor")
 
         model = self._model_for(model_uri)
-        fk_to_parent = self._fk_to_parent()
+        rank_head = self._head_for(TaskType.MULTILABEL_RANKING)
         preds: list[EntityPrediction] = []
         for ctx in contexts:
-            # one existence context per candidate parent row: attach the
-            # candidate as the masked target cell's parent (§3.2). If the
-            # candidate isn't already a context row, emit its feature cells as a
-            # fresh node so the model can actually tell candidates apart — an
-            # edge to an empty node scores identically for every candidate.
-            all_labels: list[float] = []
-            base, node_of, entity_node, tgt_idx = self._build_ctx_seq(
-                query, TaskType.MULTILABEL_RANKING, ctx, fk_to_parent,
-                all_labels, target_sem=SEM_NUMBER)
-            cand_seqs: list[_Seq] = []
-            for row in candidates:
-                s = base.clone()
-                cnode = node_of.get((parent_table, row.id))
-                if cnode is None:
-                    cnode = len(node_of)          # fresh node for this candidate
-                    for col, v in row.cells.items():
-                        sem = self._sem_for_cell(parent_table, col, v)
-                        if sem is not None:
-                            s.add(cnode, [], col, parent_table, sem, v)
-                s.f2p[tgt_idx] = ([entity_node, cnode]
-                                  + [-1] * MAX_F2P)[:MAX_F2P]
-                cand_seqs.append(s)
-            self._normalize(cand_seqs, 0.0, 1.0)
-            logits = self._forward(model, cand_seqs)
+            cand_seqs = self.candidate_seqs(query, ctx, parent_table,
+                                            candidates)
+            if rank_head is not None:
+                logits = rank_head.predict(self._encode(model, cand_seqs))[:, 0]
+            else:
+                logits = self._forward(model, cand_seqs)
             probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, np.float64)))
             order = sorted(range(len(candidates)),
                            key=lambda i: (-probs[i], i))   # ties: low cand idx

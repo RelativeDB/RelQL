@@ -87,16 +87,16 @@ engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema),
 
 r1 = engine.execute(ExecutionInput(
     query=f"PREDICT NOT EXISTS(checkins.*) OVER ({FWD} DAYS FOLLOWING) "
-          f"FOR EACH users.user_id WHERE EXISTS(checkins.*) OVER ({BACK} DAYS PRECEDING)",
-    entity_ids=test_ids, anchor_time=TEST_ANCHOR.to_pydatetime()))
+          f"FROM users WHERE users.user_id IN :ids AND EXISTS(checkins.*) OVER ({BACK} DAYS PRECEDING)",
+    params={"ids": test_ids}, anchor_time=TEST_ANCHOR.to_pydatetime()))
 ids = [p.id for p in r1.predictions]
 rtj_auc = auc(np.array([p.probability for p in r1.predictions]),
               np.array([int(yte_c[i]) for i in ids]))
 recency_auc = auc(Xte.loc[ids,"recency"].values, np.array([int(yte_c[i]) for i in ids]))
 
 r2 = engine.execute(ExecutionInput(
-    query=f"PREDICT COUNT(checkins.*) OVER ({FWD} DAYS FOLLOWING) FOR EACH users.user_id",
-    entity_ids=test_ids, anchor_time=TEST_ANCHOR.to_pydatetime()))
+    query=f"PREDICT COUNT(checkins.*) OVER ({FWD} DAYS FOLLOWING) FROM users WHERE users.user_id IN :ids",
+    params={"ids": test_ids}, anchor_time=TEST_ANCHOR.to_pydatetime()))
 ids2 = [p.id for p in r2.predictions]
 def pv(p):
     for at in ("value","prediction","expected_value"):

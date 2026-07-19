@@ -152,6 +152,11 @@ struct Output {
   std::vector<int64_t> sort_idxs;      // [B,S]
   std::vector<float> x_embed;          // [B,S,d] debug tap (block-0 input)
   std::vector<float> x_block0;         // [B,S,d] debug tap (block-0 output)
+  // Final, output-normalized hidden state at each batch row's target cell.
+  // Shape [B,d]; multiple target cells in a row are summed, matching the C
+  // ABI's score reduction. Empty unless ForwardOpts::want_target_features.
+  // This is the frozen-backbone feature consumed by the fine-tuning API.
+  std::vector<float> target_features;
 };
 
 struct ForwardOpts {
@@ -159,6 +164,7 @@ struct ForwardOpts {
   int n_threads = 0;                   // <=0: hardware concurrency (CPU only)
   bool debug_taps = true;              // fill x_embed/x_block0 (off for bench)
   bool want_text_head = false;         // also fill Output::yhat_text (CPU only)
+  bool want_target_features = false;   // fill Output::target_features [B,512]
 };
 
 Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts);

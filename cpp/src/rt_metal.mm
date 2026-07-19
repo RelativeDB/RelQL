@@ -628,7 +628,7 @@ bool metal_available() {
 }
 
 void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
-                      bool debug_taps) {
+                      bool debug_taps, bool want_target_features) {
   @autoreleasepool {
     // ---- lazy per-model context ------------------------------------------
     static std::mutex init_mu;
@@ -955,6 +955,25 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           (cb.error ? cb.error.localizedDescription.UTF8String : "?"));
 
     std::memcpy(out.yhat_number.data(), ctx.yhat.contents, BS * 4);
+    if (want_target_features) {
+      // `x` is shared/unified memory. Normalize and gather only the target
+      // rows on CPU after the command completes; this avoids a second GPU
+      // output buffer and copies just B*512 floats into the public result.
+      out.target_features.assign((size_t)B * kD, 0.f);
+      const float* final_x = static_cast<const float*>(ctx.x.contents);
+      float row[kD];
+      for (int b = 0; b < B; b++)
+        for (int s = 0; s < S; s++) {
+          const size_t i = (size_t)b * S + s;
+          if (!out.sorted_is_target[i]) continue;
+          float ss = 0.f;
+          for (int d = 0; d < kD; d++) ss += final_x[i * kD + d] * final_x[i * kD + d];
+          const float inv = 1.f / std::sqrt(ss / kD + kEps);
+          for (int d = 0; d < kD; d++) row[d] = final_x[i * kD + d] * inv * m.norm_out[d];
+          float* dst = &out.target_features[(size_t)b * kD];
+          for (int d = 0; d < kD; d++) dst[d] += row[d];
+        }
+    }
     if (debug_taps) {
       out.x_block0.resize(BS * kD);
       std::memcpy(out.x_block0.data(), ctx.tap.contents, BS * kD * 4);

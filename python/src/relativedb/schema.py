@@ -27,7 +27,11 @@ class SchemaError(ValueError):
 
 @dataclass(frozen=True)
 class ColumnDef:
-    """A typed feature column. IDs / FK columns are *not* columns here (F17)."""
+    """A typed feature column.
+
+    FK columns are graph edges, not columns. A primary key may be declared as a
+    column when it carries meaning; see :class:`TableDef`.
+    """
 
     name: str
     type: ValueType
@@ -54,7 +58,19 @@ class LinkDef:
 class TableDef:
     """A table: typed feature columns + identity (PK) + optional row time.
 
-    The primary key is identity only — never surfaced as a cell (F17).
+    The primary key names rows and resolves links. Whether it is *also* a
+    feature is the schema's choice, declared the same way ``time_column`` is —
+    by listing it as a column::
+
+        TableDef.new_table("users").primary_key("user_id")      # identity only
+        TableDef.new_table("products")                          # ...and a feature
+            .column("stock_code", ValueType.TEXT).primary_key("stock_code")
+
+    Declare it when the key carries meaning — a SKU, an ISBN, an airport code.
+    Leave it out for synthetic keys: autoincrement ids correlate with insertion
+    order, so feeding one to the model invites it to read the id as a tenure
+    proxy that will not survive a new id range.
+
     ``time_column`` drives temporal filtering (F24) and windows.
     """
 

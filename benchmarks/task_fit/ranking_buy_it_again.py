@@ -80,8 +80,8 @@ engine = Engine(schema, wiring,
 # ---- score ranking ------------------------------------------------------
 res = engine.execute(ExecutionInput(
     query=f"PREDICT LIST_DISTINCT(purchases.stock_code) OVER ({WINDOW_DAYS} DAYS "
-          f"FOLLOWING) RANK TOP {K} FOR EACH customers.customer_id",
-    entity_ids=elig, anchor_time=ANCHOR.to_pydatetime()))
+          f"FOLLOWING RANK TOP {K}) FROM customers WHERE customers.customer_id IN :ids",
+    params={"ids": elig}, anchor_time=ANCHOR.to_pydatetime()))
 
 pop_topk = top_codes[:K]                      # popularity baseline
 

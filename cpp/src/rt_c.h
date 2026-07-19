@@ -36,6 +36,7 @@ extern "C" {
 #endif
 
 typedef struct rt_model rt_model;
+typedef struct rt_finetune_head rt_finetune_head;
 
 /* Load a safetensors checkpoint (bf16 or f32). Returns NULL on failure and
  * writes a message into err (if err non-NULL, capped at errlen). */
@@ -109,6 +110,63 @@ int rt_forward_device(const rt_model*, int32_t B, int32_t S,
                       const float* text_v, const float* col_name_v,
                       int32_t n_threads, int32_t device,
                       float* out_target_scores, char* err, size_t errlen);
+
+/* ---- frozen-backbone fine-tuning --------------------------------------
+ *
+ * The transformer is used as a frozen relational feature extractor. This
+ * call returns its final output-normalized target-cell state [B,512] on the
+ * selected device. The compact head API below trains on those states with
+ * AdamW on Metal and saves a small safetensors adapter checkpoint.
+ */
+int rt_encode_targets_device(const rt_model*, int32_t B, int32_t S,
+                      const int64_t* node_idxs, const int64_t* f2p,
+                      const int64_t* col_idxs, const int64_t* table_idxs,
+                      const uint8_t* is_padding, const int64_t* sem_types,
+                      const uint8_t* is_target, const float* number_v,
+                      const float* datetime_v, const float* boolean_v,
+                      const float* text_v, const float* col_name_v,
+                      int32_t n_threads, int32_t device,
+                      float* out_target_features,
+                      char* err, size_t errlen);
+
+#define RT_FINETUNE_BINARY 0
+#define RT_FINETUNE_REGRESSION 1
+#define RT_FINETUNE_MULTICLASS 2
+#define RT_FINETUNE_RANKING 3
+
+/* Create a task head initialized from the released checkpoint. Scalar tasks
+ * copy dec_dict.number. For multiclass, class_embeddings may point to
+ * n_outputs*384 label embeddings; their projection through dec_dict.text
+ * preserves the checkpoint's zero-shot class ordering. NULL initializes a
+ * zero multiclass head. */
+rt_finetune_head* rt_finetune_head_create(const rt_model*, int32_t task,
+                                           int32_t n_outputs,
+                                           const float* class_embeddings,
+                                           char* err, size_t errlen);
+rt_finetune_head* rt_finetune_head_load(const char* path,
+                                         char* err, size_t errlen);
+void rt_finetune_head_free(rt_finetune_head*);
+int rt_finetune_head_save(const rt_finetune_head*, const char* path,
+                          char* err, size_t errlen);
+
+/* Full-batch Metal training over frozen features [N,512]. labels is length N.
+ * Ranking uses non-negative relevance labels and group_offsets[n_groups+1];
+ * other tasks ignore group_offsets/n_groups. */
+int rt_finetune_head_fit_metal(rt_finetune_head*, int32_t N,
+                               const float* features, const float* labels,
+                               const int32_t* group_offsets, int32_t n_groups,
+                               int32_t epochs, float learning_rate,
+                               float weight_decay,
+                               float* out_initial_loss, float* out_final_loss,
+                               double* out_seconds,
+                               char* err, size_t errlen);
+
+/* Raw logits/scores [N,n_outputs], evaluated on CPU for portable inference. */
+int rt_finetune_head_predict(const rt_finetune_head*, int32_t N,
+                             const float* features, float* out_logits,
+                             char* err, size_t errlen);
+int32_t rt_finetune_head_outputs(const rt_finetune_head*);
+int32_t rt_finetune_head_task(const rt_finetune_head*);
 
 #ifdef __cplusplus
 }

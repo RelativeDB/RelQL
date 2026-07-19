@@ -8,11 +8,11 @@ against the PyTorch reference. ~700 lines, no torch, no Python at inference.
 inference it now also hosts two components that were previously reimplemented
 per language, so the bindings can delegate instead of diverging:
 
-- **RelQL parser** (`src/pql.{hpp,cpp}`, C ABI `pql_parse` in `src/pql_c.h`) —
+- **RelQL parser** (`src/relql.{hpp,cpp}`, C ABI `relql_parse` in `src/relql_c.h`) —
   hand-written lexer + recursive-descent parser producing a JSON AST. Implements
   the v2 grammar (`OVER (...)`/`WINDOW` frames, `HORIZONS`, `AS OF`, `RETURN`,
-  `EXPLAIN`, `EXISTS`; see `RelQL_EVOLUTION.md`). Test: `./build/pql_test`. Python
-  binding: `relativedb.pql.native`; cross-language equivalence:
+  `EXPLAIN`, `EXISTS`; see `RelQL_EVOLUTION.md`). Test: `./build/relql_test`. Python
+  binding: `relativedb.relql.native`; cross-language equivalence:
   `python/tests/test_native_parser.py`.
 - **CSC index** (`src/csc.{hpp,cpp}`, C ABI `csc_build`/`csc_children`/`csc_free`
   in `src/csc_c.h`) — lex-sorted adjacency + binary-searched "latest ≤ anchor"
@@ -35,6 +35,39 @@ The exact `rt/model.py` (main branch) forward pass:
   embeddings, stable in-forward sort by column id, number-head decoding
   (`bool_as_num`)
 - safetensors loading (bf16 → fp32) with a built-in header parser — no JSON dep
+
+## Metal fine-tuning (`rt_train`)
+
+The native backend can now adapt RT-J without PyTorch. It freezes the
+golden-verified transformer, extracts the final normalized 512-dimensional
+target-cell state on CPU or Metal, and trains a compact task head on Metal.
+This is deliberately **head fine-tuning**, not a full 86M-parameter backward
+pass: only `512*C + C` parameters change, so an adapter is cheap to train,
+audit, save, and deploy.
+
+| task | head / loss |
+|---|---|
+| binary classification | scalar sigmoid cross-entropy |
+| regression | scalar squared error |
+| multiclass | `C`-way softmax cross-entropy |
+| ranking | scalar score + grouped listwise softmax cross-entropy |
+
+`rt_train.hpp` exposes `FineTuneHead`, `fit_head_metal`, adapter safetensors
+save/load, and portable CPU prediction. The C ABI mirrors it with
+`rt_encode_targets_device` and `rt_finetune_head_*`. Scalar heads initialize
+from the released number decoder. A multiclass head can initialize from the
+released text decoder plus class-label MiniLM embeddings, preserving its
+zero-shot class ordering before training.
+
+```bash
+./build/rt_train_test
+python/.venv/bin/python benchmarks/task_fit/digits_metal_finetune.py
+```
+
+The native test covers multiclass and variable-group ranking losses. The
+Digits benchmark is a fixed, stratified run on a dataset absent from RT-J's
+485-database pretraining recipe; its committed before/after output is in
+`benchmarks/task_fit/digits_results.json`.
 
 ## Backends (CPU / MPS / CUDA)
 

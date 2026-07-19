@@ -41,7 +41,7 @@ Python/Java/Rust bindings call the C ABI directly with **no fallback**;
 
 | Component | C++ | C ABI (in `librt_c`) | Bindings | Correctness test |
 |---|---|---|---|---|
-| RelQL parser | `cpp/src/pql.{hpp,cpp}` | `pql_parse` → JSON AST | `pql/native.py`, Java `NativePqlParser`, Rust `pql/native.rs` | C++ `test_pql` (44 parse + 10 reject) + each binding's JSON→AST tests |
+| RelQL parser | `cpp/src/relql.{hpp,cpp}` | `relql_parse` → JSON AST | `relql/native.py`, Java `NativeRelqlParser`, Rust `relql/native.rs` | C++ `test_relql` (44 parse + 10 reject) + each binding's JSON→AST tests |
 | CSC index | `cpp/src/csc.{hpp,cpp}` | `csc_build`/`csc_children`/`csc_free` | `csc_native.{py,rs}`, Java `NativeCsc` | C++ `csc_test` (22,502 vs brute force) + per-binding brute-force equivalence |
 
 - Each language keeps only its id↔dense mapping, row storage, and JSON→AST
@@ -75,7 +75,7 @@ replicate across all three.
 Other findings:
 - Churn probability is coarse (≤`num_history_windows+1` levels, 3 distinct on
   the default), compounding the recency gap above.
-- `examples.pql` never exercises `!=`, `>=`, `LIKE`, `ENDS WITH`, `IS NOT NULL`,
+- `examples.relql` never exercises `!=`, `>=`, `LIKE`, `ENDS WITH`, `IS NOT NULL`,
   `AVG`, `MIN`, `COUNT_DISTINCT`, `FIRST`; the Java/Rust hand-written parsers can
   diverge on these until they delegate to `librt_c`.
 

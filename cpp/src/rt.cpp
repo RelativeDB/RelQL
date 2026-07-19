@@ -925,7 +925,8 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
 // CPU backend: transformer blocks + output head
 // ---------------------------------------------------------------------------
 void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
-                    bool debug_taps, bool want_text_head) {
+                    bool debug_taps, bool want_text_head,
+                    bool want_target_features) {
   const int B = prep.B, S = prep.S, D = kDModel;
   if (n_threads <= 0)
     n_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -1105,6 +1106,16 @@ void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
         dst[d] = m.dec_text.b[d] + math::dot(&xn[i * D], &m.dec_text.w[(size_t)d * D], D);
     }
   }
+  if (want_target_features) {
+    out.target_features.assign((size_t)B * D, 0.f);
+    for (int b = 0; b < B; b++)
+      for (int s = 0; s < S; s++) {
+        const size_t i = (size_t)b * S + s;
+        if (!out.sorted_is_target[i]) continue;
+        math::vadd(&out.target_features[(size_t)b * D], &xn[i * D],
+                   &out.target_features[(size_t)b * D], D);
+      }
+  }
 }
 
 }  // namespace detail
@@ -1147,11 +1158,15 @@ Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
   switch (opts.device) {
     case Device::CPU:
       detail::run_blocks_cpu(m, prep, out, opts.n_threads, opts.debug_taps,
-                             opts.want_text_head);
+                             opts.want_text_head, opts.want_target_features);
       return out;
     case Device::MPS:
 #ifdef RT_METAL
-      detail::run_blocks_metal(m, prep, out, opts.debug_taps);
+      if (opts.want_text_head)
+        throw std::runtime_error("rt: text decoder output is CPU-only; use "
+                                 "target features for Metal fine-tuning");
+      detail::run_blocks_metal(m, prep, out, opts.debug_taps,
+                               opts.want_target_features);
       return out;
 #else
       break;

@@ -8,12 +8,11 @@ relational data (tables, keys, links), wire small retriever callbacks over
 whatever storage you already have, and ask questions about the **future**:
 
 ```sql
-PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
-FOR EACH customers.customer_id
+PREDICT NOT EXISTS(orders.*)
+FROM customers
 ```
 
-*"For every customer, what is the probability they place zero orders in the
-next 90 days?"*.
+*"For every customer, what is the probability they place zero orders"*.
 
 ## The model
 Relational Transformers work by pretraining a 22m parameter model on relational data for prediction and classifications tasks. This method has been shown to scale, and remarkably, shows the emergence of zero-shot ability on novel tasks.
@@ -23,26 +22,6 @@ Relational Transformers work by pretraining a 22m parameter model on relational 
 | [stanford-star/relational-transformer](https://github.com/stanford-star/relational-transformer) | RT-J: Large-Scale Pretraining of Relational Transformers for Context-Efficient Predictions — code, in progress | Jul 2026  |
 | [Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data](https://arxiv.org/abs/2510.06377) | Paper (arXiv:2510.06377) | Oct, 2025 |
 
-### Checkpoints
-
-int8/int4 run low-precision matmuls — int8×int8 integer dot products on CPU,
-packed weights streamed straight into the GPU kernels — so the weights are
-never expanded to fp32. Pick by size vs. accuracy:
-
-| Checkpoint | On-disk | Latency | Throughput | Accuracy | Download |
-| --- | --- | --- | --- | --- | --- |
-| fp32 | 171 MB | 317 ms | 6.5k tok/s | reference | — |
-| int8 | 88 MB | 453 ms | 4.5k tok/s | ±0.01 | [rt-j-int8](https://huggingface.co/RelativeDB/rt-j-int8) |
-| int4 | 64 MB | 464 ms | 4.4k tok/s | ±0.15 | [rt-j-int4](https://huggingface.co/RelativeDB/rt-j-int4) |
-| fp16 | 172 MB | 483 ms | 4.2k tok/s | identical | [rt-j-fp16](https://huggingface.co/RelativeDB/rt-j-fp16) |
-
-<sub>Apple M3 Pro, Metal/MPS, single entity at 2048-token context. Latency =
-ms/forward; throughput = tokens/s. Accuracy = target-score deviation vs. the
-fp32 golden batch (sign and ranking preserved for every format). fp32 leads on
-GPU because it uses Apple's tuned `MPSMatrixMultiplication`; on CPU the formats
-are within ~5%. Full sweep:
-[`cpp/README.md`](cpp/README.md#benchmarks-rt_bench-apple-m3-pro).</sub>
-
 # Docs
 
 Read the [RelQL book](https://relql.com/docs/).
@@ -51,40 +30,54 @@ Read the [RelQL book](https://relql.com/docs/).
 
 ```sql
 # Auto-label a GitHub issue: predict its label from title, body, and history.
-PREDICT issues.label FOR EACH issues.id
+PREDICT label
+FROM issues
+WHERE label IS NULL
+
+# or simply
+PREDICT issues.label
 WHERE issues.label IS NULL
 
--- Would customer 42 churn if we moved them to the premium plan?
-PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) 
-FOR EACH customers.customer_id
-WHERE customers.customer_id = 42
-ASSUMING customers.plan = 'premium'
+# Would customer 42 churn if we moved them to the premium plan?
+PREDICT NOT EXISTS(orders.*)
+FROM customers c
+WHERE c.customer_id = 42
+ASSUMING c.plan = 'premium'
 
 # Expected spend per customer over the next quarter.
 PREDICT SUM(transactions.price) OVER (90 DAYS FOLLOWING)
-FOR EACH customers.customer_id
+FROM customers
 
 # The 12 articles each customer is most likely to buy next.
-PREDICT LIST_DISTINCT(transactions.article_id) OVER (30 DAYS FOLLOWING)
-RANK TOP 12
-FOR EACH customers.customer_id
+PREDICT ARRAY_AGG(transactions.article_id) OVER (30 DAYS FOLLOWING RANK TOP 12)
+FROM customers
 
 # Units sold per store, one value for each of the next 4 weeks.
 PREDICT SUM(sales.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)
-FOR EACH stores.store_id
+FROM stores
 
 # Will spend in the 15–45 day window exceed $100?
 PREDICT SUM(transactions.value) OVER w > 100
-FOR EACH customers.customer_id
-WHERE customers.location NOT IN ('ALASKA', 'HAWAII')
+FROM customers c
+WHERE c.location NOT IN ('ALASKA', 'HAWAII')
 WINDOW w AS (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING)
 
 # Predicted gross margin per customer.
 PREDICT SUM(orders.revenue) OVER w - SUM(orders.cost) OVER w
-FOR EACH customers.customer_id
+FROM customers
 WINDOW w AS (30 DAYS FOLLOWING)
 ```
 ---
+
+
+### Checkpoints
+
+| Checkpoint | On-disk | Latency | Throughput | Accuracy | Download |
+| --- | --- | --- | --- | --- | --- |
+| fp32 | 171 MB | 317 ms | 6.5k tok/s | reference | — |
+| fp16 | 172 MB | 483 ms | 4.2k tok/s | identical | [rt-j-fp16](https://huggingface.co/RelativeDB/rt-j-fp16) |
+| int8 | 88 MB | 453 ms | 4.5k tok/s | ±0.01 | [rt-j-int8](https://huggingface.co/RelativeDB/rt-j-int8) |
+| int4 | 64 MB | 464 ms | 4.4k tok/s | ±0.15 | [rt-j-int4](https://huggingface.co/RelativeDB/rt-j-int4) |
 
 ## The Python library
 
@@ -120,8 +113,9 @@ wiring = (RetrieverWiring.new_wiring()
 
 engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
 result = engine.execute(ExecutionInput(
-    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id",
-    entity_ids=["C7"],   # score just this cohort; omit to score the whole table
+    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
+          "WHERE customers.customer_id IN :ids",
+    params={"ids": ["C7"]},   # the cohort; drop the WHERE to score every customer
     anchor_time=t0))
 ```
 
@@ -173,9 +167,10 @@ RelativeDbEngine engine = RelativeDbEngine.newEngine(schema, wiring)
     .build();
 
 PredictionResult churn = engine.execute(ExecutionInput.newInput()
-    .query("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id")
+    .query("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
+         + "WHERE customers.customer_id IN :ids")
     .anchorTime(Instant.parse("2026-07-01T00:00:00Z"))
-    .entityIds(List.of(42L))
+    .param("ids", List.of(42L))
     .build()).toCompletableFuture().join();
 ```
 
@@ -233,7 +228,7 @@ let wiring = RetrieverWiring::new_wiring()
 let mut engine = Engine::new(schema, wiring).model_backend(RtNativeBackend::new(&schema)?);
 let result = engine.execute(
     ExecutionInput::query(
-        "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FOR EACH customers.customer_id")
+        "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers")
     .anchor_time(anchor),
 )?;
 
@@ -249,9 +244,6 @@ for p in &result.predictions {
 
 Recurring invariant numbers you will see referenced in code and docs:
 
-- **F17** — PK/FK columns are graph edges, never feature cells. The schema
-  builder rejects ID-typed feature columns; `Row` has no way to carry an ID as
-  a value.
 - **F24** — the engine re-validates every retriever-returned row against the
   `TemporalBound` and drops violations; temporal safety does not depend on
   retriever correctness.

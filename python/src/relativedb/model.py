@@ -2,7 +2,7 @@
 
 RT-J ships TWO separate checkpoints — a classifier and a regressor — so the
 config holds one URI per task family and the engine routes by the query's
-inferred :class:`~relativedb.pql.ast.TaskType`:
+inferred :class:`~relativedb.relql.ast.TaskType`:
 
 * BINARY/MULTICLASS classification, ranking  -> ``classification_model_uri``
 * regression, forecasting                    -> ``regression_model_uri``
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from .pql.ast import TaskType
+from .relql.ast import TaskType
 
 __all__ = ["ModelConfig", "EmbeddingMismatchError",
            "DEFAULT_CLASSIFICATION_MODEL_URI", "DEFAULT_REGRESSION_MODEL_URI",

@@ -16,9 +16,9 @@ from conftest import dt
 T0 = dt("2026-07-01")
 
 CHURN = ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
-         "FOR EACH customers.customer_id")
+         "FROM customers")
 REG = ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) "
-       "FOR EACH customers.customer_id WHERE customers.customer_id = 'C7'")
+       "FROM customers WHERE customers.customer_id = 'C7'")
 
 
 class SpyBackend:
@@ -112,7 +112,7 @@ def test_explain_plan_fields(churn_schema, churn_wiring):
     assert plan["task_type"] == "binary_classification"
     assert plan["output"] == "probability"
     assert plan["entity"] == {"table": "customers", "pk": "customer_id",
-                              "selector": "FOR EACH"}
+                              "selector": "ALL"}
     assert plan["as_of"]["source"] == "execution-anchor"
     # exactly one target window: (0, 90] days
     tgt = [w for w in plan["windows"] if w["role"] == "target"]
@@ -183,7 +183,7 @@ def test_explain_ablation_warns_not_implemented(churn_schema, churn_wiring):
     eng = Engine(churn_schema, churn_wiring)
     res = eng.explain(ExecutionInput(
         query="EXPLAIN ABLATION PREDICT COUNT(orders.*) OVER (90 DAYS "
-              "FOLLOWING) = 0 FOR EACH customers.customer_id "
+              "FOLLOWING) = 0 FROM customers "
               "ABLATE TABLE products", anchor_time=T0))
     assert res.mode == "ABLATION"
     assert any("ablation not implemented" in w for w in res.plan["warnings"])

@@ -20,13 +20,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional, Protocol, Sequence, Union
 
+import numpy as np
+
 from .csc import CscIndex
-from .evaluate import eval_bool
+from .evaluate import eval_bool, eval_value
 from .model import ModelConfig
-from .pql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
-                      Explain, Func, Lit, LogicalOp, Not, ParsedQuery, TaskType,
-                      Window, _find_aggregations)
-from .pql.parser import parse, validate
+from .relql.ast import (AggFunc, Aggregation, Arith, BoolOp, Case, ColumnRef,
+                      Condition, Explain, Func, Lit, LogicalOp, Not, Operator,
+                      ParsedQuery, TaskType, Window, _find_aggregations)
+from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema
 
@@ -108,6 +110,50 @@ def _expr_str(e: Any) -> str:
     return str(e)
 
 
+def _target_span(pq: ParsedQuery):
+    """How far past the anchor the target's window reaches — the bound the
+    label context needs. None when the frame is unbounded."""
+    for a in pq.target_aggregations:
+        if a.window is not None:
+            return a.window.span()
+    return None
+
+
+def _pinned_ids(where: Any, entity_key: ColumnRef) -> Optional[list[Any]]:
+    """The cohort a WHERE clause pins the primary key to, or None if it
+    doesn't pin one.
+
+    Only conjunctive top-level predicates count: `pk = v` and `pk IN (...)`
+    joined by AND. Under an OR (or a NOT) the clause no longer restricts the
+    cohort on its own, so there is nothing safe to push down and we fall back
+    to enumerating. Several ANDed pk predicates intersect.
+    """
+    if where is None:
+        return None
+    if isinstance(where, LogicalOp) and where.op is BoolOp.AND:
+        left = _pinned_ids(where.left, entity_key)
+        right = _pinned_ids(where.right, entity_key)
+        if left is None:
+            return right
+        if right is None:
+            return left
+        keep = set(right)
+        return [v for v in left if v in keep]      # intersect, order-stable
+    if not isinstance(where, Condition):
+        return None
+    if not (isinstance(where.left, ColumnRef)
+            and where.left.table == entity_key.table
+            and where.left.column == entity_key.column):
+        return None
+    if where.right_expr is not None:
+        return None                                 # unbound param / expression
+    if where.op is Operator.EQ:
+        return [where.right]
+    if where.op is Operator.IN:
+        return list(where.right)
+    return None
+
+
 class ExecutionError(RuntimeError):
     pass
 
@@ -160,8 +206,9 @@ class ExecutionInput:
     anchor_time: Optional[datetime] = None       # "now"; None = unbounded
     per_entity_anchor: bool = False              # anchor_time="entity" semantics
     context_anchor_time: Optional[datetime] = None  # decouple context "now"
-    entity_ids: Optional[Sequence[Any]] = None   # pins the FOR EACH cohort to these ids
-    params: Optional[dict[str, datetime]] = None  # AS OF :name bindings
+    # `:name` bindings for the query text — the anchor (`AS OF :t`), the
+    # cohort (`WHERE t.pk IN :ids`), and any other parameterized literal.
+    params: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -514,7 +561,8 @@ class Engine:
         if pq.explain is not None:
             # An EXPLAIN-prefixed query must never silently score; route it.
             return self.explain(replace(input, query=pq))
-        validate(pq, self.schema)
+        pq = validate(pq, self.schema).query   # binds the population's pk
+        pq = pq.bind_params(input.params)      # substitutes :name -> values
         # Bind the effective anchor (AS OF) before any assembly/scoring so it
         # threads through the temporal bound and pseudo-anchors unchanged.
         input = replace(input, anchor_time=self._effective_anchor(pq, input))
@@ -568,21 +616,35 @@ class Engine:
 
     def _where_ok(self, pq: ParsedQuery, ctx: EntityContext,
                   entity_table: str) -> bool:
-        return eval_bool(pq.where, ctx.rows_by_table(),
-                         ctx.entity_cells(entity_table), ctx.anchor)
+        cells = dict(ctx.entity_cells(entity_table))
+        # The primary key is the row's identity, not one of its cells, so a
+        # predicate on it (`WHERE t.pk IN :ids`) would otherwise see NULL and
+        # drop every entity.
+        pk = pq.entity_key.column
+        if pk:
+            cells.setdefault(pk, ctx.entity_id)
+        return eval_bool(pq.where, ctx.rows_by_table(), cells, ctx.anchor)
 
     def _resolve_entity_ids(self, pq: ParsedQuery,
                             input: ExecutionInput) -> list[Any]:
-        if input.entity_ids is not None:
-            return list(input.entity_ids)
-        sampler = self._sampler()
-        ids = sampler.all_ids(pq.entity_key.table)
+        """The cohort to score.
+
+        A WHERE clause that pins the primary key — `pk = :id`, `pk IN :ids`, or
+        a literal equivalent — names the cohort outright, so it is pushed down
+        and no enumeration happens. Anything else needs the table enumerated
+        and filtered, which requires a TableScanner.
+        """
+        pinned = _pinned_ids(pq.where, pq.entity_key)
+        if pinned is not None:
+            return pinned
+        ids = self._sampler().all_ids(pq.entity_key.table)
         if ids is None:
             raise ExecutionError(
-                f"FOR EACH over all {pq.entity_key.table!r} entities needs "
-                f"either explicit entity_ids on the execution input, or a "
-                f"TableScanner wired for the entity table "
-                f"(retrievers alone cannot enumerate a table)")
+                f"FROM {pq.entity_key.table!r} scores every entity in the "
+                f"table, which needs a TableScanner wired for it (retrievers "
+                f"alone cannot enumerate a table). To score a specific cohort "
+                f"instead, pin the key: WHERE {pq.entity_key.table}."
+                f"{pq.entity_key.column} IN :ids")
         return ids
 
     def _anchor_for(self, entity_table: str, entity_id: Any,
@@ -642,6 +704,156 @@ class Engine:
         return d.replace(tzinfo=timezone.utc)
 
     # -- EXPLAIN ------------------------------------------------------------
+    # -- fine-tuning --------------------------------------------------------
+    def finetune(self, query: Union[str, ParsedQuery], anchors: Sequence[datetime],
+                 *, entity_ids: Optional[Sequence[Any]] = None,
+                 params: Optional[dict[str, Any]] = None,
+                 labels: Optional[dict] = None,
+                 epochs: int = 100, learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 model_uri: Optional[str] = None):
+        """Train a task head for ``query`` over the frozen backbone.
+
+        The transformer is not updated; each training example is encoded once
+        into its target-cell state and a small head is fitted on those. Returns
+        a :class:`~relativedb.rt_native.FineTunedHead` — inspect its losses,
+        ``save(path)`` it, and serve it by passing ``head=`` to
+        :class:`~relativedb.rt_native.RtNativeBackend`.
+
+        ``anchors`` are past cut-off times. For each one the context is bounded
+        at the anchor — exactly as at prediction time — while the **label** is
+        read from what actually happened in the target's window after it. So
+        the query defines its own supervision and no labels need supplying.
+
+        Pass ``labels`` to override that: ``{(entity_id, anchor): value}``, or
+        for ranking ``{(entity_id, anchor): {candidate_id: relevance}}``.
+        """
+        from .rt_native import (FT_MULTICLASS, FT_RANKING, FineTunedHead,
+                                RtNativeError)
+        backend = self._require_backend()
+        if not hasattr(backend, "candidate_seqs"):
+            raise ExecutionError(
+                "fine-tuning requires the native RT backend (RtNativeBackend)")
+        if not anchors:
+            raise ExecutionError("fine-tuning needs at least one anchor")
+        # Row timestamps are UTC-aware; naive anchors would fail to compare.
+        anchors = [self._coerce_anchor(a) for a in anchors]
+
+        pq = parse(query) if isinstance(query, str) else query
+        pq = validate(pq, self.schema).query.bind_params(params)
+        task_type = pq.task_type(self.schema)
+        model_uri = model_uri or self.model_config.model_uri_for(task_type)
+        model = backend._model_for(model_uri)
+
+        entity_table = pq.entity_key.table
+        span = _target_span(pq)
+        feats: list = []
+        ys: list[float] = []
+        groups: list[int] = [0]
+        classes: list[Any] = []
+        skipped = 0
+
+        for t in anchors:
+            ids = (list(entity_ids) if entity_ids is not None
+                   else self._resolve_entity_ids(
+                       pq, ExecutionInput(query=pq, anchor_time=t)))
+            for eid in ids:
+                # features see only what was knowable at the anchor...
+                ctx = self.assemble_context(entity_table, eid, t)
+                # ...the label reads the window after it
+                label_ctx = self.assemble_context(
+                    entity_table, eid, None if span is None else t + span)
+                if task_type is TaskType.MULTILABEL_RANKING:
+                    parent = backend.ranking_parent_table(pq)
+                    cands = backend._rank_candidates(
+                        parent, TemporalBound.at_or_before(t) if t
+                        else TemporalBound.unbounded())
+                    if not cands:
+                        continue
+                    rel = self._ranking_relevance(pq, label_ctx, t, cands,
+                                                  labels, eid)
+                    if not any(r > 0 for r in rel):
+                        # listwise cross-entropy needs a positive in the group;
+                        # an entity that interacted with nothing in the window
+                        # carries no ranking signal, so it is not an example.
+                        skipped += 1
+                        continue
+                    seqs = backend.candidate_seqs(pq, ctx, parent, cands)
+                    feats.append(backend._encode(model, seqs))
+                    ys.extend(rel)
+                    groups.append(len(ys))
+                else:
+                    y = self._scalar_label(pq, task_type, label_ctx, t,
+                                           labels, eid, classes)
+                    if y is None:
+                        continue
+                    seqs, _, _ = backend._build_sequences(pq, task_type, [ctx])
+                    feats.append(backend._encode(model, seqs))
+                    ys.append(float(y))
+
+        if not ys:
+            extra = (f" ({skipped} ranking groups had no positive relevance in "
+                     f"the target window)" if skipped else "")
+            raise ExecutionError(
+                f"fine-tuning produced no training examples — check the anchors "
+                f"and that the cohort resolves at them{extra}")
+        if skipped:
+            warnings.warn(
+                f"fine-tuning skipped {skipped} ranking group(s) with no "
+                f"positive relevance in the target window; listwise loss needs "
+                f"at least one relevant candidate per group",
+                UserWarning, stacklevel=2)
+        features = np.concatenate(feats, axis=0).astype(np.float32)
+        y = np.asarray(ys, np.float32)
+        n_outputs = len(classes) if task_type is TaskType.MULTICLASS_CLASSIFICATION else 1
+        if task_type is TaskType.MULTICLASS_CLASSIFICATION and n_outputs < 2:
+            raise ExecutionError(
+                f"multiclass fine-tuning needs at least two observed classes, "
+                f"saw {n_outputs}")
+        group_off = (np.asarray(groups, np.int32)
+                     if task_type is TaskType.MULTILABEL_RANKING
+                     else np.zeros(1, np.int32))
+        n_groups = (len(groups) - 1
+                    if task_type is TaskType.MULTILABEL_RANKING else 0)
+        return backend.fit_head(
+            model, task_type, features, y, group_off, n_groups,
+            epochs=epochs, learning_rate=learning_rate,
+            weight_decay=weight_decay, classes=classes)
+
+    def _scalar_label(self, pq, task_type, label_ctx, t, labels, eid, classes):
+        """The outcome the query asks about, as it actually turned out."""
+        if labels is not None and (eid, t) in labels:
+            v = labels[(eid, t)]
+        else:
+            rows = label_ctx.rows_by_table()
+            cells = label_ctx.entity_cells(pq.entity_key.table)
+            if task_type is TaskType.BINARY_CLASSIFICATION:
+                v = 1.0 if eval_bool(pq.target, rows, cells, t) else 0.0
+            else:
+                v = eval_value(pq.target, rows, cells, t)
+        if task_type is TaskType.MULTICLASS_CLASSIFICATION:
+            if v is None:
+                return None
+            if v not in classes:
+                classes.append(v)
+            return float(classes.index(v))
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if not isinstance(v, (int, float)):
+            return None
+        return float(v)
+
+    def _ranking_relevance(self, pq, label_ctx, t, candidates, labels, eid):
+        """Per-candidate relevance: which candidate ids actually turned up in
+        the target's window after the anchor."""
+        if labels is not None and (eid, t) in labels:
+            given = labels[(eid, t)] or {}
+            return [float(given.get(c.id, 0.0)) for c in candidates]
+        observed = eval_value(pq.target, label_ctx.rows_by_table(),
+                              label_ctx.entity_cells(pq.entity_key.table), t)
+        seen = {str(x) for x in (observed or [])}
+        return [1.0 if str(c.id) in seen else 0.0 for c in candidates]
+
     def explain(self, input: Union[ExecutionInput, str], **kwargs) -> ExplainResult:
         """Explain a query without (PLAN/CONTEXT) or with (ANALYZE) scoring.
         A non-EXPLAIN query is explained as PLAN by default."""
@@ -649,7 +861,8 @@ class Engine:
             input = ExecutionInput(query=input, **kwargs)
         pq = (parse(input.query) if isinstance(input.query, str)
               else input.query)
-        validate(pq, self.schema)
+        pq = validate(pq, self.schema).query   # binds the population's pk
+        pq = pq.bind_params(input.params)      # substitutes :name -> values
         ex = pq.explain or Explain()
         mode = (ex.mode or "PLAN").upper()
         fmt = (ex.format or "TEXT").upper()
@@ -678,11 +891,10 @@ class Engine:
     def _build_plan(self, pq: ParsedQuery, input: ExecutionInput,
                     effective: Optional[datetime]) -> dict:
         task_type = pq.task_type(self.schema)
-        # entity selector
-        if input.entity_ids is not None:
-            selector = list(input.entity_ids)
-        else:
-            selector = "FOR EACH"
+        # entity selector: the cohort a pinned primary key names, else the
+        # whole table
+        pinned = _pinned_ids(pq.where, pq.entity_key)
+        selector = pinned if pinned is not None else "ALL"
         # output form
         if pq.ret is not None:
             output = pq.ret.kind.lower()

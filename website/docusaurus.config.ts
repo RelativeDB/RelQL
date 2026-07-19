@@ -43,10 +43,10 @@ const config: Config = {
     [
       '@docusaurus/plugin-content-docs',
       {
-        id: 'pql',
-        path: 'pql',
-        routeBasePath: 'pql',
-        sidebarPath: './sidebars-pql.ts',
+        id: 'relql',
+        path: 'relql',
+        routeBasePath: 'relql',
+        sidebarPath: './sidebars-relql.ts',
       },
     ],
   ],
@@ -66,10 +66,10 @@ const config: Config = {
           label: 'Docs',
         },
         {
-          to: '/pql/',
+          to: '/relql/',
           position: 'left',
           label: 'RelQL Language',
-          activeBaseRegex: '/pql/',
+          activeBaseRegex: '/relql/',
         },
         {
           href: 'https://github.com/RelativeDB/RelQL',
@@ -85,9 +85,9 @@ const config: Config = {
         {
           title: 'Documentation',
           items: [
-            {label: 'Getting started', to: '/docs/getting-started/installation'},
-            {label: 'RelQL language', to: '/pql/'},
-            {label: 'How-to guides', to: '/docs/how-to/predict-churn'},
+            {label: 'Getting started', to: '/docs/#installation'},
+            {label: 'RelQL language', to: '/relql/'},
+            {label: 'How-to guides', to: '/docs/#predict-churn'},
           ],
         },
         {
@@ -101,10 +101,10 @@ const config: Config = {
         {
           title: 'Libraries',
           items: [
-            {label: 'Python', to: '/docs/libraries/python'},
-            {label: 'Java', to: '/docs/libraries/java'},
-            {label: 'Rust', to: '/docs/libraries/rust'},
-            {label: 'C++ inference engine', to: '/docs/libraries/cpp'},
+            {label: 'Python', to: '/docs/#python-library'},
+            {label: 'Java', to: '/docs/#java-library'},
+            {label: 'Rust', to: '/docs/#rust-library'},
+            {label: 'C++ inference engine', to: '/docs/#c-inference-engine-rtcpp'},
           ],
         },
       ],

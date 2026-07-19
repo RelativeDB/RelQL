@@ -117,7 +117,7 @@ def main():
     print("=" * 78)
     g = audit_grammar.run()
     report["audits"]["grammar"] = g
-    from relativedb.pql.native import native_available
+    from relativedb.relql.native import native_available
     print(f"shared C++ parser (librt_c) available: {native_available()}  "
           f"(enable engine-wide with RELATIVEDB_USE_NATIVE_PARSER=1)")
     report["audits"]["native_parser_available"] = native_available()
@@ -200,7 +200,7 @@ def main():
     miss = g["coverage"]["op_missing"] + g["coverage"]["agg_missing"]
     if miss:
         all_findings.append(
-            f"shared conformance corpus (examples.pql) never exercises {sorted(miss)} — "
+            f"shared conformance corpus (examples.relql) never exercises {sorted(miss)} — "
             f"the 3 hand-maintained parsers (py/java/rust) can diverge on these undetected; "
             f"a single parser+CSC in the C++ layer would remove the divergence surface")
     for ds_name, la in report["audits"].get("leakage", {}).items():

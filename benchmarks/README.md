@@ -42,7 +42,7 @@ RelQL parsing and the CSC index are single-sourced in the C++ layer (`librt_c`),
 a hard dependency — the same native library the RT-J model requires. The Python
 CSC binding is checked against a brute-force reference by
 `python/tests/test_native_csc.py`; parser correctness rides on the C++
-conformance test (`cpp/src/test_pql.cpp`) plus `python/tests/test_pql_parser.py`.
+conformance test (`cpp/src/test_relql.cpp`) plus `python/tests/test_relql_parser.py`.
 
 ## Method
 

@@ -2,7 +2,7 @@
  *
  * One implementation of the time-bounded "latest <= anchor" children query
  * for all three language bindings (Python/Java/Rust). Wraps the C++20
- * CscAdjacency in csc.cpp. Follows the rt_c.h / pql_c.h convention: opaque
+ * CscAdjacency in csc.cpp. Follows the rt_c.h / relql_c.h convention: opaque
  * handle, (char* err, size_t errlen), nonzero return on failure.
  *
  * The index owns only the array algorithm — the CSC/CSR adjacency and the

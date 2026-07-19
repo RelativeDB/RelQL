@@ -15,10 +15,9 @@ from .datasets import Dataset
 def run(ret: Dataset) -> dict:
     findings, checks = [], {}
     anchor = ret.anchors[1]
-    pk = ret.schema.table(ret.entity_table).primary_key
     child = "purchases"
-    count_q = (f"PREDICT COUNT({child}.*) OVER (90 DAYS FOLLOWING) FOR EACH "
-               f"{ret.entity_table}.{pk} WHERE COUNT({child}.*) OVER (90 DAYS PRECEDING) > 0")
+    count_q = (f"PREDICT COUNT({child}.*) OVER (90 DAYS FOLLOWING) "
+               f"FROM {ret.entity_table} WHERE COUNT({child}.*) OVER (90 DAYS PRECEDING) > 0")
 
     # Under the default cap the truncation is surfaced (warns + stats > 0);
     # under a wide policy it is silent (stats == 0). Predictions are unchanged

@@ -201,10 +201,12 @@ converge to ~3,500–4,000 tok/s at S=8192. Metal uses less RSS at the largest s
 
 ## Known Limitations
 
-1. **Single score head.** The published RT-J classification/regression checkpoints
-   expose one scalar head. Multiclass, ranking (`LIST_DISTINCT ... RANK TOP k`), and
-   distributional outputs (`RETURN QUANTILES`/`INTERVAL`) are **not supported** and
-   raise a clear error rather than fabricating a result.
+1. **Published heads are narrow.** The released RT-J classification/regression
+   checkpoints expose one scalar head and were not pretrained for multiclass or
+   ranking. The native backend can now freeze the backbone and Metal-fine-tune a
+   compact binary, regression, multiclass, or grouped-listwise ranking head; this
+   is head adaptation, not full-transformer backpropagation. Distributional
+   outputs (`RETURN QUANTILES`/`INTERVAL`) remain unsupported.
 2. **Long context is memory-bound.** With no positional cap, context scales to
    8192+ cells, but attention cost grows with sequence length and dominates at long
    S; the Metal backend's advantage disappears there (CPU is faster for long single

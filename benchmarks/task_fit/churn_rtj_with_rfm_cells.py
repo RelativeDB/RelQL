@@ -95,16 +95,16 @@ def pval(p):
 print(f"RT-J + {len(RFM)} RFM feature cells | {len(sample)} customers @ {ANCHOR.date()}\n")
 r1 = engine.execute(ExecutionInput(
     query=f"PREDICT NOT EXISTS(purchases.*) OVER ({FWD} DAYS FOLLOWING) "
-          f"FOR EACH customers.customer_id WHERE EXISTS(purchases.*) OVER ({BACK} DAYS PRECEDING)",
-    entity_ids=sample, anchor_time=ANCHOR.to_pydatetime()))
+          f"FROM customers WHERE customers.customer_id IN :ids AND EXISTS(purchases.*) OVER ({BACK} DAYS PRECEDING)",
+    params={"ids": sample}, anchor_time=ANCHOR.to_pydatetime()))
 ids = [p.id for p in r1.predictions]
 churn_p = np.array([p.probability for p in r1.predictions])
 churned = np.array([0 if i in buyers else 1 for i in ids])
 a = auc(churn_p, churned)
 
 r2 = engine.execute(ExecutionInput(
-    query=f"PREDICT SUM(purchases.amount) OVER ({FWD} DAYS FOLLOWING) FOR EACH customers.customer_id",
-    entity_ids=sample, anchor_time=ANCHOR.to_pydatetime()))
+    query=f"PREDICT SUM(purchases.amount) OVER ({FWD} DAYS FOLLOWING) FROM customers WHERE customers.customer_id IN :ids",
+    params={"ids": sample}, anchor_time=ANCHOR.to_pydatetime()))
 ids2 = [p.id for p in r2.predictions]
 ps = np.array([pval(p) for p in r2.predictions]); ts = np.array([float(fut_spend.get(i,0.0)) for i in ids2])
 sp, mae = spearman(ps, ts), float(np.abs(ps-ts).mean())

@@ -77,9 +77,9 @@ print(f"anchor {ANCHOR.date()} | {len(sample)} active customers | "
       f"churn = no purchase in next {FWD}d\n")
 res = engine.execute(ExecutionInput(
     query=f"PREDICT NOT EXISTS(purchases.*) OVER ({FWD} DAYS FOLLOWING) "
-          f"FOR EACH customers.customer_id "
+          f"FROM customers WHERE customers.customer_id IN :ids "
           f"WHERE EXISTS(purchases.*) OVER ({BACK} DAYS PRECEDING)",
-    entity_ids=sample, anchor_time=ANCHOR.to_pydatetime()))
+    params={"ids": sample}, anchor_time=ANCHOR.to_pydatetime()))
 ids = [p.id for p in res.predictions]
 churn_prob = np.array([p.probability for p in res.predictions])
 churned = np.array([0 if i in fut_buyers else 1 for i in ids])   # 1 = churned
@@ -93,8 +93,8 @@ print(f"  recency baseline AUC : {auc(recency, churned):.3f}")
 # ================= (2) SPEND — regression ================================
 res2 = engine.execute(ExecutionInput(
     query=f"PREDICT SUM(purchases.amount) OVER ({FWD} DAYS FOLLOWING) "
-          f"FOR EACH customers.customer_id",
-    entity_ids=sample, anchor_time=ANCHOR.to_pydatetime()))
+          f"FROM customers WHERE customers.customer_id IN :ids",
+    params={"ids": sample}, anchor_time=ANCHOR.to_pydatetime()))
 ids2 = [p.id for p in res2.predictions]
 pred_spend = np.array([pval(p) for p in res2.predictions])
 true_spend = np.array([float(fut_spend.get(i, 0.0)) for i in ids2])

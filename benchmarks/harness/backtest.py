@@ -42,7 +42,7 @@ class TaskResult:
 # ---------------------------------------------------------------------------
 def churn_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -> TaskResult:
     q = (f"PREDICT COUNT({child}.*) OVER ({horizon_days} DAYS FOLLOWING) = 0 "
-         f"FOR EACH {ds.entity_table}.{_pk(ds)} "
+         f"FROM {ds.entity_table} "
          f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     y_true, y_prob = [], []
     recency, past_cnt = [], []       # naive churn scores
@@ -78,7 +78,7 @@ def churn_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -
 # ---------------------------------------------------------------------------
 def count_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -> TaskResult:
     q = (f"PREDICT COUNT({child}.*) OVER ({horizon_days} DAYS FOLLOWING) "
-         f"FOR EACH {ds.entity_table}.{_pk(ds)} "
+         f"FROM {ds.entity_table} "
          f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     y_true, y_pred, past, gmean_src = [], [], [], []
     t0 = time.time()
@@ -104,7 +104,7 @@ def count_task(ds: Dataset, child: str, horizon_days: int, lookback_days: int) -
 def value_task(ds: Dataset, child: str, value_col: str, horizon_days: int,
                lookback_days: int) -> TaskResult:
     q = (f"PREDICT SUM({child}.{value_col}) OVER ({horizon_days} DAYS FOLLOWING) "
-         f"FOR EACH {ds.entity_table}.{_pk(ds)} "
+         f"FROM {ds.entity_table} "
          f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     y_true, y_pred, past = [], [], []
     t0 = time.time()
@@ -131,7 +131,7 @@ def ranking_task(ds: Dataset, child: str, item_col: str, horizon_days: int,
                  lookback_days: int, k: int = 10) -> TaskResult:
     q = (f"PREDICT LIST_DISTINCT({child}.{item_col}) OVER ({horizon_days} DAYS FOLLOWING) "
          f"RANK TOP {k} "
-         f"FOR EACH {ds.entity_table}.{_pk(ds)} "
+         f"FROM {ds.entity_table} "
          f"WHERE COUNT({child}.*) OVER ({lookback_days} DAYS PRECEDING) > 0")
     recs, rels, pop_recs = [], [], []
     t0 = time.time()
@@ -159,10 +159,6 @@ def ranking_task(ds: Dataset, child: str, item_col: str, horizon_days: int,
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def _pk(ds: Dataset) -> str:
-    return ds.schema.table(ds.entity_table).primary_key
-
-
 def _recency_gap(events: EntityEvents, eid, T: datetime) -> float:
     ts = events.times.get(eid)
     a = to_epoch(T)

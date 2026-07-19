@@ -4,15 +4,15 @@ Measured, honest evaluation of **what the RT-J checkpoint can and cannot do** on
 real relational data with real future-outcome ground truth. Companion to
 [`../FINDINGS.md`](../FINDINGS.md).
 
-> ⚠️ **These are IN-DISTRIBUTION results, not zero-shot.** All three evaluation
+> ⚠️ **The legacy tables below are IN-DISTRIBUTION results, not zero-shot.**
+> All three evaluation
 > datasets are in the RT-J pretraining mixture
 > (`~/relational-transformer/scripts/recipe_rt_j.txt`): `join-online-retail`,
 > `join-movielens` (+ `-1m`/`-imdb`/`-bird` variants), and `join-brightkite`.
 > The model's weights saw this data — including rows in what we treat as the
 > "future" window, since pretraining sees the whole DB. So every number below is
-> **optimistic** (potential contamination) and none of it demonstrates zero-shot
-> generalization. A clean zero-shot claim requires a dataset **not** in those 482
-> databases — an experiment still to run.
+> **optimistic** (potential contamination). The new Digits experiment below is
+> the clean exception: it is absent from the released 485-database recipe.
 
 ## Headline
 
@@ -120,6 +120,80 @@ on a **held-out** dataset (outside `recipe_rt_j.txt`) so the result is a clean,
 uncontaminated comparison — the thing this in-distribution round could not
 provide.
 
+## Metal fine-tuning on a held-out dataset
+
+Implemented in the dependency-light C++ backend as frozen-backbone head
+fine-tuning. `sklearn.datasets.load_digits` has 1,797 handwritten 8×8 images
+and 10 classes, and `digits` does not occur in RT-J's released 485-database
+recipe. The benchmark uses a fixed stratified 80/20 split (seed 1729), computes
+normalization statistics on the 1,437-example train split only, and evaluates
+once on 360 held-out examples.
+
+| held-out metric | released head (before) | Metal fine-tuned head (after) |
+|---|---:|---:|
+| accuracy | 0.100 | **0.703** |
+| macro-F1 | 0.018 | **0.700** |
+| cross-entropy | 2.303 | **0.987** |
+| class-ranking MRR | 0.289 | **0.813** |
+| class-ranking recall@3 | 0.267 | **0.914** |
+
+The multiclass head has 5,130 trainable parameters (`10×512 + 10`). Its 2,000
+full-batch AdamW steps ran on Metal in **1.29 s**, reducing train loss from
+2.303 to 0.928; the saved safetensors adapter is 20 KB. Ranking is also a
+native training objective: `rt_train_test` verifies grouped listwise softmax
+on variable candidate groups. The class-ranking figures above rank all ten
+digit labels by the multiclass logits.
+
+Reproduce and overwrite the committed result/adapter:
+
+```bash
+python/.venv/bin/python benchmarks/task_fit/digits_metal_finetune.py
+```
+
+Exact machine-readable output: `digits_results.json`; adapter:
+`digits_head.safetensors`.
+
+## Olist versus XGBoost
+
+Olist is a useful relational stress test, but **not a clean held-out dataset**:
+the released RT-J recipe contains `join-spider2-brazilian-e-commerce`. Results
+must therefore be read as a supervised adaptation comparison, not evidence of
+zero-shot generalization.
+
+Task: at order delivery, predict the later 1–5 star review. Orders whose review
+predates delivery are excluded. Customer, order, item/product/seller, payment,
+and actual-versus-estimated delivery features are all observable at the anchor.
+The chronological split is 2018-05-01: 61,795 train and 25,748 test orders;
+normalization and categorical encoders are fitted on train only. RT-J and
+XGBoost receive the same source feature columns.
+
+| held-out metric | train prior | released RT-J | Metal fine-tuned RT-J | XGBoost |
+|---|---:|---:|---:|---:|
+| accuracy | **0.647** | 0.642 | **0.647** | 0.646 |
+| macro-F1 | 0.157 | 0.159 | 0.157 | **0.182** |
+| cross-entropy | 1.055 | 1.601 | 1.043 | **1.033** |
+| bad-review (1–2 star) AUC | 0.500 | 0.561 | 0.607 | **0.660** |
+| class-ranking MRR | 0.789 | 0.764 | 0.789 | **0.790** |
+| class-ranking recall@3 | 0.914 | 0.914 | 0.919 | **0.923** |
+
+The test set is 64.7% five-star, so accuracy alone is misleading: the
+fine-tuned RT-J head and train-prior baseline both choose five stars almost
+everywhere. Fine-tuning still materially improves RT-J cross-entropy
+(1.601→1.043), bad-review AUC (0.561→0.607), and recall@3 (0.914→0.919), but
+XGBoost wins the discriminative metrics.
+
+Cost on the same machine: XGBoost preprocessing plus 500-tree training took
+5.58 s. RT-J frozen feature extraction took 154.24 s and its 2,565-parameter,
+800-step Metal head optimization took another 22.82 s. RT-J features can be
+cached for later heads, but end-to-end it is substantially slower here.
+
+```bash
+python/.venv/bin/python benchmarks/task_fit/olist_metal_vs_xgboost.py
+```
+
+The script downloads the public Olist archive when needed. Exact output:
+`olist_results.json`; adapter: `olist_review_head.safetensors`.
+
 ## Reproduce
 
 Run inside `python/.venv` with the native lib built and the checkpoint cached:
@@ -134,6 +208,8 @@ $V benchmarks/task_fit/brightkite_clf_reg.py        # churn + count, 2nd domain,
 $V benchmarks/task_fit/ranking_buy_it_again.py      # ranking vs popularity (fails)
 $V benchmarks/task_fit/churn_rtj_with_rfm_cells.py  # RT-J + RFM feature cells (barely helps)
 $V benchmarks/task_fit/data_efficiency.py           # XGBoost AUC vs #labels — the cold-start crossover
+$V benchmarks/task_fit/digits_metal_finetune.py     # held-out Digits, native Metal fine-tuning
+$V benchmarks/task_fit/olist_metal_vs_xgboost.py    # Olist review score vs XGBoost (contaminated)
 ```
 
 > **xgboost note:** `pip` is broken in the py3.14 venv (its vendored SSL bundle
