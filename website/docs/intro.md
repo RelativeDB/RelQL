@@ -2,7 +2,7 @@
 id: intro
 title: The relativedb engine
 slug: /
-description: The complete engine guide — install, concepts, how-to, and the language libraries, in one page.
+description: "The complete engine guide: install, concepts, how-to, and the language libraries, in one page."
 ---
 
 # What is relativedb?
@@ -15,25 +15,16 @@ over your existing storage, and write a predictive query:
 PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers
 ```
 
-That's 90-day churn for every customer — no feature engineering, no training
-pipeline, and no temporal leakage by construction.
-
 ## How it fits together
 
-1. **RelQL** — a SQL-flavored query language for predictions. Parsed and
+1. **RelQL.** A SQL-flavored query language for predictions. Parsed and
    validated against your declared schema. See the [RelQL docs](/relql/).
-2. **Retrievers** — the engine never touches your database. All data access
+2. **Retrievers.** The engine never touches your database. All data access
    goes through callbacks you implement, GraphQL-style. See
    [Retrievers](#retrievers).
-3. **Temporal context assembly** — the engine hops your relational graph to
+3. **Temporal context assembly.** The engine hops your relational graph to
    build a per-entity context, and guarantees nothing newer than the anchor
    time enters it. See [Temporal correctness](#temporal-correctness).
-4. **Model backends** — contexts are scored by a required, pluggable backend.
-   The shipped one is `RtNativeBackend`, running **RT-J**, a relational
-   transformer foundation model that predicts in-context. There is no
-   model-free default. See
-   [Use the native RT-J backend](#use-the-native-rt-j-backend).
-
 
 ## Installation
 
@@ -91,8 +82,8 @@ result = engine.execute(ExecutionInput(
 ### Next steps
 
 - Learn the query language: [RelQL tutorial](/relql/#relql-tutorial)
-- Score with the shipped model: [Use the native RT-J backend](#use-the-native-rt-j-backend)
-- Connect real storage: [Wire custom retrievers](#wire-custom-retrievers)
+- Wire your own storage: [Retrievers](#retrievers)
+- Train a head on your history: [Fine-tune a task head](#fine-tune-a-task-head)
 
 
 ## Retrievers
@@ -106,29 +97,29 @@ traits, usually closures):
 | `EntityRetriever` | `(table, ids, bound) → rows` | Batched point lookup: seed rows, parents |
 | `LinkRetriever` | `(link, parent_id, bound, limit) → rows` | Children along one FK link, newest-first |
 | `CohortRetriever` *(optional)* | `(table, anchor, bound, limit) → ids` | Similar entities for in-context examples |
-| `TableScanner` *(optional)* | `(table, bound) → row stream` | Bulk streaming; enables whole-table `FROM` and CSC mode |
+| `TableScanner` *(optional)* | `(table, bound) → row stream` | Bulk streaming. Enables whole-table `FROM` and CSC mode |
 | `StatsProvider` *(optional)* | — | Normalization statistics |
 
 ### Rows
 
 A `Row` carries typed cells, an optional timestamp, and **parent edges**
-(`{fk_column: parent_id}`). FK values are not cells — they surface as edges.
+(`{fk_column: parent_id}`). FK values are not cells. They surface as edges.
 The primary key surfaces as identity, and additionally as a cell when the
 schema declares it as a column.
 
 :::caution
-A row whose table declares no feature columns emits no tokens, and a
-token-less row that others link through is a dead end — nothing below it can
-reach the prediction, and every entity scores alike. The engine raises
-`ContextConnectivityWarning` when it detects this. Give the table a feature
-column, or declare its primary key as one.
+A row whose table declares no feature columns emits no tokens. A token-less row
+that others link through is a dead end: nothing below it reaches the prediction,
+and every entity scores alike. The engine raises `ContextConnectivityWarning`
+when it detects this. Give the table a feature column, or declare its primary
+key as one.
 :::
 
 ### Keys as features
 
-A primary key is identity by default. When the key itself carries meaning — a
-SKU, an ISBN, an airport code — declare it as a column as well, exactly as you
-would a `time_column`, and it is emitted as a feature cell too:
+A primary key is identity by default. When the key carries meaning (a stock
+code, an ISBN, an airport code), declare it as a column too, the same way you
+declare a `time_column`. The engine then emits it as a feature cell:
 
 ```python
 TableDef.new_table("users").primary_key("user_id")          # identity only
@@ -136,30 +127,29 @@ TableDef.new_table("products")                              # ...and a feature
     .column("stock_code", ValueType.TEXT).primary_key("stock_code")
 ```
 
-Leave synthetic keys out: autoincrement ids track insertion order, so feeding
-one to the model invites it to read the id as a tenure proxy that will not
-survive a new id range.
+Leave synthetic keys out. Autoincrement IDs track insertion order, so the model
+reads one as a proxy for tenure, a signal that breaks on a new ID range.
 
 ### Wiring
 
 A `RetrieverWiring` binds retrievers to tables and links, with a
 `default_links` catch-all. It is validated against the schema when the engine
-is built, so a missing retriever fails fast, not mid-query.
+is built, so a missing retriever fails at startup, before any query runs.
 
 ## Temporal correctness
 
-Temporal leakage — a "future" fact sneaking into the features — is the classic
-way predictive systems lie in backtests. relativedb treats leakage prevention
-as an **engine guarantee**, not a user discipline.
+Temporal leakage (a "future" fact sneaking into the features) is the classic
+way predictive systems lie in backtests. relativedb makes leakage prevention
+an **engine guarantee** rather than something you have to remember.
 
 ### The anchor time
 
 Every execution has an anchor time t₀. The prediction target reads the window
-*after* t₀; the assembled context may only contain data at or *before* t₀.
+*after* t₀. The assembled context may only contain data at or *before* t₀.
 
 ### Defense in depth
 
-1. Every retriever call carries a `TemporalBound` — "return nothing newer
+1. Every retriever call carries a `TemporalBound`: "return nothing newer
    than this". Rows without timestamps (static dimension tables) are always
    admitted.
 2. The engine **re-checks every returned row** against the bound and drops
@@ -169,40 +159,40 @@ Every execution has an anchor time t₀. The prediction target reads the window
 
 ### Window direction is validated
 
-Target windows must face the future (non-negative offsets); `WHERE` filter
+Target windows must face the future (non-negative offsets). `WHERE` filter
 windows face the past (negative or `-INF` starts). The validator rejects
 queries that mix these up.
 
 ### Backtesting for free
 
 Because "as of" is an explicit input, evaluating yesterday's model is just
-running the same query with yesterday's anchor — no snapshot tables, no
+running the same query with yesterday's anchor. No snapshot tables, no
 point-in-time joins.
 
 ## Sampler modes
 
 Context assembly walks the graph: seed entity → parents (always followed) →
 children (fanout-capped, newest-first) → optional cohort, until the hop limit
-or cell budget. Two interchangeable samplers drive this walk — both produce
+or cell budget. Two interchangeable samplers drive this walk, and both produce
 **identical contexts** (asserted by tests).
 
 ### RETRIEVER (default)
 
 Pull-per-hop: the hop loop calls your retrievers for each expansion.
 
-Use when data is **remote, huge, or access-controlled** — nothing is copied,
+Use when data is **remote, huge, or access-controlled**. Nothing is copied, and
 your retrievers see every access.
 
 ### CSC
 
 The engine drains each `TableScanner` once into in-memory
 compressed-sparse-column adjacency arrays (time-sorted neighbor lists), then
-samples entirely in-process — "latest *w* children ≤ anchor" is one binary
+samples entirely in-process, so "latest *w* children ≤ anchor" is one binary
 search plus a tail slice.
 
 Use for **latency-sensitive, repeated scoring** over data that fits in
 memory. The index is a **snapshot**, built once when the engine is
-constructed and immutable thereafter — to pick up changed data, construct
+constructed and immutable thereafter. To pick up changed data, construct
 a new engine.
 
 ### Context budgets
@@ -220,11 +210,11 @@ guide and benchmark numbers.
 The checkpoint executes **binary classification**, **regression**,
 **multiclass classification**, and **ranking**. `RETURN CLASS`, `RETURN
 DISTRIBUTION`, `RETURN PROBABILITY`, and `RETURN EXPECTED VALUE` work.
-Multiclass reuses the checkpoint's **text head**: the masked target cell is
-decoded to a 384-dim embedding and matched by cosine similarity to the class
-labels' MiniLM embeddings, yielding a predicted class plus approximate,
-uncalibrated class probabilities (a softmax over the cosine scores — the argmax
-is reference-exact). Ranking scores each candidate parent ID with the existence
+Multiclass reuses the checkpoint's **text head**. It decodes the masked target
+cell to a 384-dim embedding, then matches that against the class labels' MiniLM
+embeddings by cosine similarity. You get a predicted class and approximate class
+probabilities: the argmax is reference-exact, while the probabilities are only a
+softmax over cosine scores. Ranking scores each candidate parent ID with the existence
 head, sigmoids it, and returns the top *k*. `RETURN QUANTILES` and
 `RETURN INTERVAL` are **not part of the language**: the model exposes a single
 point estimate, not a distribution, so they could never execute. A query using
@@ -272,9 +262,9 @@ large populations and the data fits in memory.
 ## Fine-tune a task head
 
 The released checkpoint is zero-shot. When you have history to learn from, train
-a small task head over the **frozen** backbone: the transformer is never
-updated, so each example is encoded once into its target-cell state and fitting
-a ~2 KB adapter is fast.
+a small task head over the **frozen** transformer. Nothing in the transformer
+changes, so the engine encodes each example once into its target-cell state and
+fits a ~2 KB adapter quickly.
 
 ```python
 head = engine.finetune(
@@ -296,7 +286,7 @@ At each anchor the context is bounded exactly as it would be at prediction
 time, while the **label** is read from the target's own window *after* it. The
 query therefore defines its own supervision and nothing needs labelling by hand.
 
-Pass `labels={(entity_id, anchor): value}` to override — for ranking, a
+Pass `labels={(entity_id, anchor): value}` to override. For ranking, that is a
 `{candidate_id: relevance}` mapping.
 
 :::caution
@@ -306,13 +296,13 @@ head learns from the future it is meant to predict.
 
 ### What to expect
 
-- Works for all four task types; the head replaces the checkpoint's zero-shot
+- Works for all four task types. The head replaces the checkpoint's zero-shot
   head only for the task it was trained on.
 - Fitting requires **Metal**. Inference on a trained head is plain CPU, so an
   adapter trained on a Mac serves anywhere.
 - Ranking groups with no relevant candidate in the window carry no signal and
-  are skipped — the count is reported, since listwise loss needs a positive per
-  group.
+  are skipped, and the count is reported, since listwise loss needs a positive
+  per group.
 - Judge the result on **held-out** anchors, never on training loss. A falling
-  loss with flat held-out quality means the head is data-limited: add anchors or
-  entities, not epochs.
+  loss with flat held-out quality means the head is data-limited. Adding epochs
+  will not help. Add anchors or entities.

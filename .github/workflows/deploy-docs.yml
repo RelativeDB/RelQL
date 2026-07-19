@@ -1,0 +1,100 @@
+name: Deploy docs
+
+# Builds the Docusaurus site and publishes it to S3 behind CloudFront.
+#
+# Configure once, in the repository's Settings:
+#   Variables  DOCS_S3_BUCKET             target bucket name (no s3:// prefix)
+#              DOCS_CLOUDFRONT_ID         distribution to invalidate (optional)
+#              AWS_REGION                 e.g. us-east-1
+#   Secrets    AWS_DEPLOY_ROLE_ARN        IAM role this workflow assumes via OIDC
+#
+# The role needs s3:ListBucket + s3:PutObject/DeleteObject on the bucket, and
+# cloudfront:CreateInvalidation on the distribution. Prefer OIDC over stored
+# access keys: no long-lived credentials live in the repository.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload to S3 (unchecked = build and verify only)
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write        # required for OIDC role assumption
+
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and publish the docs site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install dependencies
+        working-directory: website
+        run: npm ci
+
+      # A broken link fails the build, so this doubles as the docs test.
+      - name: Build
+        working-directory: website
+        run: npm run build
+
+      - name: Check the build produced both documents
+        working-directory: website
+        run: |
+          set -euo pipefail
+          for page in build/index.html build/docs/index.html build/relql/index.html; do
+            test -s "$page" || { echo "missing or empty: $page"; exit 1; }
+          done
+          echo "site built: $(find build -name '*.html' | wc -l) pages"
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' || inputs.publish
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Hashed assets are immutable and cached hard; HTML must revalidate, or
+      # readers keep seeing the previous build.
+      - name: Sync assets to S3
+        if: github.event_name == 'push' || inputs.publish
+        working-directory: website
+        run: |
+          aws s3 sync build/ "s3://${{ vars.DOCS_S3_BUCKET }}/" \
+            --delete \
+            --exclude '*.html' \
+            --cache-control 'public,max-age=31536000,immutable'
+
+      - name: Sync HTML to S3
+        if: github.event_name == 'push' || inputs.publish
+        working-directory: website
+        run: |
+          aws s3 sync build/ "s3://${{ vars.DOCS_S3_BUCKET }}/" \
+            --delete \
+            --exclude '*' --include '*.html' \
+            --cache-control 'public,max-age=0,must-revalidate'
+
+      - name: Invalidate CloudFront
+        if: (github.event_name == 'push' || inputs.publish) && vars.DOCS_CLOUDFRONT_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.DOCS_CLOUDFRONT_ID }}" \
+            --paths '/*'

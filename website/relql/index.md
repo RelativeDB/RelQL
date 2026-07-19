@@ -2,7 +2,7 @@
 id: index
 title: RelQL — the language
 slug: /
-description: The complete RelQL language — grammar, semantics, and patterns, in one page.
+description: The complete RelQL language, grammar to patterns, in one page.
 ---
 
 # RelQL — the Predictive Query Language
@@ -21,12 +21,12 @@ anchor time?*
 
 ## Why a language?
 
-- **Declarative** — changing the question means changing the string, not a
+- **Declarative.** Changing the question means changing the string, not a
   pipeline.
-- **Validated** — every query is bound against your schema before execution:
+- **Validated.** Every query is bound against your schema before execution:
   unknown names, type mismatches, and backwards time windows are rejected up
   front.
-- **Self-routing** — the query's shape determines the
+- **Self-routing.** The query's shape determines the
   [task type](#task-types) (classification, regression, ranking,
   forecasting), which selects the model checkpoint and output form.
 
@@ -39,7 +39,7 @@ We'll build up a real query step by step, on a two-table schema:
 
 ### Step 1: predict an aggregate
 
-Start with the target — an aggregation over linked rows in a future window:
+Start with the target, an aggregation over linked rows in a future window:
 
 ```sql
 PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FROM customers
@@ -48,18 +48,18 @@ PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FROM customers
 `OVER (30 DAYS FOLLOWING)` is a frame relative to the **anchor time** (the "as
 of" instant you pass at execution): it covers the 30 days *after* the anchor,
 start excluded, end included. This predicts each customer's total order
-quantity over the next 30 days — a **regression**.
+quantity over the next 30 days.
 
 ### Step 2: turn it into a yes/no question
 
 Compare the aggregate to a literal and the task becomes **binary
-classification** — the result is a probability:
+classification**, so the result is a probability:
 
 ```sql
 PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers
 ```
 
-"Will this customer place zero orders in the next 90 days?" — churn.
+"Will this customer place zero orders in the next 90 days?" That is churn.
 
 ### Step 3: narrow the population
 
@@ -76,7 +76,7 @@ Static attributes work too: `WHERE customers.age >= 18`.
 
 ### Step 4: target specific entities
 
-`FROM` names the population by table; the primary key comes from the schema.
+`FROM` names the population by table. The primary key comes from the schema.
 To score only a specific subset, either constrain them with a `WHERE` predicate
 on the key:
 
@@ -90,13 +90,13 @@ WHERE customers.customer_id IN :ids
 engine.execute(ExecutionInput(query=q, params={"ids": ["C7", "C9"]}))
 ```
 
-`:ids` is a **bind parameter** — the cohort lives in `params`, not in the query
+`:ids` is a **bind parameter**. The cohort lives in `params`, not in the query
 text, so the same query string is reusable across cohorts. A literal list
 (`IN ('C7', 'C9')`) is also valid when the cohort really is fixed.
 
 ### Step 5: filter the aggregated rows
 
-Aggregations accept an inline row filter — different from `WHERE`, which
+Aggregations accept an inline row filter, distinct from `WHERE`, which
 filters entities:
 
 ```sql
@@ -106,8 +106,7 @@ FROM customers
 
 ### Step 6: forecast over multiple horizons
 
-Add `HORIZONS N` to a target frame and the single window repeats back to back
-— a multi-horizon window *is* a forecast:
+Add `HORIZONS N` to a target frame and the single window repeats back to back:
 
 ```sql
 PREDICT SUM(orders.qty) OVER (7 DAYS FOLLOWING HORIZONS 4)
@@ -119,7 +118,7 @@ the horizons on the window imply it.)
 
 ### Step 7: rank a set of items
 
-`LIST_DISTINCT` predicts *which* linked IDs will appear; `RANK TOP K` ranks
+`LIST_DISTINCT` predicts *which* linked IDs will appear. `RANK TOP K` ranks
 them:
 
 ```sql
@@ -129,7 +128,7 @@ FROM customers
 
 ### Step 8: ask "what if"
 
-`ASSUMING` states a counterfactual — the engine rewrites the assembled context
+`ASSUMING` states a counterfactual. The engine rewrites the assembled context
 so the assumption holds, then scores that instead of the real one:
 
 ```sql
@@ -142,9 +141,8 @@ ASSUMING customers.plan = 'premium'
 :::note
 An assumption must assign a concrete value: `column = literal`, optionally
 joined by `AND`. Inequalities, `IN`, `OR`/`NOT` and aggregate conditions
-describe a *set* of possible worlds rather than one, so there is no single
-context the engine can build — those raise at execution rather than being
-quietly ignored.
+describe a *set* of possible worlds, so no single context satisfies them. The
+engine raises at execution instead of quietly dropping the clause.
 
 Difference the counterfactual against the factual run (same query without
 `ASSUMING`) to estimate an intervention's effect.
@@ -173,9 +171,37 @@ PREDICT   <target> [CLASSIFY]                  -- required: what to predict
 [WINDOW    <name> AS (<window_spec>)]           -- optional, repeatable: named frames
 ```
 
-The **trailing clauses** — `WHERE`, `ASSUMING`, `AS OF`, `RETURN`, `WINDOW` —
+The **trailing clauses** (`WHERE`, `ASSUMING`, `AS OF`, `RETURN`, `WINDOW`)
 may appear in any order after `FROM`. Each may appear at
 most once, except `WINDOW`, which repeats (one per named frame).
+
+## RETURN
+
+Every task type produces a default output: a value for regression, one value per
+horizon for forecasting, a probability for binary classification, a class for
+multiclass, a ranked ID list for ranking. `RETURN` overrides that default.
+
+| Form | Valid for |
+|---|---|
+| `EXPECTED VALUE` | regression, forecasting, binary classification |
+| `PROBABILITY` | binary classification |
+| `CLASS` | binary classification, multiclass classification |
+| `DISTRIBUTION` | binary classification, multiclass classification |
+| `MULTICLASS` | multiclass classification |
+| `MULTILABEL` | ranking |
+
+The validator rejects a form the inferred task cannot produce, so
+`RETURN PROBABILITY` on a regression target fails before the query runs.
+
+```sql
+PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0
+FROM customers
+RETURN CLASS
+```
+
+`RETURN QUANTILES` and `RETURN INTERVAL` are not part of the language. The model
+gives a single point estimate, not a distribution, so a query using either is
+rejected at parse time.
 
 ## Aggregations and time windows
 
@@ -184,8 +210,8 @@ AGG( table.column | table.* [WHERE <row filter>] ) [OVER ( <window_spec> )]
 ```
 
 An aggregation names a column (or `table.*`), an optional inline row filter,
-and a **frame** introduced by `OVER`. The frame — not positional offsets —
-carries the time window.
+and a **frame** introduced by `OVER`. The frame carries the time window;
+positional offsets do not exist in this grammar.
 
 `OVER` is optional. Without it the frame is **unbounded in the direction of the
 clause**: the future in `PREDICT` and `ASSUMING`, the past in `WHERE`.
@@ -202,21 +228,21 @@ WHERE COUNT(orders.*) > 5         -- (-inf, NOW]  have they ever ordered 5+ time
 `ARRAY_AGG`, `FIRST`, `LAST`, `EXISTS`, `NOT EXISTS`.
 
 - `COUNT(table.*)` counts rows.
-- `FIRST` / `LAST` pick a value by row time — useful for status columns.
+- `FIRST` / `LAST` pick a value by row time, which suits status columns.
 - `LIST_DISTINCT` predicts the *set* of values that will appear (usually FK
   IDs); duplicates collapse.
-- `ARRAY_AGG` predicts the values in order and **keeps duplicates** — use it
+- `ARRAY_AGG` predicts the values in order and **keeps duplicates**. Use it
   when "bought twice" should count twice.
 - Either can be ranked with the frame's `RANK TOP K` directive, or turned into
   a per-value yes/no with `CLASSIFY`.
-- `EXISTS(table.*)` / `NOT EXISTS(table.*)` is a boolean existence test — true
+- `EXISTS(table.*)` / `NOT EXISTS(table.*)` is a boolean existence test, true
   when any matching row falls in the frame. It reads more directly than the
   `COUNT(...) > 0` idiom (which is still valid): `EXISTS(orders.*) OVER (90 DAYS
   PRECEDING)`.
 
 ### The OVER frame
 
-A frame is measured relative to the anchor time (`NOW`); membership is
+A frame is measured relative to the anchor time (`NOW`). Membership is
 start-**exclusive**, end-**inclusive**. Direction comes from `PRECEDING`
 (past) / `FOLLOWING` (future), and durations are always **positive**.
 
@@ -257,7 +283,7 @@ SUM(sales.qty)  OVER (RANGE BETWEEN 15 DAYS FOLLOWING AND 45 DAYS FOLLOWING)
 
 ### Multiple horizons (forecasting)
 
-Append `HORIZONS N` to repeat the frame N times back to back — a multi-horizon
+Append `HORIZONS N` to repeat the frame N times back to back. A multi-horizon
 window *is* a forecast (there is no separate `FORECAST` clause). `STEP`
 optionally sets the stride between horizons; it defaults to the frame width, so
 give a smaller `STEP` for overlapping horizons:
@@ -289,7 +315,7 @@ FROM customers
 ### Named windows
 
 Declare a frame once with a trailing `WINDOW` clause and reference it by name
-as `OVER <name>` — handy when several aggregations share one frame:
+as `OVER <name>`, which helps when several aggregations share one frame:
 
 ```sql
 PREDICT SUM(orders.revenue) OVER w - SUM(orders.cost) OVER w
@@ -324,7 +350,7 @@ rows (inline `WHERE` inside an aggregation), and stating counterfactuals
 Either side of a comparison may be a literal, a static column, an aggregation
 over an `OVER` frame, or a richer expression (arithmetic, `CASE WHEN … END`,
 `COALESCE`, `NULLIF`, `ABS`/`LOG`/`EXP`/`LEAST`/`GREATEST`). Column-to-column
-comparisons are allowed — e.g. `orders.shipped_at > orders.ordered_at`.
+comparisons are allowed, for example `orders.shipped_at > orders.ordered_at`.
 
 ### Boolean composition
 
@@ -364,7 +390,7 @@ WHERE customers.plan LIKE :pattern AND customers.age > :min_age
 engine.execute(ExecutionInput(query=q, params={"ids": ["C7", "C9"]}))
 ```
 
-Values come from `params` on the execution input — the same place `AS OF :t`
+Values come from `params` on the execution input, the same place `AS OF :t`
 reads its anchor. A `:name` with no supplied value is an error, never a silent
 NULL.
 
@@ -389,7 +415,7 @@ PREDICT LAST(loan.status) OVER (30 DAYS FOLLOWING) NOT LIKE '%DENIED' FROM loan
 ## Task types
 
 The validator infers a task type from the target's shape. The task type
-selects the model checkpoint and the output form — you never declare it.
+selects the model checkpoint and the output form. You never declare it.
 
 | Target shape | Task type | Output |
 |---|---|---|
@@ -442,12 +468,12 @@ PREDICT SUM(usage.count) OVER (1 DAY FOLLOWING HORIZONS 28)
 FROM accounts
 ```
 
-The `HORIZONS 28` on the window makes this a 28-step forecast — one prediction
+The `HORIZONS 28` on the window makes this a 28-step forecast, one prediction
 per day.
 
 ### Specific entities
 
-`FROM` is the only entity clause; narrow to specific ids with a `WHERE`
+`FROM` is the only entity clause. Narrow to specific ids with a `WHERE`
 predicate on the primary key. Bind the ids as a parameter so one query text
 serves any cohort:
 
