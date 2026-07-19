@@ -4,7 +4,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'relativedb',
-  tagline: 'Predictive queries over your own relational data',
+  tagline: 'Predictive queries over your relational data',
   favicon: 'img/favicon.ico',
 
   future: {
@@ -54,6 +54,10 @@ const config: Config = {
   themeConfig: {
     navbar: {
       title: 'relativedb',
+      logo: {
+        alt: 'relativedb logo',
+        src: 'img/logo.svg',
+      },
       items: [
         {
           type: 'docSidebar',

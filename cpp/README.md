@@ -69,7 +69,7 @@ pass the same golden-parity and batching-invariance tests.
 | Concern | Approach |
 |---|---|
 | Dense projections | one GEMM per projection over the whole (B·S, d) panel (Accelerate / MPS / cuBLAS); `wq/wk/wv/wg` are stacked into a single `[4d, d]` weight so QKV+gate is one GEMM |
-| Masked attention | never materializes S×S: queries sharing a key list are **grouped** (column groups, (node, FK-set) groups, reverse-FK lists) in O(S) per batch row, and each group runs as per-head GEMMs over ≤64-query tiles — `scores = Q_g K_gᵀ`, max-subtracted softmax (`vvexpf`), `out = P V_g` — on the AMX units (CPU) or as online-softmax streaming kernels (GPU) |
+| Masked attention | never materializes S×S: queries sharing a key list are **grouped** (column groups, (node, FK-set) groups, reverse-FK lists) in O(S) per batch row, and each group runs as per-head GEMMs over ≤64-query tiles — `scores = Q_g K_gᵀ`, max-subtracted softmax (`vvexpf`), `out = P V_g` — on the AMX units (CPU) or as online-softmax streaming kernels (GPU); GPU key lists >512 are flash split-K'd into 256-key chunks reduced with the online-softmax identity |
 | Memory | weights converted once to contiguous fp32; activations reused across blocks; per-worker scratch buffers, no allocation inside the block loop; GPU weight upload once per model, activation buffers reused across forwards |
 | Parallelism | attention/FFN elementwise work parallelized across (batch × group × query-tile) work items on a persistent thread pool (workers park between jobs); GEMMs use the BLAS library's internal threading; on GPU each work item is a threadgroup/block |
 
@@ -101,9 +101,11 @@ input-side error would otherwise propagate through all 12 blocks:
 On CPU, `matmul_w` dequantizes 64-row weight tiles into per-thread scratch
 (hot in cache) right before the Accelerate/portable GEMM, so DRAM weight
 traffic is the quantized payload. On Metal, quantized projections skip MPS
-entirely and run a custom `qgemm`: one threadgroup per 32×32 output tile,
-K-chunks staged in threadgroup memory with **in-register dequant on the DRAM
-load**, accumulated via `simdgroup_float8x8` MMA (K-chunks of 32 align with
+entirely and run a custom `qgemm`: 32-row tiles below 128 tokens favor
+latency/tails, while 64-row tiles reuse each staged weight panel across twice
+as many rows. K-chunks are staged in threadgroup memory with **in-register
+dequant on the DRAM load**, accumulated via `simdgroup_float8x8` MMA
+(K-chunks of 32 align with
 Q4's group size, so each staged row-chunk touches one scale pair). fp32
 checkpoints take the exact same code paths as before (Accelerate / MPS).
 CPU and MPS produce identical drift per format; CUDA is fp32-only for now.
@@ -149,60 +151,95 @@ cmake -B build -S . && cmake --build build -j        # add -DRT_CUDA=ON for CUDA
     [--device cpu|mps|cuda]
 ```
 
-## Benchmarks (`rt_bench`, M-series CPU, fp32)
+## Benchmarks (`rt_bench`, Apple M3 Pro)
 
 **Batching correctness** — batched vs single-row, batch-order-permuted, and
-duplicated-row runs are all **bit-identical** (`max|Δ| = 0.0`): attention
-provably never leaks across batch rows.
+duplicated-row runs are all **bit-identical** (`max|Δ| = 0.0`) on every
+backend/format: attention provably never leaks across batch rows.
 
-**Memory** — RSS 336 MB after load (≈ the 342 MB fp32 weight conversion of the
-85.6M-param bf16 checkpoint); peaks at ~1.0 GB across B=8 × S=1024 /
-B=1 × S=2048 forwards (qkvg/FFN activation panels + per-worker attention
-scratch, freed per call). Warm checkpoint load: ~85 ms (page-cached; 0.7 s cold).
+Three representative shapes — `1×16` (single-entity latency), `80×16`
+(batched throughput), `1×2048` (long-context, where flash split-K attention
+matters). `size` is the on-disk checkpoint (resident weight RAM: fp32 342 MB,
+f16 172 MB, q8 91 MB, q4 68 MB — the quantized formats stay packed, so RSS
+after load drops from ~480 MB to ~130 MB).
 
-**Batch-size sweep** (S=16) — weights are streamed once per forward, so
-batching amortizes the memory-bound floor ~5×:
+### CPU (Accelerate + int8 `sdot` for q8)
 
-| B | ms/fwd | ms/entity |
-|---|---|---|
-| 1 | 15 | 14.7 |
-| 5 | 25 | 4.9 |
-| 20 | 63 | 3.2 |
-| 80 | 221 | **2.8** |
+| model | B×S | ms/fwd | tok/s | ms/entity | size |
+|---|---|---|---|---|---|
+| fp32 | 1×16 | 14.7 | 1.1k | 14.7 | 171 MB |
+| f16  | 1×16 | 12.0 | 1.3k | 12.0 | 172 MB |
+| q8   | 1×16 | 12.3 | 1.3k | 12.3 | 88 MB |
+| q4   | 1×16 | 15.5 | 1.0k | 15.5 | 64 MB |
+| fp32 | 80×16 | 219 | 5.8k | 2.7 | 171 MB |
+| f16  | 80×16 | 201 | 6.4k | 2.5 | 172 MB |
+| q8   | 80×16 | 207 | 6.2k | 2.6 | 88 MB |
+| q4   | 80×16 | 212 | 6.0k | 2.7 | 64 MB |
+| fp32 | 1×2048 | 388 | 5.3k | 388 | 171 MB |
+| f16  | 1×2048 | 363 | 5.6k | 363 | 172 MB |
+| q8   | 1×2048 | 370 | 5.5k | 370 | 88 MB |
+| q4   | 1×2048 | 384 | 5.3k | 384 | 64 MB |
 
-**Context-length sweep** (synthetic relational batches — entity/facts/items/
-label-history shape):
+### MPS (Metal — custom `qgemm` + flash split-K attention)
 
-| B | S | ms/fwd | tok/s |
-|---|---|---|---|
-| 1 | 256 | 55 | 4.7k |
-| 1 | 1024 | 193 | 5.3k |
-| 1 | 2048 | 405 | 5.1k |
-| 8 | 1024 | 1323 | 6.2k |
+| model | B×S | ms/fwd | tok/s | ms/entity | size |
+|---|---|---|---|---|---|
+| fp32 | 1×16 | 7.6 | 2.1k | 7.6 | 171 MB |
+| f16  | 1×16 | 11.2 | 1.4k | 11.2 | 172 MB |
+| q8   | 1×16 | 9.1 | 1.8k | 9.1 | 88 MB |
+| q4   | 1×16 | 8.9 | 1.8k | 8.9 | 64 MB |
+| fp32 | 80×16 | 63 | 20.3k | 0.8 | 171 MB |
+| f16  | 80×16 | 151 | 8.5k | 1.9 | 172 MB |
+| q8   | 80×16 | 143 | 8.9k | 1.8 | 88 MB |
+| q4   | 80×16 | 143 | 8.9k | 1.8 | 64 MB |
+| fp32 | 1×2048 | 317 | 6.5k | 317 | 171 MB |
+| f16  | 1×2048 | 483 | 4.2k | 483 | 172 MB |
+| q8   | 1×2048 | 453 | 4.5k | 453 | 88 MB |
+| q4   | 1×2048 | 464 | 4.4k | 464 | 64 MB |
 
-(Interleaved A/B against the pre-GEMM-attention baseline: 1.2–1.9× depending
-on shape — largest at S=2048, where group-batched attention replaces per-query
-key streaming, and at B=1/S=16, where the persistent pool removes per-pass
-thread spawns.) Growth beyond linear at large S comes from column-group
-attention (fact columns form large groups → O(S·group) score work), the same
-asymptotic FlexAttention pays upstream — it just runs as AMX GEMMs now.
+Reading the numbers:
 
-**MPS vs CPU** (same M3 Pro, `--device mps`): the GPU wins wherever there is
-batch or width to fill it — B=80/S=16: 63 ms vs 228 ms (**3.6×**),
-B=8/S=1024: 628 ms vs 1342 ms (**2.1×**), B=20/S=16: 20 ms vs 71 ms — and is
-roughly at parity on single-row long-context shapes (B=1/S=2048: 416 vs
-388 ms), where a handful of huge-key-list groups leave the grouped-attention
-kernel latency-bound rather than throughput-bound. Single-row S=16 inference
-costs ~7 ms of fixed command-buffer overhead vs 15 ms on CPU.
+- **Quantization is a footprint/bandwidth play, not a raw-throughput one at
+  this scale.** RT-J is 86M params at d=512; at batched shapes the GEMMs are
+  compute-bound, so q8/q4 land within ~5% of fp32 while cutting resident RAM
+  ~4× (the 480→127 MB RSS drop). The CPU q8 path is a true int8×int8 integer
+  matmul: on i8mm hardware (M2/M3) it uses **SMMLA** (`vmmlaq_s32`, a 2×8·8×2
+  int32 MMA per instruction) with weights pre-packed into 2×8 panels and
+  activations quantized directly into the paired layout; on
+  older ARM (M1) it falls back to **SDOT** (`vdotq_s32`). Both are
+  bit-identical. The table above was measured on the SDOT kernel; focused
+  SMMLA/SDOT A/B runs after fusing activation quantization with panel packing
+  measured 11.3/12.5 ms at `1×16`, 22.8/24.1 ms at `5×16`, and about 203/229
+  ms at `80×16` (SMMLA first in each pair).
+- **The quantized MPS path coalesces dependent compute dispatches** into one
+  encoder, specializes overwrite vs residual qgemm epilogues, stores aligned
+  overwrite tiles directly to output, and folds the attention clear into
+  pre-norm. On the M3 Pro q8 improved from 17.1→12.9 ms at `5×16` and
+  268→188 ms at `1×1024`; `1×2048` is 376 ms (previously 453 ms). Weights
+  remain quantized-resident throughout.
+- **fp32 stays fastest on the GPU** because MPS's `MPSMatrixMultiplication`
+  is a more tuned kernel than the custom `qgemm`; the quantized kernels trade
+  a little speed for the memory win. On CPU the dequant tiles are free (all
+  paths hit the same Accelerate GEMM), so f16/q8 even edge ahead of fp32.
+- **Flash split-K** cut single-row long-context MPS latency: `1×2048` fp32
+  is now 317 ms (was 416 ms pre-flash) and `1×1024` is 135 ms (was 158 ms) —
+  the big reverse-FK key lists are streamed by `nk/256` parallel threadgroups
+  instead of one. Beyond ~S=4096 column groups dominate (O(S·group)), the
+  same asymptotic FlexAttention pays upstream.
+- **MPS wins on batch/width** (`80×16`: 63 ms vs 219 ms fp32, 3.5×); single
+  `1×16` inference carries ~7 ms fixed command-buffer overhead, so CPU is
+  competitive there.
 
 ## Scope / next steps
 
 - Classification head only (`dec_dict.number`, matching `bool_as_num=True`
   releases); the regression checkpoint loads with the same code.
-- Activations are fp32; weights are fp32/f16/q8/q4 with in-kernel dequant
-  (see Quantization). Remaining wins: int8 activations on CPU (NEON sdot)
-  for true int8 throughput, key-tiled (flash-style) GPU attention for the
-  single-row long-context case, quantized formats on the CUDA backend.
+- Weights are fp32/f16/q8/q4 with in-kernel dequant (see Quantization).
+  Activations are fp32 except the CPU q8 path: it quantizes them to int8 and
+  runs SMMLA (i8mm) or SDOT (int8×int8) — a quarter of the weight bandwidth.
+  Metal attention uses flash split-K for long key lists. Remaining wins:
+  quantized formats on the CUDA backend, int8/fp16 compute on the GPU, and
+  fusing the CPU activation-quantization into the preceding RMSNorm.
 - The CUDA backend mirrors the golden-verified Metal design but has not been
   compiled or run yet (no CUDA toolchain on the dev machine) — build with
   `-DRT_CUDA=ON` and run `rt_test --device cuda` on the first CUDA box to

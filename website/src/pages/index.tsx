@@ -1,9 +1,11 @@
 import type {ReactNode} from 'react';
+import {useState} from 'react';
 import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import CodeBlock from '@theme/CodeBlock';
 import Heading from '@theme/Heading';
+import useBaseUrl from '@docusaurus/useBaseUrl';
 
 import styles from './index.module.css';
 
@@ -12,14 +14,20 @@ function Hero() {
   return (
     <header className={styles.hero}>
       <div className="container">
+        <img
+          className={styles.heroLogo}
+          src={useBaseUrl('img/logo.svg')}
+          alt="relativedb logo"
+          width={96}
+          height={96}
+        />
         <Heading as="h1" className={styles.heroTitle}>
-          {siteConfig.title}
+          RelativeDB
         </Heading>
         <p className={styles.heroSubtitle}>
-          Predictive queries over your own relational data. Declare your
-          schema, wire retrievers over the storage you already have, and ask
-          about the future in one line of RelQL — no feature engineering, no
-          training pipeline, no temporal leakage.
+          Predictive queries over relational data.
+          Declare the shape of your relational data, wire small retrievers over
+          your storage, and ask questions about the future:
         </p>
         <CodeBlock language="sql" className={styles.heroCode}>
           {`PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)\nFOR EACH customers.customer_id`}
@@ -54,8 +62,74 @@ function Hero() {
             title="Follow RelativeDB on GitHub"
           />
         </div>
+        <ClaudeDemo />
+        
       </div>
     </header>
+  );
+}
+
+function CopyCommand({lines, prompt = '$'}: {lines: string[]; prompt?: string}) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    navigator.clipboard.writeText(lines.join('\n')).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+  return (
+    <div className={styles.copyBox}>
+      <code className={styles.copyText}>
+        {lines.map((line) => (
+          <span className={styles.copyLine} key={line}>
+            <span className={styles.copyPrompt}>{prompt}</span> {line}
+          </span>
+        ))}
+      </code>
+      <button
+        type="button"
+        className={styles.copyButton}
+        onClick={copy}
+        aria-label="Copy commands to clipboard">
+        {copied ? 'Copied!' : 'Copy'}
+      </button>
+    </div>
+  );
+}
+
+function ClaudeDemo() {
+  return (
+    <div className={styles.claudeCard}>
+      <div className={styles.claudeBar}>
+        <span className={styles.claudeDots}>
+          <i /> <i /> <i />
+        </span>
+        <span className={styles.claudeBarTitle}>Claude Code</span>
+      </div>
+      <div className={styles.claudeBody}>
+        {/* 1. install the plugin from the marketplace */}
+        <span className={styles.claudeLabel}>Install the plugin</span>
+        <CopyCommand prompt=">" lines={['/plugin marketplace add RelativeDB/RelQL']} />
+        <CopyCommand prompt=">" lines={['/plugin install RelQL@RelQL']} />
+
+        {/* 2. ask with the /relql command */}
+        <span className={styles.claudeLabel}>Then ask</span>
+        <div className={styles.claudeMsg}>
+          <span className={styles.claudePrompt}>&gt;</span>
+          <span>
+            <span className={styles.claudeSlash}>/relql</span> which of my
+            customers are about to stop ordering?
+          </span>
+        </div>
+        <div className={styles.claudeReply}>
+          <span className={styles.claudeSkillTag}>relql</span>
+          <span>
+            scored 12,304 customers — top risk{' '}
+            <code>Jane Doe · 0.94</code>…
+          </span>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -77,35 +151,164 @@ function VideoStub() {
   );
 }
 
-const PILLARS = [
+const COMPARE_COLUMNS = [
+  {key: 'rt', label: 'Relational Transformer', sub: 'RelativeDB', highlight: true},
+  {key: 'gbdt', label: 'GBDTs', sub: 'XGBoost & co.'},
+  {key: 'gnn', label: 'Graph neural nets', sub: 'per-schema GNNs'},
+  {key: 'llm', label: 'LLMs on rows', sub: 'serialized to text'},
+];
+
+type MarkState = 'yes' | 'partial' | 'no';
+type Cell = [MarkState, string];
+
+// 'yes' | 'partial' | 'no', each with a short qualifier shown under the mark.
+const COMPARE_ROWS: {capability: string; cells: Record<string, Cell>}[] = [
   {
-    title: 'A query, not a pipeline',
-    body: 'RelQL states the target, the population, and the time window declaratively. Change the question, change the string. Every query is validated against your schema before it runs.',
+    capability: 'No hand-built features',
+    cells: {
+      rt: ['yes', 'raw cells'],
+      gbdt: ['no', 'feature tables'],
+      gnn: ['partial', 'graph wiring'],
+      llm: ['partial', 'prompt design'],
+    },
   },
   {
-    title: 'Your data stays yours',
-    body: 'GraphQL-style execution: all data access goes through retrievers you implement. No connectors, no credentials, no SQL generation — the same query runs on JDBC, REST, DataFrames, or a test double.',
+    capability: 'No per-task training',
+    cells: {
+      rt: ['yes', 'pretrained'],
+      gbdt: ['no', 'every task'],
+      gnn: ['no', 'schema + task'],
+      llm: ['yes', 'pretrained'],
+    },
   },
   {
-    title: 'Leakage-proof by construction',
-    body: 'Every retriever call carries a temporal bound, and the engine re-checks every returned row. A buggy retriever cannot leak the future into a prediction.',
+    capability: 'Zero-shot on new tasks',
+    cells: {
+      rt: ['yes', 'in-context'],
+      gbdt: ['no', ''],
+      gnn: ['no', ''],
+      llm: ['partial', 'if it fits text'],
+    },
+  },
+  {
+    capability: 'Schema-native structure',
+    cells: {
+      rt: ['yes', 'keys, rows, cols'],
+      gbdt: ['no', 'flat table'],
+      gnn: ['yes', 'graph edges'],
+      llm: ['no', 'flattened text'],
+    },
+  },
+  {
+    capability: 'Typed cells & real time',
+    cells: {
+      rt: ['yes', 'native'],
+      gbdt: ['partial', 'manual'],
+      gnn: ['partial', 'manual'],
+      llm: ['no', 'lost as text'],
+    },
+  },
+  {
+    capability: 'No train/serve skew',
+    cells: {
+      rt: ['yes', ''],
+      gbdt: ['no', 'common'],
+      gnn: ['no', 'common'],
+      llm: ['yes', ''],
+    },
+  },
+  {
+    capability: 'Small & scalable',
+    cells: {
+      rt: ['yes', '22M params'],
+      gbdt: ['yes', 'tiny'],
+      gnn: ['partial', 'grows'],
+      llm: ['no', 'billions'],
+    },
   },
 ];
 
-function Pillars() {
+const MARK: Record<MarkState, {glyph: string; label: string; cls: string}> = {
+  yes: {glyph: '✓', label: 'yes', cls: styles.markYes},
+  partial: {glyph: '~', label: 'partial', cls: styles.markPartial},
+  no: {glyph: '–', label: 'no', cls: styles.markNo},
+};
+
+function ComparisonMatrix() {
   return (
-    <section className={styles.section}>
-      <div className="container">
-        <div className="row">
-          {PILLARS.map((p) => (
-            <div className="col col--4" key={p.title}>
-              <Heading as="h3">{p.title}</Heading>
-              <p>{p.body}</p>
-            </div>
-          ))}
-        </div>
+    <figure className={styles.compareFigure}>
+      <div className={styles.compareScroll}>
+        <table className={styles.compareTable}>
+          <caption className={styles.compareCaption}>
+            One pretrained model covers what today takes three different
+            toolchains — no single alternative gets everything.
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col" className={styles.compareCorner}>
+                Capability
+              </th>
+              {COMPARE_COLUMNS.map((c) => (
+                <th
+                  scope="col"
+                  key={c.key}
+                  className={c.highlight ? styles.compareColHi : undefined}>
+                  <span className={styles.compareColLabel}>{c.label}</span>
+                  <span className={styles.compareColSub}>{c.sub}</span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {COMPARE_ROWS.map((row) => (
+              <tr key={row.capability}>
+                <th scope="row" className={styles.compareRowHead}>
+                  {row.capability}
+                </th>
+                {COMPARE_COLUMNS.map((c) => {
+                  const [state, note] = row.cells[c.key];
+                  const mark = MARK[state];
+                  return (
+                    <td
+                      key={c.key}
+                      title={note || undefined}
+                      className={c.highlight ? styles.compareColHi : undefined}>
+                      <span className={`${styles.mark} ${mark.cls}`} aria-hidden>
+                        {mark.glyph}
+                      </span>
+                      <span className={styles.srOnly}>
+                        {mark.label}
+                        {note ? ` — ${note}` : ''}.{' '}
+                      </span>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
-    </section>
+      <div className={styles.compareLegend}>
+        <span>
+          <span className={`${styles.mark} ${styles.markYes}`} aria-hidden>
+            ✓
+          </span>{' '}
+          built in
+        </span>
+        <span>
+          <span className={`${styles.mark} ${styles.markPartial}`} aria-hidden>
+            ~
+          </span>{' '}
+          partial / manual
+        </span>
+        <span>
+          <span className={`${styles.mark} ${styles.markNo}`} aria-hidden>
+            –
+          </span>{' '}
+          not really
+        </span>
+      </div>
+    </figure>
   );
 }
 
@@ -113,90 +316,24 @@ function RelationalTransformers() {
   return (
     <section className={`${styles.section} ${styles.sectionAlt}`}>
       <div className="container">
-        <Heading as="h2">Scored by a relational transformer</Heading>
-        <div className="row">
-          <div className="col col--6">
-            <p>
-              A transformer normally attends over word tokens. A{' '}
-              <strong>relational transformer</strong> attends over a small
-              subgraph of your database: each token is one cell, and attention
-              is masked along the structure that relates cells — same column,
-              same row and its FK parents, FK children. No positional
-              encodings; the schema <em>is</em> the structure.
-            </p>
-            <p>
-              Pretrained across many schemas, it predicts{' '}
-              <strong>in-context</strong>: the engine assembles the entity, its
-              neighborhood, and a few labeled examples (including the entity's
-              own past outcomes), and the model fills in the masked target in
-              one forward pass — the relational analogue of prompting an LLM.
-            </p>
-          </div>
-          <div className="col col--6">
-            <ul>
-              <li>
-                <strong>vs. GBDTs on feature tables</strong> — no hand-built
-                features, no per-task training, no train/serve skew.
-              </li>
-              <li>
-                <strong>vs. graph neural networks</strong> — no per-schema,
-                per-task training; one pretrained model, prompted in-context.
-              </li>
-              <li>
-                <strong>vs. LLMs on serialized rows</strong> — typed cells,
-                real keys, and real time instead of tables flattened to text.
-              </li>
-            </ul>
-            <p>
-              relativedb ships RT-J inference as a ~700-line dependency-light
-              C++ engine, golden-verified against the PyTorch reference — and
-              a model-free history baseline so the pipeline runs with zero
-              model artifacts.{' '}
-              <Link to="/docs/concepts/relational-transformers">
-                Read more →
-              </Link>
-            </p>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-const BENCH = [
-  {label: 'relativedb (CSC sampler)', seconds: 0.66, throughput: '~15,000 entities/s', pct: 1.2, highlight: true},
-  {label: 'Naive per-entity pandas loop', seconds: 57.4, throughput: '~174 entities/s', pct: 100, highlight: false},
-];
-
-function Benchmark() {
-  return (
-    <section className={styles.section}>
-      <div className="container">
-        <Heading as="h2">87× faster than the naive loop</Heading>
-        <p>
-          Scoring 90-day churn for 10,000 customers over 200,000 orders
-          (history baseline, M-series laptop). Same predictions; the CSC
-          sampler indexes each table once and answers every context hop with a
-          binary search.
+        <Heading as="h2">What are Relational Transformers?</Heading>
+        <p className={styles.sectionLede}>
+          A transformer normally attends over word tokens. A{' '}
+          <strong>relational transformer</strong> attends over a small subgraph
+          of your database: each token is one cell, and attention is masked
+          along the structure that relates cells. No positional encodings, the
+          schema <em>is</em> the structure. Pretrained across many schemas, it
+          predicts <strong>in-context</strong> — the engine assembles the
+          entity, its neighborhood, and a few labeled examples, and the model
+          fills in the masked target in one forward pass. The relational
+          analogue of prompting an LLM, in a 22M-parameter model that scales.
         </p>
-        <div className={styles.bench}>
-          {BENCH.map((b) => (
-            <div className={styles.benchRow} key={b.label}>
-              <div className={styles.benchLabel}>{b.label}</div>
-              <div className={styles.benchTrack}>
-                <div
-                  className={`${styles.benchBar} ${b.highlight ? styles.benchBarHighlight : ''}`}
-                  style={{width: `${b.pct}%`}}
-                />
-                <span className={styles.benchValue}>
-                  {b.seconds} s&nbsp;·&nbsp;{b.throughput}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-        <p className={styles.benchNote}>
-          Reproduce with <code>examples/bench_naive_vs_csc.py</code>.
+        <ComparisonMatrix />
+        <p className={styles.sectionLede}>
+          RelativeDB ships RT-J inference as a highly optimized,
+          dependency-light C++ engine, with several quantized models for highly
+          constrained environments.{' '}
+          <Link to="/docs/concepts/relational-transformers">Read more →</Link>
         </p>
       </div>
     </section>
@@ -205,13 +342,11 @@ function Benchmark() {
 
 export default function Home(): ReactNode {
   return (
-    <Layout description="Predictive queries over your own relational data — RelQL, retrievers, and a relational transformer.">
+    <Layout description="Predictive queries over relational data — RelQL, retrievers, and a relational transformer.">
       <Hero />
       <main>
-        <Pillars />
         <VideoStub />
         <RelationalTransformers />
-        <Benchmark />
       </main>
     </Layout>
   );

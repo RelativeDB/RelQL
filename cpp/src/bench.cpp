@@ -242,33 +242,23 @@ int main(int argc, char** argv) {
     printf("B=%-3d S=%-5d  %8.1f ms/fwd   %9.0f tok/s   %6.1f ms/entity\n",
            b.B, b.S, ms, tok, ms / b.B);
   };
-  printf("\n== speed: batch-size sweep (golden rows replicated, S=16) ==\n");
-  for (int bs : {1, 5, 20, 80, 160, 320, 640, 1280}) {
-    std::vector<int> rows(bs);
-    for (int i = 0; i < bs; i++) rows[i] = i % golden.B;
-    bench(take_rows(golden, rows), bs >= 20 ? 5 : 20);
+  // Smell test only: one tiny shape to confirm the harness runs. Real
+  // relational inference is long-context (S >= 1024) — everything below that
+  // is latency-dominated by fixed overhead and isn't representative.
+  printf("\n== smell test (tiny shape, correctness of the harness) ==\n");
+  {
+    std::vector<int> rows(5);
+    for (int i = 0; i < 5; i++) rows[i] = i % golden.B;
+    bench(take_rows(golden, rows), 20);
   }
-  printf("\n== speed: context-length sweep (synthetic relational batches) ==\n");
-  bench(synth(1, 256, 1), 10);
+  printf("\n== speed: single-entity long context ==\n");
   bench(synth(1, 1024, 2), 5);
   bench(synth(1, 2048, 3), 3);
   bench(synth(1, 4096, 20), 2);
   bench(synth(1, 8192, 21), 2);
-  printf("\n== speed: big B x S sweep (synthetic relational batches) ==\n");
-  bench(synth(16, 256, 5), 5);
-  bench(synth(64, 256, 6), 3);
-  bench(synth(256, 256, 7), 3);
-  bench(synth(16, 512, 8), 3);
-  bench(synth(64, 512, 9), 3);
+  printf("\n== speed: batched long context ==\n");
   bench(synth(8, 1024, 4), 3);
-  bench(synth(32, 1024, 10), 2);
-  bench(synth(64, 1024, 11), 2);
   bench(synth(8, 2048, 12), 2);
-  bench(synth(32, 2048, 13), 2);
-  bench(synth(4, 4096, 22), 2);
-  bench(synth(8, 4096, 23), 2);
-  bench(synth(2, 8192, 24), 2);
-  bench(synth(4, 8192, 25), 2);
 
   // ---- 3. memory after the big forward ------------------------------------
   printf("\n== memory after S=2048/B=8 forwards ==\n");

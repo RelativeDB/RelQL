@@ -81,6 +81,10 @@ struct Weight {
   const uint8_t* q = nullptr;          // F16/Q8/Q4 payload
   const uint8_t* qs = nullptr;         // Q8/Q4 scales
   int out = 0, in = 0;
+  // Q8 only: lazily-built i8mm (SMMLA) panel repacking of `q`, cached on
+  // first use of the CPU SMMLA kernel. `q` itself stays row-major so the GPU
+  // backend and the SDOT/tile-dequant paths keep reading the canonical layout.
+  mutable std::shared_ptr<std::vector<int8_t>> q8_smmla;
 };
 
 struct Attn {

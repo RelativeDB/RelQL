@@ -8,7 +8,14 @@
 //  - attn: one threadgroup per (group, query-tile) work item; each simdgroup
 //    owns a (query, head) pair and streams the shared key list with a
 //    single-pass online softmax — no S x S scores, exactly the query-group
-//    sparsity the CPU path uses, with the same bf16-rounded log(kv) scaling
+//    sparsity the CPU path uses, with the same bf16-rounded log(kv) scaling.
+//    Groups with >512 keys are flash split-K'd (attn_part -> attn_reduce):
+//    the key list is chunked across independent threadgroups whose partial
+//    online-softmax states are merged, so a single huge reverse-FK group is
+//    no longer one latency-bound key stream
+//  - dense projections: fp32 -> MPSMatrixMultiplication; f16/q8/q4 -> custom
+//    qgemm (adaptive 32/64-row x 32-column tiles, threadgroup-staged
+//    in-register dequant, simdgroup MMA), weights uploaded quantized-resident
 //  - gate_mul / swiglu / head: elementwise gating, SwiGLU, and the fused
 //    output-norm + number-head dot
 // Weights are uploaded once per model (fp32, unified memory); activation and
@@ -44,19 +51,25 @@ constant float kEps = 1e-6f;
 
 // Weight dtype baked per pipeline: 1 = F16, 2 = Q8, 3 = Q4 (rt::WType).
 constant int WT [[function_constant(0)]];
+// Overwrite and residual-accumulate projections use separate pipelines so
+// overwrite GEMMs never read the destination buffer.
+constant bool ACCUMULATE [[function_constant(1)]];
+// 32 rows favors latency/tails; 64 rows reuses each staged weight tile across
+// twice as many activation rows for throughput-oriented shapes.
+constant ushort TM [[function_constant(2)]];
 
 struct QGemmArgs {
   uint M, N, K;
-  float beta;
 };
 
-// y[M,N] = x[M,K] @ W[N,K]^T (+ beta*y) with W quantized-resident.
-// One threadgroup (128 threads / 4 simdgroups) computes a 32x32 output tile:
-// the K loop stages a 32x32 x-tile and a 32x32 *dequantized* W-tile in
-// threadgroup memory (dequant happens on the load from DRAM — the fp32 tile
-// never exists outside on-chip memory), then each simdgroup accumulates an
-// 8x32 strip with simdgroup_float8x8 MMA. K and N are multiples of 32 for
-// every RT-J projection; M (tokens) is edge-guarded.
+// y[M,N] = x[M,K] @ W[N,K]^T (+ residual) with W quantized-resident.
+// One threadgroup computes a TMx32 output tile: TM=32 (128 threads) favors
+// latency/tails, while TM=64 (256 threads) reuses each staged weight tile
+// across twice as many rows. The K loop stages a TMx32 x-tile and a 32x32
+// *dequantized* W-tile in threadgroup memory (dequant happens on the load from
+// DRAM — the fp32 tile never exists outside on-chip memory), then each
+// simdgroup accumulates an 8x32 strip with simdgroup_float8x8 MMA. K and N are
+// multiples of 32 for every RT-J projection; M (tokens) is edge-guarded.
 // Q4 layout note: K-chunks of 32 align exactly with Q4's group size, so each
 // staged W-row chunk touches one (scale, min) pair.
 kernel void qgemm(device const float* x [[buffer(0)]],
@@ -64,23 +77,24 @@ kernel void qgemm(device const float* x [[buffer(0)]],
                   device const uchar* ws [[buffer(2)]],
                   device float* y [[buffer(3)]],
                   constant QGemmArgs& args [[buffer(4)]],
+                  threadgroup float* Xt [[threadgroup(0)]],
+                  threadgroup float* Wt [[threadgroup(1)]],
+                  threadgroup float* Ct [[threadgroup(2)]],
                   uint2 tg [[threadgroup_position_in_grid]],
                   uint tid [[thread_index_in_threadgroup]],
                   uint sg [[simdgroup_index_in_threadgroup]]) {
-  const uint n0 = tg.x * 32, m0 = tg.y * 32;
+  const uint n0 = tg.x * 32, m0 = tg.y * TM;
   const uint K = args.K;
-  threadgroup float Xt[32 * 33];
-  threadgroup float Wt[32 * 33];
-  threadgroup float Ct[32 * 33];
   simdgroup_float8x8 C[4];
   for (int j = 0; j < 4; j++) C[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
   for (uint k0 = 0; k0 < K; k0 += 32) {
-    for (uint i = tid; i < 32 * 32; i += 128) {          // stage x tile
+    for (uint i = tid; i < TM * 32; i += TM * 4) {       // stage x tile
       uint r = i / 32, c = i % 32;
-      Xt[r * 33 + c] = (m0 + r < args.M) ? x[(ulong)(m0 + r) * K + k0 + c] : 0.0f;
+      Xt[r * 33 + c] =
+          (m0 + r < args.M) ? x[(ulong)(m0 + r) * K + k0 + c] : 0.0f;
     }
-    for (uint i = tid; i < 32 * 32; i += 128) {          // stage + dequant W
+    for (uint i = tid; i < 32 * 32; i += TM * 4) {       // stage + dequant W
       uint n = i / 32, kk = i % 32;
       ulong gn = n0 + n;
       float v;
@@ -111,14 +125,28 @@ kernel void qgemm(device const float* x [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
+  // Most projections overwrite a fresh output. When M is 8-row aligned,
+  // store each simdgroup tile straight to device memory and skip the output
+  // scratch tile, threadgroup barrier, and scalar copy-out entirely.
+  if (!ACCUMULATE && (args.M & 7) == 0) {
+    if (m0 + sg * 8 < args.M)
+      for (int j = 0; j < 4; j++)
+        simdgroup_store(C[j], y + (ulong)(m0 + sg * 8) * args.N + n0 + j * 8,
+                        args.N);
+    return;
+  }
+
   for (int j = 0; j < 4; j++)
     simdgroup_store(C[j], Ct + (sg * 8) * 33 + j * 8, 33);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = tid; i < 32 * 32; i += 128) {
+  for (uint i = tid; i < TM * 32; i += TM * 4) {
     uint r = i / 32, c = i % 32;
     if (m0 + r < args.M) {
       device float* d = y + (ulong)(m0 + r) * args.N + n0 + c;
-      *d = args.beta * *d + Ct[r * 33 + c];
+      if (ACCUMULATE)
+        *d += Ct[r * 33 + c];
+      else
+        *d = Ct[r * 33 + c];
     }
   }
 }
@@ -138,6 +166,28 @@ kernel void rmsnorm_rows(device const float* in [[buffer(0)]],
   ss = simd_sum(ss);
   float inv = 1.0f / sqrt(ss / float(n) + kEps);
   for (uint i = lane; i < n; i += 32) y[i] = x[i] * inv * scale[i];
+}
+
+// Attention pre-norm plus zeroing of the attention output row. Folding the
+// clear into this already row-coalesced pass avoids a separate blit encoder.
+kernel void rmsnorm_rows_clear(device const float* in [[buffer(0)]],
+                               device float* out [[buffer(1)]],
+                               device const float* scale [[buffer(2)]],
+                               device float* clear [[buffer(3)]],
+                               constant uint& n [[buffer(4)]],
+                               uint row [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  device const float* x = in + (ulong)row * n;
+  device float* y = out + (ulong)row * n;
+  device float* z = clear + (ulong)row * n;
+  float ss = 0.0f;
+  for (uint i = lane; i < n; i += 32) ss += x[i] * x[i];
+  ss = simd_sum(ss);
+  float inv = 1.0f / sqrt(ss / float(n) + kEps);
+  for (uint i = lane; i < n; i += 32) {
+    y[i] = x[i] * inv * scale[i];
+    z[i] = 0.0f;
+  }
 }
 
 // In-place QK-RMSNorm on the fused qkvg buffer (row = [q|k|v|g], stride 2048).
@@ -351,6 +401,21 @@ struct AttnWorkGpu {
   float logkv;
 };
 
+// Host mirrors of the flash split-K structs (see the MSL above).
+struct AttnPWorkGpu {
+  int qstart, tq, kstart, nk, rowbase;
+  float logkv;
+  int part;
+};
+struct AttnRWorkGpu {
+  int qstart, tq, rowbase, part, nchunks;
+};
+
+// A group whose shared key list exceeds this is split into chunks of this
+// size, each streamed by an independent threadgroup (flash-decoding).
+constexpr int kFlashChunk = 256;
+constexpr int kFlashSplit = 512;   // only split when nk exceeds this
+
 // Weight on the GPU: fp32 buffer (MPS GEMM path) or quantized payload +
 // scales (custom qgemm path). Uploaded once per model.
 struct GpuWeight {
@@ -369,15 +434,17 @@ struct BlockWeights {
 
 struct QGemmArgsHost {
   uint32_t M, N, K;
-  float beta;
 };
 
 struct MetalCtx {
   std::mutex mu;                       // serializes forwards on this model
   id<MTLDevice> dev;
   id<MTLCommandQueue> queue;
-  id<MTLComputePipelineState> p_rms, p_qknorm, p_attn, p_gate, p_swiglu, p_head;
-  id<MTLComputePipelineState> p_qgemm[4];  // indexed by WType (F16/Q8/Q4)
+  id<MTLComputePipelineState> p_rms, p_rms_clear, p_qknorm, p_attn, p_gate;
+  id<MTLComputePipelineState> p_swiglu, p_head;
+  id<MTLComputePipelineState> p_attn_part, p_attn_reduce;
+  // Indexed by [WType][overwrite/accumulate][32/64-row tile].
+  id<MTLComputePipelineState> p_qgemm[4][2][2];
   BlockWeights blk[kBlocks];
   id<MTLBuffer> norm_out, dec_w;
   float dec_b = 0.f;
@@ -386,6 +453,8 @@ struct MetalCtx {
   // reusable activation / index buffers (grow-on-demand)
   id<MTLBuffer> x, xn, qkvg, att, ffa, ffb, yhat, tap;
   id<MTLBuffer> qidx[3], kidx[3], work[3];
+  // flash split-K attention (large key lists): partials + part/reduce work
+  id<MTLBuffer> pwork[3], rwork[3], partials;
 };
 
 id<MTLDevice> pick_device() {
@@ -440,25 +509,34 @@ MetalCtx* make_ctx(const Model& m) {
     return ps;
   };
   ctx->p_rms = pipe(@"rmsnorm_rows");
+  ctx->p_rms_clear = pipe(@"rmsnorm_rows_clear");
   ctx->p_qknorm = pipe(@"qknorm");
   ctx->p_attn = pipe(@"attn");
+  ctx->p_attn_part = pipe(@"attn_part");
+  ctx->p_attn_reduce = pipe(@"attn_reduce");
   ctx->p_gate = pipe(@"gate_mul");
   ctx->p_swiglu = pipe(@"swiglu");
   ctx->p_head = pipe(@"head");
-  for (int wt : {(int)WType::F16, (int)WType::Q8, (int)WType::Q4}) {
-    MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
-    [cv setConstantValue:&wt type:MTLDataTypeInt atIndex:0];
-    NSError* ferr = nil;
-    id<MTLFunction> fn = [lib newFunctionWithName:@"qgemm"
-                                   constantValues:cv
-                                            error:&ferr];
-    NSError* perr = nil;
-    ctx->p_qgemm[wt] = fn ? [ctx->dev newComputePipelineStateWithFunction:fn
-                                                                    error:&perr]
-                          : nil;
-    if (!ctx->p_qgemm[wt])
-      throw std::runtime_error("rt/metal: qgemm pipeline failed");
-  }
+  for (int wt : {(int)WType::F16, (int)WType::Q8, (int)WType::Q4})
+    for (int accumulate = 0; accumulate < 2; accumulate++)
+      for (int tile = 0; tile < 2; tile++) {
+        MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+        [cv setConstantValue:&wt type:MTLDataTypeInt atIndex:0];
+        bool acc = accumulate;
+        [cv setConstantValue:&acc type:MTLDataTypeBool atIndex:1];
+        uint16_t tile_m = tile ? 64 : 32;
+        [cv setConstantValue:&tile_m type:MTLDataTypeUShort atIndex:2];
+        NSError* ferr = nil;
+        id<MTLFunction> fn = [lib newFunctionWithName:@"qgemm"
+                                       constantValues:cv
+                                                error:&ferr];
+        NSError* perr = nil;
+        ctx->p_qgemm[wt][accumulate][tile] =
+            fn ? [ctx->dev newComputePipelineStateWithFunction:fn error:&perr]
+               : nil;
+        if (!ctx->p_qgemm[wt][accumulate][tile])
+          throw std::runtime_error("rt/metal: qgemm pipeline failed");
+      }
 
   auto gw = [&](const Weight& w) {
     GpuWeight g;
@@ -529,8 +607,14 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     const size_t BS = (size_t)B * S;
 
     // ---- flatten group indices / work items for the GPU ------------------
+    // Small groups (nk <= kFlashSplit) run the single-pass `attn` kernel;
+    // large groups are split into kFlashChunk-key chunks handled by the
+    // flash split-K pair (attn_part -> attn_reduce).
     std::vector<int32_t> qflat[3], kflat[3];
     std::vector<AttnWorkGpu> wflat[3];
+    std::vector<AttnPWorkGpu> pflat[3];
+    std::vector<AttnRWorkGpu> rflat[3];
+    size_t part_floats[3] = {0, 0, 0};
     const std::vector<Groups>* gsets[3] = {&prep.g_col, &prep.g_feat,
                                            &prep.g_nbr};
     for (int a = 0; a < 3; a++) {
@@ -548,14 +632,32 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
         qflat[a].insert(qflat[a].end(), G.q.begin(), G.q.end());
         kflat[a].insert(kflat[a].end(), G.k.begin(), G.k.end());
       }
-      wflat[a].reserve(prep.work[a].size());
+      size_t poff = 0;
       for (const Work& W : prep.work[a]) {
         const Groups& G = (*gsets[a])[W.b];
-        wflat[a].push_back({qbase[W.b] + G.qoff[W.g] + W.q0, W.q1 - W.q0,
-                            kbase[W.b] + G.koff[W.g],
-                            G.koff[W.g + 1] - G.koff[W.g], W.b * S, W.logkv});
+        const int qs = qbase[W.b] + G.qoff[W.g] + W.q0;
+        const int tq = W.q1 - W.q0;
+        const int ks = kbase[W.b] + G.koff[W.g];
+        const int nk = G.koff[W.g + 1] - G.koff[W.g];
+        if (nk <= kFlashSplit) {
+          wflat[a].push_back({qs, tq, ks, nk, W.b * S, W.logkv});
+          continue;
+        }
+        const int nchunks = (nk + kFlashChunk - 1) / kFlashChunk;
+        const int item_base = (int)poff;
+        for (int c = 0; c < nchunks; c++) {
+          const int c0 = c * kFlashChunk;
+          const int cnk = std::min(kFlashChunk, nk - c0);
+          pflat[a].push_back({qs, tq, ks + c0, cnk, W.b * S, W.logkv,
+                              item_base + c * (tq * 8 * 66)});
+        }
+        rflat[a].push_back({qs, tq, W.b * S, item_base, nchunks});
+        poff += (size_t)nchunks * tq * 8 * 66;
       }
+      part_floats[a] = poff;
     }
+    const size_t part_max =
+        std::max({part_floats[0], part_floats[1], part_floats[2], (size_t)1});
 
     // ---- buffers ----------------------------------------------------------
     ensure(ctx.dev, ctx.x, BS * kD * 4);
@@ -566,6 +668,7 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     ensure(ctx.dev, ctx.ffb, BS * (size_t)kDFF * 4);
     ensure(ctx.dev, ctx.yhat, BS * 4);
     if (debug_taps) ensure(ctx.dev, ctx.tap, BS * kD * 4);
+    ensure(ctx.dev, ctx.partials, part_max * 4);
     for (int a = 0; a < 3; a++) {
       ensure(ctx.dev, ctx.qidx[a], std::max<size_t>(1, qflat[a].size()) * 4);
       ensure(ctx.dev, ctx.kidx[a], std::max<size_t>(1, kflat[a].size()) * 4);
@@ -575,6 +678,16 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       std::memcpy(ctx.kidx[a].contents, kflat[a].data(), kflat[a].size() * 4);
       std::memcpy(ctx.work[a].contents, wflat[a].data(),
                   wflat[a].size() * sizeof(AttnWorkGpu));
+      ensure(ctx.dev, ctx.pwork[a],
+             std::max<size_t>(1, pflat[a].size()) * sizeof(AttnPWorkGpu));
+      ensure(ctx.dev, ctx.rwork[a],
+             std::max<size_t>(1, rflat[a].size()) * sizeof(AttnRWorkGpu));
+      if (!pflat[a].empty())
+        std::memcpy(ctx.pwork[a].contents, pflat[a].data(),
+                    pflat[a].size() * sizeof(AttnPWorkGpu));
+      if (!rflat[a].empty())
+        std::memcpy(ctx.rwork[a].contents, rflat[a].data(),
+                    rflat[a].size() * sizeof(AttnRWorkGpu));
     }
     std::memcpy(ctx.x.contents, prep.x.data(), BS * kD * 4);
 
@@ -605,25 +718,55 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       [mm encodeToCommandBuffer:cb leftMatrix:A rightMatrix:W resultMatrix:C];
     };
 
+    // Keep adjacent custom kernels in one encoder. Quantized forwards issue
+    // over a hundred small compute dispatches, and creating an encoder for
+    // every projection is measurable at latency-oriented shapes.
+    id<MTLComputeCommandEncoder> enc = nil;
+    auto compute = [&]() -> id<MTLComputeCommandEncoder> {
+      if (!enc) enc = [cb computeCommandEncoder];
+      return enc;
+    };
+    auto end_compute = [&] {
+      if (enc) {
+        [enc endEncoding];
+        enc = nil;
+      }
+    };
+    auto buffer_barrier = [&] {
+      if (enc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+
     // Projection dispatch: fp32 weights keep the MPS GEMM; quantized weights
     // run the custom qgemm (threadgroup-staged in-register dequant + MMA).
     auto proj = [&](id<MTLBuffer> a, const GpuWeight& w, id<MTLBuffer> c,
                     int M, float beta) {
       if (w.type == WType::F32) {
+        end_compute();
         gemm(a, w.w, c, M, w.out, w.in, beta);
         return;
       }
-      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-      [enc setComputePipelineState:ctx.p_qgemm[(int)w.type]];
-      [enc setBuffer:a offset:0 atIndex:0];
-      [enc setBuffer:w.w offset:0 atIndex:1];
-      [enc setBuffer:(w.s ? w.s : w.w) offset:0 atIndex:2];
-      [enc setBuffer:c offset:0 atIndex:3];
-      QGemmArgsHost args{(uint32_t)M, (uint32_t)w.out, (uint32_t)w.in, beta};
-      [enc setBytes:&args length:sizeof(args) atIndex:4];
-      [enc dispatchThreadgroups:MTLSizeMake((w.out + 31) / 32, (M + 31) / 32, 1)
-          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-      [enc endEncoding];
+      id<MTLComputeCommandEncoder> qenc = compute();
+      const int accumulate = beta != 0.f;
+      const int tile = M >= 128;
+      const int tile_m = tile ? 64 : 32;
+      [qenc setComputePipelineState:ctx.p_qgemm[(int)w.type][accumulate][tile]];
+      [qenc setBuffer:a offset:0 atIndex:0];
+      [qenc setBuffer:w.w offset:0 atIndex:1];
+      [qenc setBuffer:(w.s ? w.s : w.w) offset:0 atIndex:2];
+      [qenc setBuffer:c offset:0 atIndex:3];
+      QGemmArgsHost args{(uint32_t)M, (uint32_t)w.out, (uint32_t)w.in};
+      [qenc setBytes:&args length:sizeof(args) atIndex:4];
+      [qenc setThreadgroupMemoryLength:(size_t)tile_m * 33 * sizeof(float)
+                               atIndex:0];
+      [qenc setThreadgroupMemoryLength:32 * 33 * sizeof(float) atIndex:1];
+      const size_t output_scratch =
+          !accumulate && M % 8 == 0
+              ? 0
+              : (size_t)tile_m * 33 * sizeof(float);
+      [qenc setThreadgroupMemoryLength:output_scratch atIndex:2];
+      [qenc dispatchThreadgroups:MTLSizeMake((w.out + 31) / 32,
+                                             (M + tile_m - 1) / tile_m, 1)
+             threadsPerThreadgroup:MTLSizeMake(tile_m * 4, 1, 1)];
     };
 
     auto simdrows = [&](id<MTLComputePipelineState> ps, size_t rows,
@@ -637,30 +780,32 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     for (int blk_i = 0; blk_i < kBlocks; blk_i++) {
       const BlockWeights& gw = ctx.blk[blk_i];
       for (int a = 0; a < 3; a++) {
-        // pre-norm
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        // Pre-norm and clear attention in one row pass. The barrier also
+        // makes the preceding residual projection visible when this remains
+        // in the same quantized compute encoder.
+        buffer_barrier();
+        id<MTLComputeCommandEncoder> cenc = compute();
         uint32_t n = kD;
-        [enc setBuffer:ctx.x offset:0 atIndex:0];
-        [enc setBuffer:ctx.xn offset:0 atIndex:1];
-        [enc setBuffer:gw.norm[a] offset:0 atIndex:2];
-        [enc setBytes:&n length:4 atIndex:3];
-        simdrows(ctx.p_rms, BS, enc);
-        [enc endEncoding];
+        [cenc setBuffer:ctx.x offset:0 atIndex:0];
+        [cenc setBuffer:ctx.xn offset:0 atIndex:1];
+        [cenc setBuffer:gw.norm[a] offset:0 atIndex:2];
+        [cenc setBuffer:ctx.att offset:0 atIndex:3];
+        [cenc setBytes:&n length:4 atIndex:4];
+        simdrows(ctx.p_rms_clear, BS, cenc);
+        buffer_barrier();
         // fused qkvg projection
         proj(ctx.xn, gw.wqkvg[a], ctx.qkvg, (int)BS, 0.f);
-        // zero att accumulator (tokens outside every group must stay 0)
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-        [blit fillBuffer:ctx.att range:NSMakeRange(0, BS * kD * 4) value:0];
-        [blit endEncoding];
+        buffer_barrier();
         // qk-norm + attention + gating
-        enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:ctx.p_qknorm];
-        [enc setBuffer:ctx.qkvg offset:0 atIndex:0];
-        [enc setBuffer:gw.q_norm[a] offset:0 atIndex:1];
-        [enc setBuffer:gw.k_norm[a] offset:0 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(BS * 16, 1, 1)
+        cenc = compute();
+        [cenc setComputePipelineState:ctx.p_qknorm];
+        [cenc setBuffer:ctx.qkvg offset:0 atIndex:0];
+        [cenc setBuffer:gw.q_norm[a] offset:0 atIndex:1];
+        [cenc setBuffer:gw.k_norm[a] offset:0 atIndex:2];
+        [cenc dispatchThreadgroups:MTLSizeMake(BS * 16, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        if (!wflat[a].empty()) {
+        buffer_barrier();
+        if (!wflat[a].empty()) {          // single-pass small groups
           [enc setComputePipelineState:ctx.p_attn];
           [enc setBuffer:ctx.qkvg offset:0 atIndex:0];
           [enc setBuffer:ctx.att offset:0 atIndex:1];
@@ -671,35 +816,59 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           [enc dispatchThreadgroups:MTLSizeMake(wflat[a].size(), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
         }
+        if (!rflat[a].empty()) {          // flash split-K large groups
+          // serial encoder: part -> reduce is implicitly ordered
+          [enc setComputePipelineState:ctx.p_attn_part];
+          [enc setBuffer:ctx.qkvg offset:0 atIndex:0];
+          [enc setBuffer:ctx.partials offset:0 atIndex:1];
+          [enc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
+          [enc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
+          [enc setBuffer:ctx.pwork[a] offset:0 atIndex:4];
+          [enc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake(pflat[a].size(), 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+          buffer_barrier();
+          [enc setComputePipelineState:ctx.p_attn_reduce];
+          [enc setBuffer:ctx.partials offset:0 atIndex:0];
+          [enc setBuffer:ctx.att offset:0 atIndex:1];
+          [enc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
+          [enc setBuffer:ctx.rwork[a] offset:0 atIndex:3];
+          [enc dispatchThreadgroups:MTLSizeMake(rflat[a].size(), 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+        }
+        buffer_barrier();
         [enc setComputePipelineState:ctx.p_gate];
         [enc setBuffer:ctx.att offset:0 atIndex:0];
         [enc setBuffer:ctx.qkvg offset:0 atIndex:1];
         [enc dispatchThreads:MTLSizeMake(BS * kD, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
+        buffer_barrier();
         // x += att @ wo^T
         proj(ctx.att, gw.wo[a], ctx.x, (int)BS, 1.f);
       }
       // FFN: x += w2( silu(w1 xn) * w3 xn )
-      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      buffer_barrier();
+      id<MTLComputeCommandEncoder> fenc = compute();
       uint32_t n = kD;
-      [enc setBuffer:ctx.x offset:0 atIndex:0];
-      [enc setBuffer:ctx.xn offset:0 atIndex:1];
-      [enc setBuffer:gw.norm[3] offset:0 atIndex:2];
-      [enc setBytes:&n length:4 atIndex:3];
-      simdrows(ctx.p_rms, BS, enc);
-      [enc endEncoding];
+      [fenc setBuffer:ctx.x offset:0 atIndex:0];
+      [fenc setBuffer:ctx.xn offset:0 atIndex:1];
+      [fenc setBuffer:gw.norm[3] offset:0 atIndex:2];
+      [fenc setBytes:&n length:4 atIndex:3];
+      simdrows(ctx.p_rms, BS, fenc);
+      buffer_barrier();
       proj(ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
       proj(ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
-      enc = [cb computeCommandEncoder];
-      [enc setComputePipelineState:ctx.p_swiglu];
-      [enc setBuffer:ctx.ffa offset:0 atIndex:0];
-      [enc setBuffer:ctx.ffb offset:0 atIndex:1];
-      [enc dispatchThreads:MTLSizeMake(BS * kDFF, 1, 1)
+      buffer_barrier();
+      fenc = compute();
+      [fenc setComputePipelineState:ctx.p_swiglu];
+      [fenc setBuffer:ctx.ffa offset:0 atIndex:0];
+      [fenc setBuffer:ctx.ffb offset:0 atIndex:1];
+      [fenc dispatchThreads:MTLSizeMake(BS * kDFF, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      [enc endEncoding];
+      buffer_barrier();
       proj(ctx.ffa, gw.w2, ctx.x, (int)BS, 1.f);
       if (blk_i == 0 && debug_taps) {
+        end_compute();
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         [blit copyFromBuffer:ctx.x
                 sourceOffset:0
@@ -711,16 +880,17 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     }
 
     // ---- output norm + number head ---------------------------------------
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:ctx.p_head];
-    [enc setBuffer:ctx.x offset:0 atIndex:0];
-    [enc setBuffer:ctx.norm_out offset:0 atIndex:1];
-    [enc setBuffer:ctx.dec_w offset:0 atIndex:2];
-    [enc setBytes:&ctx.dec_b length:4 atIndex:3];
-    [enc setBuffer:ctx.yhat offset:0 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(BS, 1, 1)
+    buffer_barrier();
+    id<MTLComputeCommandEncoder> henc = compute();
+    [henc setComputePipelineState:ctx.p_head];
+    [henc setBuffer:ctx.x offset:0 atIndex:0];
+    [henc setBuffer:ctx.norm_out offset:0 atIndex:1];
+    [henc setBuffer:ctx.dec_w offset:0 atIndex:2];
+    [henc setBytes:&ctx.dec_b length:4 atIndex:3];
+    [henc setBuffer:ctx.yhat offset:0 atIndex:4];
+    [henc dispatchThreadgroups:MTLSizeMake(BS, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    [enc endEncoding];
+    end_compute();
 
     [cb commit];
     [cb waitUntilCompleted];

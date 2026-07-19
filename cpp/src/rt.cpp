@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -19,6 +20,9 @@
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
 #define RT_SDOT 1
 #include <arm_neon.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace rt {
@@ -178,6 +182,51 @@ std::unordered_map<std::string, Tensor> load_safetensors(const std::string& path
 // ---------------------------------------------------------------------------
 static const char* kSem[4] = {"number", "text", "datetime", "boolean"};
 static const char* kAttnName[3] = {"col", "feat", "nbr"};
+
+namespace {
+
+// Runtime check for the ARM int8 matrix-multiply extension (SMMLA). The
+// SMMLA kernel is compiled with a per-function target attribute, so the
+// library still loads on chips without i8mm (e.g. M1) — it just takes the
+// SDOT path there. Detected once.
+bool cpu_has_i8mm() {
+#if defined(RT_SDOT)
+  static const bool v = [] {
+    if (const char* e = std::getenv("RT_NO_I8MM"))   // force the SDOT path
+      if (e[0] == '1') return false;
+#if defined(__APPLE__)
+    int r = 0;
+    size_t s = sizeof r;
+    if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &r, &s, nullptr, 0) != 0)
+      return false;
+    return r != 0;
+#elif defined(__ARM_FEATURE_MATMUL_INT8)
+    return true;
+#else
+    return false;
+#endif
+  }();
+  return v;
+#else
+  return false;
+#endif
+}
+
+// Repack an int8 [out,in] weight (row-major) into SMMLA panels:
+//   packed[(p*(in/8) + kb)*16 + 0..7]  = row(2p)[kb*8 : kb*8+8]
+//   packed[(p*(in/8) + kb)*16 + 8..15] = row(2p+1)[kb*8 : kb*8+8]
+// so one vld1q_s8 feeds a full 2x8 SMMLA operand. Requires out even, in%8==0.
+void pack_q8_smmla(const int8_t* src, int8_t* dst, int out, int in) {
+  const int KB = in / 8;
+  for (int p = 0; p < out / 2; p++)
+    for (int kb = 0; kb < KB; kb++) {
+      int8_t* d = dst + ((size_t)p * KB + kb) * 16;
+      std::memcpy(d, src + (size_t)(2 * p) * in + kb * 8, 8);
+      std::memcpy(d + 8, src + (size_t)(2 * p + 1) * in + kb * 8, 8);
+    }
+}
+
+}  // namespace
 
 Model Model::load(const std::string& path) {
   Model m;
@@ -384,6 +433,20 @@ void matmul(const float* x, const Linear& l, float* y, int rows) {
 }
 
 #ifdef RT_SDOT
+inline float q8_absmax(const float* x, int n) {
+  float32x4_t mx = vdupq_n_f32(0.f);
+  for (int k = 0; k < n; k += 4)
+    mx = vmaxnmq_f32(mx, vabsq_f32(vld1q_f32(x + k)));
+  return vmaxnmvq_f32(mx);
+}
+
+inline int8x8_t quantize_q8x8(const float* x, float inv) {
+  const float32x4_t scale = vdupq_n_f32(inv);
+  const int32x4_t lo = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x), scale));
+  const int32x4_t hi = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + 4), scale));
+  return vqmovn_s16(vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi)));
+}
+
 // True int8 throughput for Q8 weights: activations are quantized per row
 // (absmax/127, like llama.cpp's Q8_0 activations), then y = (sx*sw) *
 // (xq . wq) with the int8 dot products running on the NEON sdot units
@@ -391,20 +454,35 @@ void matmul(const float* x, const Linear& l, float* y, int rows) {
 // half the traffic of the fp16 path, a quarter of fp32 — and the fp32
 // weights never exist at all. Loop order keeps a 4-row weight strip in L1
 // across a 16-row activation block.
-void matmul_q8_sdot(const float* x, const Weight& w, float* y, int rows) {
-  const int K = w.in;                       // 512/2048: multiples of 16
-  std::vector<int8_t> xq((size_t)rows * K);
-  std::vector<float> sx(rows);
+struct Q8RowActivations {
+  int rows = 0, K = 0;
+  std::vector<int8_t> q;
+  std::vector<float> scales;
+};
+
+Q8RowActivations quantize_q8_rows(const float* x, int rows, int K) {
+  Q8RowActivations a;
+  a.rows = rows;
+  a.K = K;
+  a.q.resize((size_t)rows * K);
+  a.scales.resize(rows);
   Pool::get().run(Pool::get().size(), rows, [&](int, int r) {
     const float* xr = x + (size_t)r * K;
-    float amax = 0.f;
-    for (int k = 0; k < K; k++) amax = std::max(amax, std::fabs(xr[k]));
+    const float amax = q8_absmax(xr, K);
     const float s = amax > 0.f ? amax / 127.f : 1.f;
-    sx[r] = s;
+    a.scales[r] = s;
     const float inv = 1.f / s;
-    int8_t* q = &xq[(size_t)r * K];
-    for (int k = 0; k < K; k++) q[k] = (int8_t)lrintf(xr[k] * inv);
+    int8_t* q = &a.q[(size_t)r * K];
+    for (int k = 0; k < K; k += 8)
+      vst1_s8(q + k, quantize_q8x8(xr + k, inv));
   });
+  return a;
+}
+
+void matmul_q8_sdot_packed(const Q8RowActivations& a, const Weight& w,
+                           float* y) {
+  assert(a.K == w.in);
+  const int rows = a.rows, K = a.K;          // 512/2048: multiples of 16
   const float* sw = reinterpret_cast<const float*>(w.qs);
   const int8_t* wq = reinterpret_cast<const int8_t*>(w.q);
   constexpr int kNTile = 32, kRBlk = 16;
@@ -419,7 +497,7 @@ void matmul_q8_sdot(const float* x, const Weight& w, float* y, int rows) {
         const int8_t* w2 = w1 + K;
         const int8_t* w3 = w2 + K;
         for (int r = r0; r < r1; r++) {
-          const int8_t* xr = &xq[(size_t)r * K];
+          const int8_t* xr = &a.q[(size_t)r * K];
           int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0;
           for (int k = 0; k < K; k += 16) {
             int8x16_t xv = vld1q_s8(xr + k);
@@ -429,7 +507,7 @@ void matmul_q8_sdot(const float* x, const Weight& w, float* y, int rows) {
             a3 = vdotq_s32(a3, xv, vld1q_s8(w3 + k));
           }
           float* yr = y + (size_t)r * w.out + n;
-          const float sr = sx[r];
+          const float sr = a.scales[r];
           yr[0] = sr * sw[n] * (float)vaddvq_s32(a0);
           yr[1] = sr * sw[n + 1] * (float)vaddvq_s32(a1);
           yr[2] = sr * sw[n + 2] * (float)vaddvq_s32(a2);
@@ -438,6 +516,161 @@ void matmul_q8_sdot(const float* x, const Weight& w, float* y, int rows) {
       }
     }
   });
+}
+
+void matmul_q8_sdot(const float* x, const Weight& w, float* y, int rows) {
+  auto a = quantize_q8_rows(x, rows, w.in);
+  matmul_q8_sdot_packed(a, w, y);
+}
+
+// ---- i8mm (SMMLA) path ----------------------------------------------------
+// SMMLA does a full 2x8 . 8x2 -> 2x2 int32 matrix-multiply-accumulate per
+// instruction (vs SDOT's four 4-lane dots), so one instruction advances a
+// 2x2 output block by 8 along K. Both operands are pre-interleaved into 2x8
+// panels: weights once on first use (pack_q8_smmla), activations per forward.
+// This function carries a per-function i8mm target attribute so the rest of
+// the TU stays baseline — it is only ever called when cpu_has_i8mm() packed
+// the weights, so chips without i8mm never reach it.
+//
+// Micro-kernel: 4 activation rows (2 pairs) x 8 output cols (4 pairs) held in
+// 8 int32x4 accumulators (16 int32-lane accumulators — enough independent
+// chains to saturate the SMMLA units and amortize the panel loads).
+__attribute__((target("arch=armv8.6-a+i8mm")))
+void smmla_stripe(const int8_t* Apack, const float* sx, const int8_t* Wpack,
+                  const float* sw, float* y, int Mp, int M, int N, int K,
+                  int n0, int n1) {
+  const int KB = K / 8;
+  for (int r = 0; r < Mp; r += 4) {
+    const int8_t* Ap0 = Apack + (size_t)(r / 2) * KB * 16;       // rows r,   r+1
+    const int8_t* Ap1 = Apack + (size_t)(r / 2 + 1) * KB * 16;   // rows r+2, r+3
+    for (int n = n0; n < n1; n += 8) {
+      const int8_t* Wp0 = Wpack + (size_t)(n / 2) * KB * 16;
+      const int8_t* Wp1 = Wp0 + (size_t)KB * 16;
+      const int8_t* Wp2 = Wp1 + (size_t)KB * 16;
+      const int8_t* Wp3 = Wp2 + (size_t)KB * 16;
+      int32x4_t c00 = vdupq_n_s32(0), c01 = c00, c02 = c00, c03 = c00;
+      int32x4_t c10 = c00, c11 = c00, c12 = c00, c13 = c00;
+      for (int kb = 0; kb < KB; kb++) {
+        int8x16_t a0 = vld1q_s8(Ap0 + kb * 16), a1 = vld1q_s8(Ap1 + kb * 16);
+        int8x16_t w0 = vld1q_s8(Wp0 + kb * 16), w1 = vld1q_s8(Wp1 + kb * 16),
+                  w2 = vld1q_s8(Wp2 + kb * 16), w3 = vld1q_s8(Wp3 + kb * 16);
+        c00 = vmmlaq_s32(c00, a0, w0); c01 = vmmlaq_s32(c01, a0, w1);
+        c02 = vmmlaq_s32(c02, a0, w2); c03 = vmmlaq_s32(c03, a0, w3);
+        c10 = vmmlaq_s32(c10, a1, w0); c11 = vmmlaq_s32(c11, a1, w1);
+        c12 = vmmlaq_s32(c12, a1, w2); c13 = vmmlaq_s32(c13, a1, w3);
+      }
+      // lanes of each 2x2 block: [ (row_even . col_even), (row_even . col_odd),
+      //                            (row_odd  . col_even), (row_odd  . col_odd) ]
+      const int32x4_t C[2][4] = {{c00, c01, c02, c03}, {c10, c11, c12, c13}};
+      for (int i = 0; i < 2; i++) {
+        const int re = r + 2 * i, ro = re + 1;
+        if (re >= M) break;                     // padded tile tail
+        for (int j = 0; j < 4; j++) {
+          const int ce = n + 2 * j, co = ce + 1;
+          const int32x4_t v = C[i][j];
+          y[(size_t)re * N + ce] = sx[re] * sw[ce] * (float)vgetq_lane_s32(v, 0);
+          y[(size_t)re * N + co] = sx[re] * sw[co] * (float)vgetq_lane_s32(v, 1);
+          if (ro < M) {
+            y[(size_t)ro * N + ce] = sx[ro] * sw[ce] * (float)vgetq_lane_s32(v, 2);
+            y[(size_t)ro * N + co] = sx[ro] * sw[co] * (float)vgetq_lane_s32(v, 3);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Quantize directly into pair-packed activation panels, then run smmla_stripe
+// over N stripes. Writing the final layout here avoids materializing a
+// row-major int8 panel and reading it back in a separate packing pass.
+// The weight repacking is built once and cached (w.q8_smmla); w.q itself is
+// left row-major so the GPU backend and SDOT path keep their canonical view.
+struct Q8SmmlaActivations {
+  int rows = 0, K = 0, Mp = 0;
+  std::unique_ptr<int8_t[]> q;
+  std::vector<float> scales;
+};
+
+Q8SmmlaActivations quantize_q8_smmla(const float* x, int rows, int K) {
+  Q8SmmlaActivations a;
+  a.rows = rows;
+  a.K = K;
+  a.Mp = (rows + 3) & ~3;                   // pad rows to a multiple of 4
+  a.scales.resize(a.Mp, 0.f);
+  const int KB = K / 8;
+  // Every panel byte is assigned below, including at most three padded rows,
+  // so avoid zero-filling the full buffer before overwriting its real rows.
+  a.q.reset(new int8_t[(size_t)(a.Mp / 2) * KB * 16]);
+  Pool::get().run(Pool::get().size(), a.Mp / 2, [&](int, int p) {
+    int8_t* d = a.q.get() + (size_t)p * KB * 16;
+    for (int rp = 0; rp < 2; rp++) {
+      const int r = 2 * p + rp;
+      if (r >= rows) {
+        for (int kb = 0; kb < KB; kb++)
+          vst1_s8(d + kb * 16 + rp * 8, vdup_n_s8(0));
+        continue;
+      }
+      const float* xr = x + (size_t)r * K;
+      const float amax = q8_absmax(xr, K);
+      const float s = amax > 0.f ? amax / 127.f : 1.f;
+      a.scales[r] = s;
+      const float inv = 1.f / s;
+      for (int kb = 0; kb < KB; kb++)
+        vst1_s8(d + kb * 16 + rp * 8, quantize_q8x8(xr + kb * 8, inv));
+    }
+  });
+  return a;
+}
+
+void matmul_q8_smmla_packed(const Q8SmmlaActivations& a, const Weight& w,
+                            float* y) {
+  assert(a.K == w.in);
+  const int K = w.in, N = w.out;
+  if (!w.q8_smmla) {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!w.q8_smmla) {                       // double-checked under the lock
+      auto packed = std::make_shared<std::vector<int8_t>>((size_t)N * K);
+      pack_q8_smmla(reinterpret_cast<const int8_t*>(w.q), packed->data(), N, K);
+      w.q8_smmla = packed;
+    }
+  }
+  const int8_t* Wpack = w.q8_smmla->data();
+  const float* sw = reinterpret_cast<const float*>(w.qs);
+  constexpr int kStripe = 64;               // multiple of 8
+  const int nstripes = (N + kStripe - 1) / kStripe;
+  Pool::get().run(Pool::get().size(), nstripes, [&](int, int st) {
+    const int n0 = st * kStripe, n1 = std::min(n0 + kStripe, N);
+    smmla_stripe(a.q.get(), a.scales.data(), Wpack, sw, y, a.Mp, a.rows, N, K,
+                 n0, n1);
+  });
+}
+
+void matmul_q8_smmla(const float* x, const Weight& w, float* y, int rows) {
+  auto a = quantize_q8_smmla(x, rows, w.in);
+  matmul_q8_smmla_packed(a, w, y);
+}
+
+// w1 and w3 consume the same normalized FFN input. Quantize/pack that panel
+// once and feed both projections instead of repeating the activation pass.
+bool matmul_q8_pair(const float* x, const Weight& w0, float* y0,
+                    const Weight& w1, float* y1, int rows) {
+  if (w0.type != WType::Q8 || w1.type != WType::Q8 || w0.in != w1.in)
+    return false;
+  if (cpu_has_i8mm() && w0.out % 8 == 0 && w1.out % 8 == 0 &&
+      w0.in % 8 == 0) {
+    auto a = quantize_q8_smmla(x, rows, w0.in);
+    matmul_q8_smmla_packed(a, w0, y0);
+    matmul_q8_smmla_packed(a, w1, y1);
+    return true;
+  }
+  if (w0.out % 4 == 0 && w1.out % 4 == 0 && w0.in % 16 == 0) {
+    auto a = quantize_q8_rows(x, rows, w0.in);
+    matmul_q8_sdot_packed(a, w0, y0);
+    matmul_q8_sdot_packed(a, w1, y1);
+    return true;
+  }
+  return false;
 }
 #endif
 
@@ -455,6 +688,10 @@ void matmul_w(const float* x, const Weight& w, float* y, int rows) {
     return;
   }
 #ifdef RT_SDOT
+  if (w.type == WType::Q8 && cpu_has_i8mm() && w.out % 8 == 0 && w.in % 8 == 0) {
+    matmul_q8_smmla(x, w, y, rows);         // i8mm (weights packed lazily)
+    return;
+  }
   if (w.type == WType::Q8 && w.out % 4 == 0 && w.in % 16 == 0) {
     matmul_q8_sdot(x, w, y, rows);
     return;
@@ -795,8 +1032,14 @@ void run_blocks_cpu(const Model& m, Prepared& prep, Output& out, int n_threads,
     }
     // FFN: x += w2( silu(w1 xn) * w3 xn )
     for (size_t i = 0; i < BS; i++) rmsnorm(&x[i * D], blk.norm[3], &xn[i * D], D);
-    matmul_w(xn.data(), blk.w1, ffa.data(), (int)BS);
-    matmul_w(xn.data(), blk.w3, ffb.data(), (int)BS);
+#ifdef RT_SDOT
+    if (!matmul_q8_pair(xn.data(), blk.w1, ffa.data(), blk.w3, ffb.data(),
+                        (int)BS))
+#endif
+    {
+      matmul_w(xn.data(), blk.w1, ffa.data(), (int)BS);
+      matmul_w(xn.data(), blk.w3, ffb.data(), (int)BS);
+    }
     // silu(ffa) * ffb per row: silu(x) = x/(1+exp(-x))
     parallel_for((int)BS, [&](int w, int i) {
       Scratch& sp = scratch[w];
