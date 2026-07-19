@@ -411,7 +411,9 @@ samples entirely in-process — "latest *w* children ≤ anchor" is one binary
 search plus a tail slice.
 
 Use for **latency-sensitive, repeated scoring** over data that fits in
-memory. The index is a snapshot; rebuild with `engine.refresh()`.
+memory. The index is a **snapshot**, built once when the engine is
+constructed and immutable thereafter — to pick up changed data, construct
+a new engine.
 
 ### Context budgets
 
@@ -761,7 +763,7 @@ Both modes produce identical contexts. Choose by data locality.
 | | RETRIEVER (default) | CSC |
 |---|---|---|
 | Data location | stays in your store | copied into an in-memory index |
-| Freshness | live, per query | snapshot (`engine.refresh()`) |
+| Freshness | live, per query | snapshot, fixed at construction |
 | Requires | Entity + Link retrievers | `TableScanner` per table |
 | Best for | remote, huge, or access-controlled data | repeated low-latency scoring |
 

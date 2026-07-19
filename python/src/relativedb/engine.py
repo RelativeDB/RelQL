@@ -4,7 +4,7 @@ Two traversal strategies (:class:`SamplerMode`):
 
 * ``RETRIEVER`` (default) — pull-per-hop through Entity/Link retrievers.
 * ``CSC`` — a materialized in-memory CSC index built from TableScanners
-  (:mod:`relativedb.csc`); refresh with :meth:`Engine.refresh`.
+  (:mod:`relativedb.csc`), snapshotted once at construction.
 
 Both enforce the temporal bound defensively: every row returned by user code
 is re-checked and dropped if it is newer than the bound (F24 — a buggy
@@ -450,13 +450,11 @@ class Engine:
         self.model_backend: Optional[ModelBackend] = model_backend
         self.context_policy = context_policy or ContextPolicy()
         self.sampler_mode = sampler_mode
+        # The CSC snapshot is built once, here. It is immutable for the life of
+        # the engine: to pick up changed data, construct a new Engine.
         self._csc_index: Optional[CscIndex] = None
         if sampler_mode is SamplerMode.CSC:
-            self.refresh()
-
-    def refresh(self) -> None:
-        """(Re)build the CSC snapshot from the wired TableScanners."""
-        self._csc_index = CscIndex.build(self.schema, self.wiring)
+            self._csc_index = CscIndex.build(self.schema, self.wiring)
 
     def _require_backend(self) -> ModelBackend:
         """Scoring paths (execute, EXPLAIN ANALYZE) need a model backend; the
@@ -471,7 +469,12 @@ class Engine:
     def _sampler(self):
         if self.sampler_mode is SamplerMode.CSC:
             if self._csc_index is None:
-                self.refresh()
+                # Only reachable by flipping sampler_mode after construction.
+                # Say so rather than silently draining every scanner mid-query.
+                raise ExecutionError(
+                    "CSC mode has no index: the snapshot is built once, in the "
+                    "Engine constructor. Construct the engine with "
+                    "sampler_mode=SamplerMode.CSC instead of setting it later.")
             return _CscSampler(self._csc_index)
         return _RetrieverSampler(self.schema, self.wiring)
 
