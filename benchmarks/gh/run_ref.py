@@ -89,6 +89,13 @@ def main():
     ap.add_argument("--checkpoint", default="stanford-star/rt-j/classification")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--ctx-size", type=int, default=8192)
+    # eval_bs = tokens_per_gpu // ctx_size. The reference's 2**18 means a batch
+    # of 32, and the materialized (B, S, S) attention masks at ctx 8192 then
+    # ask for a 10 GiB buffer, which this machine refuses. This is a batching
+    # knob only: local_ctx_size, bfs_width, num_walks, walk_length and the
+    # context size are all left at the reference's own defaults, so the
+    # contexts the model sees are unchanged.
+    ap.add_argument("--tokens-per-gpu", type=int, default=2**14)
     ap.add_argument("--keep", action="store_true",
                     help="reuse an existing preprocessed directory")
     args = ap.parse_args()
@@ -136,7 +143,10 @@ def main():
                          embedding_model=cfg.get("embedding_model",
                                                  "all-MiniLM-L12-v2"),
                          d_text=cfg.get("d_text", 384), device=args.device,
-                         ctx_size=ctx, items_per_task=10_000_000)
+                         ctx_size=ctx, items_per_task=10_000_000,
+                         tokens_per_gpu=args.tokens_per_gpu)
+    print(f"   ctx={ctx} local_ctx=256 bfs_width=32 walks=10000x20 "
+          f"eval_bs={max(1, args.tokens_per_gpu // ctx)}", flush=True)
     ((task, _c, _l, out, _n, node_idxs),) = ev.evaluate_raw(
         [(model, "")], [ctx], with_node_idxs=True)
 
