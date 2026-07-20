@@ -1,0 +1,355 @@
+actor_login,why,n_events,n_repos,span_min,ev_per_min,own_repo_share,own_junk,login_family,n_created,n_deleted,example_repos
+a25814740,name-family,11,2,1348.6666666666667,0.0,0.0,0.0,22,10,1,
+aws-aemilia-pdx,"name-family,create-delete-churn",383,24,1437.1833333333334,0.3,1.0,0.2,18,183,186,aws-aemilia-pdx/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-gamma-us-west-2; aws-aemilia-pdx/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-gamma-us-west-2; aws-aemilia-pdx/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-beta-us-west-2
+aws-aemilia-iad,"name-family,create-delete-churn",284,19,1438.2666666666667,0.2,1.0,0.2,18,145,128,aws-aemilia-iad/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-us-east-1; aws-aemilia-iad/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-us-east-1; aws-aemilia-iad/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-gamma-us-east-1
+aws-aemilia-dub,"name-family,create-delete-churn",200,13,1437.85,0.1,1.0,0.2,18,109,86,aws-aemilia-dub/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-eu-west-1; aws-aemilia-dub/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-eu-west-1; aws-aemilia-dub/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-eu-west-1
+aws-aemilia-sin,"name-family,create-delete-churn",203,9,1423.4666666666667,0.1,1.0,0.2,18,107,86,aws-aemilia-sin/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-prod-ap-southeast-1; aws-aemilia-sin/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-ap-southeast-1; aws-aemilia-sin/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-southeast-1
+aws-aemilia-nrt,"name-family,create-delete-churn",192,12,1432.45,0.1,1.0,0.21,18,106,81,aws-aemilia-nrt/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ap-northeast-1; aws-aemilia-nrt/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-northeast-1; aws-aemilia-nrt/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-ap-northeast-1
+aws-aemilia-cdg,"name-family,create-delete-churn",191,14,1424.9833333333333,0.1,1.0,0.2,18,105,80,aws-aemilia-cdg/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-eu-west-3; aws-aemilia-cdg/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-eu-west-3; aws-aemilia-cdg/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-eu-west-3
+aws-aemilia-arn,"name-family,create-delete-churn",197,11,1427.2333333333333,0.1,1.0,0.2,18,103,90,aws-aemilia-arn/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-eu-north-1; aws-aemilia-arn/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-eu-north-1; aws-aemilia-arn/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-eu-north-1
+aws-aemilia-sfo,"name-family,create-delete-churn",183,11,1429.7333333333333,0.1,1.0,0.2,18,103,76,aws-aemilia-sfo/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-us-west-1; aws-aemilia-sfo/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-us-west-1; aws-aemilia-sfo/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-us-west-1
+aws-aemilia-syd,"name-family,create-delete-churn",192,11,1430.5166666666667,0.1,1.0,0.21,18,102,87,aws-aemilia-syd/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-southeast-2; aws-aemilia-syd/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ap-southeast-2; aws-aemilia-syd/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-ap-southeast-2
+aws-aemilia-fra,"name-family,create-delete-churn",188,13,1438.0333333333333,0.1,1.0,0.21,18,99,83,aws-aemilia-fra/react-app7313302770760777; aws-aemilia-fra/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-prod-eu-central-1; aws-aemilia-fra/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-eu-central-1
+aws-aemilia-mxp,"name-family,create-delete-churn",181,12,1422.25,0.1,1.0,0.2,18,97,80,aws-aemilia-mxp/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-eu-south-1; aws-aemilia-mxp/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-eu-south-1; aws-aemilia-mxp/react-app37733589718515015
+aws-aemilia-icn,"name-family,create-delete-churn",192,15,1435.9166666666667,0.1,1.0,0.21,18,96,90,aws-aemilia-icn/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-northeast-2; aws-aemilia-icn/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ap-northeast-2; aws-aemilia-icn/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-ap-northeast-2
+aws-aemilia-yul,"name-family,create-delete-churn",178,9,1427.25,0.1,1.0,0.21,18,95,76,aws-aemilia-yul/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-prod-ca-central-1; aws-aemilia-yul/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ca-central-1; aws-aemilia-yul/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ca-central-1
+aws-aemilia-kix,"name-family,create-delete-churn",183,9,1438.7166666666667,0.1,1.0,0.21,18,89,90,aws-aemilia-kix/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-prod-ap-northeast-3; aws-aemilia-kix/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ap-northeast-3; aws-aemilia-kix/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-northeast-3
+aws-aemilia-bom,"name-family,create-delete-churn",171,11,1435.7833333333333,0.1,1.0,0.2,18,87,81,aws-aemilia-bom/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ap-south-1; aws-aemilia-bom/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-south-1; aws-aemilia-bom/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-ap-south-1
+aws-aemilia-lhr,"name-family,create-delete-churn",164,9,1425.5,0.1,1.0,0.2,18,76,85,aws-aemilia-lhr/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-eu-west-2; aws-aemilia-lhr/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-eu-west-2; aws-aemilia-lhr/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-eu-west-2
+aws-aemilia-cmh,"name-family,create-delete-churn",159,5,1411.5333333333333,0.1,1.0,0.2,18,75,80,aws-aemilia-cmh/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-us-east-2; aws-aemilia-cmh/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-us-east-2; aws-aemilia-cmh/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-us-east-2
+aws-aemilia-gru,"name-family,create-delete-churn",164,9,1439.05,0.1,1.0,0.2,18,69,88,aws-aemilia-gru/Github-PR-Commit-Integration-Test-DoNotTouch-GitHubAutoBuildPrPreviewCanaryTest-v2-prod-sa-east-1; aws-aemilia-gru/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-sa-east-1; aws-aemilia-gru/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-sa-east-1
+s-silt,name-family,9,1,1123.4833333333333,0.0,1.0,0.07,16,6,3,s-silt/fxapk
+s977043,name-family,9,2,7.283333333333333,1.2,1.0,0.07,16,0,2,s977043/PlanGate; s977043/my-blog
+0x06060606,name-family,16,1,1375.8833333333334,0.0,0.0,0.0,10,6,10,
+chris17453,"name-family,create-delete-churn",66,1,713.25,0.1,0.0,0.0,9,44,18,
+justin808,name-family,16,5,367.9,0.0,0.125,0.07,9,8,5,justin808/napkin
+chris-yyau,name-family,8,2,538.4,0.0,1.0,0.07,9,5,3,chris-yyau/busdriver; chris-yyau/helmet
+justin13888,name-family,11,2,1241.8333333333333,0.0,0.909,0.07,9,5,5,justin13888/gamut
+x812033727,name-family,30,6,1186.9166666666667,0.0,1.0,0.22,8,19,11,x812033727/AVBT; x812033727/SaaS; x812033727/FinceptWeb99
+sahil87,name-family,11,7,177.21666666666667,0.1,1.0,0.07,8,11,0,sahil87/idea; sahil87/shll; sahil87/run-kit
+sahil-noon,name-family,11,5,484.05,0.0,0.0,0.0,8,0,9,
+daniel3303,name-family,10,1,961.3166666666667,0.0,1.0,0.07,7,8,2,daniel3303/Equibles
+andrew01234567890,name-family,12,2,1382.3,0.0,1.0,0.27,7,7,4,andrew01234567890/pgshard2; andrew01234567890/pgshard
+andrew-polk,name-family,9,4,1124.75,0.0,0.0,0.0,7,4,5,
+matt82198,name-family,35,2,1279.45,0.0,1.0,0.08,6,13,21,matt82198/aesop; matt82198/matt82198.github.io
+steve-keep,name-family,8,1,71.35,0.1,1.0,0.07,6,8,0,steve-keep/BitPerfect
+steve-dolo,name-family,11,1,1181.5833333333333,0.0,0.0,0.0,6,7,4,
+scalr-autotester6,"name-family,create-delete-churn",126,14,1369.4,0.1,0.0,0.0,5,63,61,
+scalr-autotester13,"name-family,create-delete-churn",118,15,1324.9333333333334,0.1,0.0,0.0,5,62,55,
+scalr-autotester5,"name-family,create-delete-churn",106,13,1358.0666666666666,0.1,0.0,0.0,5,54,49,
+scalr-autotester19,"name-family,create-delete-churn",94,14,1338.4166666666667,0.1,0.0,0.0,5,50,44,
+scalr-autotester0,"name-family,create-delete-churn",90,14,1315.0833333333333,0.1,0.0,0.0,5,39,51,
+mobbcitestjob6,"name-family,create-delete-churn",50,3,860.5833333333334,0.1,0.0,0.0,5,27,22,
+eric-foo,name-family,26,1,997.05,0.0,1.0,0.07,5,14,12,eric-foo/forseti
+mobbcitestjob9,name-family,28,3,1090.65,0.0,0.0,0.0,5,14,13,
+jm2,name-family,21,2,1436.3,0.0,1.0,0.07,5,12,9,jm2/tributary; jm2/kisakcod
+mobbcitestjob7,name-family,14,4,943.7666666666667,0.0,0.0,0.0,5,8,5,
+mobbcitestjob8,name-family,18,4,752.7166666666667,0.0,0.0,0.0,5,7,10,
+himanshu231204,name-family,9,2,705.5166666666667,0.0,0.0,0.0,5,6,1,
+jonathan-nam,name-family,9,1,1221.6833333333334,0.0,1.0,0.07,5,4,5,jonathan-nam/maplestorage
+mobbcitestjob5,name-family,8,2,9.6,0.8,0.0,0.0,5,3,4,
+nh13,name-family,22,2,1286.1666666666667,0.0,0.0,0.0,4,14,8,
+josh,name-family,25,4,1096.8,0.0,1.0,0.07,4,13,12,josh/imdb-trakt-sync; josh/trakt-data; josh/trakt-plex-sync
+c-vigo,name-family,24,4,688.1166666666667,0.0,0.0,0.0,4,12,11,
+mohammed-alaa40123,name-family,11,1,1372.8333333333333,0.0,1.0,0.13,4,11,0,mohammed-alaa40123/How.to.llama.cpp
+Michael141111,name-family,8,3,895.3666666666667,0.0,1.0,0.07,4,8,0,Michael141111/mgh-cashier-system; Michael141111/Lockery; Michael141111/quack-war
+shin-core,name-family,8,2,986.1333333333333,0.0,1.0,0.12,4,8,0,shin-core/loopover; shin-core/metagraphed
+pat-mw,name-family,10,1,748.45,0.0,1.0,0.07,4,7,3,pat-mw/revu
+rob531,name-family,9,1,1101.6833333333334,0.0,1.0,0.07,4,7,2,rob531/zo-sentinel
+pat792,name-family,14,1,1116.85,0.0,1.0,0.07,4,6,7,pat792/set-picks
+g761007,name-family,8,1,638.9166666666666,0.0,1.0,0.07,4,4,3,g761007/git-worklog
+jeremy,name-family,10,2,1146.3833333333334,0.0,0.0,0.0,4,2,1,
+just-trey,name-family,8,1,1311.6,0.0,1.0,0.13,4,2,6,just-trey/makegood-tmt-mosaic
+Ahmad-S792,name-family,8,1,2.9166666666666665,2.7,1.0,0.07,4,0,8,Ahmad-S792/WebKit
+ethan42,name-family,157,141,875.6166666666667,0.2,0.0,0.0,3,154,0,
+George-RD,name-family,25,3,1047.3833333333334,0.0,0.6,0.07,3,18,6,George-RD/openspine; George-RD/firth
+dan-nor98,name-family,21,1,608.4,0.0,1.0,0.07,3,13,7,dan-nor98/pypostboy
+kim-em,name-family,28,5,1409.1833333333334,0.0,0.214,0.07,3,12,6,kim-em/TauCeti; kim-em/lean-zip; kim-em/hex-dev
+matthew-dean,name-family,11,1,206.1,0.1,0.0,0.0,3,11,0,
+Mahmoud-Emad,name-family,20,1,590.95,0.0,0.0,0.0,3,10,9,
+seeker71,name-family,12,1,819.3833333333333,0.0,1.0,0.07,3,10,1,seeker71/coherence-kernel
+Aayush-jpg,name-family,15,1,19.433333333333334,0.8,1.0,0.07,3,8,7,Aayush-jpg/public-health-pipeline
+Ghost-bp,"name-family,burst",8,1,0.05,16.0,1.0,0.22,3,8,0,Ghost-bp/2_FER
+shu1513,name-family,13,1,1361.3166666666666,0.0,1.0,0.13,3,8,5,shu1513/voteapp
+Ethan-IS,name-family,13,1,1353.0,0.0,0.0,0.0,3,7,5,
+ll7,name-family,12,1,843.8166666666667,0.0,1.0,0.23,3,7,5,ll7/robot_sf_ll7
+seeker19110,name-family,14,3,1375.8333333333333,0.0,1.0,0.11,3,7,6,seeker19110/Xgold; seeker19110/xboss; seeker19110/bilingual-english-vietnamese
+tim-nish,name-family,21,2,835.15,0.0,1.0,0.09,3,7,13,tim-nish/tanuki; tim-nish/writing-assistant
+Mahmoud-Magd,name-family,8,1,876.7333333333333,0.0,1.0,0.13,3,6,1,Mahmoud-Magd/SW_MM
+Mr-B042,name-family,10,1,459.6166666666667,0.0,1.0,0.07,3,4,6,Mr-B042/Protohub
+zw008,name-family,9,5,336.51666666666665,0.0,0.0,0.0,3,4,4,
+abhinav-jain09,name-family,9,2,1177.4,0.0,1.0,0.07,3,3,5,abhinav-jain09/options-edge-deploy; abhinav-jain09/option-edge-feed-gateway
+dy-hu,create-delete-churn,120,1,135.1,0.9,1.0,0.07,2,67,51,dy-hu/dy-hu-playground
+fw-bot,create-delete-churn,111,6,1418.6333333333334,0.1,0.0,0.0,2,42,67,
+Zeref-XXX,burst,9,1,0.06666666666666667,18.0,1.0,0.07,2,9,0,Zeref-XXX/devops-vprofile-project
+iroha1203,junk-repos,9,1,1214.6166666666666,0.0,1.0,0.67,2,5,4,iroha1203/AlgebraicArchitectureTheoryV2
+realkrxgod,create-delete-churn,2918,1,1438.4,2.0,1.0,0.07,1,1503,1415,realkrxgod/foundsomeone
+leandrohstein,create-delete-churn,734,1,1438.1166666666666,0.5,1.0,0.07,1,337,377,leandrohstein/transporteservico-urbs-data
+KooshaPari,create-delete-churn,190,22,1422.6333333333334,0.1,1.0,0.07,1,171,15,KooshaPari/substrate; KooshaPari/OmniRoute; KooshaPari/Agentora
+com-junkawasaki,create-delete-churn,201,127,1428.5666666666666,0.1,0.015,0.09,1,162,36,com-junkawasaki/office-causal; com-junkawasaki/svgraph; com-junkawasaki/fukurow
+wscsoy-google,burst,159,1,0.8166666666666667,194.7,1.0,0.07,1,159,0,wscsoy-google/daily_stock_analysis
+bettercallzaal,create-delete-churn,194,9,1431.0,0.1,0.969,0.13,1,158,29,bettercallzaal/ZAOOS; bettercallzaal/wwtracker; bettercallzaal/zol
+jatin471,create-delete-churn,261,5,1075.4166666666667,0.2,0.0,0.0,1,146,111,
+ai-integr8tor,burst,123,2,7.766666666666667,15.8,1.0,0.13,1,123,0,ai-integr8tor/ollama-ollama; ai-integr8tor/proycon-colibri-core
+tzervas,create-delete-churn,203,92,1151.55,0.2,1.0,0.1,1,119,74,tzervas/mycelium; tzervas/vsa-optim-rs; tzervas/security-mcp
+BRN-SLP,"create-delete-churn,burst",238,3,42.75,5.6,1.0,0.07,1,111,106,BRN-SLP/meracle; BRN-SLP/mercato; BRN-SLP/tipitip
+jehalladay,create-delete-churn,179,2,1268.2,0.1,1.0,0.07,1,106,73,jehalladay/beads; jehalladay/gastown
+amplify-github-test-hkg,create-delete-churn,191,12,1428.2,0.1,1.0,0.2,1,103,84,amplify-github-test-hkg/Github-PR-Commit-Integration-Test-DoNotTouch-GitH-MJCD6L4M-v2-preprod-ap-east-1; amplify-github-test-hkg/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-preprod-ap-east-1; amplify-github-test-hkg/Github-PR-Commit-Integration-Test-DoNotTouch-Gith-RB7P4TGB-v2-prod-ap-east-1
+me-safty,burst,103,1,2.2333333333333334,46.1,1.0,0.07,1,103,0,me-safty/dxcode
+vp2sfwntbg-cmd,junk-repos,104,8,1435.1166666666666,0.1,0.99,0.56,1,102,0,vp2sfwntbg-cmd/optimizing-llms-contextual-reasoning; vp2sfwntbg-cmd/llm-adaptive-learning; vp2sfwntbg-cmd/ipsum-lorem-all-you-need
+hkustnlp-cmyk,junk-repos,97,8,1417.25,0.1,1.0,0.53,1,97,0,hkustnlp-cmyk/My-Homepage; hkustnlp-cmyk/optimizing-llms-contextual-reasoning; hkustnlp-cmyk/llm-adaptive-learning
+kavincj4,burst,93,1,16.75,5.6,1.0,0.07,1,93,0,kavincj4/project
+DeliciousBuding,create-delete-churn,166,3,1430.45,0.1,0.036,0.07,1,89,52,DeliciousBuding/AgentHub
+beila,create-delete-churn,174,1,1425.3833333333334,0.1,1.0,0.07,1,87,87,beila/dotfiles
+steipete,create-delete-churn,203,18,1433.2166666666667,0.1,0.084,0.07,1,87,95,steipete/CodexBar; steipete/openclaw; steipete/birdclaw
+zbaselg1992-ops,burst,83,1,1.15,72.2,1.0,0.37,1,83,0,zbaselg1992-ops/321
+SAIKUMAR777-sai,burst,82,1,2.05,40.0,1.0,0.07,1,82,0,SAIKUMAR777-sai/imported
+jverkoey,create-delete-churn,124,65,1438.1166666666666,0.1,0.0,0.0,1,81,42,
+openshift-helm-charts-bot,create-delete-churn,158,1,688.35,0.2,0.0,0.0,1,81,75,
+tooluse222,junk-repos,81,8,1425.2833333333333,0.1,1.0,0.54,1,81,0,tooluse222/optimizing-llms-contextual-reasoning; tooluse222/BenchTasksCollv3; tooluse222/My-Homepage
+PurHur,create-delete-churn,166,1,1436.7166666666667,0.1,1.0,0.07,1,79,71,PurHur/php-compiler
+guru-dev-cicd-canary-beta,create-delete-churn,166,4,1426.45,0.1,0.0,0.0,1,79,84,
+bushidocodes,create-delete-churn,162,57,1397.3166666666666,0.1,1.0,0.1,1,77,78,bushidocodes/oldtown-map; bushidocodes/klein-cobol-faq; bushidocodes/nginx-profiling
+norris-deepsource,create-delete-churn,137,1,1428.0833333333333,0.1,0.0,0.0,1,73,62,
+security-alliance-bot,create-delete-churn,145,2,1424.1,0.1,0.959,0.07,1,70,69,security-alliance-bot/eth-phishing-detect
+BrewTestBot,create-delete-churn,118,2,1435.9166666666667,0.1,0.0,0.0,1,67,44,
+btoroled,create-delete-churn,76,4,1276.9,0.1,1.0,0.07,1,65,11,btoroled/Streak-Study-FrontEnd; btoroled/Streak-Study-Backend; btoroled/Streak-Study-Mobile
+JarbasAl,create-delete-churn,124,14,585.3666666666667,0.2,0.0,0.0,1,64,59,
+regro-cf-autotick-bot,create-delete-churn,112,104,1402.35,0.1,0.982,0.14,1,64,46,regro-cf-autotick-bot/ergocub-software-feedstock; regro-cf-autotick-bot/wayland-feedstock; regro-cf-autotick-bot/sim-atlas-feedstock
+direwolf-github,create-delete-churn,127,2,1435.4833333333333,0.1,1.0,0.13,1,62,65,direwolf-github/my-app; direwolf-github/ephemeral-ci-6414a84d
+gamohocai,burst,62,1,1.4333333333333333,43.3,1.0,0.07,1,62,0,gamohocai/minmapmermaid
+auto-master-scalr,create-delete-churn,122,16,1350.05,0.1,0.0,0.0,1,60,58,
+tamnd,create-delete-churn,108,7,1422.7666666666667,0.1,1.0,0.07,1,57,47,tamnd/aki; tamnd/bento; tamnd/unagi
+argo-testing,create-delete-churn,94,1,1396.7666666666667,0.1,1.0,0.07,1,52,42,argo-testing/repo-test
+dancinlife,create-delete-churn,93,6,1432.2833333333333,0.1,0.0,0.0,1,51,37,
+scalr-dungeon-master,create-delete-churn,106,14,1369.4833333333333,0.1,0.0,0.0,1,51,52,
+cplieger,create-delete-churn,100,39,1436.1666666666667,0.1,1.0,0.08,1,50,46,cplieger/cert-converter; cplieger/pg-autodump; cplieger/plex-language-sync
+cloudtestingph2,create-delete-churn,90,4,1302.9166666666667,0.1,1.0,0.08,1,49,41,cloudtestingph2/cloudrepo_for_tkex_cloudrepo04_script; cloudtestingph2/cloudrepo_test; cloudtestingph2/cloudrepo_for_tkex_cloudrepo08_script
+lawrencecchen,create-delete-churn,85,3,1375.1333333333334,0.1,0.0,0.0,1,49,34,
+jahia-ci,"create-delete-churn,burst",92,72,10.55,8.7,0.0,0.0,1,48,44,
+mcptest-user,junk-repos,48,7,1260.8333333333333,0.0,1.0,0.57,1,48,0,mcptest-user/llm-adaptive-learning; mcptest-user/ipsum-lorem-all-you-need; mcptest-user/BenchTasksCollv3
+hyperpolymath,create-delete-churn,122,71,1139.9833333333333,0.1,0.926,0.08,1,47,71,hyperpolymath/airborne-submarine-squadron; hyperpolymath/standards; hyperpolymath/trope-particularity-workbench
+JacobPEvans-personal,create-delete-churn,75,16,1423.8166666666666,0.1,0.053,0.13,1,46,23,JacobPEvans-personal/cc-stream-pack-template; JacobPEvans-personal/cc-stream-zscaler-incident-test
+frewilhelm,create-delete-churn,80,2,310.76666666666665,0.3,0.988,0.07,1,46,33,frewilhelm/open-component-model
+AlphaProMega,burst,45,1,3.8666666666666667,11.6,1.0,0.14,1,45,0,AlphaProMega/Ra-Thor-backup-69
+chrisbbreuer,create-delete-churn,98,19,1390.6833333333334,0.1,0.0,0.0,1,45,50,
+ramincsy,create-delete-churn,84,1,673.55,0.1,1.0,0.07,1,45,38,ramincsy/Auto
+digitalocean-e2e,create-delete-churn,87,1,1410.5666666666666,0.1,1.0,0.13,1,44,43,digitalocean-e2e/apps-deploy-on-push
+bench-induction-ai,junk-repos,41,6,1244.7833333333333,0.0,1.0,0.51,1,41,0,bench-induction-ai/LUFFY; bench-induction-ai/BenchTasksCollv3; bench-induction-ai/Annoy-DataSync
+chengzeliu79-spec,junk-repos,41,8,607.7,0.1,1.0,0.51,1,41,0,chengzeliu79-spec/My-Homepage; chengzeliu79-spec/LUFFY; chengzeliu79-spec/BenchTasksCollv3
+spectopo,create-delete-churn,89,2,1418.0166666666667,0.1,0.0,0.0,1,40,46,
+EHotwagner,create-delete-churn,86,3,1335.5333333333333,0.1,0.0,0.0,1,39,40,
+grisuno,create-delete-churn,77,65,497.3833333333333,0.2,1.0,0.13,1,39,37,grisuno/LazyOwn; grisuno/ReadMenator; grisuno/strass_strassen
+huaihsuanbusiness,create-delete-churn,86,1,1308.45,0.1,0.0,0.0,1,39,41,
+tiagotardelli,create-delete-churn,71,1,1393.95,0.1,1.0,0.07,1,39,32,tiagotardelli/curso-django
+dipper-github-preprod,create-delete-churn,89,3,1332.0,0.1,1.0,0.07,1,37,52,dipper-github-preprod/report-individual-builds-batch-list; dipper-github-preprod/report-individual-builds-batch-matrix; dipper-github-preprod/report-individual-builds-batch-graph
+joshua-temple,create-delete-churn,99,13,773.2833333333333,0.1,0.0,0.0,1,36,62,
+markdbodman,create-delete-churn,66,1,1425.8666666666666,0.0,0.0,0.0,1,36,28,
+anchapin,create-delete-churn,73,5,1402.3833333333334,0.1,1.0,0.07,1,35,29,anchapin/foundry-x; anchapin/fluxion; anchapin/planar-nexus
+madmax983,create-delete-churn,1418,21,1393.9833333333333,1.0,1.0,0.08,1,35,1381,madmax983/relvar; madmax983/autumn-harvest; madmax983/rust_swe_agent
+signcla-test-signed-indiv,create-delete-churn,50,2,1425.0,0.0,0.0,0.0,1,35,12,
+assignUser,create-delete-churn,62,1,740.5666666666667,0.1,0.0,0.0,1,34,28,
+kristof-mattei,create-delete-churn,66,28,1318.5,0.1,0.97,0.1,1,34,32,kristof-mattei/advent-of-code-2022; kristof-mattei/advent-of-code-2021; kristof-mattei/fitness-log
+ql-owo-lp,create-delete-churn,66,1,1385.6,0.0,0.0,0.0,1,34,25,
+scsbot,create-delete-churn,67,1,694.55,0.1,1.0,0.07,1,34,30,scsbot/spring-petclinic
+signcla-test-signed-corp,create-delete-churn,51,2,1424.9666666666667,0.0,0.0,0.0,1,34,16,
+dndungu,create-delete-churn,86,1,1263.05,0.1,0.0,0.0,1,32,53,
+gvbytes,create-delete-churn,66,1,16.25,4.1,1.0,0.07,1,32,33,gvbytes/github-achievements-farm
+r-ryantm,create-delete-churn,79,2,1423.1333333333334,0.1,0.987,0.07,1,32,46,r-ryantm/nixpkgs
+Gilbert09,create-delete-churn,63,2,991.65,0.1,0.0,0.0,1,31,26,
+elirc,create-delete-churn,59,8,1194.45,0.0,1.0,0.08,1,31,26,elirc/agora-net; elirc/atlas-net; elirc/pulse-net
+jollaitbot,create-delete-churn,58,6,61.03333333333333,1.0,0.0,0.0,1,31,27,
+laurenbmoody-web,create-delete-churn,53,1,736.35,0.1,1.0,0.07,1,31,22,laurenbmoody-web/yachtops_analytics
+olafkfreund,create-delete-churn,52,10,1342.4833333333333,0.0,1.0,0.07,1,31,14,olafkfreund/AIFactory; olafkfreund/aifactory-demo; olafkfreund/TFactory
+silasfelinus,create-delete-churn,58,2,1394.65,0.0,1.0,0.07,1,31,26,silasfelinus/kind_robots; silasfelinus/conductor
+w3evolutions,create-delete-churn,50,1,1184.65,0.0,0.0,0.0,1,31,19,
+JSONbored,create-delete-churn,66,3,1188.9666666666667,0.1,1.0,0.11,1,30,28,JSONbored/metagraphed; JSONbored/loopover; JSONbored/awesome-claude
+Syynth,create-delete-churn,49,1,1434.2333333333333,0.0,1.0,0.07,1,30,19,Syynth/brink
+nash226,create-delete-churn,42,2,1418.2666666666667,0.0,1.0,0.07,1,30,10,nash226/quorum; nash226/phonedex
+natthapolvanasrivilai,create-delete-churn,54,17,1408.6166666666666,0.0,0.0,0.0,1,30,21,
+rjwalters,create-delete-churn,54,6,1204.9166666666667,0.0,0.852,0.09,1,30,17,rjwalters/kicad-tools; rjwalters/geode-fem; rjwalters/lean-genius
+wingetbot,create-delete-churn,64,2,1427.7833333333333,0.0,0.734,0.07,1,30,17,wingetbot/winget-pkgs
+RyanMKrol,create-delete-churn,68,5,1336.5,0.1,1.0,0.07,1,29,39,RyanMKrol/Scout; RyanMKrol/Enough; RyanMKrol/Sprout
+chriswong6031-creator,create-delete-churn,51,2,776.4833333333333,0.1,1.0,0.07,1,29,21,chriswong6031-creator/macro; chriswong6031-creator/mastermind-terminal
+fa-assistant,create-delete-churn,63,1,1400.6833333333334,0.0,1.0,0.13,1,29,34,fa-assistant/jaffle_shop
+gasyoun,create-delete-churn,69,10,1307.6166666666666,0.1,0.913,0.16,1,29,39,gasyoun/SanskritLexicography; gasyoun/SanskritGrammar; gasyoun/WhitneyRoots
+mike-thompson-day8,create-delete-churn,68,1,1344.05,0.1,0.0,0.0,1,29,37,
+tooooolathon,junk-repos,29,6,572.5666666666667,0.1,1.0,0.58,1,29,0,tooooolathon/BenchTasksCollv3; tooooolathon/optimizing-llms-contextual-reasoning; tooooolathon/llm-adaptive-learning
+andhit-r,create-delete-churn,63,19,1308.9333333333334,0.0,0.048,0.13,1,28,33,andhit-r/odoo-yaml-test
+konflux-ci-qe-bot,create-delete-churn,99,1,1226.5833333333333,0.1,0.0,0.0,1,28,71,
+kroese,create-delete-churn,54,8,1415.8,0.0,0.0,0.0,1,28,22,
+CBirkbeck,create-delete-churn,58,1,1415.0666666666666,0.0,1.0,0.07,1,27,22,CBirkbeck/AINTLIB
+arlac77,create-delete-churn,99,75,584.2666666666667,0.2,0.687,0.08,1,27,69,arlac77/svelte-log-view; arlac77/svelte-command; arlac77/repository-provider-test-support
+sanskarpan,create-delete-churn,53,5,459.8833333333333,0.1,1.0,0.07,1,27,21,sanskarpan/Rate-Limiter-Circuit-Breaker; sanskarpan/orpheus; sanskarpan/Replication-Strategies
+truecharts-admin,create-delete-churn,67,2,1291.1,0.1,0.0,0.0,1,27,30,
+Foundup,create-delete-churn,45,1,834.6166666666667,0.1,0.0,0.0,1,26,17,
+agentydragon,create-delete-churn,47,1,1399.8833333333334,0.0,1.0,0.07,1,26,18,agentydragon/ducktape
+byeongsu-hong,create-delete-churn,45,2,1027.2333333333333,0.0,1.0,0.07,1,26,18,byeongsu-hong/ducktape-ui; byeongsu-hong/ducktape-ui-lang
+clintjeff2,create-delete-churn,42,5,606.2833333333333,0.1,0.976,0.07,1,26,15,clintjeff2/AgriTrust-Frontend; clintjeff2/AgriTrust-Backend; clintjeff2/AgriTrust-Contracts
+emersonfelipesp,create-delete-churn,52,7,1270.1333333333334,0.0,0.788,0.07,1,26,26,emersonfelipesp/netbox-ceph; emersonfelipesp/proxbox-api; emersonfelipesp/netbox-packer
+jabrown93,create-delete-churn,47,9,1358.2333333333333,0.0,1.0,0.07,1,26,19,jabrown93/.github; jabrown93/AURA; jabrown93/artwork-uploader-plex
+Noisemaker111,create-delete-churn,41,1,1351.0166666666667,0.0,1.0,0.07,1,25,10,Noisemaker111/jgengine
+clarkemoyer,create-delete-churn,49,37,1246.7166666666667,0.0,0.041,0.13,1,25,24,clarkemoyer/technologyadoptionbarriers.org
+licong01-cloud,create-delete-churn,50,2,1178.6666666666667,0.0,1.0,0.07,1,25,19,licong01-cloud/AIstock; licong01-cloud/RD-Agent
+mdheller,create-delete-churn,51,6,1310.8666666666666,0.0,0.0,0.0,1,25,22,
+yuta-yoshinaga,create-delete-churn,41,1,1327.65,0.0,1.0,0.07,1,25,13,yuta-yoshinaga/go_trumpcards
+ACSC-CyberLab,create-delete-churn,41,30,127.2,0.3,0.0,0.0,1,24,15,
+Balizero1987,create-delete-churn,40,1,1371.8666666666666,0.0,1.0,0.37,1,24,15,Balizero1987/Teman2
+Chisanan232,create-delete-churn,51,8,1435.0833333333333,0.0,0.0,0.0,1,24,25,
+floxbot,create-delete-churn,53,1,1115.6333333333334,0.0,0.0,0.0,1,24,24,
+jbdevprimary,create-delete-churn,42,2,933.15,0.0,0.0,0.0,1,24,15,
+lyc228612-sudo,junk-repos,24,7,869.2666666666667,0.0,1.0,0.51,1,24,0,lyc228612-sudo/LUFFY; lyc228612-sudo/My-Homepage; lyc228612-sudo/Annoy-DataSync
+n24q02m,create-delete-churn,52,15,1344.8666666666666,0.0,1.0,0.1,1,24,23,n24q02m/jules-task-archiver; n24q02m/mcp-core; n24q02m/tacet
+wesleysimplicio,create-delete-churn,39,5,1407.05,0.0,1.0,0.11,1,24,13,wesleysimplicio/simplicio-loop; wesleysimplicio/simplicio-agent; wesleysimplicio/simplicio-code
+wuqb2i4f,create-delete-churn,48,1,1122.1166666666666,0.0,1.0,0.13,1,24,24,wuqb2i4f/xray-config-toolkit
+Felix-LeeSM,create-delete-churn,43,1,933.0833333333334,0.0,1.0,0.07,1,23,17,Felix-LeeSM/table-view
+MaxGhenis,create-delete-churn,37,17,1422.1833333333334,0.0,0.216,0.13,1,23,12,MaxGhenis/openmessage
+Moli13337,"create-delete-churn,junk-repos",37,1,334.75,0.1,1.0,0.5,1,23,14,Moli13337/Moli13337
+alexfalkowski,create-delete-churn,37,19,641.5833333333334,0.1,1.0,0.07,1,23,14,alexfalkowski/docker; alexfalkowski/gocovmerge; alexfalkowski/go-sync
+edithatogo,create-delete-churn,48,4,1334.45,0.0,1.0,0.07,1,23,23,edithatogo/voiage; edithatogo/reimbursement-atlas; edithatogo/rac-conformance
+metaforismo,create-delete-churn,41,7,1405.3333333333333,0.0,0.659,0.07,1,23,17,metaforismo/Museion; metaforismo/IntentForm; metaforismo/AgentKeys
+modular-magician,create-delete-churn,39,6,1382.6166666666666,0.0,0.949,0.12,1,23,14,modular-magician/terraform-provider-google-beta; modular-magician/terraform-google-conversion; modular-magician/docs-examples
+okturan,create-delete-churn,44,25,810.9,0.1,1.0,0.1,1,23,21,okturan/news-extractor; okturan/news-gatherer; okturan/claude-2x
+srobroek,create-delete-churn,39,10,869.7,0.0,0.026,0.07,1,23,14,srobroek/agentic-packages
+wangzitian0,create-delete-churn,40,4,819.2333333333333,0.0,1.0,0.11,1,23,12,wangzitian0/finance_report; wangzitian0/truealpha; wangzitian0/infra2
+aks-builds,create-delete-churn,49,4,35.03333333333333,1.4,1.0,0.07,1,22,24,aks-builds/context-budget-alloc; aks-builds/model-changelog-watch; aks-builds/flag-drift-audit
+bruceblake,create-delete-churn,60,1,1223.9833333333333,0.0,1.0,0.07,1,22,26,bruceblake/prison-escape
+jeong-sik,create-delete-churn,51,2,637.1,0.1,1.0,0.07,1,22,18,jeong-sik/masc; jeong-sik/oas
+jonahgabriel,create-delete-churn,47,8,1415.25,0.0,0.021,0.13,1,22,24,jonahgabriel/steel_onslaught
+josephcrowell,create-delete-churn,40,35,1101.6166666666666,0.0,0.0,0.0,1,22,17,
+rysweet,create-delete-churn,36,4,1434.9666666666667,0.0,1.0,0.07,1,22,12,rysweet/Simard; rysweet/amplihack-rs; rysweet/agent-kgpacks-ts
+signcla-test-unsigned,create-delete-churn,41,2,1396.65,0.0,0.0,0.0,1,22,18,
+ydbot,create-delete-churn,51,1,1230.5333333333333,0.0,0.0,0.0,1,22,22,
+MagicalTux,create-delete-churn,46,25,882.8833333333333,0.1,0.0,0.0,1,21,25,
+StevenRidder,create-delete-churn,44,1,1170.8,0.0,0.0,0.0,1,21,23,
+kingchenc,create-delete-churn,45,9,1428.0833333333333,0.0,0.0,0.0,1,21,22,
+loonghao,create-delete-churn,50,9,1260.0666666666666,0.0,0.0,0.0,1,21,24,
+ryanhair,create-delete-churn,39,1,1430.6,0.0,1.0,0.07,1,21,17,ryanhair/zcli
+ChelseaKR,create-delete-churn,38,13,1261.3666666666666,0.0,1.0,0.09,1,20,17,ChelseaKR/gtfs-scorecard; ChelseaKR/sprout; ChelseaKR/family-greenhouse
+adamdroberts,create-delete-churn,47,1,668.4833333333333,0.1,1.0,0.07,1,20,27,adamdroberts/TypeScriptCTranspiler
+bamr87,create-delete-churn,38,21,886.4333333333333,0.0,0.974,0.13,1,20,13,bamr87/zer0-mistakes; bamr87/fredgar-ai; bamr87/barodybroject
+barakatammre84,create-delete-churn,38,1,1067.5166666666667,0.0,1.0,0.07,1,20,17,barakatammre84/MortgageStream
+devantler,create-delete-churn,50,11,1277.9,0.0,0.0,0.0,1,20,15,
+haowjy,create-delete-churn,65,4,1394.7166666666667,0.0,0.985,0.07,1,20,37,haowjy/meridian-flow; haowjy/meridian-cli; haowjy/mars-agents
+hognek,create-delete-churn,58,1,577.1166666666667,0.1,1.0,0.07,1,20,38,hognek/tinyagentos
+iderex,create-delete-churn,44,3,1419.9333333333334,0.0,1.0,0.1,1,20,22,iderex/jellyfin-plugin-sso; iderex/cudec; iderex/swarm.asm
+nelt,create-delete-churn,44,30,16.466666666666665,2.7,0.0,0.0,1,20,24,
+ramideltoro,create-delete-churn,38,4,1314.5333333333333,0.0,1.0,0.07,1,20,15,ramideltoro/nutsnews-backend; ramideltoro/nutsnews; ramideltoro/nutsnews-worker
+ronniepinnell,create-delete-churn,46,1,1347.6166666666666,0.0,1.0,0.07,1,20,25,ronniepinnell/benchsight
+schaurian,create-delete-churn,55,2,919.0,0.1,1.0,0.07,1,20,34,schaurian/schautrack-android; schaurian/schautrack
+wagnerra23,create-delete-churn,47,1,779.25,0.1,1.0,0.13,1,20,26,wagnerra23/oimpresso.com
+zensgit,create-delete-churn,34,2,1146.9833333333333,0.0,1.0,0.42,1,20,11,zensgit/metasheet2; zensgit/cad-ml-platform
+Achbelsdn,burst,43,35,8.216666666666667,5.2,1.0,0.12,1,18,25,Achbelsdn/3D-interactive-portfolio; Achbelsdn/3D-Ult; Achbelsdn/auto-annotated-portfolio
+wiil-tech,burst,16,1,0.4666666666666667,32.0,0.0,0.0,1,16,0,
+deekshithallamaneni,burst,13,2,0.15,26.0,0.0,0.0,1,13,0,
+jsouramid,"junk-repos,burst",13,1,0.016666666666666666,26.0,1.0,0.73,1,13,0,jsouramid/BenchTasksCollv3
+kdjordan592-star,burst,13,1,0.4166666666666667,26.0,1.0,0.13,1,13,0,kdjordan592-star/IT-ClawSweeper-
+zhengcontian-source,junk-repos,13,5,634.5333333333333,0.0,1.0,0.5,1,13,0,zhengcontian-source/BenchTasksCollv3; zhengcontian-source/Annoy-DataSync; zhengcontian-source/optimizing-llms-contextual-reasoning
+Jord-JD,burst,20,17,3.433333333333333,5.8,0.6,0.09,1,12,8,Jord-JD/php-summary; Jord-JD/php-hcl-parser; Jord-JD/array_undot
+abdullahtoscale,burst,12,1,0.13333333333333333,24.0,1.0,0.07,1,12,0,abdullahtoscale/Liberchat
+BurgessTG,burst,11,1,0.6166666666666667,17.8,0.0,0.0,1,11,0,
+M1noa,burst,11,4,0.3333333333333333,22.0,1.0,0.07,1,11,0,M1noa/MCLEServer; M1noa/LCE-Emerald-Launcher; M1noa/LCEN.Authenticator
+CongressmanTape,junk-repos,10,2,887.5666666666667,0.0,1.0,0.67,1,10,0,CongressmanTape/BenchTasksCollv3; CongressmanTape/ipsum-lorem-all-you-need
+MerlysOcantomi,burst,10,1,0.18333333333333332,20.0,1.0,0.07,1,10,0,MerlysOcantomi/seven
+WJL-Lab,burst,10,1,0.5166666666666667,19.4,1.0,0.07,1,10,0,WJL-Lab/NextChat
+adeval2026-dot,junk-repos,10,2,77.51666666666667,0.1,1.0,0.67,1,10,0,adeval2026-dot/Annoy-DataSync; adeval2026-dot/BenchTasksCollv3
+andreeesz17,burst,12,2,2.4166666666666665,5.0,0.0,0.0,1,10,2,
+cdub50,burst,10,1,0.8333333333333334,12.0,1.0,0.07,1,10,0,cdub50/orngejuce
+mialina395-ops,junk-repos,10,4,1005.55,0.0,1.0,0.55,1,10,0,mialina395-ops/llm-adaptive-learning; mialina395-ops/ipsum-lorem-all-you-need; mialina395-ops/BenchTasksCollv3
+GregAcket,burst,9,1,0.016666666666666666,18.0,1.0,0.37,1,9,0,GregAcket/4HYBD
+MoonlightABHI,burst,9,9,0.7333333333333333,12.3,1.0,0.09,1,9,0,MoonlightABHI/boxing-bet-lab; MoonlightABHI/command-er; MoonlightABHI/execution-os
+SC-suyama,burst,9,8,1.8,5.0,0.0,0.0,1,9,0,
+accentedbench-design,junk-repos,9,1,886.0,0.0,1.0,0.73,1,9,0,accentedbench-design/BenchTasksCollv3
+eaglys-amit,burst,9,1,0.45,18.0,1.0,0.07,1,9,0,eaglys-amit/alabs-dev-local
+floringz,junk-repos,9,4,625.1,0.0,1.0,0.53,1,9,0,floringz/My-Homepage; floringz/llm-adaptive-learning; floringz/ipsum-lorem-all-you-need
+ierfanam,burst,9,1,0.03333333333333333,18.0,1.0,0.37,1,9,0,ierfanam/w0
+jryny,junk-repos,9,3,871.15,0.0,1.0,0.59,1,9,0,jryny/My-Homepage; jryny/BenchTasksCollv3; jryny/Annoy-DataSync
+jwodqmilzt123,junk-repos,9,2,701.3333333333334,0.0,1.0,0.6,1,9,0,jwodqmilzt123/LUFFY; jwodqmilzt123/BenchTasksCollv3
+rodeospita,junk-repos,9,3,384.76666666666665,0.0,1.0,0.6,1,9,0,rodeospita/ipsum-lorem-all-you-need; rodeospita/BenchTasksCollv3; rodeospita/LUFFY
+sys2agent2026,junk-repos,9,3,717.2666666666667,0.0,1.0,0.6,1,9,0,sys2agent2026/LUFFY; sys2agent2026/BenchTasksCollv3; sys2agent2026/optimizing-llms-contextual-reasoning
+webbakkantha,junk-repos,9,1,208.08333333333334,0.0,1.0,0.73,1,9,0,webbakkantha/BenchTasksCollv3
+ythencu,junk-repos,9,2,703.1666666666666,0.0,1.0,0.67,1,9,0,ythencu/BenchTasksCollv3; ythencu/Annoy-DataSync
+Kaikei-e,burst,8,1,0.15,16.0,1.0,0.07,1,8,0,Kaikei-e/Alt
+VarnishSeekerCabin,junk-repos,8,1,1199.35,0.0,1.0,0.73,1,8,0,VarnishSeekerCabin/BenchTasksCollv3
+Zena-park,burst,8,1,0.08333333333333333,16.0,1.0,0.22,1,8,0,Zena-park/zk-X509
+akusumalatha-jpg,burst,8,1,1.1,7.3,1.0,0.37,1,8,0,akusumalatha-jpg/CLIq1
+frankleviti,junk-repos,8,2,887.6833333333333,0.0,1.0,0.66,1,8,0,frankleviti/Annoy-DataSync; frankleviti/BenchTasksCollv3
+migols-web,burst,8,1,0.08333333333333333,16.0,1.0,0.07,1,8,0,migols-web/AMS
+nyleeaa0503-nv,"junk-repos,burst",8,2,0.8666666666666667,9.2,1.0,0.66,1,8,0,nyleeaa0503-nv/llm-adaptive-learning; nyleeaa0503-nv/BenchTasksCollv3
+professorrockvibrationcoach-sudo,burst,8,1,0.1,16.0,1.0,0.07,1,8,0,professorrockvibrationcoach-sudo/hk
+romdruidpath,junk-repos,8,3,510.76666666666665,0.0,1.0,0.58,1,8,0,romdruidpath/LUFFY; romdruidpath/BenchTasksCollv3; romdruidpath/llm-adaptive-learning
+sinossju,junk-repos,8,1,132.35,0.1,1.0,0.73,1,8,0,sinossju/BenchTasksCollv3
+steffyoudaz08,junk-repos,8,1,779.85,0.0,1.0,0.73,1,8,0,steffyoudaz08/BenchTasksCollv3
+davidps-17,burst,11,1,0.25,22.0,1.0,0.07,1,7,4,davidps-17/AduanasSync
+710breadman,burst,14,1,1.1166666666666667,12.5,1.0,0.07,1,0,14,710breadman/Steam-Shortcut-Studio
+Acelogic,burst,8,1,0.0,16.0,1.0,0.07,1,0,8,Acelogic/sharpemu
+AliceJump,burst,10,1,0.9666666666666667,10.3,1.0,0.07,1,0,10,AliceJump/ok-ef-update
+AndriGitDev,burst,14,1,0.75,18.7,1.0,0.13,1,0,14,AndriGitDev/Komms
+DeXtroTip,burst,246,1,14.35,17.1,1.0,0.07,1,0,246,DeXtroTip/orca
+Escovan,burst,12,1,1.0833333333333333,11.1,0.0,0.0,1,0,12,
+Fviret,burst,8,1,0.8833333333333333,9.1,1.0,0.07,1,0,8,Fviret/podometre-android
+HGXZ277,burst,8,1,0.6,13.3,1.0,0.07,1,0,8,HGXZ277/OnlyClient
+JackDanger,burst,32,1,0.3333333333333333,64.0,1.0,0.13,1,0,32,JackDanger/gzippy
+LanternOfDarkness,burst,17,1,0.016666666666666666,34.0,1.0,0.13,1,0,17,LanternOfDarkness/wishlist-app
+LenThava,burst,9,1,0.016666666666666666,18.0,0.0,0.0,1,0,9,
+Link-Start,burst,103,103,12.916666666666666,8.0,1.0,0.12,1,0,103,Link-Start/AntiDebug_Breaker_mcp_vs-olitus; Link-Start/AionUi-iOfficeAI; Link-Start/ChatGPT-gopay_feiyue211
+N1kky-wed,burst,18,1,0.9,20.0,1.0,0.13,1,0,18,N1kky-wed/Stellar
+NexusVAI,burst,8,1,0.26666666666666666,16.0,1.0,0.07,1,0,8,NexusVAI/NexusV
+Ochichan,burst,13,1,0.016666666666666666,26.0,1.0,0.07,1,0,13,Ochichan/Yututui
+Okuro3499,burst,9,1,1.8,5.0,0.0,0.0,1,0,9,
+OrigamiKoala,burst,12,1,0.5,24.0,1.0,0.07,1,0,12,OrigamiKoala/chronos
+PatrickFanella,burst,13,1,0.03333333333333333,26.0,1.0,0.07,1,0,13,PatrickFanella/oh-my-opencode-slim
+RhabbyJ,burst,13,1,0.016666666666666666,26.0,1.0,0.07,1,0,13,RhabbyJ/liber
+Sanjeevlabs,burst,12,1,0.5,24.0,0.0,0.0,1,0,12,
+Spitfire09,burst,12,1,0.7166666666666667,16.7,1.0,0.07,1,0,12,Spitfire09/WorkoutTrainer
+Stahl-G,burst,13,1,1.3,10.0,1.0,0.13,1,0,13,Stahl-G/briefloop
+Stefwint,burst,24,1,3.25,7.4,0.0,0.0,1,0,24,
+SujanMishra,burst,8,1,0.016666666666666666,16.0,0.0,0.0,1,0,8,
+TadresRadi,burst,8,1,0.6666666666666666,12.0,1.0,0.07,1,0,8,TadresRadi/Vitmain_Test
+Torwent,burst,198,1,20.566666666666666,9.6,0.0,0.0,1,0,198,
+Tr3kkR,burst,8,1,0.06666666666666667,16.0,1.0,0.07,1,0,8,Tr3kkR/Yuzu
+Yoo-JK,burst,25,1,0.11666666666666667,50.0,1.0,0.07,1,0,25,Yoo-JK/MNPBEM
+ajeetchouksey,burst,12,1,1.3666666666666667,8.8,1.0,0.07,1,0,12,ajeetchouksey/ajch_platform
+alexclaydon,burst,8,1,0.35,16.0,1.0,0.07,1,0,8,alexclaydon/Cataclysm-TLG
+androosio,burst,8,1,0.08333333333333333,16.0,1.0,0.07,1,0,8,androosio/neostation-frontend
+anorbert-cmyk,burst,13,1,2.1666666666666665,6.0,1.0,0.07,1,0,13,anorbert-cmyk/autocognitix-landing
+arodriguez-novusintelligence,burst,44,1,4.666666666666667,9.4,1.0,0.37,1,0,41,arodriguez-novusintelligence/NovusAIDevelopmentFramework
+bata-san,burst,13,1,0.2833333333333333,26.0,1.0,0.28,1,0,13,bata-san/misc5-scrobbler
+blackhill24,burst,155,1,7.35,21.1,1.0,0.07,1,0,155,blackhill24/openclaw
+bor-project,burst,10,1,0.016666666666666666,20.0,1.0,0.07,1,0,10,bor-project/amneziageo
+chufleco,burst,17,1,0.7666666666666667,22.2,1.0,0.07,1,0,17,chufleco/Sentry-USB-Rusty
+dangkhoabi456,burst,19,1,0.95,20.0,1.0,0.07,1,0,19,dangkhoabi456/ai-study-hub
+denysbutenko,burst,31,1,0.2,62.0,1.0,0.07,1,0,31,denysbutenko/git-warp
+devin-thomas,burst,11,1,0.03333333333333333,22.0,1.0,0.13,1,0,11,devin-thomas/vid-chopper
+diudiuyc5200,burst,14,1,1.75,8.0,1.0,0.17,1,0,14,diudiuyc5200/kernel_xiaomi_sm8150t
+dunningdan,burst,13,1,0.4,26.0,0.0,0.0,1,0,13,
+dylangrech92,burst,10,1,0.016666666666666666,20.0,0.0,0.0,1,0,10,
+elfege,burst,9,1,0.016666666666666666,18.0,1.0,0.07,1,0,9,elfege/MOBIUS.NVR
+elkaix,burst,13,1,0.95,13.7,0.0,0.0,1,0,13,
+elu-foundation,burst,9,1,0.11666666666666667,18.0,0.0,0.0,1,0,9,
+ericmourant,burst,50,1,2.183333333333333,22.9,0.0,0.0,1,0,50,
+hemarina,burst,36,3,7.033333333333333,5.1,0.0,0.0,1,0,36,
+hkong2,burst,70,1,12.783333333333333,5.5,1.0,0.37,1,0,70,hkong2/cvelistV5
+jav201,burst,12,1,0.5333333333333333,22.5,1.0,0.28,1,0,12,jav201/s19_app
+jsummerfield,burst,15,1,2.45,6.1,0.0,0.0,1,0,15,
+kimlage,burst,11,1,0.0,22.0,1.0,0.07,1,0,11,kimlage/wiki-viva-kit
+kuchurisatwik,burst,10,1,1.0166666666666666,9.8,1.0,0.07,1,0,10,kuchurisatwik/DeliveryOS
+lachie83,burst,8,1,0.35,16.0,1.0,0.07,1,0,8,lachie83/mlb-draft-tracker
+luckofthelefty,burst,16,1,1.3,12.3,1.0,0.37,1,0,16,luckofthelefty/LuckyBotReleases
+maimere,burst,26,1,1.7,15.3,1.0,0.43,1,0,26,maimere/MyOwnProprietaryFreeBSD
+matthew-plusprogramming,burst,12,1,0.016666666666666666,24.0,0.0,0.0,1,0,12,
+maurhll,burst,10,1,1.5166666666666666,6.6,1.0,0.07,1,0,10,maurhll/anki_french
+nichrun,burst,12,1,0.016666666666666666,24.0,0.0,0.0,1,0,12,
+parvahuja,burst,16,1,0.016666666666666666,32.0,0.0,0.0,1,0,16,
+pbertain,burst,10,1,0.7666666666666667,13.0,1.0,0.07,1,0,10,pbertain/claude-puhfph-chat-bot
+saotokenplan,burst,23,1,1.7666666666666666,13.0,1.0,0.07,1,0,23,saotokenplan/saoworld
+shaqman,burst,22,1,0.2,44.0,1.0,0.07,1,0,22,shaqman/codex-lb
+swt2c,burst,18,1,1.7666666666666666,10.2,1.0,0.07,1,0,18,swt2c/Phoenix
+teh-hippo,burst,9,1,0.016666666666666666,18.0,1.0,0.07,1,0,9,teh-hippo/haos-mobile-wan
+timkindberg,burst,8,1,0.2,16.0,1.0,0.07,1,0,0,timkindberg/formframe
+wattnpapa,burst,10,1,0.9666666666666667,10.3,1.0,0.13,1,0,10,wattnpapa/erfassungsbogen
+wonder1ng,burst,11,1,0.5,22.0,0.0,0.0,1,0,11,
+zbybko,burst,9,1,0.5166666666666667,17.4,1.0,0.07,1,0,9,zbybko/quizik
+zhumingjue138,burst,12,1,0.3,24.0,1.0,0.13,1,0,12,zhumingjue138/vllm-omni
+zilvercat,burst,9,1,0.6166666666666667,14.6,1.0,0.07,1,0,0,zilvercat/zilvercat-website
+ztzzxyz,burst,8,1,0.9166666666666666,8.7,0.0,0.0,1,0,8,

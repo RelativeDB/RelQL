@@ -257,11 +257,18 @@ class ContextPolicy:
     is the global cell budget.
     """
 
+    # Defaults follow the reference RT implementation's evaluation settings:
+    # ctx_size 8192, bfs_width 32, local neighbourhood a small fraction of the
+    # window. There the remainder is filled by random walks over the database;
+    # cohort seeding is this engine's equivalent, and it is on by default
+    # because an RT context is mostly other rows. With it off, a numeric
+    # column on the entity's own row appears exactly once, so its in-context
+    # z-score is undefined and the value reaches the model as 0.0.
     max_context_cells: int = 8192
     bfs_width: int = 32
     fanouts: Optional[tuple[int, ...]] = None
     max_hops: int = 2
-    cohort_size: int = 0
+    cohort_size: int = 256
     prefer_latest: bool = True
 
     def __post_init__(self) -> None:
@@ -478,8 +485,27 @@ class _RetrieverSampler:
 
     def cohort(self, table: str, anchor: Any, bound: TemporalBound,
                limit: int) -> list[Any]:
+        """Cohort ids for the context window.
+
+        A wiring may supply its own retriever — a similarity index, say. When
+        it does not, the cohort is derived from the table scanner using the
+        same definition :meth:`CscIndex.cohort` uses, so the two sampler modes
+        assemble identical contexts. Returning nothing here instead would let
+        RETRIEVER mode quietly drop the cohort that CSC mode includes.
+        """
         r = self.wiring.cohort_retriever(table)
-        return list(r(table, anchor, bound, limit)) if r else []
+        if r is not None:
+            return list(r(table, anchor, bound, limit))
+        scanner = self.wiring.scanners.get(table)
+        if scanner is None:
+            return []
+        out: list[Any] = []
+        for row in scanner(table, bound):
+            if row.id != anchor:
+                out.append(row.id)
+                if len(out) >= limit:
+                    break
+        return out
 
     def all_ids(self, table: str) -> Optional[list[Any]]:
         if table in self.wiring.scanners:
@@ -809,7 +835,11 @@ class Engine:
         the query defines its own supervision and no labels need supplying.
 
         Pass ``labels`` to override that: ``{(entity_id, anchor): value}``, or
-        for ranking ``{(entity_id, anchor): {candidate_id: relevance}}``.
+        for ranking ``{(entity_id, anchor): {candidate_id: relevance}}``. When
+        given, it also *selects* the examples — a pair it does not name is
+        skipped rather than derived — so passing every row's own timestamp as
+        an anchor and labelling only the diagonal trains each entity at its own
+        cut-off instead of at a cut-off shared with rows it predates.
         """
         from .rt_native import (FT_MULTICLASS, FT_RANKING, FineTunedHead,
                                 RtNativeError)
@@ -828,6 +858,14 @@ class Engine:
         model_uri = model_uri or self.model_config.model_uri_for(task_type)
         model = backend._model_for(model_uri)
 
+        # Fit the numeric preprocessing before encoding anything, bounded by
+        # the last training anchor. Statistics drawn from rows after it would
+        # leak the future into every scaled value — in aggregate, but really.
+        # The head carries these so serving cannot diverge from fitting.
+        from .rt_native import ColumnStats
+        backend.column_stats = ColumnStats.fit(
+            self.schema, self.wiring, TemporalBound.at_or_before(max(anchors)))
+
         entity_table = pq.entity_key.table
         span = _target_span(pq)
         feats: list = []
@@ -841,11 +879,25 @@ class Engine:
                    else self._resolve_entity_ids(
                        pq, ExecutionInput(query=pq, anchor_time=t)))
             for eid in ids:
+                # A supplied ``labels`` dict IS the training set: it names the
+                # (entity, anchor) pairs that are examples, and pairs it does
+                # not name are not examples. That is what lets every row carry
+                # its own anchor -- pass each row's timestamp and label the
+                # diagonal -- which is the shape a RelBench train table has.
+                # Without it a shared anchor either hides the entities after it
+                # or shows the ones before it their own outcome.
+                if labels is not None and (eid, t) not in labels:
+                    continue
                 # features see only what was knowable at the anchor...
                 ctx = self.assemble_context(entity_table, eid, t)
-                # ...the label reads the window after it
-                label_ctx = self.assemble_context(
-                    entity_table, eid, None if span is None else t + span)
+                # ...the label reads the window after it, but only when the
+                # label has to be *derived*. A supplied label needs no context,
+                # and assembling one anyway doubled the cost of every fit --
+                # unbounded, when the target names no window.
+                label_ctx = (None if labels is not None
+                             else self.assemble_context(
+                                 entity_table, eid,
+                                 None if span is None else t + span))
                 if task_type is TaskType.MULTILABEL_RANKING:
                     parent = backend.ranking_parent_table(pq)
                     cands = backend._rank_candidates(

@@ -3,6 +3,12 @@
 </p>
 
 # What is RelativeDB/RelQL?
+We have dozens to hundreds of tables of data in our ecosystem. Lets say we want to predict customer churn? We could spend a great deal of time looking for all of the features we need (recent transactions, complaint calls, refunds issued, etc). Or we can have a graph search across our tables build a small subgraph, and use a pretrained model that is trained to figure it out. This is the real advantage of relativedb, we look through your whole graph of data to find what is interesting, and use a zero-shot model to make predictions. 
+
+So this scales with more data. Meaning you can fine tune all of your data, and any other data you get your hands on, to improve the model.
+
+Try not to look at what the model does now, look at what it could do in the future. This technique can produce comparable results to things like xgboost, but isn't trained on things like multiclass identification so the results are junk without fine tuning.
+
 RelativeDB is an optimized implementation of Relational Transformers (2026), surfaced as RelQL, a predictive query language for relational data. You declare the shape of your
 relational data (tables, keys, links), wire small retriever callbacks over
 whatever storage you already have, and ask questions about the **future**:
@@ -12,7 +18,9 @@ PREDICT NOT EXISTS(orders.*)
 FROM customers
 ```
 
-*"For every customer, what is the probability they place zero orders"*.
+*"For every customer, what is the probability they don't place an order"*.
+
+RelativeDB works best for large graphs, 10-100 tables. Unlike xgboost, it works well with text since all text values get encoded into latent space with the rest of the features.
 
 ## The model
 Relational Transformers work by utilizing a pretrained 22m parameter model from over 650 databases of relational data for prediction and classifications tasks. This method has been shown to scale, and remarkably, shows the emergence of zero-shot ability on novel tasks.

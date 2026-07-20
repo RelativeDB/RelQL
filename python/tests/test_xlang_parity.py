@@ -37,8 +37,10 @@ FIXTURE = (Path(__file__).resolve().parent.parent.parent
 
 # Mirror benchmarks/harness/datasets.WIDE_POLICY: one hop entity->events, a
 # generous budget so the full per-user history + all candidates enter context.
+# cohort_size=0: this fixture wants exactly the per-user history plus the
+# candidates, and the cross-language goldens were recorded against that.
 WIDE_POLICY = ContextPolicy(max_context_cells=5_000_000, bfs_width=20_000,
-                            max_hops=1)
+                            max_hops=1, cohort_size=0)
 
 _TYPES = {"TEXT": ValueType.TEXT, "NUMBER": ValueType.NUMBER,
           "DATETIME": ValueType.DATETIME, "BOOLEAN": ValueType.BOOLEAN}

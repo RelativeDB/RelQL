@@ -21,7 +21,11 @@ T0 = dt("2026-07-01")
 # ---------------------------------------------------------------------------
 
 def test_future_row_never_enters_context(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring)
+    # cohort_size=0: this asserts a future row's subtree is unreachable from
+    # the seed. Cohort seeding legitimately reaches those rows through OTHER
+    # customers' admitted orders, which is a different question.
+    eng = Engine(churn_schema, churn_wiring,
+                 context_policy=ContextPolicy(cohort_size=0))
     ctx = eng.assemble_context("customers", "C7", T0)
     keys = ctx.row_keys
     assert ("orders", "O1") in keys
@@ -63,7 +67,10 @@ def test_temporal_bound_semantics():
 
 def test_fanout_caps_children_newest_first(churn_schema, churn_wiring):
     eng = Engine(churn_schema, churn_wiring,
-                 context_policy=ContextPolicy(fanouts=(1, 0), max_hops=2))
+                 # cohort_size=0: this checks the fanout cap on the seed's own
+                 # children; cohort entities bring their own, which is not it.
+                 context_policy=ContextPolicy(fanouts=(1, 0), max_hops=2,
+                                              cohort_size=0))
     ctx = eng.assemble_context("customers", "C7", T0)
     order_rows = [r for r in ctx.rows if r.table == "orders"]
     assert [r.id for r in order_rows] == ["O2"]  # newest admitted child only
@@ -102,7 +109,7 @@ def test_csc_children_bound_and_limit(churn_schema, churn_wiring):
 
 def test_csc_context_equals_retriever_context(churn_schema, churn_wiring):
     """The two sampler modes must assemble the same context on a toy graph."""
-    policy = ContextPolicy(fanouts=(8, 8), max_hops=2)
+    policy = ContextPolicy(fanouts=(8, 8), max_hops=2, cohort_size=0)
     ret = Engine(churn_schema, churn_wiring, context_policy=policy,
                  sampler_mode=SamplerMode.RETRIEVER)
     csc = Engine(churn_schema, churn_wiring, context_policy=policy,

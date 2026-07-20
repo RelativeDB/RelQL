@@ -1,0 +1,595 @@
+{
+  "dataset": "Brazilian E-Commerce Public Dataset by Olist",
+  "dataset_url": "https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce",
+  "generated": "2026-07-19T22:25:35.262827+00:00",
+  "precision": "fp32",
+  "split": "2018-01-01",
+  "data_end": "2018-10-17",
+  "machine": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "processor": "arm"
+  },
+  "table_sizes": {
+    "customers": 96096,
+    "orders": 99441,
+    "items": 112650,
+    "products": 32951,
+    "sellers": 3095,
+    "payments": 103886,
+    "reviews": 99224
+  },
+  "wiring_seconds": 2.6387075409293175,
+  "sparsity": {
+    "note": "Olist keys every order to a fresh customer_id; customer_unique_id is the person. 97% of people order exactly once, so most rows are cold-start."
+  },
+  "tasks": [
+    {
+      "name": "bad_review",
+      "kind": "binary",
+      "title": "Bad review at purchase",
+      "question": "Will this order be reviewed 1 or 2 stars?",
+      "query": "PREDICT LAST(reviews.review_score) OVER (120 DAYS FOLLOWING) <= 2 FROM orders WHERE orders.order_id IN :ids",
+      "notes": "Imbalanced: roughly one order in six draws a 1-2 star review.",
+      "entity_table": "orders",
+      "n_train_available": 45037,
+      "n_test_available": 38603,
+      "horizon_days": 120,
+      "rows_dropped_unobservable": 14962,
+      "n_train": 2500,
+      "n_test": 400,
+      "label_balance": {
+        "0": 0.8375,
+        "1": 0.1625
+      },
+      "depth_counts": {
+        "0 prior": 388,
+        "1 prior": 12,
+        "2-5 prior": 0,
+        "6+ prior": 0
+      },
+      "systems": [
+        {
+          "system": "XGBoost",
+          "train_seconds": 0.5686811252962798,
+          "inference_ms_per_row": 0.0056331249652430415,
+          "wall_seconds": 0.6031678339932114,
+          "overall": {
+            "n": 400,
+            "positive_rate": 0.1625,
+            "auc": 0.521239954075775,
+            "log_loss": 0.5756464004516602,
+            "accuracy": 0.83,
+            "f1": 0.05555555555555555
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 388,
+              "positive_rate": 0.16237113402061856,
+              "auc": 0.5315262515262514,
+              "log_loss": 0.5684878826141357,
+              "accuracy": 0.8298969072164949,
+              "f1": 0.05714285714285714
+            },
+            "1 prior": {
+              "n": 12,
+              "positive_rate": 0.16666666666666666,
+              "auc": 0.25,
+              "log_loss": 0.8071048855781555,
+              "accuracy": 0.8333333333333334,
+              "f1": 0.0
+            }
+          },
+          "detail": {
+            "encoded_features": 22,
+            "preprocessing_seconds": 0.017449417151510715,
+            "fit_seconds": 0.5512317081447691,
+            "n_estimators": 400,
+            "max_depth": 6
+          }
+        },
+        {
+          "system": "RelativeDB (zero-shot)",
+          "train_seconds": 0.0,
+          "inference_ms_per_row": 39.5147279149387,
+          "wall_seconds": 16.27472783299163,
+          "overall": {
+            "n": 400,
+            "positive_rate": 0.1625,
+            "auc": 0.5469804822043629,
+            "log_loss": 0.6923323470952198,
+            "accuracy": 0.8275,
+            "f1": 0.0547945205479452
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 388,
+              "positive_rate": 0.16237113402061856,
+              "auc": 0.5459096459096457,
+              "log_loss": 0.6923187913575221,
+              "accuracy": 0.8324742268041238,
+              "f1": 0.0
+            },
+            "1 prior": {
+              "n": 12,
+              "positive_rate": 0.16666666666666666,
+              "auc": 0.9500000000000001,
+              "log_loss": 0.6927706492807825,
+              "accuracy": 0.6666666666666666,
+              "f1": 0.5
+            }
+          },
+          "detail": {
+            "task_type": "binary_classification",
+            "model_uri": "hf://stanford-star/rt-j/classification",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        },
+        {
+          "system": "RelativeDB (fine-tuned)",
+          "train_seconds": 171.28511799988337,
+          "inference_ms_per_row": 31.931589477462694,
+          "wall_seconds": 185.05145470798016,
+          "overall": {
+            "n": 400,
+            "positive_rate": 0.1625,
+            "auc": 0.47639494833524687,
+            "log_loss": 0.5472980899540097,
+            "accuracy": 0.8375,
+            "f1": 0.0
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 388,
+              "positive_rate": 0.16237113402061856,
+              "auc": 0.48363858363858364,
+              "log_loss": 0.5461865566183396,
+              "accuracy": 0.8376288659793815,
+              "f1": 0.0
+            },
+            "1 prior": {
+              "n": 12,
+              "positive_rate": 0.16666666666666666,
+              "auc": 0.04999999999999999,
+              "log_loss": 0.583237667807344,
+              "accuracy": 0.8333333333333334,
+              "f1": 0.0
+            }
+          },
+          "detail": {
+            "epochs": 300,
+            "learning_rate": 0.01,
+            "anchors": [
+              "2017-05-31",
+              "2017-08-24",
+              "2017-11-08",
+              "2017-12-16"
+            ],
+            "examples": 10000,
+            "loss_before": 0.6839399933815002,
+            "loss_after": 0.1885797679424286,
+            "head_fit_seconds": 1.266821125,
+            "task_type": "binary_classification",
+            "model_uri": "hf://stanford-star/rt-j/classification",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        }
+      ],
+      "headline_metric": "auc"
+    },
+    {
+      "name": "review_stars",
+      "kind": "multiclass",
+      "title": "Star rating at purchase",
+      "question": "How many stars will this order be reviewed?",
+      "query": "PREDICT LAST(reviews.star) OVER (120 DAYS FOLLOWING) FROM orders WHERE orders.order_id IN :ids",
+      "notes": "Five classes, heavily skewed to five stars.",
+      "entity_table": "orders",
+      "n_train_available": 45037,
+      "n_test_available": 38603,
+      "horizon_days": 120,
+      "rows_dropped_unobservable": 14962,
+      "n_train": 2500,
+      "n_test": 400,
+      "label_balance": {
+        "0": 0.1275,
+        "1": 0.035,
+        "2": 0.0725,
+        "3": 0.2,
+        "4": 0.565
+      },
+      "depth_counts": {
+        "0 prior": 388,
+        "1 prior": 12,
+        "2-5 prior": 0,
+        "6+ prior": 0
+      },
+      "systems": [
+        {
+          "system": "XGBoost",
+          "train_seconds": 2.8440882090944797,
+          "inference_ms_per_row": 0.004653334617614746,
+          "wall_seconds": 2.8466584580019116,
+          "overall": {
+            "n": 400,
+            "accuracy": 0.5475,
+            "macro_f1": 0.17647698103143647,
+            "cross_entropy": 1.3855596780776978
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 388,
+              "accuracy": 0.5438144329896907,
+              "macro_f1": 0.17635996635828427,
+              "cross_entropy": 1.385489583015442
+            },
+            "1 prior": {
+              "n": 12,
+              "accuracy": 0.6666666666666666,
+              "macro_f1": 0.2,
+              "cross_entropy": 1.3878177404403687
+            }
+          },
+          "detail": {
+            "encoded_features": 22,
+            "preprocessing_seconds": 0.004721625009551644,
+            "fit_seconds": 2.839366584084928,
+            "n_estimators": 400,
+            "max_depth": 6
+          }
+        },
+        {
+          "system": "RelativeDB (zero-shot)",
+          "train_seconds": 0.0,
+          "inference_ms_per_row": 45.41123323026113,
+          "wall_seconds": 18.634074250003323,
+          "overall": {
+            "n": 400,
+            "accuracy": 0.565,
+            "macro_f1": 0.14440894568690096,
+            "cross_entropy": 1.4749382966813815
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 388,
+              "accuracy": 0.5592783505154639,
+              "macro_f1": 0.1434710743801653,
+              "cross_entropy": 1.478138799838597
+            },
+            "1 prior": {
+              "n": 12,
+              "accuracy": 0.75,
+              "macro_f1": 0.21428571428571427,
+              "cross_entropy": 1.3714553612647429
+            }
+          },
+          "detail": {
+            "task_type": "multiclass_classification",
+            "model_uri": "hf://stanford-star/rt-j/classification",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        },
+        {
+          "system": "RelativeDB (fine-tuned)",
+          "train_seconds": 48.98314562486485,
+          "inference_ms_per_row": 30.182022500084713,
+          "wall_seconds": 61.97706558299251,
+          "overall": {
+            "n": 400,
+            "accuracy": 0.565,
+            "macro_f1": 0.14440894568690096,
+            "cross_entropy": 1.2358160303753143
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 388,
+              "accuracy": 0.5592783505154639,
+              "macro_f1": 0.1434710743801653,
+              "cross_entropy": 1.243407980076204
+            },
+            "1 prior": {
+              "n": 12,
+              "accuracy": 0.75,
+              "macro_f1": 0.21428571428571427,
+              "cross_entropy": 0.9903429900465558
+            }
+          },
+          "detail": {
+            "epochs": 300,
+            "learning_rate": 0.01,
+            "anchors": [
+              "2017-05-31",
+              "2017-08-24",
+              "2017-11-08",
+              "2017-12-16"
+            ],
+            "examples": 3132,
+            "loss_before": 1.596734642982483,
+            "loss_after": 1.2301437854766846,
+            "head_fit_seconds": 0.401670333,
+            "task_type": "multiclass_classification",
+            "model_uri": "hf://stanford-star/rt-j/classification",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        }
+      ],
+      "headline_metric": "accuracy"
+    },
+    {
+      "name": "future_spend",
+      "kind": "regression",
+      "title": "Next-year spend after the first order (sparse)",
+      "question": "How much will this customer spend in the year after their first order?",
+      "query": "PREDICT SUM(payments.payment_value) OVER (90 DAYS FOLLOWING) FROM customers WHERE customers.customer_unique_id IN :ids",
+      "notes": "A 90-day future-window aggregate over a linked table, so the target cannot appear in the entity's own row. Zero for the majority who never return.",
+      "entity_table": "customers",
+      "n_train_available": 44034,
+      "n_test_available": 42890,
+      "horizon_days": 90,
+      "rows_dropped_unobservable": 9172,
+      "n_train": 2500,
+      "n_test": 400,
+      "label_balance": {
+        "0.0": 0.96,
+        "20.29": 0.0025,
+        "26.78": 0.0025,
+        "35.0": 0.0025,
+        "50.34": 0.0025,
+        "56.39": 0.0025,
+        "60.39": 0.0025,
+        "68.87": 0.0025,
+        "103.26": 0.0025,
+        "109.38": 0.0025,
+        "133.3": 0.0025,
+        "162.02": 0.0025,
+        "168.96": 0.0025,
+        "179.78": 0.0025,
+        "214.69": 0.0025,
+        "266.66": 0.0025,
+        "839.77": 0.0025
+      },
+      "depth_counts": {
+        "0 prior": 400,
+        "1 prior": 0,
+        "2-5 prior": 0,
+        "6+ prior": 0
+      },
+      "systems": [
+        {
+          "system": "XGBoost",
+          "train_seconds": 0.7412491659633815,
+          "inference_ms_per_row": 0.001945417607203126,
+          "wall_seconds": 0.7421613750047982,
+          "overall": {
+            "n": 400,
+            "mae": 11.351988766423007,
+            "rmse": 49.766323076834034,
+            "r2": -0.041925404689344026
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 400,
+              "mae": 11.351988766423007,
+              "rmse": 49.766323076834034,
+              "r2": -0.041925404689344026
+            }
+          },
+          "detail": {
+            "encoded_features": 22,
+            "preprocessing_seconds": 0.0036130829248577356,
+            "fit_seconds": 0.7376360830385238,
+            "n_estimators": 400,
+            "max_depth": 6
+          }
+        },
+        {
+          "system": "RelativeDB (zero-shot)",
+          "train_seconds": 0.0,
+          "inference_ms_per_row": 30.49271781288553,
+          "wall_seconds": 12.658553124871105,
+          "overall": {
+            "n": 400,
+            "mae": 38.25382611996023,
+            "rmse": 66.2359502658532,
+            "r2": -0.8456657828965766
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 400,
+              "mae": 38.25382611996023,
+              "rmse": 66.2359502658532,
+              "r2": -0.8456657828965766
+            }
+          },
+          "detail": {
+            "task_type": "regression",
+            "model_uri": "hf://stanford-star/rt-j/regression",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        },
+        {
+          "system": "RelativeDB (fine-tuned)",
+          "train_seconds": 177.00659570796415,
+          "inference_ms_per_row": 31.564258022699505,
+          "wall_seconds": 190.61079616704956,
+          "overall": {
+            "n": 400,
+            "mae": 709.6427213170158,
+            "rmse": 1221.0939117388273,
+            "r2": -626.2831906480302
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 400,
+              "mae": 709.6427213170158,
+              "rmse": 1221.0939117388273,
+              "r2": -626.2831906480302
+            }
+          },
+          "detail": {
+            "epochs": 300,
+            "learning_rate": 0.01,
+            "anchors": [
+              "2017-05-31",
+              "2017-08-22",
+              "2017-11-04",
+              "2017-12-15"
+            ],
+            "examples": 10000,
+            "loss_before": 8362.7421875,
+            "loss_after": 6790.76171875,
+            "head_fit_seconds": 1.332361875,
+            "task_type": "regression",
+            "model_uri": "hf://stanford-star/rt-j/regression",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        }
+      ],
+      "headline_metric": "mae"
+    },
+    {
+      "name": "repeat_purchase",
+      "kind": "binary",
+      "title": "Repeat purchase (sparse)",
+      "question": "After their first order, will this customer ever order again?",
+      "query": "PREDICT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers WHERE customers.customer_unique_id IN :ids",
+      "notes": "The sparse case: most customers have exactly one order, so per-customer aggregates carry almost no signal.",
+      "entity_table": "customers",
+      "n_train_available": 44034,
+      "n_test_available": 42890,
+      "horizon_days": 90,
+      "rows_dropped_unobservable": 9172,
+      "n_train": 2500,
+      "n_test": 400,
+      "label_balance": {
+        "0": 0.96,
+        "1": 0.04
+      },
+      "depth_counts": {
+        "0 prior": 400,
+        "1 prior": 0,
+        "2-5 prior": 0,
+        "6+ prior": 0
+      },
+      "systems": [
+        {
+          "system": "XGBoost",
+          "train_seconds": 0.5379914999939501,
+          "inference_ms_per_row": 0.0035604176810011268,
+          "wall_seconds": 0.5396869999822229,
+          "overall": {
+            "n": 400,
+            "positive_rate": 0.04,
+            "auc": 0.5836588541666666,
+            "log_loss": 0.26915431022644043,
+            "accuracy": 0.96,
+            "f1": 0.0
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 400,
+              "positive_rate": 0.04,
+              "auc": 0.5836588541666666,
+              "log_loss": 0.26915431022644043,
+              "accuracy": 0.96,
+              "f1": 0.0
+            }
+          },
+          "detail": {
+            "encoded_features": 22,
+            "preprocessing_seconds": 0.0047681250143796206,
+            "fit_seconds": 0.5332233749795705,
+            "n_estimators": 400,
+            "max_depth": 6
+          }
+        },
+        {
+          "system": "RelativeDB (zero-shot)",
+          "train_seconds": 0.0,
+          "inference_ms_per_row": 31.53955801972188,
+          "wall_seconds": 13.114907416980714,
+          "overall": {
+            "n": 400,
+            "positive_rate": 0.04,
+            "auc": 0.6297200520833333,
+            "log_loss": 0.6532980873946466,
+            "accuracy": 0.96,
+            "f1": 0.0
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 400,
+              "positive_rate": 0.04,
+              "auc": 0.6297200520833333,
+              "log_loss": 0.6532980873946466,
+              "accuracy": 0.96,
+              "f1": 0.0
+            }
+          },
+          "detail": {
+            "task_type": "binary_classification",
+            "model_uri": "hf://stanford-star/rt-j/classification",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        },
+        {
+          "system": "RelativeDB (fine-tuned)",
+          "train_seconds": 168.39938004198484,
+          "inference_ms_per_row": 32.16681291523855,
+          "wall_seconds": 182.2429262921214,
+          "overall": {
+            "n": 400,
+            "positive_rate": 0.04,
+            "auc": 0.40657552083333337,
+            "log_loss": 0.20141299826533718,
+            "accuracy": 0.96,
+            "f1": 0.0
+          },
+          "by_depth": {
+            "0 prior": {
+              "n": 400,
+              "positive_rate": 0.04,
+              "auc": 0.40657552083333337,
+              "log_loss": 0.20141299826533718,
+              "accuracy": 0.96,
+              "f1": 0.0
+            }
+          },
+          "detail": {
+            "epochs": 300,
+            "learning_rate": 0.01,
+            "anchors": [
+              "2017-05-31",
+              "2017-08-22",
+              "2017-11-04",
+              "2017-12-15"
+            ],
+            "examples": 10000,
+            "loss_before": 0.6471084356307983,
+            "loss_after": 0.3348115384578705,
+            "head_fit_seconds": 1.273996709,
+            "task_type": "binary_classification",
+            "model_uri": "hf://stanford-star/rt-j/classification",
+            "precision": "fp32",
+            "scored": 400,
+            "anchoring": "per-entity"
+          }
+        }
+      ],
+      "headline_metric": "auc"
+    }
+  ]
+}

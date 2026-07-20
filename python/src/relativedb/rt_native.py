@@ -28,6 +28,7 @@ and plain filesystem paths are accepted directly.
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import os
 import sys
@@ -40,12 +41,15 @@ import numpy as np
 from .engine import EntityContext, EntityPrediction, ModelBackend
 from .evaluate import eval_bool, eval_value
 from .model import ModelConfig
-from .relql.ast import Aggregation, ColumnRef, ParsedQuery, TaskType
+from .relql.ast import (Aggregation, Arith, Case, ColumnRef, Condition, Func,
+                        LogicalOp, Not, ParsedQuery, TaskType)
 from .retrieve import RetrieverWiring, TemporalBound
 from .schema import Schema, ValueType
 
 __all__ = ["RtNativeUnavailableError", "RtNativeError",
-           "ContextConnectivityWarning", "RtLib", "RtModel",
+           "ContextConnectivityWarning", "ContextTruncationWarning",
+           "ColumnStats",
+           "RtLib", "RtModel",
            "TextEmbedder", "RtNativeBackend", "FineTunedHead",
            "load_lib", "resolve_model_path"]
 
@@ -92,6 +96,116 @@ class ContextConnectivityWarning(UserWarning):
     """A context row that other rows hang off emits no tokens, so nothing
     below it can reach the prediction. Declare a feature column on that table
     — or declare its primary key as a column when the key carries meaning."""
+
+
+class ColumnStats:
+    """Per-column ``(mean, std)`` for numeric cells, plus one global normalizer
+    for datetimes. Fitted from the data, exactly as the reference does it.
+
+    The reference computes these once at preprocessing (``rustler/src/pre.rs``):
+    each numeric column gets the mean and sample standard deviation of its
+    whole column with nulls and NaNs excluded, a zero standard deviation is
+    replaced by 1.0, and every value is stored as ``(v - mean) / std``. Every
+    datetime cell in the dataset shares a single mean/std accumulated across
+    all tables.
+
+    This engine previously normalized against the values present in the
+    context window instead. That is undefined when a column appears once —
+    which is every column on the entity's own row when entities are scored one
+    at a time — and it made a value depend on which other rows shared the call.
+
+    Fit under the training temporal bound: statistics drawn from rows after the
+    anchor leak the future into every scaled value.
+    """
+
+    __slots__ = ("stats", "dt", "bound")
+
+    def __init__(self, stats: dict[tuple[str, str], tuple[float, float]],
+                 dt: tuple[float, float] = (0.0, 1.0),
+                 bound: str = "unbounded"):
+        self.stats = dict(stats)
+        self.dt = dt
+        self.bound = bound
+
+    @classmethod
+    def fit(cls, schema: Schema, wiring: RetrieverWiring,
+            bound: Optional[TemporalBound] = None) -> "ColumnStats":
+        bound = TemporalBound.unbounded() if bound is None else bound
+        out: dict[tuple[str, str], tuple[float, float]] = {}
+        dt_vals: list[float] = []
+        for table in schema.tables:
+            wanted = {c.name: c.type for c in table.columns
+                      if c.type in (ValueType.NUMBER, ValueType.BOOLEAN,
+                                    ValueType.DATETIME)}
+            if not wanted:
+                continue
+            acc: dict[str, list[float]] = {c: [] for c in wanted}
+            scanner = wiring.scanner(table.name)
+            for r in scanner(table.name, bound):
+                for c, vt in wanted.items():
+                    v = r.cells.get(c)
+                    if v is None:
+                        continue
+                    if vt is ValueType.DATETIME:
+                        dt_vals.append(_days(v))
+                        continue
+                    if isinstance(v, bool):
+                        v = 1.0 if v else 0.0
+                    if isinstance(v, (int, float)) and not math.isnan(float(v)):
+                        acc[c].append(float(v))
+            for c, vals in acc.items():
+                if not vals:
+                    continue
+                a = np.asarray(vals, float)
+                # ddof=1 to match polars' std(1) in the reference
+                sd = float(a.std(ddof=1)) if len(a) > 1 else 0.0
+                out[(table.name, c)] = (float(a.mean()),
+                                        sd if sd != 0.0 else 1.0)
+        if len(dt_vals) > 1:
+            a = np.asarray(dt_vals, float)
+            sd = float(a.std(ddof=1))
+            dt = (float(a.mean()), sd if sd != 0.0 else 1.0)
+        else:
+            dt = (0.0, 1.0)
+        return cls(out, dt=dt, bound=repr(bound))
+
+    def has(self, table: str, column: str) -> bool:
+        return (table, column) in self.stats
+
+    def transform(self, table: str, column: str, x: float) -> float:
+        mu, sd = self.stats[(table, column)]
+        return (x - mu) / sd
+
+    def transform_datetime(self, x: float) -> float:
+        mu, sd = self.dt
+        return (x - mu) / sd
+
+    def to_dict(self) -> dict:
+        return {"bound": self.bound, "datetime": list(self.dt),
+                "stats": {f"{t}.{c}": list(v) for (t, c), v in self.stats.items()}}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ColumnStats":
+        stats = {}
+        for k, v in (d.get("stats") or {}).items():
+            t, _, c = k.partition(".")
+            stats[(t, c)] = (float(v[0]), float(v[1]))
+        dt = tuple(d.get("datetime") or (0.0, 1.0))
+        return cls(stats, dt=(float(dt[0]), float(dt[1])),
+                   bound=d.get("bound", "unbounded"))
+
+    def __len__(self) -> int:
+        return len(self.stats)
+
+    def __repr__(self) -> str:
+        return (f"<ColumnStats {len(self.stats)} columns "
+                f"datetime={self.dt[0]:.1f}/{self.dt[1]:.1f} bound={self.bound}>")
+
+
+class ContextTruncationWarning(UserWarning):
+    """A context exceeded ``max_seq_len`` and lost cells. Raised because the
+    cap bites hardest on the busiest entities, so silent truncation skews a
+    comparison rather than merely shrinking it."""
 
 
 class RtNativeError(RuntimeError):
@@ -159,6 +273,19 @@ class RtLib:
             u8p, f64p, u8p,                  # is_padding, sem_types, is_target
             f32p, f32p, f32p, f32p, f32p,    # number, datetime, boolean, text, col_name
             ctypes.c_int32, f32p, f32p,      # n_threads, out_scores, out_target_text
+            ctypes.c_char_p, ctypes.c_size_t]
+
+        # rt_forward on an explicit device. rt_forward is the CPU entry point;
+        # without this binding every score and every encode ran on CPU while
+        # Metal sat idle, which is most of the per-row inference cost.
+        lib.rt_forward_device.restype = ctypes.c_int
+        lib.rt_forward_device.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            f64p, f64p, f64p, f64p,          # node, f2p, col, table
+            u8p, f64p, u8p,                  # is_padding, sem_types, is_target
+            f32p, f32p, f32p, f32p, f32p,    # number, datetime, boolean, text, col_name
+            ctypes.c_int32, ctypes.c_int32,  # n_threads, device
+            f32p,                            # out_target_scores
             ctypes.c_char_p, ctypes.c_size_t]
 
         # ---- frozen-backbone fine-tuning (see rt_c.h) ----------------------
@@ -236,7 +363,10 @@ class FineTunedHead:
                  final_loss: Optional[float] = None,
                  seconds: Optional[float] = None,
                  n_examples: Optional[int] = None,
-                 classes: Sequence[Any] = ()):
+                 classes: Sequence[Any] = (),
+                 feat_mu: Optional[np.ndarray] = None,
+                 feat_sd: Optional[np.ndarray] = None,
+                 column_stats: Optional["ColumnStats"] = None):
         self._native = lib
         self._handle = handle
         self.task = task
@@ -245,6 +375,14 @@ class FineTunedHead:
         self.seconds = seconds
         self.n_examples = n_examples
         self.classes = tuple(classes)
+        # Standardization statistics of the fitted features (§ below). Kept on
+        # the head so predict() applies exactly the transform fit() saw.
+        self.feat_mu = None if feat_mu is None else np.asarray(feat_mu, np.float32)
+        self.feat_sd = None if feat_sd is None else np.asarray(feat_sd, np.float32)
+        # The normalization this head was fitted under. Serving under a
+        # different one silently changes what every number means, so it
+        # travels with the weights.
+        self.column_stats = column_stats
 
     def __del__(self):
         try:
@@ -264,7 +402,17 @@ class FineTunedHead:
                 FT_MULTICLASS: "multiclass",
                 FT_RANKING: "ranking"}.get(self.task, "unknown")
 
+    def _sidecar(path: str) -> str:                      # noqa: N805
+        return str(path) + ".preproc.json"
+
     def save(self, path: str) -> str:
+        """Persist the head, plus the preprocessing it was fitted under.
+
+        The C ABI writes the weights; the feature standardization and the
+        column statistics go beside them. All three are one artifact — a head
+        served without them predicts on differently-scaled inputs and is
+        wrong in a way nothing reports.
+        """
         err = ctypes.create_string_buffer(512)
         rc = self._native._lib.rt_finetune_head_save(
             self._handle, str(path).encode("utf-8"), err, len(err))
@@ -272,6 +420,15 @@ class FineTunedHead:
             raise RtNativeError(
                 f"saving the fine-tuned head to {path!r} failed: "
                 f"{err.value.decode('utf-8', 'replace')}")
+        side = {
+            "feat_mu": None if self.feat_mu is None else self.feat_mu.tolist(),
+            "feat_sd": None if self.feat_sd is None else self.feat_sd.tolist(),
+            "column_stats": (None if self.column_stats is None
+                             else self.column_stats.to_dict()),
+            "classes": [str(c) for c in self.classes],
+        }
+        with open(FineTunedHead._sidecar(path), "w") as fh:
+            json.dump(side, fh)
         return str(path)
 
     @staticmethod
@@ -284,12 +441,31 @@ class FineTunedHead:
             raise RtNativeError(
                 f"loading a fine-tuned head from {path!r} failed: "
                 f"{err.value.decode('utf-8', 'replace')}")
+        side_path = FineTunedHead._sidecar(path)
+        if not os.path.exists(side_path):
+            raise RtNativeError(
+                f"{side_path!r} is missing: this head was saved without its "
+                f"preprocessing, and serving it would apply the wrong scale "
+                f"to every numeric cell. Refit rather than loading it.")
+        with open(side_path) as fh:
+            side = json.load(fh)
         task = int(lib._lib.rt_finetune_head_task(handle))
-        return FineTunedHead(lib, handle, task=task)
+        cs = side.get("column_stats")
+        return FineTunedHead(
+            lib, handle, task=task,
+            classes=tuple(side.get("classes") or ()),
+            feat_mu=(None if side.get("feat_mu") is None
+                     else np.asarray(side["feat_mu"], np.float32)),
+            feat_sd=(None if side.get("feat_sd") is None
+                     else np.asarray(side["feat_sd"], np.float32)),
+            column_stats=None if cs is None else ColumnStats.from_dict(cs))
 
     def predict(self, features: np.ndarray) -> np.ndarray:
         """Score frozen features ``[N, 512]`` -> logits ``[N, n_outputs]``."""
-        f = np.ascontiguousarray(features, np.float32)
+        f = np.asarray(features, np.float32)
+        if self.feat_mu is not None:
+            f = (f - self.feat_mu) / self.feat_sd
+        f = np.ascontiguousarray(f, np.float32)
         if f.ndim != 2 or f.shape[1] != D_MODEL:
             raise RtNativeError(
                 f"features must be [N, {D_MODEL}], got {f.shape}")
@@ -344,7 +520,8 @@ class RtModel:
 
     def forward(self, *, node_idxs, f2p, col_idxs, table_idxs, is_padding,
                 sem_types, is_target, number_v, datetime_v, boolean_v,
-                text_v, col_name_v, n_threads: int = 0) -> np.ndarray:
+                text_v, col_name_v, n_threads: int = 0,
+                device: int = RT_DEVICE_CPU) -> np.ndarray:
         """Raw PRE-sort arrays in (see rt_c.h) -> per-row target score [B]."""
         (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
          is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
@@ -353,10 +530,18 @@ class RtModel:
                         text_v, col_name_v)
         out = np.zeros(B, np.float32)
         err = ctypes.create_string_buffer(512)
-        rc = self._native._lib.rt_forward(
-            self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
-            is_padding, sem_types, is_target, number_v, datetime_v,
-            boolean_v, text_v, col_name_v, int(n_threads), out, err, len(err))
+        if device == RT_DEVICE_CPU:
+            rc = self._native._lib.rt_forward(
+                self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+                is_padding, sem_types, is_target, number_v, datetime_v,
+                boolean_v, text_v, col_name_v, int(n_threads), out,
+                err, len(err))
+        else:
+            rc = self._native._lib.rt_forward_device(
+                self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+                is_padding, sem_types, is_target, number_v, datetime_v,
+                boolean_v, text_v, col_name_v, int(n_threads), int(device),
+                out, err, len(err))
         if rc != 0:
             raise RtNativeError(
                 f"rt_forward failed ({rc}): "
@@ -549,6 +734,15 @@ class TextEmbedder:
                     "pip install sentence-transformers") from e
             self._model = SentenceTransformer(
                 f"sentence-transformers/{self.model_name}")
+            # Left at the encoder's shipped 128 word-piece window ON PURPOSE.
+            # RT-J is frozen and was trained on vectors this encoder produced
+            # at that setting; raising it changes the embedding function out
+            # from under the backbone. Measured on 60 long issue bodies, 256
+            # vs 128 gives mean cosine 0.883 (min 0.520) — a different input
+            # distribution, not more information. Text past ~128 word pieces
+            # cannot be represented by this encoder as trained; the way to
+            # carry more is more ROWS (each gets its own window), not a
+            # longer window.
         return self._model
 
     def encode(self, texts: Sequence[str], *,
@@ -675,7 +869,9 @@ class RtNativeBackend:
                  embedder: Optional[TextEmbedder] = None,
                  n_threads: int = 0,
                  num_history_windows: int = 3,
-                 max_seq_len: int = 1024,
+                 max_seq_len: int = 8192,      # reference eval ctx_size
+                 column_stats: Optional["ColumnStats"] = None,
+                 device: Optional[int] = None,
                  head: Optional[Any] = None):
         self.schema = schema
         self.wiring = wiring
@@ -684,6 +880,15 @@ class RtNativeBackend:
         self.n_threads = n_threads
         self.num_history_windows = max(1, num_history_windows)
         self.max_seq_len = max_seq_len
+        # A head fitted under fitted-statistics normalization must be served
+        # the same way, so the head's own stats win over anything passed here.
+        # Metal when the build and machine provide it, CPU otherwise. Scoring
+        # ran on CPU regardless before rt_forward_device was bound, which
+        # dominated per-row latency on large contexts.
+        self.device = device
+        self.column_stats = column_stats
+        if head is not None and getattr(head, "column_stats", None) is not None:
+            self.column_stats = head.column_stats
         self._models: dict[str, RtModel] = {}
         # A fine-tuned head replaces the checkpoint's zero-shot head for the
         # task it was trained on; every other task still scores zero-shot.
@@ -696,6 +901,13 @@ class RtNativeBackend:
         if self.head is None:
             return None
         return self.head if _FT_TASK_OF.get(task_type) == self.head.task else None
+
+    def _resolve_device(self) -> int:
+        if self.device is None:
+            lib = load_lib(self._lib_path)
+            self.device = (RT_DEVICE_MPS if lib.device_available(RT_DEVICE_MPS)
+                           else RT_DEVICE_CPU)
+        return self.device
 
     def _encode(self, model: RtModel, seqs: list["_Seq"]) -> np.ndarray:
         """Frozen-backbone features ``[len(seqs), 512]`` for these sequences."""
@@ -735,8 +947,13 @@ class RtNativeBackend:
             if task_type is TaskType.BINARY_CLASSIFICATION:
                 p = 1.0 / (1.0 + math.exp(-s))
                 preds.append(self._shape_binary(ctx.entity_id, ret_kind, p))
-            else:  # REGRESSION / FORECASTING: denormalize with label stats
-                v = s * label_sd + label_mu
+            else:
+                # The released head emits a normalized score, so it is scaled
+                # back with the in-context label statistics. A fine-tuned head
+                # was fitted on raw target values and already predicts in the
+                # label's own units — scaling it again applies the transform
+                # twice and inflates the error by orders of magnitude.
+                v = s if head is not None else s * label_sd + label_mu
                 if task_type is TaskType.FORECASTING:
                     n = query.num_forecasts or 1
                     preds.append(EntityPrediction(ctx.entity_id, value=v,
@@ -799,6 +1016,34 @@ class RtNativeBackend:
             out.append((pa, v))
         return out
 
+    @staticmethod
+    def _target_columns(expr: Any) -> set[tuple[str, str]]:
+        """Every ``(table, column)`` the target expression reads."""
+        out: set[tuple[str, str]] = set()
+        stack = [expr]
+        while stack:
+            e = stack.pop()
+            if isinstance(e, ColumnRef):
+                out.add((e.table, e.column))
+            elif isinstance(e, Aggregation):
+                out.add((e.column.table, e.column.column))
+                stack.append(e.filter)
+            elif isinstance(e, Condition):
+                stack += [e.left, e.right_expr]
+            elif isinstance(e, LogicalOp):
+                stack += [e.left, e.right]
+            elif isinstance(e, Not):
+                stack.append(e.expr)
+            elif isinstance(e, Arith):
+                stack += [e.left, e.right]
+            elif isinstance(e, Func):
+                stack += list(e.args)
+            elif isinstance(e, Case):
+                for c, t in e.whens:
+                    stack += [c, t]
+                stack.append(e.else_)
+        return out
+
     def _fk_to_parent(self) -> dict[str, dict[str, str]]:
         if self.schema is None:
             return {}
@@ -833,6 +1078,15 @@ class RtNativeBackend:
         masked target cell's sem-type (SEM_TEXT for multiclass, §2.1); ``tgt_idx``
         is that cell's position (used by ranking to rewire its f2p, §3.2)."""
         entity_table = query.entity_key.table
+        # Columns the target reads off the entity's own table. The task row
+        # carries a masked copy of the answer, but the entity's real row sits
+        # in its own context and would otherwise hand the answer straight to
+        # the model. Suppressed on that one row only: the same column on every
+        # *other* row is legitimate history, and for a static attribute it is
+        # the only thing that forms a class domain at all.
+        suppressed = {c for t, c in self._target_columns(query.target)
+                      if t == entity_table}
+        truncated = [False]
         seq = _Seq()
         node_of: dict[tuple[str, Any], int] = {}
 
@@ -883,13 +1137,25 @@ class RtNativeBackend:
                 if len(cands) == 1:
                     parents.append(node_of[cands[0]])
             rnode = node_of[r.key]
+            is_entity_row = r.key == (entity_table, ctx.entity_id)
             for col, v in r.cells.items():
                 if len(seq) >= self.max_seq_len:
+                    # Truncation is never silent: it falls hardest on the
+                    # busiest entities, which in an imbalanced task tend to be
+                    # the positive class, so a quiet clip biases the result.
+                    truncated[0] = True
                     break
+                if is_entity_row and col in suppressed:
+                    continue
                 sem = self._sem_for_cell(r.table, col, v)
                 if sem is None:
                     continue
                 seq.add(rnode, parents, col, r.table, sem, v)
+        if truncated[0]:
+            warnings.warn(
+                f"context for {entity_table}={ctx.entity_id!r} was truncated at "
+                f"max_seq_len={self.max_seq_len}; the tail of its history did "
+                f"not reach the model", ContextTruncationWarning, stacklevel=2)
         return seq, node_of, entity_node, tgt_idx
 
     def _build_sequences(self, query: ParsedQuery, task_type: TaskType,
@@ -945,8 +1211,20 @@ class RtNativeBackend:
                     num_vals.setdefault(ck, []).append(
                         float(v) if not isinstance(v, bool)
                         else (1.0 if v else 0.0))
+        # Fitted statistics when this backend has them, in-context otherwise.
+        # This is a regime, not a per-column fallback: either the whole batch
+        # normalizes against fitted state or none of it does, so a value never
+        # depends on which other rows shared the call. See :class:`ColumnStats`
+        # for why the released checkpoint uses the in-context regime.
+        cs = self.column_stats
         stats: dict[tuple[str, str], tuple[float, float]] = {}
         for ck, vals in num_vals.items():
+            if cs is not None and ck[1] != _TASK_TABLE and cs.has(ck[1], ck[0]):
+                continue                      # handled by cs.transform below
+            # The synthetic task row is not in the schema: its label shares the
+            # self-label statistics so history tokens and the model's output
+            # live in the same space. Without fitted stats this falls back to
+            # the pre-conformance in-context behaviour.
             a = np.asarray(vals, float)
             stats[ck] = (float(a.mean()), float(a.std() + 1e-8))
         stats[(_TASK_LABEL_COL, _TASK_TABLE)] = (label_mu, label_sd)
@@ -962,12 +1240,18 @@ class RtNativeBackend:
                     seq.value[i] = 0.0
                     continue
                 if sem == SEM_DATETIME:
-                    seq.value[i] = (_days(v) - dt_mu) / dt_sd
+                    seq.value[i] = (cs.transform_datetime(_days(v))
+                                    if cs is not None
+                                    else (_days(v) - dt_mu) / dt_sd)
                 elif sem in (SEM_NUMBER, SEM_BOOLEAN):
-                    mu, sd = stats[ck]
                     x = float(v) if not isinstance(v, bool) \
                         else (1.0 if v else 0.0)
-                    seq.value[i] = (x - mu) / sd
+                    if cs is not None and ck[1] != _TASK_TABLE \
+                            and cs.has(ck[1], ck[0]):
+                        seq.value[i] = cs.transform(ck[1], ck[0], x)
+                    else:
+                        mu, sd = stats[ck]
+                        seq.value[i] = (x - mu) / sd
                 # text values stay as raw strings; embedded at collate
 
     def _forward(self, model: RtModel, seqs: list[_Seq], *,
@@ -989,12 +1273,20 @@ class RtNativeBackend:
         text_v = np.zeros((B, S, D_TEXT), np.float32)
         col_name_v = np.zeros((B, S, D_TEXT), np.float32)
 
-        # schema phrases + text cells embed in one cached batch
-        phrases = [f"{c} of {t}" for seq in seqs for (c, t) in seq.col]
-        texts = [v for seq in seqs
-                 for (sem, v) in zip(seq.sem, seq.value)
-                 if sem == SEM_TEXT and isinstance(v, str)]
-        self.embedder.encode(list(dict.fromkeys(phrases + texts)))
+        # Schema phrases and text cells embed in one batch, then are looked up
+        # by key in the fill loop below. Going back through encode_one() per
+        # cell cost a list allocation, a dict.fromkeys and a comprehension for
+        # every one of the B*S tokens — no model calls, since the batch has
+        # already warmed the cache, but the overhead is paid thousands of times
+        # per forward and grew with the context size.
+        distinct_cols = {ck for seq in seqs for ck in seq.col}
+        texts = list({v for seq in seqs
+                      for (sem, v) in zip(seq.sem, seq.value)
+                      if sem == SEM_TEXT and isinstance(v, str)})
+        phrases = [f"{c} of {t}" for (c, t) in distinct_cols]
+        embedded = self.embedder.encode(phrases + texts)
+        phrase_emb = dict(zip(distinct_cols, embedded[:len(phrases)]))
+        text_emb = dict(zip(texts, embedded[len(phrases):]))
 
         for b, seq in enumerate(seqs):
             for s in range(len(seq)):
@@ -1005,12 +1297,11 @@ class RtNativeBackend:
                 table_idxs[b, s] = tab_vocab.setdefault(table, len(tab_vocab))
                 is_padding[b, s] = 0
                 is_target[b, s] = 1 if seq.is_tgt[s] else 0
-                col_name_v[b, s] = self.embedder.encode_one(
-                    f"{ck[0]} of {ck[1]}")
+                col_name_v[b, s] = phrase_emb[ck]
                 v = seq.value[s]
                 if sem == SEM_TEXT:
                     if isinstance(v, str):
-                        text_v[b, s] = self.embedder.encode_one(v)
+                        text_v[b, s] = text_emb[v]
                     sem_types[b, s] = SEM_TEXT
                 elif sem == SEM_DATETIME:
                     datetime_v[b, s] = float(v)
@@ -1025,10 +1316,11 @@ class RtNativeBackend:
             datetime_v=datetime_v, boolean_v=boolean_v, text_v=text_v,
             col_name_v=col_name_v, n_threads=self.n_threads)
         if encode:
-            return model.encode_targets(**kw)   # frozen features [B, 512]
+            return model.encode_targets(device=self._resolve_device(),
+                                        **kw)   # frozen features [B, 512]
         if want_text:
             return model.forward_ex(**kw)   # (scores[B], target_text[B, 384])
-        return model.forward(**kw)
+        return model.forward(device=self._resolve_device(), **kw)
 
     # -- multiclass / ranking domain enumeration ----------------------------
     def _require_wiring(self, what: str) -> RetrieverWiring:
@@ -1194,7 +1486,19 @@ class RtNativeBackend:
                 f"rt_finetune_head_create failed: "
                 f"{err.value.decode('utf-8', 'replace')}")
 
-        f = np.ascontiguousarray(features, np.float32).reshape(-1)
+        # The backbone's target-cell features sit in a very narrow cone —
+        # measured mean pairwise cosine 0.9976 on a 240-issue sample. The
+        # shared constant direction then dominates the gradient and the linear
+        # head fits only its bias, converging to the label prior and predicting
+        # one class for every row. Standardizing per dimension puts the
+        # variation on a comparable scale to the mean; on that sample it moved
+        # a 4-class probe from 0.450 to 0.817 at identical lr and epochs.
+        feats = np.asarray(features, np.float32).reshape(len(labels), -1)
+        feat_mu = feats.mean(0)
+        feat_sd = feats.std(0) + 1e-6
+        feats = (feats - feat_mu) / feat_sd
+
+        f = np.ascontiguousarray(feats, np.float32).reshape(-1)
         y = np.ascontiguousarray(labels, np.float32)
         go = np.ascontiguousarray(group_offsets, np.int32)
         i_loss = ctypes.c_float(0.0)
@@ -1214,7 +1518,9 @@ class RtNativeBackend:
                              initial_loss=float(i_loss.value),
                              final_loss=float(f_loss.value),
                              seconds=float(secs.value),
-                             n_examples=int(y.shape[0]), classes=classes)
+                             n_examples=int(y.shape[0]), classes=classes,
+                             feat_mu=feat_mu, feat_sd=feat_sd,
+                             column_stats=self.column_stats)
 
     def ranking_parent_table(self, query: ParsedQuery) -> str:
         """The parent table a ranking query's FK target points at."""

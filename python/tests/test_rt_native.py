@@ -136,10 +136,14 @@ def test_churn_end_to_end_with_native_backend(churn_schema):
     pytest.importorskip("sentence_transformers")
     _lib_or_skip()
     _checkpoint_or_skip("classification")
-    from relativedb import Engine, ExecutionInput
+    from relativedb import ContextPolicy, Engine, ExecutionInput
 
     backend = RtNativeBackend(schema=churn_schema)
+    # cohort_size=0: with three customers in the fixture, cohort seeding puts
+    # all of them in every context, so this stops being a per-entity ordering
+    # check. Cohort behaviour is covered where the graph is large enough.
     engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                    context_policy=ContextPolicy(cohort_size=0),
                     model_backend=backend)
     result = engine.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
@@ -473,3 +477,21 @@ def test_finetune_accepts_naive_anchors(churn_schema):
         [_dt(2026, 5, 1), _dt(2026, 6, 1)],      # naive on purpose
         epochs=20, learning_rate=1e-2)
     assert head.n_examples > 0
+
+
+def test_finetuned_regression_head_predicts_in_label_units(churn_schema):
+    """A fine-tuned head is fitted on raw targets, so its output must not be
+    put through the released head's denormalization a second time."""
+    _lib_or_skip()
+    _metal_or_skip()
+    from relativedb import ExecutionInput
+    q = "PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) FROM customers"
+    eng = _ft_engine(churn_schema)
+    head = eng.finetune(q, [dt("2026-04-01"), dt("2026-05-01"), dt("2026-06-01")],
+                        epochs=60, learning_rate=1e-2)
+    tuned = _ft_engine(churn_schema, head=head)
+    res = tuned.execute(ExecutionInput(query=q, anchor_time=dt("2026-07-01")))
+    vals = [p.value for p in res.predictions]
+    # the fixture's orders-per-customer counts are single digits; a double
+    # transform sent this into the hundreds
+    assert all(abs(v) < 50 for v in vals), vals

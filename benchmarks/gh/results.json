@@ -1,0 +1,818 @@
+{
+  "dataset": "GH Archive",
+  "dataset_url": "https://www.gharchive.org",
+  "hours": [
+    "2026-07-17-0",
+    "2026-07-17-1",
+    "2026-07-17-2",
+    "2026-07-17-3",
+    "2026-07-17-4",
+    "2026-07-17-5",
+    "2026-07-17-6",
+    "2026-07-17-7",
+    "2026-07-17-8",
+    "2026-07-17-9",
+    "2026-07-17-10",
+    "2026-07-17-11",
+    "2026-07-17-12",
+    "2026-07-17-13",
+    "2026-07-17-14",
+    "2026-07-17-15",
+    "2026-07-17-16",
+    "2026-07-17-17",
+    "2026-07-17-18",
+    "2026-07-17-19",
+    "2026-07-17-20",
+    "2026-07-17-21",
+    "2026-07-17-22",
+    "2026-07-17-23"
+  ],
+  "precision": "fp32",
+  "generated": "2026-07-20T03:24:03.870709+00:00",
+  "machine": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O"
+  },
+  "table_sizes": {
+    "actors": 503490,
+    "orgs": 618774,
+    "repos": 759263,
+    "events": 336593,
+    "issues": 3051,
+    "comments": 4348,
+    "pulls": 9606,
+    "issue_labels": 6310,
+    "label_defs": 2565
+  },
+  "tasks": [
+    {
+      "name": "bot_detection",
+      "kind": "binary",
+      "query": "PREDICT actors.is_bot = 1 FROM actors WHERE actors.actor_login IN :ids",
+      "question": "Does this account behave like a bot?",
+      "ground_truth": "actor_login ends in [bot] (never shown to either model)",
+      "n_train": 44,
+      "n_test": 67,
+      "label_balance": {
+        "0": 0.3284,
+        "1": 0.6716
+      },
+      "systems": [
+        {
+          "system": "XGBoost",
+          "train_seconds": 0.19830679101869464,
+          "inference_ms_per_row": 0.008791671204033182,
+          "overall": {
+            "positive_rate": 0.6716417910447762,
+            "auc": 0.9767676767676767,
+            "accuracy": 0.9402985074626866,
+            "f1": 0.9545454545454546
+          },
+          "detail": {}
+        },
+        {
+          "system": "RelativeDB (fine-tuned)",
+          "train_seconds": 47.90638612490147,
+          "inference_ms_per_row": 461.0262245057957,
+          "overall": {
+            "positive_rate": 0.6716417910447762,
+            "auc": 0.5232323232323233,
+            "accuracy": 0.47761194029850745,
+            "f1": 0.4444444444444444
+          },
+          "detail": {
+            "examples": 88,
+            "loss_before": 0.7188517451286316,
+            "loss_after": 0.01999361254274845
+          }
+        }
+      ],
+      "suspects": [
+        {
+          "login": "bugsbuny243",
+          "score": 1.0,
+          "n_events": 46,
+          "n_stars": 0,
+          "active_minutes": 1060.3,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "tonyhyworld",
+          "score": 1.0,
+          "n_events": 20,
+          "n_stars": 0,
+          "active_minutes": 846.2,
+          "n_repos": 2,
+          "n_types": 3
+        },
+        {
+          "login": "mrpmvah",
+          "score": 1.0,
+          "n_events": 432,
+          "n_stars": 0,
+          "active_minutes": 962.0,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "nhya985hzu14",
+          "score": 1.0,
+          "n_events": 1192,
+          "n_stars": 0,
+          "active_minutes": 770.5,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "tchomski",
+          "score": 1.0,
+          "n_events": 414,
+          "n_stars": 0,
+          "active_minutes": 959.8,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "golterm-zz",
+          "score": 1.0,
+          "n_events": 221,
+          "n_stars": 0,
+          "active_minutes": 158.3,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "jiway2221",
+          "score": 1.0,
+          "n_events": 248,
+          "n_stars": 0,
+          "active_minutes": 354.5,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "jasu78",
+          "score": 1.0,
+          "n_events": 299,
+          "n_stars": 0,
+          "active_minutes": 463.1,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "ronnoto",
+          "score": 1.0,
+          "n_events": 225,
+          "n_stars": 0,
+          "active_minutes": 163.8,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "mrgamerdu84-ctrl",
+          "score": 1.0,
+          "n_events": 25,
+          "n_stars": 0,
+          "active_minutes": 940.3,
+          "n_repos": 2,
+          "n_types": 2
+        },
+        {
+          "login": "rrhester",
+          "score": 1.0,
+          "n_events": 34,
+          "n_stars": 0,
+          "active_minutes": 828.9,
+          "n_repos": 1,
+          "n_types": 3
+        },
+        {
+          "login": "zayoseriu",
+          "score": 1.0,
+          "n_events": 281,
+          "n_stars": 0,
+          "active_minutes": 514.5,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "sfiuk27mhz91",
+          "score": 1.0,
+          "n_events": 858,
+          "n_stars": 0,
+          "active_minutes": 799.6,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "ylushihua",
+          "score": 1.0,
+          "n_events": 737,
+          "n_stars": 0,
+          "active_minutes": 317.8,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "MarcoM-98",
+          "score": 1.0,
+          "n_events": 26,
+          "n_stars": 0,
+          "active_minutes": 117.7,
+          "n_repos": 2,
+          "n_types": 2
+        },
+        {
+          "login": "0xgleb",
+          "score": 0.9997,
+          "n_events": 41,
+          "n_stars": 0,
+          "active_minutes": 1413.6,
+          "n_repos": 2,
+          "n_types": 3
+        },
+        {
+          "login": "greenLemin",
+          "score": 0.9997,
+          "n_events": 22,
+          "n_stars": 0,
+          "active_minutes": 193.2,
+          "n_repos": 1,
+          "n_types": 3
+        },
+        {
+          "login": "STARSAAS",
+          "score": 0.9996,
+          "n_events": 25,
+          "n_stars": 0,
+          "active_minutes": 606.8,
+          "n_repos": 1,
+          "n_types": 2
+        },
+        {
+          "login": "terenceponce",
+          "score": 0.9991,
+          "n_events": 24,
+          "n_stars": 0,
+          "active_minutes": 211.2,
+          "n_repos": 1,
+          "n_types": 4
+        },
+        {
+          "login": "joku-dev",
+          "score": 0.9987,
+          "n_events": 28,
+          "n_stars": 0,
+          "active_minutes": 443.2,
+          "n_repos": 2,
+          "n_types": 4
+        }
+      ],
+      "rows": [
+        {
+          "id": "aws-aemilia-mxp",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0001
+        },
+        {
+          "id": "aws-aemilia-pdx",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.6098
+        },
+        {
+          "id": "aws-aemilia-cmh",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.1457
+        },
+        {
+          "id": "aws-aemilia-dub",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0169
+        },
+        {
+          "id": "aws-aemilia-gru",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0003
+        },
+        {
+          "id": "aws-aemilia-sin",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0389
+        },
+        {
+          "id": "aws-aemilia-kix",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0001
+        },
+        {
+          "id": "aws-aemilia-icn",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.1889
+        },
+        {
+          "id": "aws-aemilia-iad",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0002
+        },
+        {
+          "id": "vp2sfwntbg-cmd",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.0216,
+          "RelativeDB (fine-tuned)": 0.0015
+        },
+        {
+          "id": "aws-aemilia-fra",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0002
+        },
+        {
+          "id": "aws-aemilia-nrt",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0004
+        },
+        {
+          "id": "dorukardahan",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0578,
+          "RelativeDB (fine-tuned)": 0.0012
+        },
+        {
+          "id": "eltmon",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0256,
+          "RelativeDB (fine-tuned)": 0.0715
+        },
+        {
+          "id": "aws-aemilia-bom",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.8206
+        },
+        {
+          "id": "aws-aemilia-cdg",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0553
+        },
+        {
+          "id": "s741dev",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9092,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "aws-aemilia-lhr",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0017
+        },
+        {
+          "id": "ps-toolathlon",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.9962
+        },
+        {
+          "id": "Hmbown",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0198,
+          "RelativeDB (fine-tuned)": 0.3979
+        },
+        {
+          "id": "aws-aemilia-syd",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.052
+        },
+        {
+          "id": "aws-aemilia-arn",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0011
+        },
+        {
+          "id": "aws-aemilia-sfo",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "aws-aemilia-yul",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0032
+        },
+        {
+          "id": "elasticsearchmachine",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.1156,
+          "RelativeDB (fine-tuned)": 0.0254
+        },
+        {
+          "id": "tooluse222",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.8672,
+          "RelativeDB (fine-tuned)": 0.434
+        },
+        {
+          "id": "riverhe459-lgtm",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.806,
+          "RelativeDB (fine-tuned)": 0.0407
+        },
+        {
+          "id": "JoNil-Botta",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0274,
+          "RelativeDB (fine-tuned)": 0.0006
+        },
+        {
+          "id": "edburns",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0439,
+          "RelativeDB (fine-tuned)": 0.2815
+        },
+        {
+          "id": "hkustnlp-cmyk",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.0287
+        },
+        {
+          "id": "lyc228612-sudo",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9101,
+          "RelativeDB (fine-tuned)": 0.1145
+        },
+        {
+          "id": "mcptest-user",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 0.9997
+        },
+        {
+          "id": "jahia-ci",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.8878,
+          "RelativeDB (fine-tuned)": 0.2602
+        },
+        {
+          "id": "newtonick",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.1118,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "teidesu",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.1293,
+          "RelativeDB (fine-tuned)": 0.014
+        },
+        {
+          "id": "scalr-autotester6",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9314,
+          "RelativeDB (fine-tuned)": 0.0001
+        },
+        {
+          "id": "willgriffin",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0443,
+          "RelativeDB (fine-tuned)": 0.0289
+        },
+        {
+          "id": "hshimizu",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0911,
+          "RelativeDB (fine-tuned)": 0.9105
+        },
+        {
+          "id": "scalr-autotester5",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9314,
+          "RelativeDB (fine-tuned)": 0.0001
+        },
+        {
+          "id": "scalr-autotester19",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9314,
+          "RelativeDB (fine-tuned)": 0.0092
+        },
+        {
+          "id": "malaquiasdev",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0223,
+          "RelativeDB (fine-tuned)": 0.0002
+        },
+        {
+          "id": "dennougorilla",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0128,
+          "RelativeDB (fine-tuned)": 0.0014
+        },
+        {
+          "id": "KyleMit",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0122,
+          "RelativeDB (fine-tuned)": 0.0736
+        },
+        {
+          "id": "mobbcitestjob9",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.806,
+          "RelativeDB (fine-tuned)": 0.1624
+        },
+        {
+          "id": "daiki-beppu",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0198,
+          "RelativeDB (fine-tuned)": 0.0003
+        },
+        {
+          "id": "scalr-autotester13",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.806,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "scalr-autotester0",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9314,
+          "RelativeDB (fine-tuned)": 0.0181
+        },
+        {
+          "id": "alltomatos",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0274,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "mobbcitestjob7",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.8189,
+          "RelativeDB (fine-tuned)": 0.5615
+        },
+        {
+          "id": "mobbcitestjob8",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.806,
+          "RelativeDB (fine-tuned)": 0.0137
+        },
+        {
+          "id": "michael-conrad",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0421,
+          "RelativeDB (fine-tuned)": 0.0405
+        },
+        {
+          "id": "inureyes",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0449,
+          "RelativeDB (fine-tuned)": 0.0372
+        },
+        {
+          "id": "Toolathlon-beta",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.6964,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "jsouramid",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9101,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "openshift-helm-charts-bot",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9547,
+          "RelativeDB (fine-tuned)": 0.9758
+        },
+        {
+          "id": "chengzeliu79-spec",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.8672,
+          "RelativeDB (fine-tuned)": 0.9996
+        },
+        {
+          "id": "mobbcitestjob6",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9314,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "bennetwi92",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0292,
+          "RelativeDB (fine-tuned)": 0.413
+        },
+        {
+          "id": "jacobbpp",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0439,
+          "RelativeDB (fine-tuned)": 0.1912
+        },
+        {
+          "id": "tooooolathon",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.9101,
+          "RelativeDB (fine-tuned)": 0.179
+        },
+        {
+          "id": "mrofisr",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.2447,
+          "RelativeDB (fine-tuned)": 0.7754
+        },
+        {
+          "id": "yugabyte-ci",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.3629,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "eminogrande",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.0398,
+          "RelativeDB (fine-tuned)": 0.1712
+        },
+        {
+          "id": "nyleeaa0503-nv",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.8005,
+          "RelativeDB (fine-tuned)": 0.9999
+        },
+        {
+          "id": "kilasuit",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.5742,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "theDawckta",
+          "label": 0,
+          "title": null,
+          "XGBoost": 0.1813,
+          "RelativeDB (fine-tuned)": 1.0
+        },
+        {
+          "id": "mobbcitestjob5",
+          "label": 1,
+          "title": null,
+          "XGBoost": 0.8791,
+          "RelativeDB (fine-tuned)": 1.0
+        }
+      ],
+      "examples": [
+        {
+          "id": "dorukardahan",
+          "actual": "human",
+          "XGBoost": 0.058,
+          "RelativeDB (fine-tuned)": 0.001
+        },
+        {
+          "id": "eltmon",
+          "actual": "human",
+          "XGBoost": 0.026,
+          "RelativeDB (fine-tuned)": 0.072
+        },
+        {
+          "id": "Hmbown",
+          "actual": "human",
+          "XGBoost": 0.02,
+          "RelativeDB (fine-tuned)": 0.398
+        },
+        {
+          "id": "JoNil-Botta",
+          "actual": "human",
+          "XGBoost": 0.027,
+          "RelativeDB (fine-tuned)": 0.001
+        },
+        {
+          "id": "edburns",
+          "actual": "human",
+          "XGBoost": 0.044,
+          "RelativeDB (fine-tuned)": 0.281
+        },
+        {
+          "id": "newtonick",
+          "actual": "human",
+          "XGBoost": 0.112,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "aws-aemilia-mxp",
+          "actual": "bot",
+          "XGBoost": 0.696,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "aws-aemilia-pdx",
+          "actual": "bot",
+          "XGBoost": 0.696,
+          "RelativeDB (fine-tuned)": 0.61
+        },
+        {
+          "id": "aws-aemilia-cmh",
+          "actual": "bot",
+          "XGBoost": 0.696,
+          "RelativeDB (fine-tuned)": 0.146
+        },
+        {
+          "id": "aws-aemilia-dub",
+          "actual": "bot",
+          "XGBoost": 0.696,
+          "RelativeDB (fine-tuned)": 0.017
+        },
+        {
+          "id": "aws-aemilia-gru",
+          "actual": "bot",
+          "XGBoost": 0.696,
+          "RelativeDB (fine-tuned)": 0.0
+        },
+        {
+          "id": "aws-aemilia-sin",
+          "actual": "bot",
+          "XGBoost": 0.696,
+          "RelativeDB (fine-tuned)": 0.039
+        }
+      ]
+    }
+  ]
+}

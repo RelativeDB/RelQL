@@ -1,0 +1,249 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RelativeDB vs XGBoost — Olist</title>
+<style>
+:root{
+  --ground:#fbfbfd; --ink:#12151b; --mut:#5d6675; --line:#e3e6ec;
+  --panel:#fff; --sunk:#f3f5f8;
+  --xgb:#c2410c; --zs:#0e7490; --ft:#4f46e5;
+}
+@media(prefers-color-scheme:dark){:root{
+  --ground:#0d1014; --ink:#e9ecf2; --mut:#8f98a8; --line:#212630;
+  --panel:#13171d; --sunk:#0a0d11;
+  --xgb:#f97316; --zs:#22d3ee; --ft:#818cf8;
+}}
+:root[data-theme=dark]{
+  --ground:#0d1014; --ink:#e9ecf2; --mut:#8f98a8; --line:#212630;
+  --panel:#13171d; --sunk:#0a0d11; --xgb:#f97316; --zs:#22d3ee; --ft:#818cf8;
+}
+:root[data-theme=light]{
+  --ground:#fbfbfd; --ink:#12151b; --mut:#5d6675; --line:#e3e6ec;
+  --panel:#fff; --sunk:#f3f5f8; --xgb:#c2410c; --zs:#0e7490; --ft:#4f46e5;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font:400 15.5px/1.65 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+  font-variant-numeric:tabular-nums}
+th,td.n,.eyebrow,.chip,.big,pre{font-family:ui-monospace,SFMono-Regular,"SF Mono",
+  Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+main{max-width:64rem;margin:0 auto;padding:3.5rem 1.25rem 5rem;
+  display:flex;flex-direction:column;gap:2.25rem}
+.eyebrow{font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--mut);margin:0 0 .7rem}
+h1{font-size:clamp(1.8rem,4.5vw,2.6rem);line-height:1.1;letter-spacing:-.025em;
+  margin:0 0 .6rem;text-wrap:balance;font-weight:650}
+.lede{color:var(--mut);max-width:64ch;margin:0}
+h2{font-size:1.05rem;letter-spacing:-.01em;margin:0;font-weight:640}
+section{display:flex;flex-direction:column;gap:1rem}
+hr{height:1px;background:var(--line);border:0;margin:0}
+.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr))}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:1.15rem 1.3rem;display:flex;flex-direction:column;gap:.5rem}
+.big{font-size:1.75rem;line-height:1;letter-spacing:-.03em}
+.cap{color:var(--mut);font-size:.82rem;margin:0}
+.chips{display:flex;gap:.6rem;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:.4rem;font-size:.72rem;
+  border:1px solid var(--line);border-radius:999px;padding:.12rem .55rem;color:var(--mut)}
+.sw{width:.55rem;height:.55rem;border-radius:2px;display:inline-block}
+.wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.88rem;min-width:36rem}
+th,td{padding:.5rem .65rem;border-bottom:1px solid var(--line);text-align:left;
+  white-space:nowrap}
+th{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);
+  font-weight:600}
+td.n,th.n{text-align:right}
+tbody tr:last-child td{border-bottom:0}
+.track{position:relative;display:block;height:7px;border-radius:4px;
+  background:var(--sunk);min-width:5rem}
+.fill{position:absolute;top:0;bottom:0;left:0;border-radius:4px}
+.lead{font-weight:700}
+pre{background:var(--sunk);border:1px solid var(--line);border-radius:8px;margin:0;
+  padding:.75rem .9rem;overflow-x:auto;font-size:.79rem;line-height:1.55}
+.caveat{border-left:2px solid var(--line);padding-left:.9rem;color:var(--mut);
+  font-size:.9rem;margin:0}
+.bug{border-left:2px solid var(--xgb);padding-left:.9rem;font-size:.9rem;margin:0}
+footer{color:var(--mut);font-size:.82rem;display:flex;flex-direction:column;gap:.3rem}
+:focus-visible{outline:2px solid var(--ft);outline-offset:2px}
+</style>
+<main>
+
+<header>
+  <p class="eyebrow">Olist · Brazilian e-commerce · fp32 weights</p>
+  <h1>RelativeDB against XGBoost, on the same rows</h1>
+  <p class="lede">One relational dataset, one chronological split at 2018-01-01,
+  the same labels on both sides. XGBoost gets a flat encoded matrix; RelativeDB
+  answers a RelQL query over the graph. Every entity is scored at its own anchor
+  time, and every row whose outcome window closes after the data ends
+  (2018-10-17) is dropped rather than counted as a negative.</p>
+</header>
+
+<section>
+  <div class="grid">
+    <div class="panel"><p class="cap">Test rows per task</p>
+      <p class="big">400</p><p class="cap">sampled from 38.6k–42.9k available</p></div>
+    <div class="panel"><p class="cap">XGBoost inference</p>
+      <p class="big">0.01 ms</p><p class="cap">per row · fit 0.5–2.8 s</p></div>
+    <div class="panel"><p class="cap">RelativeDB inference</p>
+      <p class="big">30–45 ms</p><p class="cap">per row · zero-shot needs no fit</p></div>
+    <div class="panel"><p class="cap">Fine-tune cost</p>
+      <p class="big">49–171 s</p><p class="cap">frozen backbone · ~2 KB adapter</p></div>
+  </div>
+  <div class="chips">
+    <span class="chip"><i class="sw" style="background:var(--xgb)"></i>XGBoost</span>
+    <span class="chip"><i class="sw" style="background:var(--zs)"></i>RelativeDB (zero-shot)</span>
+    <span class="chip"><i class="sw" style="background:var(--ft)"></i>RelativeDB (fine-tuned)</span>
+  </div>
+</section>
+
+<hr>
+<section>
+  <p class="eyebrow">binary · 400 test rows · 16.3% positive · 120-day window</p>
+  <h2>Bad review at purchase</h2>
+  <p class="cap">Will this order be reviewed 1 or 2 stars?</p>
+<pre>PREDICT LAST(reviews.review_score) OVER (120 DAYS FOLLOWING) &lt;= 2
+FROM orders WHERE orders.order_id IN :ids</pre>
+  <div class="wrap"><table>
+    <thead><tr><th>System</th><th class="n">AUC</th><th></th>
+      <th class="n">train</th><th class="n">inference</th></tr></thead>
+    <tbody>
+      <tr><td>XGBoost</td><td class="n">0.521</td>
+        <td style="width:38%"><span class="track"><span class="fill" style="width:95.3%;background:var(--xgb)"></span></span></td>
+        <td class="n">0.6 s</td><td class="n">0.01 ms</td></tr>
+      <tr><td>RelativeDB (zero-shot)</td><td class="n lead">0.547</td>
+        <td><span class="track"><span class="fill" style="width:100%;background:var(--zs)"></span></span></td>
+        <td class="n">—</td><td class="n">39.51 ms</td></tr>
+      <tr><td>RelativeDB (fine-tuned)</td><td class="n">0.476</td>
+        <td><span class="track"><span class="fill" style="width:87.1%;background:var(--ft)"></span></span></td>
+        <td class="n">171.3 s</td><td class="n">31.93 ms</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caveat">Anchored at purchase, before delivery. The strongest driver
+  of a bad review is a late delivery, which has not happened yet, so all three
+  sit near chance. Fine-tuning moved this <em>down</em> here and <em>up</em> on
+  the earlier 2018-05-01 split, so the direction is noise, not an effect.</p>
+</section>
+
+<hr>
+<section>
+  <p class="eyebrow">multiclass · 400 test rows · 5 classes · 120-day window</p>
+  <h2>Star rating at purchase</h2>
+  <p class="cap">How many stars will this order be reviewed?</p>
+<pre>PREDICT LAST(reviews.star) OVER (120 DAYS FOLLOWING)
+FROM orders WHERE orders.order_id IN :ids</pre>
+  <div class="wrap"><table>
+    <thead><tr><th>System</th><th class="n">Accuracy</th><th></th>
+      <th class="n">train</th><th class="n">inference</th></tr></thead>
+    <tbody>
+      <tr><td>XGBoost</td><td class="n">0.548</td>
+        <td style="width:38%"><span class="track"><span class="fill" style="width:96.9%;background:var(--xgb)"></span></span></td>
+        <td class="n">2.8 s</td><td class="n">0.00 ms</td></tr>
+      <tr><td>RelativeDB (zero-shot)</td><td class="n lead">0.565</td>
+        <td><span class="track"><span class="fill" style="width:100%;background:var(--zs)"></span></span></td>
+        <td class="n">—</td><td class="n">45.41 ms</td></tr>
+      <tr><td>RelativeDB (fine-tuned)</td><td class="n lead">0.565</td>
+        <td><span class="track"><span class="fill" style="width:100%;background:var(--ft)"></span></span></td>
+        <td class="n">49.0 s</td><td class="n">30.18 ms</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caveat">56.5% of test rows are five-star, so accuracy near 0.55 is
+  close to always predicting the majority class. The fine-tuned head returns the
+  same predictions as zero-shot to four decimals, which means it is not changing
+  the argmax at all.</p>
+</section>
+
+<hr>
+<section>
+  <p class="eyebrow">regression · 400 test rows · 96% zero · 90-day window</p>
+  <h2>Next-90-day spend after the first order</h2>
+  <p class="cap">How much will this customer spend in the 90 days after their first order?</p>
+<pre>PREDICT SUM(payments.payment_value) OVER (90 DAYS FOLLOWING)
+FROM customers WHERE customers.customer_unique_id IN :ids</pre>
+  <div class="wrap"><table>
+    <thead><tr><th>System</th><th class="n">MAE</th><th></th>
+      <th class="n">train</th><th class="n">inference</th></tr></thead>
+    <tbody>
+      <tr><td>XGBoost</td><td class="n lead">11.35</td>
+        <td style="width:38%"><span class="track"><span class="fill" style="width:100%;background:var(--xgb)"></span></span></td>
+        <td class="n">0.7 s</td><td class="n">0.00 ms</td></tr>
+      <tr><td>RelativeDB (zero-shot)</td><td class="n">38.25</td>
+        <td><span class="track"><span class="fill" style="width:29.7%;background:var(--zs)"></span></span></td>
+        <td class="n">—</td><td class="n">30.49 ms</td></tr>
+      <tr><td>RelativeDB (fine-tuned)</td><td class="n">14.20</td>
+        <td><span class="track"><span class="fill" style="width:79.9%;background:var(--ft)"></span></span></td>
+        <td class="n">166.8 s</td><td class="n">30.18 ms</td></tr>
+    </tbody>
+  </table></div>
+  <p class="bug"><b>Fine-tuning is the only thing that closes this gap.</b>
+  Zero-shot is 3.4× XGBoost's error; a trained head gets within 25% of it. This
+  row read 709.64 before a fix: a fine-tuned head is fitted on raw targets, but
+  <code>rt_native.score()</code> was still applying the released head's
+  denormalization <code>value = score × label_sd + label_mu</code> on top,
+  transforming it twice.</p>
+  <p class="caveat">96% of customers spend nothing in the window, so MAE is
+  dominated by how tightly a model predicts zero.</p>
+</section>
+
+<hr>
+<section>
+  <p class="eyebrow">binary · sparse · 400 test rows · 4.0% positive · 90-day window</p>
+  <h2>Repeat purchase after the first order</h2>
+  <p class="cap">Will this customer order again within 90 days?</p>
+<pre>PREDICT EXISTS(orders.*) OVER (90 DAYS FOLLOWING)
+FROM customers WHERE customers.customer_unique_id IN :ids</pre>
+  <div class="wrap"><table>
+    <thead><tr><th>System</th><th class="n">AUC</th><th></th>
+      <th class="n">train</th><th class="n">inference</th></tr></thead>
+    <tbody>
+      <tr><td>XGBoost</td><td class="n">0.584</td>
+        <td style="width:38%"><span class="track"><span class="fill" style="width:92.7%;background:var(--xgb)"></span></span></td>
+        <td class="n">0.5 s</td><td class="n">0.00 ms</td></tr>
+      <tr><td>RelativeDB (zero-shot)</td><td class="n lead">0.630</td>
+        <td><span class="track"><span class="fill" style="width:100%;background:var(--zs)"></span></span></td>
+        <td class="n">—</td><td class="n">31.54 ms</td></tr>
+      <tr><td>RelativeDB (fine-tuned)</td><td class="n">0.407</td>
+        <td><span class="track"><span class="fill" style="width:64.6%;background:var(--ft)"></span></span></td>
+        <td class="n">168.4 s</td><td class="n">32.17 ms</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caveat">The sparse case, and the clearest gap in the set: every test
+  customer is cold-start with exactly one prior order, so per-customer
+  aggregates carry almost nothing and XGBoost is working from order attributes
+  alone. Zero-shot reads the order's items, payments and seller directly.
+  Fine-tuning lands below chance on a 4%-positive target, which is the same
+  instability seen on the other binary task.</p>
+</section>
+
+<hr>
+<section>
+  <p class="eyebrow">What the sparsity slice shows</p>
+  <h2>Almost every row is cold-start</h2>
+  <p class="cap">Olist keys every order to a fresh <code>customer_id</code>;
+  <code>customer_unique_id</code> is the person. Of the 400 test rows per task,
+  388–400 have no prior order. The customer-level tasks are 100% cold-start, so
+  their numbers <em>are</em> the sparse-data result rather than an average over
+  a mixed population.</p>
+  <div class="wrap"><table>
+    <thead><tr><th>Task</th><th class="n">0 prior</th><th class="n">1 prior</th>
+      <th class="n">2–5 prior</th><th class="n">dropped as unobservable</th></tr></thead>
+    <tbody>
+      <tr><td>bad_review</td><td class="n">388</td><td class="n">12</td><td class="n">0</td><td class="n">14,962</td></tr>
+      <tr><td>review_stars</td><td class="n">388</td><td class="n">12</td><td class="n">0</td><td class="n">14,962</td></tr>
+      <tr><td>future_spend</td><td class="n">400</td><td class="n">0</td><td class="n">0</td><td class="n">9,172</td></tr>
+      <tr><td>repeat_purchase</td><td class="n">400</td><td class="n">0</td><td class="n">0</td><td class="n">9,172</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caveat">The dropped column is rows whose outcome window extends past
+  2018-10-17. Counting them would have scored an unobserved outcome as a
+  negative — which is exactly what made the first run of these two tasks
+  unreadable.</p>
+</section>
+
+<hr>
+<footer>
+  <span>macOS-15.5-arm64 · arm64 · RT-J fp32 (quantized variants explicitly disabled)</span>
+  <span>Brazilian E-Commerce Public Dataset by Olist · 99,441 orders · 112,650 items · 103,886 payments · 99,224 reviews</span>
+  <span>Numbers from benchmarks/olist/results.json, run at split 2018-01-01 with 2,500 train / 400 test per task, 300 fine-tune epochs.</span>
+</footer>
+
+</main>
