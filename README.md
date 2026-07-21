@@ -12,9 +12,10 @@ FROM customers
 
 *"For every customer, what is the probability they don't place an order"*.
 
-RelativeDB works best for large graphs, 10-100 tables, without needing any feature engineering.
+RelativeDB works best with many tables, 10-100 tables, without needing any feature engineering. Subgraphs are discovered automatically, though you can ablate them to find what features really matter. Since RelativeDB uses a pretrained model, it will work in environments with very little data.
 
 ## The Model
+RelativeDB is based on these papers:
 
 | Resource | Description | Date      |
 | --- | --- |-----------|
@@ -25,11 +26,6 @@ RelativeDB works best for large graphs, 10-100 tables, without needing any featu
 
 ```sql
 # Auto-label a GitHub issue: predict its label from title, body, and history.
-PREDICT label
-FROM issues
-WHERE label IS NULL
-
-# or simply
 PREDICT issues.label
 WHERE issues.label IS NULL
 
@@ -67,11 +63,11 @@ WINDOW w AS (30 DAYS FOLLOWING)
 
 Read the [RelQL book](https://relql.com/docs/).
 
-### Checkpoints
+# Checkpoints
 
 | Checkpoint | On-disk | Latency | Throughput | Accuracy | Download |
 | --- | --- | --- | --- | --- | --- |
-| fp32 | 171 MB | 317 ms | 6.5k tok/s | reference | — |
+| fp32 | 342 MB | 317 ms | 6.5k tok/s | reference | — |
 | fp16 | 172 MB | 483 ms | 4.2k tok/s | identical | [rt-j-fp16](https://huggingface.co/RelativeDB/rt-j-fp16) |
 | int8 | 88 MB | 453 ms | 4.5k tok/s | ±0.01 | [rt-j-int8](https://huggingface.co/RelativeDB/rt-j-int8) |
 | int4 | 64 MB | 464 ms | 4.4k tok/s | ±0.15 | [rt-j-int4](https://huggingface.co/RelativeDB/rt-j-int4) |
@@ -128,3 +124,6 @@ result = engine.execute(ExecutionInput(
 ```
 
 </details>
+
+# Notes
+- The multi-label head requires tuning (e.g. RANK TOP 10)
