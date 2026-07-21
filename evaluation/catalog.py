@@ -47,12 +47,20 @@ EVAL_TASKS: tuple[EvalTask, ...] = (
     EvalTask("rel-avito", "ad-ctr", "num_click", "reg"),
 )
 
+# Additional scalar task tables shipped by rel-f1 but not included in the
+# curated 21-task paper benchmark. They are available for explicit query
+# experiments and are never added to the default catalog selection.
+EXTRA_TASKS: tuple[EvalTask, ...] = (
+    EvalTask("rel-f1", "qualifying-position", "position", "reg"),
+    EvalTask("rel-f1", "results-position", "position", "reg"),
+)
+
 
 def select_tasks(selectors: list[str] | None) -> list[EvalTask]:
     if not selectors:
         return list(EVAL_TASKS)
     wanted = set(selectors)
-    selected = [t for t in EVAL_TASKS
+    selected = [t for t in (*EVAL_TASKS, *EXTRA_TASKS)
                 if t.database in wanted or t.id in wanted]
     unknown = wanted - {t.database for t in selected} - {t.id for t in selected}
     if unknown:

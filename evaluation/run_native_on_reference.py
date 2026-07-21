@@ -98,14 +98,9 @@ def main() -> None:
     args = parser.parse_args()
 
     from rt.eval_utils import build_evaluator, run_and_report
-    from rt.recipes import get_tasks
+    from evaluation.reference_tasks import selected_test_tasks
 
-    tasks = [t for t in get_tasks("relbench_eval_test", args.pre_dir)
-             if t.task_type == args.task_type]
-    if args.tasks:
-        selected = set(args.tasks)
-        tasks = [t for t in tasks if t.db_name in selected
-                 or f"{t.db_name}/{t.table_name}" in selected]
+    tasks = selected_test_tasks(args.pre_dir, args.tasks, args.task_type)
     heads = None
     if args.heads_json:
         import json

@@ -541,3 +541,17 @@ def test_fit_head_rejects_regression_adapter(churn_schema):
     eng = _ft_engine(churn_schema)
     with pytest.raises(ExecutionError, match="full-backbone fine-tuning"):
         eng.fit_head(q, [dt("2026-04-01")])
+
+
+def test_physical_forward_batch_is_bounded_without_reordering():
+    backend = RtNativeBackend(batch_size=2)
+    calls = []
+
+    def fake_forward(model, seqs, **kwargs):
+        calls.append(list(seqs))
+        return np.asarray(seqs, np.float32)
+
+    backend._forward = fake_forward
+    got = backend._forward_batched(object(), [0, 1, 2, 3, 4])
+    assert [len(chunk) for chunk in calls] == [2, 2, 1]
+    assert got.tolist() == [0, 1, 2, 3, 4]

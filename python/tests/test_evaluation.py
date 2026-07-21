@@ -49,6 +49,15 @@ def test_reference_catalog_is_the_curated_12_clf_9_reg_set():
         select_tasks(["not-a-task"])
 
 
+def test_extra_f1_scalar_tasks_require_explicit_selection():
+    assert all(t.id not in {
+        "rel-f1/qualifying-position", "rel-f1/results-position"
+    } for t in select_tasks(None))
+    assert [t.id for t in select_tasks([
+        "rel-f1/qualifying-position", "rel-f1/results-position"
+    ])] == ["rel-f1/qualifying-position", "rel-f1/results-position"]
+
+
 def test_optional_ours_and_finetuned_emit_comparable_submissions(
         tmp_path, monkeypatch):
     module = types.ModuleType("eval_test_factory")

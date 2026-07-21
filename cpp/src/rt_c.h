@@ -56,6 +56,21 @@ int64_t rt_model_num_params(const rt_model*);
 /* 1 if the device can run rt_forward_device, else 0. */
 int rt_device_available(int32_t device);
 
+/* Reference graph-walk sampler primitive.  ``offsets``/``neighbors`` are a
+ * CSR graph with deterministic neighbor order; ``eligible`` marks nodes whose
+ * visits are counted. The RNG and integer range sampling match rand 0.9.1
+ * StdRng. This keeps the product traversal exact while moving the 10k x 20
+ * inner loop out of Python. Returns 0 on success. */
+int rt_reference_walk_counts(int32_t node_count, const int32_t* offsets,
+                             const int32_t* neighbors, int32_t target,
+                             const uint8_t* eligible, uint64_t seed,
+                             int32_t num_walks, int32_t walk_length,
+                             uint32_t* out_counts);
+
+/* First u64 from independently seeded rand 0.9.1 StdRng streams. */
+int rt_stdrng_first_u64_batch(const uint64_t* seeds, int32_t count,
+                              uint64_t* out_values);
+
 /* Run the forward pass.
  *
  * out_target_scores: length B. For each batch row, the number-head output

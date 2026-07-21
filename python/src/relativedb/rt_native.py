@@ -211,6 +211,35 @@ class ColumnStats:
         return ColumnStats(self.stats, dt=self.dt, bound=self.bound,
                            task_stats=task_stats)
 
+    def with_column_values(self, table: str, column: str,
+                           values: Sequence[float]) -> "ColumnStats":
+        """Return a copy with reference-style numeric statistics for a
+        materialized table column that is not part of the product schema."""
+        vals = np.asarray(list(values), dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            raise ValueError("column statistics need at least one finite value")
+        sd = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+        stats = dict(self.stats)
+        stats[(table, column)] = (float(vals.mean()),
+                                  sd if sd != 0.0 else 1.0)
+        return ColumnStats(stats, dt=self.dt, bound=self.bound,
+                           task_stats=self.task_stats)
+
+    def with_datetime_values(self, values: Sequence[float]) -> "ColumnStats":
+        """Return a copy with the reference's global datetime normalizer.
+
+        Values use the same day units as the runtime ``_days`` conversion.
+        """
+        vals = np.asarray(list(values), dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            raise ValueError("datetime statistics need at least one finite value")
+        sd = float(vals.std(ddof=0)) if vals.size > 1 else 0.0
+        return ColumnStats(self.stats,
+                           dt=(float(vals.mean()), sd if sd != 0.0 else 1.0),
+                           bound=self.bound, task_stats=self.task_stats)
+
     def task(self, task: "TaskSpec | str") -> tuple[float, float]:
         key = task.id if isinstance(task, TaskSpec) else str(task)
         try:
@@ -297,8 +326,17 @@ class RtLib:
         lib.rt_model_num_params.restype = ctypes.c_int64
         lib.rt_model_num_params.argtypes = [ctypes.c_void_p]
         f64p = np.ctypeslib.ndpointer(np.int64, flags="C_CONTIGUOUS")
+        i32p = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
+        u32p = np.ctypeslib.ndpointer(np.uint32, flags="C_CONTIGUOUS")
+        u64p = np.ctypeslib.ndpointer(np.uint64, flags="C_CONTIGUOUS")
         u8p = np.ctypeslib.ndpointer(np.uint8, flags="C_CONTIGUOUS")
         f32p = np.ctypeslib.ndpointer(np.float32, flags="C_CONTIGUOUS")
+        lib.rt_reference_walk_counts.restype = ctypes.c_int
+        lib.rt_reference_walk_counts.argtypes = [
+            ctypes.c_int32, i32p, i32p, ctypes.c_int32, u8p,
+            ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32, u32p]
+        lib.rt_stdrng_first_u64_batch.restype = ctypes.c_int
+        lib.rt_stdrng_first_u64_batch.argtypes = [u64p, ctypes.c_int32, u64p]
         lib.rt_forward.restype = ctypes.c_int
         lib.rt_forward.argtypes = [
             ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
@@ -922,6 +960,18 @@ class TextEmbedder:
         self._model = None
         self._cache: dict[str, np.ndarray] = {}
         self._cache_norm: dict[str, np.ndarray] = {}
+        self._strict_precomputed = False
+
+    def install_precomputed(self, values: dict[str, np.ndarray], *,
+                            strict: bool = True) -> None:
+        """Install preprocessing-time embeddings.
+
+        With ``strict=True`` an unknown string is an error, never an implicit
+        switch to a newly computed embedding distribution.
+        """
+        self._cache.update({str(key): np.asarray(value, np.float32)
+                            for key, value in values.items()})
+        self._strict_precomputed = strict
 
     def _load(self):
         if self._model is None:
@@ -933,7 +983,7 @@ class TextEmbedder:
                     f"pinned {self.model_name} text encoder: "
                     "pip install sentence-transformers") from e
             self._model = SentenceTransformer(
-                f"sentence-transformers/{self.model_name}")
+                f"sentence-transformers/{self.model_name}", device="cpu")
             # Left at the encoder's shipped 128 word-piece window ON PURPOSE.
             # RT-J is frozen and was trained on vectors this encoder produced
             # at that setting; raising it changes the embedding function out
@@ -954,6 +1004,10 @@ class TextEmbedder:
         cache = self._cache_norm if normalize else self._cache
         missing = [t for t in dict.fromkeys(texts) if t not in cache]
         if missing:
+            if self._strict_precomputed:
+                raise RtNativeError(
+                    "precomputed embedding table has no value for "
+                    + ", ".join(repr(value) for value in missing[:3]))
             embs = self._load().encode(missing, normalize_embeddings=normalize,
                                        show_progress_bar=False)
             for t, e in zip(missing, embs):
@@ -1088,7 +1142,8 @@ class RtNativeBackend:
                  normalization_mode: Optional[NormalizationMode | str] = None,
                  task_spec_factory: Optional[TaskSpecFactory] = None,
                  device: Optional[int] = None,
-                 head: Optional[Any] = None):
+                 head: Optional[Any] = None,
+                 batch_size: Optional[int] = None):
         self.schema = schema
         self.wiring = wiring
         self._lib_path = lib_path
@@ -1105,6 +1160,14 @@ class RtNativeBackend:
         # ran on CPU regardless before rt_forward_device was bound, which
         # dominated per-row latency on large contexts.
         self.device = device
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be positive when provided")
+        # Bound the physical native forward without changing the query cohort
+        # or the context length. Engine.execute() may resolve thousands of
+        # entities at once; passing that whole cohort through one MPS forward
+        # makes the public product path unusable for normal evaluation and can
+        # OOM even when a small physical batch would fit comfortably.
+        self.batch_size = batch_size
         if isinstance(head, (str, os.PathLike)):
             head = FineTunedHead.load(str(head))
         self.column_stats = column_stats
@@ -1145,7 +1208,20 @@ class RtNativeBackend:
 
     def _encode(self, model: RtModel, seqs: list["_Seq"]) -> np.ndarray:
         """Frozen-backbone features ``[len(seqs), 512]`` for these sequences."""
-        return self._forward(model, seqs, encode=True)
+        return self._forward_batched(model, seqs, encode=True)
+
+    def _forward_batched(self, model: RtModel, seqs: list["_Seq"], **kwargs):
+        """Run bounded physical forwards while preserving logical ordering."""
+        bs = self.batch_size or len(seqs)
+        if not seqs or len(seqs) <= bs:
+            return self._forward(model, seqs, **kwargs)
+        chunks = [self._forward(model, seqs[i:i + bs], **kwargs)
+                  for i in range(0, len(seqs), bs)]
+        if kwargs.get("want_text"):
+            scores = np.concatenate([chunk[0] for chunk in chunks], axis=0)
+            text = np.concatenate([chunk[1] for chunk in chunks], axis=0)
+            return scores, text
+        return np.concatenate(chunks, axis=0)
 
     # -- model handles ------------------------------------------------------
     def _model_for(self, model_uri: str) -> RtModel:
@@ -1175,7 +1251,7 @@ class RtNativeBackend:
             # trained head over the frozen backbone's target-cell features
             scores = head.predict(self._encode(model, seqs))[:, 0]
         else:
-            scores = self._forward(model, seqs)
+            scores = self._forward_batched(model, seqs)
         preds: list[EntityPrediction] = []
         for ctx, s, mu, sd in zip(contexts, scores, label_mu, label_sd):
             s = float(s)
@@ -1370,18 +1446,21 @@ class RtNativeBackend:
         else:
             focal_task = next((r for r in ctx.rows
                                if r.table == task_spec.table_name
-                               and r.parents.get("__entity__") == ctx.entity_id
+                               and r.key in ctx.focal_row_keys
                                and task_spec.target_column not in r.cells), None)
             tgt_node = node(focal_task.key if focal_task is not None else
                             (task_spec.table_name,
                              f"__target__:{task_spec.id}"))
-            tgt_parents = [entity_node]
+            tgt_parents = (row_parents(focal_task) if focal_task is not None
+                           else [entity_node])
         tgt_idx = len(seq)
         seq.add(tgt_node, tgt_parents, task_spec.target_column,
                 task_spec.table_name, target_sem, None, target=True)
         # The reference contract is target cell first, including for a derived
         # task row; its timestamp follows the masked target token.
-        if not task_spec.direct_target and ctx.anchor is not None:
+        if (not task_spec.direct_target and ctx.anchor is not None
+                and (focal_task is None
+                     or task_spec.time_column not in focal_task.cells)):
             seq.add(tgt_node, tgt_parents, task_spec.time_column,
                     task_spec.table_name, SEM_DATETIME, ctx.anchor)
 
@@ -1472,7 +1551,12 @@ class RtNativeBackend:
             seq, node_of, _, _ = self._build_ctx_seq(
                 query, task_type, ctx, fk_to_parent, labels,
                 target_sem=target_sem, task_spec=task_spec)
-            severed |= self._severed_parents(seq, node_of)
+            # A node can be token-less because the configured sequence budget
+            # clipped its cells, not because its schema has no features. Do
+            # not misdiagnose an intentional context cap as a connectivity
+            # error; the explicit truncation warning above is the right one.
+            if len(seq) < self.max_seq_len:
+                severed |= self._severed_parents(seq, node_of)
             seqs.append(seq)
             labels_by_seq.append(labels)
         if severed:
@@ -1480,7 +1564,7 @@ class RtNativeBackend:
             warnings.warn(
                 f"context is disconnected: {tables} rows carry no feature "
                 f"cells, so nothing linked through them can reach the "
-                f"prediction and every entity will score alike. Declare a "
+                f"prediction through those rows. Declare a "
                 f"feature column on those tables — or, when the primary key "
                 f"itself carries meaning, declare it as a column too.",
                 ContextConnectivityWarning, stacklevel=4)
@@ -1621,6 +1705,21 @@ class RtNativeBackend:
                 else:  # number/boolean -> number channel (bool_as_num, F52)
                     number_v[b, s] = float(v)
                     sem_types[b, s] = SEM_NUMBER
+        # rustler persists every model-valued channel as bfloat16. The native
+        # ABI accepts float32, so reproduce that storage boundary by rounding
+        # to bfloat16 and widening back to float32 before the call. This is
+        # deterministic and avoids an optional runtime dtype dependency.
+        def bf16_as_f32(values: np.ndarray) -> np.ndarray:
+            values = np.asarray(values, dtype=np.float32)
+            bits = values.view(np.uint32)
+            rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+            return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+
+        number_v = bf16_as_f32(number_v)
+        datetime_v = bf16_as_f32(datetime_v)
+        boolean_v = bf16_as_f32(boolean_v)
+        text_v = bf16_as_f32(text_v)
+        col_name_v = bf16_as_f32(col_name_v)
         return dict(
             node_idxs=node_idxs, f2p=f2p, col_idxs=col_idxs,
             table_idxs=table_idxs, is_padding=is_padding,

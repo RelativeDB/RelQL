@@ -1,0 +1,59 @@
+{
+  "output_dir": "evaluation/runs/rel-f1-extra-queries-1024",
+  "tasks": [
+    "rel-f1/driver-dnf",
+    "rel-f1/qualifying-position",
+    "rel-f1/results-position"
+  ],
+  "diagnostic_r2": true,
+  "dataset_sources": {
+    "rel-f1": "stanford-rdl/relbench/rel-f1"
+  },
+  "report": {
+    "protocol": [
+      "Zero-shot only: no task-specific fine-tuning or frozen head is used.",
+      "The examples ask whether a driver will fail to finish, what qualifying position an entry will get, and what race finishing position an entry will get.",
+      "Complete official test tables are scored with the RelBench task metric. Both runners request 1,024-cell reference contexts, seed 0, BFS width 32, 10,000 walks, and walk length 20. Any OOM fallback is isolated to the failing model."
+    ],
+    "runners": {
+      "xgboost": "Reference-style SQL relational features with the same validation-tuned 200-tree XGBoost settings used by the main comparison.",
+      "ours": "RelativeDB native C++ RT-J on MPS, consuming the reference Rust sampler's exact tensors without task-specific fitting."
+    },
+    "limitations": [
+      "This is a small query-behavior experiment, not the 21-task benchmark.",
+      "The row-level finishing-position task exposes other completed-race fields, including official finish order, to both methods; it measures masked-column completion rather than forecasting before a race."
+    ]
+  },
+  "runners": {
+    "xgboost": {
+      "enabled": true,
+      "type": "reference_xgboost",
+      "python": "/Users/henneberger/relativedb/.venv-eval/bin/python",
+      "pre_dir": "stanford-star/relbench-preprocessed",
+      "context_size": 1024,
+      "oom_fallback_context_sizes": [512],
+      "extra_args": ["--ctx-size", "1024", "--local-ctx-size", "256", "--batch-size", "4", "--bfs-width", "32", "--num-walks", "10000", "--walk-length", "20"],
+      "env": {
+        "PYTHONPATH": "/Users/henneberger/relational-transformer/src:/Users/henneberger/relational-transformer:/Users/henneberger/relativedb/python/src:/Users/henneberger/relativedb"
+      }
+    },
+    "ours": {
+      "enabled": true,
+      "type": "reference_context_native",
+      "python": "/Users/henneberger/relativedb/.venv-eval/bin/python",
+      "pre_dir": "stanford-star/relbench-preprocessed",
+      "library": "/Users/henneberger/relativedb/cpp/build/librt_c.dylib",
+      "native_device": "mps",
+      "context_size": 1024,
+      "oom_fallback_context_sizes": [512],
+      "checkpoints": {
+        "clf": "hf://stanford-star/rt-j/classification",
+        "reg": "hf://stanford-star/rt-j/regression"
+      },
+      "extra_args": ["--ctx-size", "1024", "--local-ctx-size", "256", "--batch-size", "4", "--bfs-width", "32", "--num-walks", "10000", "--walk-length", "20"],
+      "env": {
+        "PYTHONPATH": "/Users/henneberger/relational-transformer/src:/Users/henneberger/relational-transformer:/Users/henneberger/relativedb/python/src:/Users/henneberger/relativedb"
+      }
+    }
+  }
+}

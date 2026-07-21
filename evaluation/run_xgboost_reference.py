@@ -96,23 +96,28 @@ def main() -> None:
 
     _install_relbench_legacy_api()
     from rel2tab.featurizers.sql_featurizer import SQLFeaturizer
+    from rel2tab.featurizers.sql_queries import SQL_REGISTRY
     from rel2tab.model import Rel2TabModel
     from rt.eval_utils import build_evaluator, run_and_report
     from rt.pre import resolve_pre_dir
-    from rt.recipes import get_tasks
+    import rt.recipes as recipes
+    from evaluation.f1_extra_queries import install_sql_queries
+    from evaluation.reference_tasks import selected_test_tasks
 
-    tasks = get_tasks("relbench_eval_test", args.pre_dir)
-    if args.tasks:
-        selected = set(args.tasks)
-        tasks = [t for t in tasks if t.db_name in selected
-                 or f"{t.db_name}/{t.table_name}" in selected]
+    tasks = selected_test_tasks(args.pre_dir, args.tasks)
+    install_sql_queries(SQL_REGISTRY)
     pre_dir = resolve_pre_dir(
         args.pre_dir, sorted({t.db_name for t in tasks}), "all-MiniLM-L12-v2"
     )
     for database in sorted({t.db_name for t in tasks}):
         db_tasks = [t for t in tasks if t.db_name == database]
-        featurizer = SQLFeaturizer(
-            pre_dir=pre_dir, eval_recipe="relbench_eval_test", db=database)
+        original_get_tasks = recipes.get_tasks
+        recipes.get_tasks = lambda _recipe, _pre_dir: db_tasks
+        try:
+            featurizer = SQLFeaturizer(
+                pre_dir=pre_dir, eval_recipe="relbench_eval_test", db=database)
+        finally:
+            recipes.get_tasks = original_get_tasks
         predictor = IsolatedPredictor()
         model = Rel2TabModel(featurizer, predictor, 4096)
         evaluator = build_evaluator(

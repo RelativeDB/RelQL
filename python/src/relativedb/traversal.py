@@ -5,6 +5,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, Sequence
 
+import numpy as np
+
 from .retrieve import Row, TemporalBound
 from .schema import Schema
 from .evaluate import eval_bool, eval_value
@@ -254,6 +256,16 @@ class BreadthFirstTraversal:
 class ReferenceTraversal:
     """Reference tiering: target BFS, graph-walk peers, random table fallback."""
 
+    def __init__(self, task_spec_factory=None, task_graph_factory=None):
+        # Engine executes timestamp cohorts consecutively. Direct-target rows
+        # at one timestamp share the exact same temporally filtered graph, so
+        # retain only that most-recent CSR snapshot. A one-entry cache captures
+        # the reuse without retaining a full graph for every historical date.
+        self._native_graph_key = None
+        self._native_graph_value = None
+        self.task_spec_factory = task_spec_factory or TaskSpec.from_query
+        self.task_graph_factory = task_graph_factory
+
     def traverse(self, schema, graph, entity_table, entity_id, bound, policy,
                  *, query=None) -> TraversalResult:
         rows_by_table = {t.name: (graph.all_rows(t.name) or [])
@@ -261,61 +273,93 @@ class ReferenceTraversal:
         rows = [r for t in schema.tables for r in rows_by_table[t.name]]
         physical_node_ids = {r.key: i for i, r in enumerate(rows)}
         task_node_ids: dict[tuple[str, Any], int] = {}
+        reference_p2f_order = None
+        reference_f2p_order = None
         sampling_table = entity_table
         target_key = (entity_table, entity_id)
         task_spec = None
         if query is not None:
             task_type = query.task_type(schema)
-            task_spec = TaskSpec.from_query(query, task_type)
+            task_spec = self.task_spec_factory(query, task_type)
+            if not isinstance(task_spec, TaskSpec):
+                raise TypeError("task_spec_factory must return a TaskSpec")
             if not task_spec.direct_target:
                 sampling_table = task_spec.table_name
-                span = next((a.window.span() for a in query.target_aggregations
-                             if a.window is not None), None)
-                task_rows: list[Row] = []
                 anchor = bound.as_of
-                entity_rows = rows_by_table.get(entity_table, [])
-                task_base = len(physical_node_ids)
-                task_stride = policy.num_history_windows + 1
-                for entity_i, entity in enumerate(entity_rows):
-                    # Unknown focal target at the requested anchor.
-                    if entity.id == entity_id:
-                        target_id = (entity.id, anchor, "target")
-                        task_rows.append(Row(
-                            sampling_table, target_id, {}, timestamp=anchor,
-                            parents={"__entity__": entity.id}))
-                        target_key = (sampling_table, target_id)
-                        task_node_ids[target_key] = (task_base
-                                                     + entity_i * task_stride)
-                    if anchor is None or span is None:
-                        continue
-                    for k in range(1, policy.num_history_windows + 1):
-                        ts = anchor - span * k
-                        # A historical FOLLOWING label may use outcomes after
-                        # its own task timestamp, but never after the focal
-                        # prediction anchor.
-                        label_cutoff = min(anchor, ts + span)
-                        visible = {name: [r for r in table_rows
-                                          if r.timestamp is None
-                                          or r.timestamp <= label_cutoff]
-                                   for name, table_rows in rows_by_table.items()}
-                        if task_type is TaskType.BINARY_CLASSIFICATION:
-                            value = 1.0 if eval_bool(
-                                query.target, visible, entity.cells, ts) else 0.0
-                        else:
-                            value = eval_value(query.target, visible,
-                                               entity.cells, ts)
-                            if isinstance(value, bool):
-                                value = 1.0 if value else 0.0
-                            if not isinstance(value, (int, float)):
-                                continue
-                        history = Row(
-                            sampling_table, (entity.id, ts, k),
-                            {task_spec.target_column: value}, timestamp=ts,
-                            parents={"__entity__": entity.id})
-                        task_rows.append(history)
-                        task_node_ids[history.key] = (task_base
-                                                     + entity_i * task_stride + k)
-                rows_by_table[sampling_table] = task_rows
+                if self.task_graph_factory is not None:
+                    supplied = self.task_graph_factory(
+                        task_spec, entity_id, anchor)
+                    if (not isinstance(supplied, tuple)
+                            or len(supplied) not in (3, 4, 5)):
+                        raise TypeError(
+                            "task_graph_factory must return "
+                            "(rows, node_ids, target_key[, p2f_order[, "
+                            "f2p_order]])")
+                    supplied_rows, supplied_ids, target_key = supplied[:3]
+                    if len(supplied) == 4:
+                        reference_p2f_order = supplied[3]
+                    elif len(supplied) == 5:
+                        reference_p2f_order = supplied[3]
+                        reference_f2p_order = supplied[4]
+                    task_rows = list(supplied_rows)
+                    task_node_ids = dict(supplied_ids)
+                    if target_key not in task_node_ids:
+                        raise RuntimeError(
+                            "materialized task graph did not assign the focal "
+                            "task row a stable node id")
+                else:
+                    span = next((a.window.span()
+                                 for a in query.target_aggregations
+                                 if a.window is not None), None)
+                    task_rows = []
+                    entity_rows = rows_by_table.get(entity_table, [])
+                    task_base = len(physical_node_ids)
+                    task_stride = policy.num_history_windows + 1
+                    for entity_i, entity in enumerate(entity_rows):
+                        # Unknown focal target at the requested anchor.
+                        if entity.id == entity_id:
+                            target_id = (entity.id, anchor, "target")
+                            task_rows.append(Row(
+                                sampling_table, target_id, {}, timestamp=anchor,
+                                parents={"__entity__": entity.id}))
+                            target_key = (sampling_table, target_id)
+                            task_node_ids[target_key] = (
+                                task_base + entity_i * task_stride)
+                        if anchor is None or span is None:
+                            continue
+                        for k in range(1, policy.num_history_windows + 1):
+                            ts = anchor - span * k
+                            # A historical FOLLOWING label may use outcomes
+                            # after its own task timestamp, but never after the
+                            # focal prediction anchor.
+                            label_cutoff = min(anchor, ts + span)
+                            visible = {
+                                name: [r for r in table_rows
+                                       if r.timestamp is None
+                                       or r.timestamp <= label_cutoff]
+                                for name, table_rows in rows_by_table.items()}
+                            if task_type is TaskType.BINARY_CLASSIFICATION:
+                                value = 1.0 if eval_bool(
+                                    query.target, visible, entity.cells, ts) else 0.0
+                            else:
+                                value = eval_value(query.target, visible,
+                                                   entity.cells, ts)
+                                if isinstance(value, bool):
+                                    value = 1.0 if value else 0.0
+                                if not isinstance(value, (int, float)):
+                                    continue
+                            history = Row(
+                                sampling_table, (entity.id, ts, k),
+                                {task_spec.target_column: value}, timestamp=ts,
+                                parents={"__entity__": entity.id})
+                            task_rows.append(history)
+                            task_node_ids[history.key] = (
+                                task_base + entity_i * task_stride + k)
+                materialized_by_table: dict[str, list[Row]] = {}
+                for task_row in task_rows:
+                    materialized_by_table.setdefault(
+                        task_row.table, []).append(task_row)
+                rows_by_table.update(materialized_by_table)
                 rows.extend(task_rows)
         by_key = {r.key: r for r in rows}
         target = by_key.get(target_key)
@@ -325,17 +369,83 @@ class ReferenceTraversal:
         links_from = {t.name: {l.fk_column: l for l in schema.links_from(t.name)}
                       for t in schema.tables}
         p2f: dict[tuple[str, Any], list[Row]] = {}
-        for row in rows:
+        p2f_walk: dict[tuple[str, Any], list[Row]] = {}
+        isolated_task = bool(
+            task_spec is not None and not task_spec.direct_target
+            and all(not row.parents
+                    for row in rows_by_table.get(sampling_table, ())))
+        edge_rows = (rows_by_table[sampling_table] if isolated_task else rows)
+        for row in edge_rows:
             if (task_spec is not None and row.table == sampling_table
                     and "__entity__" in row.parents):
                 p2f.setdefault((entity_table, row.parents["__entity__"]), []).append(row)
+                p2f_walk.setdefault(
+                    (entity_table, row.parents["__entity__"]), []).append(row)
             for fk, pid in row.parents.items():
+                if fk.startswith("__parent__:"):
+                    parent_table = fk.split(":", 1)[1]
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        # Other task tables participate in random walks, but
+                        # reference BFS filters them before constructing its
+                        # task frontier.
+                        p2f_walk.setdefault((parent_table, one), []).append(row)
+                    continue
                 link = links_from.get(row.table, {}).get(fk)
                 if link is not None:
                     for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
                         p2f.setdefault((link.to_table, one), []).append(row)
+                        p2f_walk.setdefault((link.to_table, one), []).append(row)
+        # pre.rs sorts every parent-to-foreign adjacency by Option<timestamp>:
+        # None first, then ascending event time. BFS samples indices from this
+        # ordered list, so insertion/table order is not interchangeable.
+        def order_children(parent_key, children):
+            if reference_p2f_order is None:
+                children.sort(key=lambda row: (
+                    row.timestamp is not None,
+                    row.timestamp.timestamp()
+                    if row.timestamp is not None else 0.0))
+                return
+            expected = reference_p2f_order.get(parent_key)
+            if expected is None:
+                if children:
+                    raise RuntimeError(
+                        f"reference p2f order is missing parent {parent_key!r}")
+                return
+            rank = {key: index for index, key in enumerate(expected)}
+            actual = {row.key for row in children}
+            if actual != set(expected):
+                missing = set(expected) - actual
+                extra = actual - set(expected)
+                raise RuntimeError(
+                    f"reference p2f order disagrees at {parent_key!r}: "
+                    f"missing={sorted(map(str, missing))[:3]}, "
+                    f"extra={sorted(map(str, extra))[:3]}")
+            children.sort(key=lambda row: rank[row.key])
+
+        for parent_key, children in p2f_walk.items():
+            order_children(parent_key, children)
+        for parent_key, children in p2f.items():
+            if reference_p2f_order is None:
+                order_children(parent_key, children)
+            else:
+                expected = reference_p2f_order.get(parent_key)
+                if expected is None:
+                    raise RuntimeError(
+                        f"reference p2f order is missing parent {parent_key!r}")
+                rank = {key: index for index, key in enumerate(expected)}
+                unknown = [row.key for row in children if row.key not in rank]
+                if unknown:
+                    raise RuntimeError(
+                        f"reference p2f order is missing children for "
+                        f"{parent_key!r}: {unknown[:3]!r}")
+                children.sort(key=lambda row: rank[row.key])
+
+        parents_cache: dict[tuple[str, Any], tuple[Row, ...]] = {}
 
         def parents(row):
+            cached = parents_cache.get(row.key)
+            if cached is not None:
+                return cached
             out = []
             if (row.table == sampling_table and task_spec is not None
                     and not task_spec.direct_target):
@@ -344,13 +454,29 @@ class ReferenceTraversal:
                 if entity is not None:
                     out.append(entity)
             for fk, pid in row.parents.items():
+                if fk.startswith("__parent__:"):
+                    parent_table = fk.split(":", 1)[1]
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        parent = by_key.get((parent_table, one))
+                        if parent is not None:
+                            out.append(parent)
+                    continue
                 link = links_from.get(row.table, {}).get(fk)
                 if link:
                     for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
                         parent = by_key.get((link.to_table, one))
                         if parent is not None:
                             out.append(parent)
-            return out
+            result = tuple(out)
+            if reference_f2p_order is not None:
+                expected = reference_f2p_order.get(row.key, ())
+                if {parent.key for parent in result} != set(expected):
+                    raise RuntimeError(
+                        f"reference f2p order disagrees at {row.key!r}")
+                rank = {key: index for index, key in enumerate(expected)}
+                result = tuple(sorted(result, key=lambda parent: rank[parent.key]))
+            parents_cache[row.key] = result
+            return result
 
         def temporally_valid(row, anchor):
             return (row.timestamp is None or anchor.timestamp is None
@@ -359,7 +485,10 @@ class ReferenceTraversal:
         target_node_idx = (task_node_ids.get(target.key)
                            if target.key in task_node_ids
                            else physical_node_ids[target.key])
-        step_seed = _StdRng(policy.seed).u64()
+        # Sampler::new_impl first expands the user-facing context seed, then
+        # seq_build expands that stored seed again for step zero.
+        context_seed = _StdRng(policy.seed).u64()
+        step_seed = _StdRng(context_seed).u64()
         walk_rng = _StdRng((step_seed + target_node_idx
                             + 0xD0D0_D0D0_D0D0_D0D0) & _U64)
         bfs_rng = _StdRng((step_seed + target_node_idx
@@ -367,22 +496,93 @@ class ReferenceTraversal:
         fallback_rng = _StdRng((step_seed + target_node_idx
                                 + 0xA5A5_A5A5_A5A5_A5A5) & _U64)
 
-        visits: dict[tuple[str, Any], int] = {}
-        for _ in range(policy.num_walks):
-            current = target
-            for _ in range(policy.walk_length):
-                if (current.table == target.table and current.key != target.key
-                        and temporally_valid(current, target)):
-                    visits[current.key] = visits.get(current.key, 0) + 1
-                neighbors = parents(current) + [r for r in p2f.get(current.key, [])
-                                                 if temporally_valid(r, target)]
-                if not neighbors:
-                    break
-                current = neighbors[walk_rng.range(len(neighbors))]
+        # A 10k x 20 reference walk revisits the same small neighborhood many
+        # thousands of times.  Filtering and allocating that neighbor list on
+        # every step dominated end-to-end query execution even though the
+        # graph and focal temporal cutoff are invariant for this traversal.
+        # Cache the exact ordered list; RNG consumption and resulting walks are
+        # unchanged.
+        walk_neighbor_cache: dict[tuple[str, Any], tuple[Row, ...]] = {}
 
-        tie = {key: _StdRng((step_seed + task_node_ids.get(
-                    key, physical_node_ids.get(key))) & _U64).u64()
-               for key in visits}
+        def walk_neighbors(row):
+            cached = walk_neighbor_cache.get(row.key)
+            if cached is not None:
+                return cached
+            result = tuple(parents(row)) + tuple(
+                r for r in p2f_walk.get(row.key, ())
+                if temporally_valid(r, target))
+            walk_neighbor_cache[row.key] = result
+            return result
+
+        # ReferenceTraversal has one execution contract: the exact native
+        # rand-0.9.1 graph walk. Missing/old native libraries are hard errors;
+        # never switch algorithms or performance regimes implicitly.
+        from .rt_native import load_lib
+        native_lib = load_lib()._lib
+
+        graph_identity = getattr(graph, "index", graph)
+        graph_key = (id(graph_identity), target.table, target.timestamp)
+        cached_graph = (self._native_graph_value
+                        if task_spec is not None and task_spec.direct_target
+                        and self._native_graph_key == graph_key else None)
+        if cached_graph is not None and target.key in cached_graph[1]:
+            discovered, position, offsets, neighbors_array, eligible_base = cached_graph
+        else:
+            discovered = [target]
+            position = {target.key: 0}
+            neighbor_rows: list[tuple[Row, ...]] = []
+            at = 0
+            while at < len(discovered):
+                nbrs = walk_neighbors(discovered[at])
+                neighbor_rows.append(nbrs)
+                for neighbor in nbrs:
+                    if neighbor.key not in position:
+                        position[neighbor.key] = len(discovered)
+                        discovered.append(neighbor)
+                at += 1
+            offsets = np.empty(len(discovered) + 1, dtype=np.int32)
+            offsets[0] = 0
+            flat: list[int] = []
+            for i, nbrs in enumerate(neighbor_rows):
+                flat.extend(position[row.key] for row in nbrs)
+                offsets[i + 1] = len(flat)
+            neighbors_array = np.asarray(flat, dtype=np.int32)
+            eligible_base = np.asarray([
+                row.table == target.table and temporally_valid(row, target)
+                for row in discovered], dtype=np.uint8)
+            if task_spec is not None and task_spec.direct_target:
+                self._native_graph_key = graph_key
+                self._native_graph_value = (
+                    discovered, position, offsets, neighbors_array,
+                    eligible_base)
+        target_position = position[target.key]
+        eligible = eligible_base.copy()
+        eligible[target_position] = 0
+        counts = np.zeros(len(discovered), dtype=np.uint32)
+        rc = native_lib.rt_reference_walk_counts(
+            len(discovered), offsets, neighbors_array, target_position, eligible,
+            (step_seed + target_node_idx
+             + 0xD0D0_D0D0_D0D0_D0D0) & _U64,
+            policy.num_walks, policy.walk_length, counts)
+        if rc:
+            raise RuntimeError("native reference walk rejected its graph")
+        visits = {row.key: int(count)
+                  for row, count in zip(discovered, counts) if count}
+
+        visit_keys = list(visits)
+        if visit_keys:
+            seeds = np.asarray([
+                (step_seed + task_node_ids.get(
+                    key, physical_node_ids.get(key))) & _U64
+                for key in visit_keys], dtype=np.uint64)
+            tie_values = np.empty(len(seeds), dtype=np.uint64)
+            rc = native_lib.rt_stdrng_first_u64_batch(
+                seeds, len(seeds), tie_values)
+            if rc:
+                raise RuntimeError("native tie RNG rejected its seeds")
+            tie = dict(zip(visit_keys, map(int, tie_values)))
+        else:
+            tie = {}
         if policy.prefer_latest:
             def peer_key(key):
                 row = by_key[key]
@@ -400,19 +600,13 @@ class ReferenceTraversal:
 
         tier1 = [key for key in sorted(visits, key=peer_key)
                  if has_seed_label(by_key[key])]
-        fallback = [r.key for r in rows_by_table[sampling_table]
-                    if r.key != target.key and r.key not in visits
-                    and temporally_valid(r, target) and has_seed_label(r)]
-        amount = min(max(policy.max_context_cells - 1, 0), len(fallback))
-        fallback = [fallback[i] for i in
-                    _rand_sample(fallback_rng, len(fallback), amount)]
-
         visited_depth: dict[tuple[str, Any], int] = {}
         emitted: set[tuple[str, Any]] = set()
         ordered: list[Row] = []
         focal: set[tuple[str, Any]] = set()
         cells = 1  # target cell is emitted separately and first
         full = False
+        db_tables = {table.name for table in schema.tables}
 
         def cell_count(row):
             if (row.table == sampling_table and task_spec is not None
@@ -421,7 +615,9 @@ class ReferenceTraversal:
                 # timestamp as schema cells in the reference dataset. The
                 # focal target value is unknown here but is still the masked
                 # first token and participates in local BFS accounting.
-                return (len(row.cells) + (1 if row.timestamp is not None else 0)
+                return (len(row.cells)
+                        + (1 if row.timestamp is not None
+                           and task_spec.time_column not in row.cells else 0)
                         + (1 if row.key == target.key
                            and task_spec.target_column not in row.cells else 0))
             table = schema.require_table(row.table)
@@ -446,7 +642,9 @@ class ReferenceTraversal:
                     if depth < 0:
                         return
                     level = p2f_levels[depth]
-                    row = level.pop(bfs_rng.range(len(level)))
+                    selected = bfs_rng.range(len(level))
+                    level[selected], level[-1] = level[-1], level[selected]
+                    row = level.pop()
                 previous = visited_depth.get(row.key)
                 if previous is not None and previous <= depth:
                     continue
@@ -459,36 +657,63 @@ class ReferenceTraversal:
                     emitted_cost = cost
                     if row.key == target.key:
                         emitted_cost = max(0, emitted_cost - 1)
-                    if cells + emitted_cost > policy.max_context_cells:
+                    if cells >= policy.max_context_cells:
                         full = True
                         return
                     emitted.add(row.key)
                     ordered.append(row)
                     cells += emitted_cost
+                    # The reference fills cell-by-cell and can stop partway
+                    # through this row. Keep the row so collation can perform
+                    # that exact final-cell truncation.
+                    if cells >= policy.max_context_cells:
+                        full = True
                     if is_focal:
                         focal.add(row.key)
                 for parent in parents(row):
                     f2p_stack.append((depth + 1, parent))
                 seed_cutoff = (seed.timestamp if query is not None
                                else (seed.timestamp or bound.as_of))
-                kids = [r for r in p2f.get(row.key, [])
-                        if (r.table != sampling_table
-                            or seed.table == sampling_table)
-                        if (r.timestamp is None or
-                            (seed_cutoff is not None
-                             and r.timestamp <= seed_cutoff))]
-                if len(kids) > policy.bfs_width:
-                    kids = [kids[i] for i in
-                            _rand_sample(bfs_rng, len(kids), policy.bfs_width)]
+                valid_kids = [
+                    r for r in p2f.get(row.key, [])
+                    if r.timestamp is None or (
+                        seed_cutoff is not None and r.timestamp <= seed_cutoff)]
+                # Reference BFS never subsamples task edges. It keeps task
+                # children only when they belong to the seed's task table,
+                # then independently samples database children to bfs_width.
+                task_kids = [r for r in valid_kids
+                             if r.table not in db_tables
+                             and r.table == seed.table]
+                db_kids = [r for r in valid_kids if r.table in db_tables]
+                if len(db_kids) > policy.bfs_width:
+                    selected_kids = _rand_sample(
+                        bfs_rng, len(db_kids), policy.bfs_width)
+                    db_kids = [db_kids[i] for i in selected_kids]
+                kids = task_kids + db_kids
                 while len(p2f_levels) <= depth + 1:
                     p2f_levels.append([])
                 p2f_levels[depth + 1].extend(kids)
 
         extend(target, True)
-        for key in tier1 + fallback:
+        for key in tier1:
             if full:
                 break
             extend(by_key[key], False)
+        if not full:
+            fallback_rows = rows_by_table[sampling_table]
+            amount = min(max(policy.max_context_cells - cells, 0),
+                         len(fallback_rows))
+            fallback = [fallback_rows[i].key for i in
+                        _rand_sample(fallback_rng, len(fallback_rows), amount)]
+            for key in fallback:
+                if full:
+                    break
+                row = by_key[key]
+                if (key == target.key or key in visits
+                        or not temporally_valid(row, target)
+                        or not has_seed_label(row)):
+                    continue
+                extend(row, False)
         # Snapshot order is the stable global node identity contract. Virtual
         # task rows follow physical rows in deterministic entity/time order.
         node_id_map = {**physical_node_ids, **task_node_ids}

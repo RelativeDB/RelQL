@@ -318,11 +318,12 @@ def _write_report(output: Path, results: list[dict], runners: list[str],
         for runner, reason in invalid:
             lines.append(
                 f"- **{runner}:** {reason or 'marked invalid by configuration'}")
+    config_path = config.get("_config_path", "evaluation/config.rel-f1.json")
     lines.extend(["", "## Reproduction", "",
-                  "Configuration: `evaluation/config.rel-f1.json`", "",
+                  f"Configuration: `{config_path}`", "",
                   "```bash",
                   "PYTHONPATH=python/src:. .venv-eval/bin/python -m evaluation.head_to_head \\",
-                  "  --config evaluation/config.rel-f1.json \\",
+                  f"  --config {config_path} \\",
                   "  --runners " + " ".join(runners),
                   "```", "",
                   "To regenerate only the combined report from existing CSVs, add "
@@ -407,6 +408,7 @@ def main() -> None:
                         help="do not execute runners; score their existing CSVs")
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
+    config["_config_path"] = args.config
     output = run(config, enabled=args.runners, selectors=args.tasks,
                  score=not args.no_score, execute=not args.score_existing)
     print(output / "results.md")
