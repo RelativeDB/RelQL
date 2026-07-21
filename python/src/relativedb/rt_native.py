@@ -33,24 +33,28 @@ import math
 import os
 import sys
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
 
 from .engine import EntityContext, EntityPrediction, ModelBackend
 from .evaluate import eval_bool, eval_value
-from .model import ModelConfig
+from .model import ModelConfig, NormalizationMode
 from .relql.ast import (Aggregation, Arith, Case, ColumnRef, Condition, Func,
                         LogicalOp, Not, ParsedQuery, TaskType)
 from .retrieve import RetrieverWiring, TemporalBound
 from .schema import Schema, ValueType
+from .task import TaskSpec, TaskSpecFactory
 
 __all__ = ["RtNativeUnavailableError", "RtNativeError",
            "ContextConnectivityWarning", "ContextTruncationWarning",
-           "ColumnStats",
+           "ColumnStats", "NormalizationMode", "TaskSpec",
            "RtLib", "RtModel",
            "TextEmbedder", "RtNativeBackend", "FineTunedHead",
+           "FineTunedCheckpoint",
            "load_lib", "resolve_model_path"]
 
 D_TEXT = 384
@@ -118,12 +122,14 @@ class ColumnStats:
     anchor leak the future into every scaled value.
     """
 
-    __slots__ = ("stats", "dt", "bound")
+    __slots__ = ("stats", "task_stats", "dt", "bound")
 
     def __init__(self, stats: dict[tuple[str, str], tuple[float, float]],
                  dt: tuple[float, float] = (0.0, 1.0),
-                 bound: str = "unbounded"):
+                 bound: str = "unbounded",
+                 task_stats: Optional[dict[str, tuple[float, float]]] = None):
         self.stats = dict(stats)
+        self.task_stats = dict(task_stats or {})
         self.dt = dt
         self.bound = bound
 
@@ -137,13 +143,18 @@ class ColumnStats:
             wanted = {c.name: c.type for c in table.columns
                       if c.type in (ValueType.NUMBER, ValueType.BOOLEAN,
                                     ValueType.DATETIME)}
+            wanted.update({l.fk_column: l.feature_type
+                           for l in schema.links_from(table.name)
+                           if l.feature_type in (ValueType.NUMBER,
+                                                 ValueType.BOOLEAN,
+                                                 ValueType.DATETIME)})
             if not wanted:
                 continue
             acc: dict[str, list[float]] = {c: [] for c in wanted}
             scanner = wiring.scanner(table.name)
             for r in scanner(table.name, bound):
                 for c, vt in wanted.items():
-                    v = r.cells.get(c)
+                    v = (r.parents.get(c) if c in r.parents else r.cells.get(c))
                     if v is None:
                         continue
                     if vt is ValueType.DATETIME:
@@ -163,7 +174,9 @@ class ColumnStats:
                                         sd if sd != 0.0 else 1.0)
         if len(dt_vals) > 1:
             a = np.asarray(dt_vals, float)
-            sd = float(a.std(ddof=1))
+            # rustler's global datetime Welford accumulator divides M2 by N,
+            # unlike numeric Polars columns which use sample std (N-1).
+            sd = float(a.std(ddof=0))
             dt = (float(a.mean()), sd if sd != 0.0 else 1.0)
         else:
             dt = (0.0, 1.0)
@@ -180,8 +193,36 @@ class ColumnStats:
         mu, sd = self.dt
         return (x - mu) / sd
 
+    def with_task_values(self, task: "TaskSpec | str",
+                         values: Sequence[float]) -> "ColumnStats":
+        """Return a copy carrying preprocessing-time stats for one task.
+
+        The task target is a real column in the reference pipeline, so its
+        transform must be persisted just like every physical numeric column.
+        """
+        vals = np.asarray(list(values), dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            raise ValueError("task statistics need at least one finite value")
+        sd = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+        key = task.id if isinstance(task, TaskSpec) else str(task)
+        task_stats = dict(self.task_stats)
+        task_stats[key] = (float(vals.mean()), sd if sd != 0.0 else 1.0)
+        return ColumnStats(self.stats, dt=self.dt, bound=self.bound,
+                           task_stats=task_stats)
+
+    def task(self, task: "TaskSpec | str") -> tuple[float, float]:
+        key = task.id if isinstance(task, TaskSpec) else str(task)
+        try:
+            return self.task_stats[key]
+        except KeyError as e:
+            raise RtNativeError(
+                f"reference normalization has no target statistics for task "
+                f"{key!r}; fit them with ColumnStats.with_task_values()") from e
+
     def to_dict(self) -> dict:
         return {"bound": self.bound, "datetime": list(self.dt),
+                "tasks": {k: list(v) for k, v in self.task_stats.items()},
                 "stats": {f"{t}.{c}": list(v) for (t, c), v in self.stats.items()}}
 
     @classmethod
@@ -191,14 +232,17 @@ class ColumnStats:
             t, _, c = k.partition(".")
             stats[(t, c)] = (float(v[0]), float(v[1]))
         dt = tuple(d.get("datetime") or (0.0, 1.0))
+        tasks = {str(k): (float(v[0]), float(v[1]))
+                 for k, v in (d.get("tasks") or {}).items()}
         return cls(stats, dt=(float(dt[0]), float(dt[1])),
-                   bound=d.get("bound", "unbounded"))
+                   bound=d.get("bound", "unbounded"), task_stats=tasks)
 
     def __len__(self) -> int:
         return len(self.stats)
 
     def __repr__(self) -> str:
         return (f"<ColumnStats {len(self.stats)} columns "
+                f"{len(self.task_stats)} tasks "
                 f"datetime={self.dt[0]:.1f}/{self.dt[1]:.1f} bound={self.bound}>")
 
 
@@ -313,6 +357,9 @@ class RtLib:
         lib.rt_finetune_head_save.restype = ctypes.c_int
         lib.rt_finetune_head_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
                                               ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_finetune_head_reparameterize_standardized.restype = ctypes.c_int
+        lib.rt_finetune_head_reparameterize_standardized.argtypes = [
+            ctypes.c_void_p, f32p, f32p, ctypes.c_char_p, ctypes.c_size_t]
         i32p = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
         lib.rt_finetune_head_fit_metal.restype = ctypes.c_int
         lib.rt_finetune_head_fit_metal.argtypes = [
@@ -332,6 +379,43 @@ class RtLib:
         lib.rt_finetune_head_outputs.argtypes = [ctypes.c_void_p]
         lib.rt_finetune_head_task.restype = ctypes.c_int32
         lib.rt_finetune_head_task.argtypes = [ctypes.c_void_p]
+        lib.rt_model_finetune_step_metal.restype = ctypes.c_int
+        lib.rt_model_finetune_step_metal.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            f64p, f64p, f64p, f64p, u8p, f64p, u8p,
+            f32p, f32p, f32p, f32p, f32p,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_double),
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_model_finetune_microbatch_metal.restype = ctypes.c_int
+        lib.rt_model_finetune_microbatch_metal.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            f64p, f64p, f64p, f64p, u8p, f64p, u8p,
+            f32p, f32p, f32p, f32p, f32p,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_double),
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_model_finetune_optimizer_save.restype = ctypes.c_int
+        lib.rt_model_finetune_optimizer_save.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_model_finetune_optimizer_load.restype = ctypes.c_int
+        lib.rt_model_finetune_optimizer_load.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_model_finetune_gradient_check_metal.restype = ctypes.c_int
+        lib.rt_model_finetune_gradient_check_metal.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            f64p, f64p, f64p, f64p, u8p, f64p, u8p,
+            f32p, f32p, f32p, f32p, f32p, ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_model_save.restype = ctypes.c_int
+        lib.rt_model_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                      ctypes.c_char_p, ctypes.c_size_t]
+        lib.rt_model_finetune_reset_optimizer.restype = None
+        lib.rt_model_finetune_reset_optimizer.argtypes = [ctypes.c_void_p]
         lib.rt_device_available.restype = ctypes.c_int
         lib.rt_device_available.argtypes = [ctypes.c_int32]
 
@@ -354,7 +438,7 @@ class FineTunedHead:
 
     The transformer is never updated; this is the small adapter that replaces
     the released checkpoint's zero-shot head. Produced by
-    :meth:`~relativedb.engine.Engine.finetune`, persisted with :meth:`save`,
+    :meth:`~relativedb.engine.Engine.fit_head`, persisted with :meth:`save`,
     and served by passing ``head=`` to :class:`RtNativeBackend`.
     """
 
@@ -366,7 +450,8 @@ class FineTunedHead:
                  classes: Sequence[Any] = (),
                  feat_mu: Optional[np.ndarray] = None,
                  feat_sd: Optional[np.ndarray] = None,
-                 column_stats: Optional["ColumnStats"] = None):
+                 column_stats: Optional["ColumnStats"] = None,
+                 normalization_mode: NormalizationMode | str = NormalizationMode.ZERO_SHOT):
         self._native = lib
         self._handle = handle
         self.task = task
@@ -383,6 +468,7 @@ class FineTunedHead:
         # different one silently changes what every number means, so it
         # travels with the weights.
         self.column_stats = column_stats
+        self.normalization_mode = NormalizationMode.coerce(normalization_mode)
 
     def __del__(self):
         try:
@@ -425,6 +511,7 @@ class FineTunedHead:
             "feat_sd": None if self.feat_sd is None else self.feat_sd.tolist(),
             "column_stats": (None if self.column_stats is None
                              else self.column_stats.to_dict()),
+            "normalization_mode": self.normalization_mode.value,
             "classes": [str(c) for c in self.classes],
         }
         with open(FineTunedHead._sidecar(path), "w") as fh:
@@ -458,7 +545,8 @@ class FineTunedHead:
                      else np.asarray(side["feat_mu"], np.float32)),
             feat_sd=(None if side.get("feat_sd") is None
                      else np.asarray(side["feat_sd"], np.float32)),
-            column_stats=None if cs is None else ColumnStats.from_dict(cs))
+            column_stats=None if cs is None else ColumnStats.from_dict(cs),
+            normalization_mode=side.get("normalization_mode", "reference"))
 
     def predict(self, features: np.ndarray) -> np.ndarray:
         """Score frozen features ``[N, 512]`` -> logits ``[N, n_outputs]``."""
@@ -488,6 +576,24 @@ class FineTunedHead:
         return f"<FineTunedHead {self.task_name}{n}{loss}>"
 
 
+@dataclass(frozen=True)
+class FineTunedCheckpoint:
+    """Complete RT-J checkpoint produced by native MPS fine-tuning."""
+
+    path: Path
+    losses: tuple[float, ...]
+    grad_norms: tuple[float, ...]
+    seconds: float
+    examples: int
+    steps: int
+    column_stats: Optional[ColumnStats] = None
+    normalization_mode: NormalizationMode = NormalizationMode.REFERENCE
+
+    @property
+    def model_uri(self) -> str:
+        return str(self.path)
+
+
 class RtModel:
     """A loaded RT-J checkpoint living in the native engine."""
 
@@ -499,6 +605,100 @@ class RtModel:
     @property
     def num_params(self) -> int:
         return int(self._native._lib.rt_model_num_params(self._handle))
+
+    def save(self, path: str) -> None:
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_model_save(
+            self._handle, os.fspath(path).encode("utf-8"), err, len(err))
+        if rc:
+            raise RtNativeError(
+                f"rt_model_save failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+
+    def reset_finetune_optimizer(self) -> None:
+        self._native._lib.rt_model_finetune_reset_optimizer(self._handle)
+
+    def save_finetune_optimizer(self, path: str | os.PathLike) -> None:
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_model_finetune_optimizer_save(
+            self._handle, os.fspath(path).encode("utf-8"), err, len(err))
+        if rc:
+            raise RtNativeError(
+                f"optimizer save failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+
+    def load_finetune_optimizer(self, path: str | os.PathLike) -> None:
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_model_finetune_optimizer_load(
+            self._handle, os.fspath(path).encode("utf-8"), err, len(err))
+        if rc:
+            raise RtNativeError(
+                f"optimizer load failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+
+    def finetune_step(self, *, node_idxs, f2p, col_idxs, table_idxs,
+                      is_padding, sem_types, is_target, number_v,
+                      datetime_v, boolean_v, text_v, col_name_v,
+                      learning_rate: float = 1e-5,
+                      weight_decay: float = 1e-2,
+                      grad_clip_norm: float = 1.0,
+                      apply_update: bool = True) -> dict[str, float | int | bool]:
+        """Accumulate one native MPS microbatch and optionally update."""
+        (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+         is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
+         ) = self._prep(node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                        sem_types, is_target, number_v, datetime_v, boolean_v,
+                        text_v, col_name_v)
+        loss = ctypes.c_float()
+        grad = ctypes.c_float()
+        step = ctypes.c_uint64()
+        accumulated = ctypes.c_uint32()
+        updated = ctypes.c_int32()
+        seconds = ctypes.c_double()
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_model_finetune_microbatch_metal(
+            self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+            is_padding, sem_types, is_target, number_v, datetime_v,
+            boolean_v, text_v, col_name_v, float(learning_rate),
+            float(weight_decay), float(grad_clip_norm), int(apply_update),
+            ctypes.byref(loss), ctypes.byref(grad), ctypes.byref(step),
+            ctypes.byref(accumulated), ctypes.byref(updated), ctypes.byref(seconds),
+            err, len(err))
+        if rc:
+            raise RtNativeError(
+                f"native MPS full-model step failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return {"loss": float(loss.value), "grad_norm": float(grad.value),
+                "step": int(step.value), "seconds": float(seconds.value),
+                "accumulated_microbatches": int(accumulated.value),
+                "updated": bool(updated.value)}
+
+    def gradient_check(self, *, node_idxs, f2p, col_idxs, table_idxs,
+                       is_padding, sem_types, is_target, number_v,
+                       datetime_v, boolean_v, text_v, col_name_v,
+                       epsilon: float = 1e-3) -> dict[str, float | int]:
+        """Compare representative native gradients with finite differences."""
+        (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+         is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
+         ) = self._prep(node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                        sem_types, is_target, number_v, datetime_v, boolean_v,
+                        text_v, col_name_v)
+        max_abs, max_rel = ctypes.c_float(), ctypes.c_float()
+        checked = ctypes.c_int32()
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_model_finetune_gradient_check_metal(
+            self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+            is_padding, sem_types, is_target, number_v, datetime_v,
+            boolean_v, text_v, col_name_v, float(epsilon),
+            ctypes.byref(max_abs), ctypes.byref(max_rel), ctypes.byref(checked),
+            err, len(err))
+        if rc:
+            raise RtNativeError(
+                f"native MPS gradient check failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return {"max_absolute_error": float(max_abs.value),
+                "max_relative_error": float(max_rel.value),
+                "checked": int(checked.value)}
 
     @staticmethod
     def _prep(node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
@@ -554,7 +754,7 @@ class RtModel:
                        device: int = RT_DEVICE_CPU) -> np.ndarray:
         """Frozen-backbone features: the final target-cell state ``[B, 512]``.
 
-        This is what fine-tuning trains on — the transformer is not updated, so
+        This is what task-head fitting trains on — the transformer is not updated, so
         every example need only be encoded once."""
         (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
          is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
@@ -791,6 +991,16 @@ def _days(t: datetime) -> float:
     return t.timestamp() / 86400.0
 
 
+def _mean_std(values: Sequence[float], *, ddof: int = 0) -> tuple[float, float]:
+    """Finite mean/std with the reference's safe zero-variance convention."""
+    a = np.asarray(list(values), dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return 0.0, 1.0
+    sd = float(a.std(ddof=ddof)) if a.size > ddof else 0.0
+    return float(a.mean()), sd if math.isfinite(sd) and sd != 0.0 else 1.0
+
+
 class _Seq:
     """Token accumulator for one entity's context window (pre-sort order)."""
 
@@ -805,8 +1015,12 @@ class _Seq:
 
     def add(self, node: int, parents: Sequence[int], col: str, table: str,
             sem: int, value: Any, *, target: bool = False) -> None:
+        if len(parents) > MAX_F2P:
+            raise RtNativeError(
+                f"node {node} has {len(parents)} foreign-key parents; "
+                f"RT supports at most {MAX_F2P}")
         self.node.append(node)
-        self.f2p.append((list(parents) + [-1] * MAX_F2P)[:MAX_F2P])
+        self.f2p.append(list(parents) + [-1] * (MAX_F2P - len(parents)))
         self.col.append((col, table))
         self.tab.append(table)
         self.sem.append(sem)
@@ -871,6 +1085,8 @@ class RtNativeBackend:
                  num_history_windows: int = 3,
                  max_seq_len: int = 8192,      # reference eval ctx_size
                  column_stats: Optional["ColumnStats"] = None,
+                 normalization_mode: Optional[NormalizationMode | str] = None,
+                 task_spec_factory: Optional[TaskSpecFactory] = None,
                  device: Optional[int] = None,
                  head: Optional[Any] = None):
         self.schema = schema
@@ -880,21 +1096,39 @@ class RtNativeBackend:
         self.n_threads = n_threads
         self.num_history_windows = max(1, num_history_windows)
         self.max_seq_len = max_seq_len
+        self.normalization_mode = (None if normalization_mode is None else
+                                   NormalizationMode.coerce(normalization_mode))
+        self.task_spec_factory = task_spec_factory or TaskSpec.from_query
         # A head fitted under fitted-statistics normalization must be served
         # the same way, so the head's own stats win over anything passed here.
         # Metal when the build and machine provide it, CPU otherwise. Scoring
         # ran on CPU regardless before rt_forward_device was bound, which
         # dominated per-row latency on large contexts.
         self.device = device
+        if isinstance(head, (str, os.PathLike)):
+            head = FineTunedHead.load(str(head))
         self.column_stats = column_stats
         if head is not None and getattr(head, "column_stats", None) is not None:
             self.column_stats = head.column_stats
+            # A persisted head must see the same fitted preprocessing it was
+            # trained with, regardless of the engine's zero-shot default.
+            if self.normalization_mode is None:
+                self.normalization_mode = head.normalization_mode
         self._models: dict[str, RtModel] = {}
         # A fine-tuned head replaces the checkpoint's zero-shot head for the
         # task it was trained on; every other task still scores zero-shot.
-        if isinstance(head, (str, os.PathLike)):
-            head = FineTunedHead.load(str(head))
         self.head: Optional[FineTunedHead] = head
+
+    def _mode(self, config: Optional[ModelConfig] = None) -> NormalizationMode:
+        return (self.normalization_mode
+                or (config.normalization_mode if config is not None else
+                    NormalizationMode.ZERO_SHOT))
+
+    def task_spec(self, query: ParsedQuery, task_type: TaskType) -> TaskSpec:
+        spec = self.task_spec_factory(query, task_type)
+        if not isinstance(spec, TaskSpec):
+            raise TypeError("task_spec_factory must return a TaskSpec")
+        return spec
 
     def _head_for(self, task_type: TaskType) -> Optional["FineTunedHead"]:
         """The fine-tuned head, when it was trained for this task type."""
@@ -928,13 +1162,14 @@ class RtNativeBackend:
         ret_kind = ret.kind if ret is not None else None
         if not contexts:
             return []
+        mode = self._mode(config)
         if task_type is TaskType.MULTICLASS_CLASSIFICATION:
-            return self._score_multiclass(query, contexts, model_uri)
+            return self._score_multiclass(query, contexts, model_uri, mode)
         if task_type is TaskType.MULTILABEL_RANKING:
-            return self._score_ranking(query, contexts, model_uri)
+            return self._score_ranking(query, contexts, model_uri, mode)
         model = self._model_for(model_uri)
-        seqs, label_mu, label_sd = self._build_sequences(query, task_type,
-                                                         contexts)
+        seqs, label_mu, label_sd = self._build_sequences(
+            query, task_type, contexts, normalization_mode=mode)
         head = self._head_for(task_type)
         if head is not None:
             # trained head over the frozen backbone's target-cell features
@@ -942,7 +1177,7 @@ class RtNativeBackend:
         else:
             scores = self._forward(model, seqs)
         preds: list[EntityPrediction] = []
-        for ctx, s in zip(contexts, scores):
+        for ctx, s, mu, sd in zip(contexts, scores, label_mu, label_sd):
             s = float(s)
             if task_type is TaskType.BINARY_CLASSIFICATION:
                 p = 1.0 / (1.0 + math.exp(-s))
@@ -953,7 +1188,7 @@ class RtNativeBackend:
                 # was fitted on raw target values and already predicts in the
                 # label's own units — scaling it again applies the transform
                 # twice and inflates the error by orders of magnitude.
-                v = s if head is not None else s * label_sd + label_mu
+                v = s if head is not None else s * sd + mu
                 if task_type is TaskType.FORECASTING:
                     n = query.num_forecasts or 1
                     preds.append(EntityPrediction(ctx.entity_id, value=v,
@@ -998,7 +1233,7 @@ class RtNativeBackend:
         span = window.span() if window is not None else None
         if ctx.anchor is None or span is None:
             return []
-        rows_by_table = ctx.rows_by_table()
+        rows_by_table = ctx.focal_rows_by_table()
         cells = ctx.entity_cells(query.entity_key.table)
         out = []
         for k in range(1, self.num_history_windows + 1):
@@ -1070,14 +1305,16 @@ class RtNativeBackend:
         return out
 
     def _build_ctx_seq(self, query: ParsedQuery, task_type: TaskType,
-                       ctx: EntityContext, fk_to_parent: dict, all_labels: list,
-                       *, target_sem: int = SEM_NUMBER
+                       ctx: EntityContext, fk_to_parent: dict, labels: list,
+                       *, target_sem: int = SEM_NUMBER,
+                       task_spec: Optional[TaskSpec] = None,
                        ) -> tuple[_Seq, dict, int, int]:
         """Assemble one entity's context into a token sequence. Returns
         ``(seq, node_of, entity_node, tgt_idx)``. ``target_sem`` overrides the
         masked target cell's sem-type (SEM_TEXT for multiclass, §2.1); ``tgt_idx``
         is that cell's position (used by ranking to rewire its f2p, §3.2)."""
         entity_table = query.entity_key.table
+        task_spec = task_spec or self.task_spec(query, task_type)
         # Columns the target reads off the entity's own table. The task row
         # carries a masked copy of the answer, but the entity's real row sits
         # in its own context and would otherwise hand the answer straight to
@@ -1088,11 +1325,13 @@ class RtNativeBackend:
                       if t == entity_table}
         truncated = [False]
         seq = _Seq()
-        node_of: dict[tuple[str, Any], int] = {}
+        node_of: dict[tuple[str, Any], int] = dict(ctx.node_ids)
+        next_node = [max(node_of.values(), default=-1) + 1]
 
         def node(key: tuple[str, Any]) -> int:
             if key not in node_of:
-                node_of[key] = len(node_of)
+                node_of[key] = next_node[0]
+                next_node[0] += 1
             return node_of[key]
 
         # rows first claim node ids so f2p links resolve in any order
@@ -1104,38 +1343,69 @@ class RtNativeBackend:
 
         entity_node = node((entity_table, ctx.entity_id))
 
-        # -- the target task row (masked label) --
-        tgt_node = node((_TASK_TABLE, "__target__"))
-        if ctx.anchor is not None:
-            seq.add(tgt_node, [entity_node], _TASK_TIME_COL, _TASK_TABLE,
-                    SEM_DATETIME, ctx.anchor)
-        tgt_idx = len(seq)
-        seq.add(tgt_node, [entity_node], _TASK_LABEL_COL, _TASK_TABLE,
-                target_sem, None, target=True)
-
-        # -- past outcomes of the same task (self labels, F65) --
-        for ts, label in self._self_labels(query, task_type, ctx):
-            hnode = node((_TASK_TABLE, ts))
-            seq.add(hnode, [entity_node], _TASK_LABEL_COL, _TASK_TABLE,
-                    SEM_NUMBER, label)
-            seq.add(hnode, [entity_node], _TASK_TIME_COL, _TASK_TABLE,
-                    SEM_DATETIME, ts)
-            all_labels.append(label)
-
-        # -- one token per feature cell of every context row --
-        for r in ctx.rows:
+        def row_parents(r) -> list[int]:
             parents: list[int] = []
             for fk, pid in r.parents.items():
+                if (fk == "__entity__" and r.table == task_spec.table_name):
+                    parents.append(node((entity_table, pid)))
+                    continue
                 ptable = fk_to_parent.get(r.table, {}).get(fk)
                 if ptable is not None:
-                    pkey = (ptable, pid)
-                    if pkey in node_of:
-                        parents.append(node_of[pkey])
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        pkey = (ptable, one)
+                        if pkey in node_of:
+                            parents.append(node_of[pkey])
                     continue
-                # no schema: link by unique id match within the context
                 cands = by_id.get(pid, [])
                 if len(cands) == 1:
                     parents.append(node_of[cands[0]])
+            return parents
+
+        # -- the target task row (masked label) --
+        if task_spec.direct_target:
+            tgt_node = entity_node
+            focal = next((r for r in ctx.rows
+                          if r.key == (entity_table, ctx.entity_id)), None)
+            tgt_parents = row_parents(focal) if focal is not None else []
+        else:
+            focal_task = next((r for r in ctx.rows
+                               if r.table == task_spec.table_name
+                               and r.parents.get("__entity__") == ctx.entity_id
+                               and task_spec.target_column not in r.cells), None)
+            tgt_node = node(focal_task.key if focal_task is not None else
+                            (task_spec.table_name,
+                             f"__target__:{task_spec.id}"))
+            tgt_parents = [entity_node]
+        tgt_idx = len(seq)
+        seq.add(tgt_node, tgt_parents, task_spec.target_column,
+                task_spec.table_name, target_sem, None, target=True)
+        # The reference contract is target cell first, including for a derived
+        # task row; its timestamp follows the masked target token.
+        if not task_spec.direct_target and ctx.anchor is not None:
+            seq.add(tgt_node, tgt_parents, task_spec.time_column,
+                    task_spec.table_name, SEM_DATETIME, ctx.anchor)
+
+        # -- past outcomes of the same task (self labels, F65) --
+        materialized_labels = [
+            r for r in ctx.rows
+            if r.table == task_spec.table_name
+            and task_spec.target_column in r.cells
+        ]
+        if materialized_labels:
+            labels.extend(r.cells[task_spec.target_column]
+                          for r in materialized_labels)
+        else:
+            for ts, label in self._self_labels(query, task_type, ctx):
+                hnode = node((task_spec.table_name, (task_spec.id, ts)))
+                seq.add(hnode, [entity_node], task_spec.target_column,
+                        task_spec.table_name, SEM_NUMBER, label)
+                seq.add(hnode, [entity_node], task_spec.time_column,
+                        task_spec.table_name, SEM_DATETIME, ts)
+                labels.append(label)
+
+        # -- one token per feature cell of every context row --
+        for r in ctx.rows:
+            parents = row_parents(r)
             rnode = node_of[r.key]
             is_entity_row = r.key == (entity_table, ctx.entity_id)
             for col, v in r.cells.items():
@@ -1147,10 +1417,36 @@ class RtNativeBackend:
                     break
                 if is_entity_row and col in suppressed:
                     continue
+                if self.schema is not None:
+                    tdef = self.schema.table(r.table)
+                    if (tdef is not None and (col == tdef.primary_key
+                                               or tdef.column(col) is None)):
+                        continue
                 sem = self._sem_for_cell(r.table, col, v)
                 if sem is None:
                     continue
                 seq.add(rnode, parents, col, r.table, sem, v)
+            if (r.table == task_spec.table_name and r.timestamp is not None
+                    and task_spec.time_column not in r.cells
+                    and rnode != tgt_node):
+                seq.add(rnode, parents, task_spec.time_column,
+                        task_spec.table_name, SEM_DATETIME, r.timestamp)
+            if self.schema is not None:
+                for link in self.schema.links_from(r.table):
+                    if link.feature_type is None:
+                        continue
+                    value = r.parents.get(link.fk_column)
+                    if value is None:
+                        continue
+                    if isinstance(value, (list, tuple)):
+                        if link.feature_type is not ValueType.TEXT:
+                            raise RtNativeError(
+                                f"list-valued FK feature {r.table}."
+                                f"{link.fk_column} must use ValueType.TEXT")
+                        value = json.dumps(list(value), separators=(",", ":"),
+                                           ensure_ascii=True)
+                    seq.add(rnode, parents, link.fk_column, r.table,
+                            _SEM_OF_VALUE_TYPE[link.feature_type], value)
         if truncated[0]:
             warnings.warn(
                 f"context for {entity_table}={ctx.entity_id!r} was truncated at "
@@ -1160,18 +1456,25 @@ class RtNativeBackend:
 
     def _build_sequences(self, query: ParsedQuery, task_type: TaskType,
                          contexts: list[EntityContext], *,
-                         target_sem: int = SEM_NUMBER
-                         ) -> tuple[list[_Seq], float, float]:
+                         target_sem: int = SEM_NUMBER,
+                         normalization_mode: Optional[NormalizationMode | str] = None,
+                         task_spec: Optional[TaskSpec] = None,
+                         ) -> tuple[list[_Seq], list[float], list[float]]:
         fk_to_parent = self._fk_to_parent()
+        task_spec = task_spec or self.task_spec(query, task_type)
+        mode = (self._mode() if normalization_mode is None else
+                NormalizationMode.coerce(normalization_mode))
         seqs: list[_Seq] = []
-        all_labels: list[float] = []
+        labels_by_seq: list[list[float]] = []
         severed: set = set()
         for ctx in contexts:
+            labels: list[float] = []
             seq, node_of, _, _ = self._build_ctx_seq(
-                query, task_type, ctx, fk_to_parent, all_labels,
-                target_sem=target_sem)
+                query, task_type, ctx, fk_to_parent, labels,
+                target_sem=target_sem, task_spec=task_spec)
             severed |= self._severed_parents(seq, node_of)
             seqs.append(seq)
+            labels_by_seq.append(labels)
         if severed:
             tables = ", ".join(sorted(repr(t) for t in severed))
             warnings.warn(
@@ -1182,80 +1485,89 @@ class RtNativeBackend:
                 f"itself carries meaning, declare it as a column too.",
                 ContextConnectivityWarning, stacklevel=4)
 
-        if all_labels:
-            a = np.asarray(all_labels, float)
-            label_mu, label_sd = float(a.mean()), float(a.std() + 1e-8)
-        else:
-            label_mu, label_sd = 0.0, 1.0
-        self._normalize(seqs, label_mu, label_sd)
-        return seqs, label_mu, label_sd
+        label_stats = [self._label_stats(seq, labels, task_spec, mode)
+                       for seq, labels in zip(seqs, labels_by_seq)]
+        for seq, stats in zip(seqs, label_stats):
+            self._normalize_one(seq, task_spec, stats, mode)
+        return (seqs, [x[0] for x in label_stats],
+                [x[1] for x in label_stats])
 
-    def _normalize(self, seqs: list[_Seq], label_mu: float,
-                   label_sd: float) -> None:
-        """In-place: raw cell values -> normalized floats (F11/F12).
+    def _label_stats(self, seq: _Seq, labels: list[float],
+                     task_spec: TaskSpec,
+                     mode: NormalizationMode) -> tuple[float, float]:
+        target_sem = next((sem for sem, tgt in zip(seq.sem, seq.is_tgt) if tgt),
+                          SEM_NUMBER)
+        if target_sem not in (SEM_NUMBER, SEM_BOOLEAN):
+            return (0.0, 1.0)
+        if mode is NormalizationMode.REFERENCE:
+            if self.column_stats is None:
+                raise RtNativeError(
+                    "reference normalization requires ColumnStats; fit with "
+                    "ColumnStats.fit(...) and attach it to RtNativeBackend")
+            if (task_spec.direct_target
+                    and self.column_stats.has(task_spec.table_name,
+                                              task_spec.target_column)):
+                return self.column_stats.stats[(task_spec.table_name,
+                                                task_spec.target_column)]
+            return self.column_stats.task(task_spec)
+        if task_spec.direct_target:
+            key = (task_spec.target_column, task_spec.table_name)
+            values = [float(v) if not isinstance(v, bool) else float(v)
+                      for ck, sem, v, tgt in zip(
+                          seq.col, seq.sem, seq.value, seq.is_tgt)
+                      if ck == key and not tgt and v is not None
+                      and sem in (SEM_NUMBER, SEM_BOOLEAN)]
+            return _mean_std(values)
+        return _mean_std(labels)
 
-        Numbers and booleans z-score per (column, table) over all in-context
-        values of the batch; datetimes share one global stat. The task label
-        column uses the self-label stats so history tokens and the model
-        output live in the same normalized space."""
+    def _normalize_one(self, seq: _Seq, task_spec: TaskSpec,
+                       label_stats: tuple[float, float],
+                       mode: NormalizationMode) -> None:
+        """Normalize one entity independently or from persisted reference stats."""
         num_vals: dict[tuple[str, str], list[float]] = {}
         dt_vals: list[float] = []
-        for seq in seqs:
-            for (ck, sem, v, tgt) in zip(seq.col, seq.sem, seq.value,
-                                         seq.is_tgt):
-                if tgt or v is None:
-                    continue
-                if sem == SEM_DATETIME:
-                    dt_vals.append(_days(v))
-                elif sem in (SEM_NUMBER, SEM_BOOLEAN):
-                    num_vals.setdefault(ck, []).append(
-                        float(v) if not isinstance(v, bool)
-                        else (1.0 if v else 0.0))
-        # Fitted statistics when this backend has them, in-context otherwise.
-        # This is a regime, not a per-column fallback: either the whole batch
-        # normalizes against fitted state or none of it does, so a value never
-        # depends on which other rows shared the call. See :class:`ColumnStats`
-        # for why the released checkpoint uses the in-context regime.
-        cs = self.column_stats
+        for ck, sem, v, tgt in zip(seq.col, seq.sem, seq.value, seq.is_tgt):
+            if tgt or v is None:
+                continue
+            if sem == SEM_DATETIME:
+                dt_vals.append(_days(v))
+            elif sem in (SEM_NUMBER, SEM_BOOLEAN):
+                num_vals.setdefault(ck, []).append(
+                    float(v) if not isinstance(v, bool)
+                    else (1.0 if v else 0.0))
+
+        task_key = (task_spec.target_column, task_spec.table_name)
         stats: dict[tuple[str, str], tuple[float, float]] = {}
         for ck, vals in num_vals.items():
-            if cs is not None and ck[1] != _TASK_TABLE and cs.has(ck[1], ck[0]):
-                continue                      # handled by cs.transform below
-            # The synthetic task row is not in the schema: its label shares the
-            # self-label statistics so history tokens and the model's output
-            # live in the same space. Without fitted stats this falls back to
-            # the pre-conformance in-context behaviour.
-            a = np.asarray(vals, float)
-            stats[ck] = (float(a.mean()), float(a.std() + 1e-8))
-        stats[(_TASK_LABEL_COL, _TASK_TABLE)] = (label_mu, label_sd)
-        if dt_vals:
-            a = np.asarray(dt_vals, float)
-            dt_mu, dt_sd = float(a.mean()), float(a.std() + 1e-8)
-        else:
-            dt_mu, dt_sd = 0.0, 1.0
-        for seq in seqs:
-            for i, (ck, sem, v, tgt) in enumerate(
-                    zip(seq.col, seq.sem, seq.value, seq.is_tgt)):
-                if tgt or v is None:
-                    seq.value[i] = 0.0
-                    continue
-                if sem == SEM_DATETIME:
-                    seq.value[i] = (cs.transform_datetime(_days(v))
-                                    if cs is not None
-                                    else (_days(v) - dt_mu) / dt_sd)
-                elif sem in (SEM_NUMBER, SEM_BOOLEAN):
-                    x = float(v) if not isinstance(v, bool) \
-                        else (1.0 if v else 0.0)
-                    if cs is not None and ck[1] != _TASK_TABLE \
-                            and cs.has(ck[1], ck[0]):
-                        seq.value[i] = cs.transform(ck[1], ck[0], x)
-                    else:
-                        mu, sd = stats[ck]
-                        seq.value[i] = (x - mu) / sd
-                # text values stay as raw strings; embedded at collate
+            if ck == task_key:
+                stats[ck] = label_stats
+            elif mode is NormalizationMode.REFERENCE:
+                if self.column_stats is None or not self.column_stats.has(ck[1], ck[0]):
+                    raise RtNativeError(
+                        f"reference normalization has no statistics for "
+                        f"{ck[1]}.{ck[0]}")
+                stats[ck] = self.column_stats.stats[(ck[1], ck[0])]
+            else:
+                stats[ck] = _mean_std(vals)
 
-    def _forward(self, model: RtModel, seqs: list[_Seq], *,
-                 want_text: bool = False, encode: bool = False):
+        dt_stats = (self.column_stats.dt
+                    if mode is NormalizationMode.REFERENCE
+                    and self.column_stats is not None else _mean_std(dt_vals))
+        for i, (ck, sem, v, tgt) in enumerate(
+                zip(seq.col, seq.sem, seq.value, seq.is_tgt)):
+            if tgt or v is None:
+                seq.value[i] = 0.0
+                continue
+            if sem == SEM_DATETIME:
+                mu, sd = dt_stats
+                seq.value[i] = (_days(v) - mu) / sd
+            elif sem in (SEM_NUMBER, SEM_BOOLEAN):
+                x = float(v) if not isinstance(v, bool) else (1.0 if v else 0.0)
+                mu, sd = stats[ck]
+                seq.value[i] = (x - mu) / sd
+            # text values stay as raw strings; embedded at collate
+
+    def _collate(self, seqs: list[_Seq]) -> dict[str, np.ndarray]:
         B = len(seqs)
         S = max(1, max(len(s) for s in seqs))
         col_vocab: dict[tuple[str, str], int] = {}
@@ -1309,12 +1621,17 @@ class RtNativeBackend:
                 else:  # number/boolean -> number channel (bool_as_num, F52)
                     number_v[b, s] = float(v)
                     sem_types[b, s] = SEM_NUMBER
-        kw = dict(
+        return dict(
             node_idxs=node_idxs, f2p=f2p, col_idxs=col_idxs,
             table_idxs=table_idxs, is_padding=is_padding,
             sem_types=sem_types, is_target=is_target, number_v=number_v,
             datetime_v=datetime_v, boolean_v=boolean_v, text_v=text_v,
-            col_name_v=col_name_v, n_threads=self.n_threads)
+            col_name_v=col_name_v)
+
+    def _forward(self, model: RtModel, seqs: list[_Seq], *,
+                 want_text: bool = False, encode: bool = False):
+        kw = self._collate(seqs)
+        kw["n_threads"] = self.n_threads
         if encode:
             return model.encode_targets(device=self._resolve_device(),
                                         **kw)   # frozen features [B, 512]
@@ -1385,12 +1702,14 @@ class RtNativeBackend:
     # -- multiclass (CONTRACT.md §2) ----------------------------------------
     def _score_multiclass(self, query: ParsedQuery,
                           contexts: list[EntityContext],
-                          model_uri: str) -> list[EntityPrediction]:
+                          model_uri: str,
+                          mode: NormalizationMode) -> list[EntityPrediction]:
         model = self._model_for(model_uri)
         col = self._target_column(query)
         head = self._head_for(TaskType.MULTICLASS_CLASSIFICATION)
         if head is not None:
-            return self._score_multiclass_head(query, contexts, model, head)
+            return self._score_multiclass_head(query, contexts, model, head,
+                                               mode)
         bound = self._batch_bound(contexts)
         labels = self._class_domain(col.table, col.column, bound)
         if not labels:
@@ -1404,7 +1723,7 @@ class RtNativeBackend:
         # masked-TEXT target cell -> text decoder head at each entity's target.
         seqs, _, _ = self._build_sequences(
             query, TaskType.MULTICLASS_CLASSIFICATION, contexts,
-            target_sem=SEM_TEXT)
+            target_sem=SEM_TEXT, normalization_mode=mode)
         _, pred_text = self._forward(model, seqs, want_text=True)
 
         preds: list[EntityPrediction] = []
@@ -1425,16 +1744,18 @@ class RtNativeBackend:
 
     def _score_multiclass_head(self, query: ParsedQuery,
                                contexts: list[EntityContext], model: RtModel,
-                               head: "FineTunedHead") -> list[EntityPrediction]:
+                               head: "FineTunedHead",
+                               mode: NormalizationMode) -> list[EntityPrediction]:
         """Multiclass through a trained head: logits over the class list the
         head was fitted on, rather than nearest-neighbour over MiniLM text."""
         labels = list(head.classes)
         if not labels:
             raise RtNativeError(
                 "the fine-tuned multiclass head carries no class list; "
-                "re-run Engine.finetune to regenerate it")
+                "re-run Engine.fit_head to regenerate it")
         seqs, _, _ = self._build_sequences(
-            query, TaskType.MULTICLASS_CLASSIFICATION, contexts)
+            query, TaskType.MULTICLASS_CLASSIFICATION, contexts,
+            normalization_mode=mode)
         logits = head.predict(self._encode(model, seqs))
         preds: list[EntityPrediction] = []
         for ctx, row in zip(contexts, logits):
@@ -1448,13 +1769,15 @@ class RtNativeBackend:
                              for i in range(len(labels))}))
         return preds
 
-    # -- fine-tuning --------------------------------------------------------
+    # -- frozen task-head fitting ------------------------------------------
     def fit_head(self, model: RtModel, task_type: TaskType,
                  features: np.ndarray, labels: np.ndarray,
                  group_offsets: np.ndarray, n_groups: int, *,
                  epochs: int = 100, learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
-                 classes: Sequence[Any] = ()) -> "FineTunedHead":
+                 classes: Sequence[Any] = (),
+                 normalization_mode: NormalizationMode | str = NormalizationMode.ZERO_SHOT,
+                 ) -> "FineTunedHead":
         """Fit a task head on frozen features ``[N, 512]``.
 
         Training runs on Metal; inference on the resulting head is plain CPU
@@ -1464,7 +1787,7 @@ class RtNativeBackend:
         ft_task = _FT_TASK_OF[task_type]
         if not lib.device_available(RT_DEVICE_MPS):
             raise RtNativeError(
-                "fine-tuning requires a Metal device (rt_finetune_head_fit_metal); "
+                "task-head fitting requires a Metal device (rt_finetune_head_fit_metal); "
                 "this build or machine has none. Scoring is unaffected.")
         n_outputs = len(classes) if ft_task == FT_MULTICLASS else 1
 
@@ -1496,6 +1819,15 @@ class RtNativeBackend:
         feats = np.asarray(features, np.float32).reshape(len(labels), -1)
         feat_mu = feats.mean(0)
         feat_sd = feats.std(0) + 1e-6
+        feat_mu = np.ascontiguousarray(feat_mu, np.float32)
+        feat_sd = np.ascontiguousarray(feat_sd, np.float32)
+        rc = lib._lib.rt_finetune_head_reparameterize_standardized(
+            handle, feat_mu, feat_sd, err, len(err))
+        if rc != 0:
+            lib._lib.rt_finetune_head_free(handle)
+            raise RtNativeError(
+                "zero-shot head reparameterization failed: "
+                f"{err.value.decode('utf-8', 'replace')}")
         feats = (feats - feat_mu) / feat_sd
 
         f = np.ascontiguousarray(feats, np.float32).reshape(-1)
@@ -1514,13 +1846,17 @@ class RtNativeBackend:
             raise RtNativeError(
                 f"rt_finetune_head_fit_metal failed: "
                 f"{err.value.decode('utf-8', 'replace')}")
+        mode = NormalizationMode.coerce(normalization_mode)
         return FineTunedHead(lib, handle, task=ft_task,
                              initial_loss=float(i_loss.value),
                              final_loss=float(f_loss.value),
                              seconds=float(secs.value),
                              n_examples=int(y.shape[0]), classes=classes,
                              feat_mu=feat_mu, feat_sd=feat_sd,
-                             column_stats=self.column_stats)
+                             column_stats=(self.column_stats
+                                           if mode is NormalizationMode.REFERENCE
+                                           else None),
+                             normalization_mode=mode)
 
     def ranking_parent_table(self, query: ParsedQuery) -> str:
         """The parent table a ranking query's FK target points at."""
@@ -1540,7 +1876,9 @@ class RtNativeBackend:
         return link.to_table
 
     def candidate_seqs(self, query: ParsedQuery, ctx: EntityContext,
-                       parent_table: str, candidates: list) -> list["_Seq"]:
+                       parent_table: str, candidates: list, *,
+                       normalization_mode: Optional[NormalizationMode | str] = None,
+                       ) -> list["_Seq"]:
         """One existence sequence per candidate parent row (§3.2).
 
         The candidate is attached as the masked target cell's parent; if it is
@@ -1550,28 +1888,34 @@ class RtNativeBackend:
         exactly the inputs it will later be served."""
         fk_to_parent = self._fk_to_parent()
         all_labels: list[float] = []
+        task_spec = self.task_spec(query, TaskType.MULTILABEL_RANKING)
+        mode = (self._mode() if normalization_mode is None else
+                NormalizationMode.coerce(normalization_mode))
         base, node_of, entity_node, tgt_idx = self._build_ctx_seq(
             query, TaskType.MULTILABEL_RANKING, ctx, fk_to_parent,
-            all_labels, target_sem=SEM_NUMBER)
+            all_labels, target_sem=SEM_NUMBER, task_spec=task_spec)
         out: list[_Seq] = []
         for row in candidates:
             s = base.clone()
             cnode = node_of.get((parent_table, row.id))
             if cnode is None:
-                cnode = len(node_of)              # fresh node for this candidate
+                cnode = max(node_of.values(), default=-1) + 1
                 for col, v in row.cells.items():
                     sem = self._sem_for_cell(parent_table, col, v)
                     if sem is not None:
                         s.add(cnode, [], col, parent_table, sem, v)
             s.f2p[tgt_idx] = ([entity_node, cnode] + [-1] * MAX_F2P)[:MAX_F2P]
             out.append(s)
-        self._normalize(out, 0.0, 1.0)
+        for seq in out:
+            label_stats = self._label_stats(seq, all_labels, task_spec, mode)
+            self._normalize_one(seq, task_spec, label_stats, mode)
         return out
 
     # -- ranking (CONTRACT.md §3) -------------------------------------------
     def _score_ranking(self, query: ParsedQuery,
                        contexts: list[EntityContext],
-                       model_uri: str) -> list[EntityPrediction]:
+                       model_uri: str,
+                       mode: NormalizationMode) -> list[EntityPrediction]:
         t = query.target
         if not isinstance(t, Aggregation):
             raise RtNativeError(
@@ -1601,7 +1945,8 @@ class RtNativeBackend:
         preds: list[EntityPrediction] = []
         for ctx in contexts:
             cand_seqs = self.candidate_seqs(query, ctx, parent_table,
-                                            candidates)
+                                            candidates,
+                                            normalization_mode=mode)
             if rank_head is not None:
                 logits = rank_head.predict(self._encode(model, cand_seqs))[:, 0]
             else:

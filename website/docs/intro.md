@@ -83,7 +83,7 @@ result = engine.execute(ExecutionInput(
 
 - Learn the query language: [RelQL tutorial](/relql/#relql-tutorial)
 - Wire your own storage: [Retrievers](#retrievers)
-- Train a head on your history: [Fine-tune a task head](#fine-tune-a-task-head)
+- Fit a ranking adapter on your history: [Fit a multiclass/ranking adapter](#fit-a-multiclassranking-adapter)
 
 
 ## Retrievers
@@ -202,8 +202,7 @@ a new engine.
 - per-hop fanouts, e.g. `fanouts(64, 64)`
 - a uniform `bfs_width` under a global `max_context_cells` budget
 
-See [Choose a sampler mode](#choose-a-sampler-mode) for a decision
-guide and benchmark numbers.
+See [Choose a sampler mode](#choose-a-sampler-mode) for a decision guide.
 
 #### Supported output types
 
@@ -259,15 +258,19 @@ Start with RETRIEVER. Move to CSC when the same engine scores many queries or
 large populations and the data fits in memory.
 
 
-## Fine-tune a task head
+## Fit a multiclass/ranking adapter
 
-The released checkpoint is zero-shot. When you have history to learn from, train
-a small task head over the **frozen** transformer. Nothing in the transformer
+The released checkpoint is zero-shot. For multiclass or multilabel ranking,
+you can fit a small task head over the **frozen** transformer. Nothing in the transformer
 changes, so the engine encodes each example once into its target-cell state and
 fits a ~2 KB adapter quickly.
 
+This is not full-model fine-tuning. `Engine.finetune()` is disabled, and scalar
+binary/regression adapters are rejected; those tasks require an externally
+trained complete checkpoint until end-to-end training is implemented.
+
 ```python
-head = engine.finetune(
+head = engine.fit_head(
     query=Q,
     anchors=[t - timedelta(days=d) for d in (150, 120, 90, 60)],  # past cut-offs
     params={"ids": cohort},

@@ -36,12 +36,34 @@ The exact `rt/model.py` (main branch) forward pass:
   (`bool_as_num`)
 - safetensors loading (bf16 → fp32) with a built-in header parser — no JSON dep
 
-## Metal fine-tuning (`rt_train`)
+## Full-checkpoint MPS fine-tuning
+
+`rt_full_train_metal.mm` implements scalar-task end-to-end fine-tuning without
+Torch. Forward, activation-gradient, and weight-gradient GEMMs use
+`MPSMatrixMultiplication`; custom MSL kernels implement the exact grouped
+column/feature/neighbor attention and backward pass, RMSNorm/QK-RMSNorm,
+gating, SwiGLU, Huber loss, global gradient clipping, and AdamW. The forward
+tape checkpoints block boundaries and recomputes one block at a time during
+backward, keeping 8,192-cell memory bounded on Apple Silicon.
+
+`fit_model_metal_step` updates encoders, mask embeddings, every transformer
+block, learned scales/norms, and the numeric decoder. Optimizer moments persist
+on `Model`; `Model::save` exports the complete FP32 safetensors checkpoint.
+The C ABI exposes `rt_model_finetune_step_metal`, `rt_model_save`, and optimizer
+reset. The Python orchestration is `Engine.finetune()` for binary/regression.
+Quantized inference checkpoints are rejected because their training precision
+has already been discarded.
+
+The committed native check verifies inference/training loss agreement,
+representative early/late parameter updates, and full checkpoint round-trip.
+An 8,192-cell batch-one step has also completed on M3 MPS without fallback.
+
+## Metal task-head fitting (`rt_train`)
 
 The native backend can now adapt RT-J without PyTorch. It freezes the
 golden-verified transformer, extracts the final normalized 512-dimensional
 target-cell state on CPU or Metal, and trains a compact task head on Metal.
-This is deliberately **head fine-tuning**, not a full 86M-parameter backward
+This is deliberately **head fitting**, not a full 86M-parameter backward
 pass: only `512*C + C` parameters change, so an adapter is cheap to train,
 audit, save, and deploy.
 
@@ -57,17 +79,17 @@ save/load, and portable CPU prediction. The C ABI mirrors it with
 `rt_encode_targets_device` and `rt_finetune_head_*`. Scalar heads initialize
 from the released number decoder. A multiclass head can initialize from the
 released text decoder plus class-label MiniLM embeddings, preserving its
-zero-shot class ordering before training.
+zero-shot class ordering before training. Feature standardization
+reparameterizes every initialized head as `w' = w*σ`, `b' = b+w·μ`, so the
+epoch-zero logits are exactly preserved. The public Python `Engine.fit_head`
+surface is restricted to multiclass/ranking; scalar heads remain a lower-level
+diagnostic and are not presented as task fine-tuning.
 
 ```bash
 ./build/rt_train_test
-python/.venv/bin/python benchmarks/task_fit/digits_metal_finetune.py
 ```
 
-The native test covers multiclass and variable-group ranking losses. The
-Digits benchmark is a fixed, stratified run on a dataset absent from RT-J's
-485-database pretraining recipe; its committed before/after output is in
-`benchmarks/task_fit/digits_results.json`.
+The native test covers multiclass and variable-group ranking losses.
 
 ## Backends (CPU / MPS / CUDA)
 
@@ -179,137 +201,9 @@ cmake -B build -S . && cmake --build build -j        # add -DRT_CUDA=ON for CUDA
 /Users/henneberger/rt/.venv/bin/python tools/dump_golden.py
 
 ./build/rt_test testdata <path-to>/classification/model.safetensors \
-    [--bench 20] [--device cpu|mps|cuda]
-./build/rt_bench testdata <path-to>/classification/model.safetensors \
     [--device cpu|mps|cuda]
 ```
 
-## Benchmarks (`rt_bench`, Apple M3 Pro)
-
-**Batching correctness** — batched vs single-row, batch-order-permuted, and
-duplicated-row runs are all **bit-identical** (`max|Δ| = 0.0`) on every
-backend/format: attention provably never leaks across batch rows.
-
-Three representative shapes — `1×16` (single-entity latency), `80×16`
-(batched throughput), `1×2048` (long-context, where flash split-K attention
-matters). `size` is the on-disk checkpoint (resident weight RAM: fp32 342 MB,
-f16 172 MB, q8 91 MB, q4 68 MB — the quantized formats stay packed, so RSS
-after load drops from ~480 MB to ~130 MB).
-
-### CPU (Accelerate + int8 `sdot` for q8)
-
-| model | B×S | ms/fwd | tok/s | ms/entity | size |
-|---|---|---|---|---|---|
-| fp32 | 1×16 | 14.7 | 1.1k | 14.7 | 171 MB |
-| f16  | 1×16 | 12.0 | 1.3k | 12.0 | 172 MB |
-| q8   | 1×16 | 12.3 | 1.3k | 12.3 | 88 MB |
-| q4   | 1×16 | 15.5 | 1.0k | 15.5 | 64 MB |
-| fp32 | 80×16 | 219 | 5.8k | 2.7 | 171 MB |
-| f16  | 80×16 | 201 | 6.4k | 2.5 | 172 MB |
-| q8   | 80×16 | 207 | 6.2k | 2.6 | 88 MB |
-| q4   | 80×16 | 212 | 6.0k | 2.7 | 64 MB |
-| fp32 | 1×2048 | 388 | 5.3k | 388 | 171 MB |
-| f16  | 1×2048 | 363 | 5.6k | 363 | 172 MB |
-| q8   | 1×2048 | 370 | 5.5k | 370 | 88 MB |
-| q4   | 1×2048 | 384 | 5.3k | 384 | 64 MB |
-
-### MPS (Metal — custom `qgemm` + flash split-K attention)
-
-| model | B×S | ms/fwd | tok/s | ms/entity | size |
-|---|---|---|---|---|---|
-| fp32 | 1×16 | 7.6 | 2.1k | 7.6 | 171 MB |
-| f16  | 1×16 | 11.2 | 1.4k | 11.2 | 172 MB |
-| q8   | 1×16 | 9.1 | 1.8k | 9.1 | 88 MB |
-| q4   | 1×16 | 8.9 | 1.8k | 8.9 | 64 MB |
-| fp32 | 80×16 | 63 | 20.3k | 0.8 | 171 MB |
-| f16  | 80×16 | 151 | 8.5k | 1.9 | 172 MB |
-| q8   | 80×16 | 143 | 8.9k | 1.8 | 88 MB |
-| q4   | 80×16 | 143 | 8.9k | 1.8 | 64 MB |
-| fp32 | 1×2048 | 317 | 6.5k | 317 | 171 MB |
-| f16  | 1×2048 | 483 | 4.2k | 483 | 172 MB |
-| q8   | 1×2048 | 453 | 4.5k | 453 | 88 MB |
-| q4   | 1×2048 | 464 | 4.4k | 464 | 64 MB |
-
-Reading the numbers:
-
-- **Quantization is a footprint/bandwidth play, not a raw-throughput one at
-  this scale.** RT-J is 86M params at d=512; at batched shapes the GEMMs are
-  compute-bound, so q8/q4 land within ~5% of fp32 while cutting resident RAM
-  ~4× (the 480→127 MB RSS drop). The CPU q8 path is a true int8×int8 integer
-  matmul: on i8mm hardware (M2/M3) it uses **SMMLA** (`vmmlaq_s32`, a 2×8·8×2
-  int32 MMA per instruction) with weights pre-packed into 2×8 panels and
-  activations quantized directly into the paired layout; on
-  older ARM (M1) it falls back to **SDOT** (`vdotq_s32`). Both are
-  bit-identical. The table above was measured on the SDOT kernel; focused
-  SMMLA/SDOT A/B runs after fusing activation quantization with panel packing
-  measured 11.3/12.5 ms at `1×16`, 22.8/24.1 ms at `5×16`, and about 203/229
-  ms at `80×16` (SMMLA first in each pair).
-- **The quantized MPS path coalesces dependent compute dispatches** into one
-  encoder, specializes overwrite vs residual qgemm epilogues, stores aligned
-  overwrite tiles directly to output, and folds the attention clear into
-  pre-norm. On the M3 Pro q8 improved from 17.1→12.9 ms at `5×16` and
-  268→188 ms at `1×1024`; `1×2048` is 376 ms (previously 453 ms). Weights
-  remain quantized-resident throughout.
-- **The fp32 path also avoids residual and launch overhead.** CPU fp32 lets
-  Accelerate accumulate `wo`/`w2` directly into the residual (`beta=1`) and
-  parallelizes RMSNorm in 16-row chunks once there are at least 256 rows. On
-  the M3 Pro this moved `5×16` from about 26.9→26.4 ms and `1×1024` from
-  200→187 ms. MPS uploads a stacked `[w1; w3]` for fp32 and issues one wide
-  FFN input GEMM per block; `5×16` moved from about 9.31→9.09 ms while
-  `1×1024` remained effectively flat (153.4→152.9 ms).
-- **fp16 now uses native mixed-type MPS GEMM**: activations and results stay
-  fp32 while weights remain fp16-resident, and the stacked `[w1; w3]` launch
-  is shared with fp32. This cut `1×1024` MPS from 191.7→150.3 ms; the final
-  `1×2048` sweep was 287.9 ms. **Q4 stages both nibbles with one thread per
-  packed byte**, halving its weight/scale staging work; controlled A/B runs
-  moved MPS `1×1024` from 193.0→187.7 ms and `1×2048` from 384.1→373.5 ms.
-  On CPU, fp16/q4 use 128-output-row dequant/GEMM tiles once the activation
-  panel reaches 256 rows (64 below that): controlled long-context A/B gains
-  were 3–5%, with final `1×1024`/`1×2048` sweeps of 159/325 ms for fp16 and
-  165/332 ms for q4.
-- **Native MPS GEMM stays fastest on the GPU**: fp32 and mixed fp16 now run
-  there, while q8/q4 use the custom `qgemm` and trade some speed for their
-  larger memory reduction. On CPU, tiled dequantization feeds the same
-  Accelerate SGEMM, so the compact formats remain competitive with fp32.
-- **Flash split-K** cut single-row long-context MPS latency: `1×2048` fp32
-  is now 317 ms (was 416 ms pre-flash) and `1×1024` is 135 ms (was 158 ms) —
-  the big reverse-FK key lists are streamed by `nk/256` parallel threadgroups
-  instead of one. Beyond ~S=4096 column groups dominate (O(S·group)), the
-  same asymptotic FlexAttention pays upstream.
-- **MPS wins on batch/width** (`80×16`: 63 ms vs 219 ms fp32, 3.5×); single
-  `1×16` inference carries ~7 ms fixed command-buffer overhead, so CPU is
-  competitive there.
-
-### Rejected experiment: direct BNNS fp16 on CPU
-
-We tested removing the CPU fp16→fp32 weight-tile expansion entirely by
-submitting each projection to Apple's `BNNSMatMul` as fp32 activations ×
-resident fp16 weights → fp32 output. The prototype used one full GEMM per
-projection, cached workspace requirements by shape, reused one thread-local
-workspace allocation, and retained the tiled Accelerate SGEMM as a fallback.
-It passed the fp16 golden test with the same accumulated model error as the
-existing path.
-
-Controlled full-forward A/B results on the M3 Pro were:
-
-| B×S | tiled fp16→fp32 + SGEMM | direct BNNS | BNNS change |
-|---|---:|---:|---:|
-| 1×1024 | 160.2 ms | 171.1 ms | +6.8% |
-| 1×2048 | 321.7 ms | 352.3 ms | +9.5% |
-| 1×4096 | 702.1 ms | 780.0 ms | +11.1% |
-| 1×8192 | 1741.5 ms | 1893.9 ms | +8.8% |
-| 8×1024 | 1154.8 ms | 1317.1 ms | +14.1% |
-| 8×2048 | 2487.8 ms | 2739.1 ms | +10.1% |
-
-Peak RSS in the complete sweep also increased from 1550 MB to 1724 MB. A
-persistent `BNNSFilterCreateLayerFullyConnected` prototype produced
-essentially the same standalone GEMM times, so retaining a BNNS filter did
-not recover the loss. The likely cause is BNNS mixed-type preparation and
-workspace overhead outweighing the explicit expansion, while the current
-path parallelizes independent output tiles and feeds highly tuned SGEMM.
-
-Decision: do not ship the BNNS route on M3 Pro. The experimental code was
-removed; the tiled 128-output-row fp16 expansion remains the CPU default.
 
 ## Scope / next steps
 

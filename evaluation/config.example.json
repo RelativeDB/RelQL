@@ -1,0 +1,64 @@
+{
+  "output_dir": "evaluation/runs/relbench",
+  "tasks": ["rel-f1/driver-top3", "rel-f1/driver-position"],
+  "dataset_sources": {
+    "rel-f1": "rel-f1"
+  },
+  "runners": {
+    "rt": {
+      "enabled": false,
+      "type": "reference_rt",
+      "repo": "/Users/henneberger/relational-transformer",
+      "python": "/path/to/reference/python",
+      "pre_dir": "/path/to/relbench-preprocessed",
+      "device": "cuda",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "checkpoints": {
+        "clf": "stanford-star/rt-j/classification",
+        "reg": "stanford-star/rt-j/regression"
+      },
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "4", "--dtype", "bfloat16"]
+    },
+    "xgboost": {
+      "enabled": false,
+      "type": "reference_xgboost",
+      "repo": "/Users/henneberger/relational-transformer",
+      "python": "/path/to/reference/python",
+      "pre_dir": "/path/to/relbench-preprocessed",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "1"]
+    },
+    "ours": {
+      "enabled": false,
+      "type": "reference_context_native",
+      "python": "/path/to/reference/python",
+      "pre_dir": "/path/to/relbench-preprocessed",
+      "library": "/absolute/path/to/librt_c.dylib",
+      "native_device": "mps",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "checkpoints": {
+        "clf": "hf://stanford-star/rt-j/classification",
+        "reg": "hf://stanford-star/rt-j/regression"
+      },
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "4"]
+    },
+    "ours_finetuned": {
+      "enabled": false,
+      "type": "reference_context_native_full_finetuned",
+      "python": "/path/to/reference/python",
+      "pre_dir": "/path/to/relbench-preprocessed",
+      "library": "/absolute/path/to/librt_c.dylib",
+      "native_device": "mps",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "task_checkpoints": {
+        "rel-f1/driver-top3": "/path/to/full-driver-top3-checkpoint.safetensors",
+        "rel-f1/driver-position": "/path/to/full-driver-position-checkpoint.safetensors"
+      },
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "4"]
+    }
+  }
+}

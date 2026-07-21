@@ -16,10 +16,11 @@ verify it against this setting and fail fast unless
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 
 from .relql.ast import TaskType
 
-__all__ = ["ModelConfig", "EmbeddingMismatchError",
+__all__ = ["ModelConfig", "NormalizationMode", "EmbeddingMismatchError",
            "DEFAULT_CLASSIFICATION_MODEL_URI", "DEFAULT_REGRESSION_MODEL_URI",
            "DEFAULT_EMBEDDING_MODEL"]
 
@@ -34,12 +35,46 @@ class EmbeddingMismatchError(ValueError):
     """A checkpoint pins a different text encoder than the config."""
 
 
+class NormalizationMode(str, Enum):
+    """How raw relational values are mapped to the checkpoint's scale.
+
+    ``ZERO_SHOT`` needs no dataset scan.  It derives statistics independently
+    inside each entity context, so adding another entity to a request cannot
+    change an existing prediction.  ``REFERENCE`` uses preprocessing-time
+    column and task statistics, matching relational-transformer's persisted
+    dataset contract; it requires a :class:`relativedb.rt_native.ColumnStats`
+    artifact on the backend.
+    """
+
+    ZERO_SHOT = "zero_shot"
+    REFERENCE = "reference"
+    # A readable alias for callers that think of the second mode by how its
+    # values are obtained rather than by the implementation it conforms to.
+    STATISTICS = "reference"
+
+    @classmethod
+    def coerce(cls, value: "NormalizationMode | str") -> "NormalizationMode":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as e:
+            choices = ", ".join(sorted({m.value for m in cls}))
+            raise ValueError(
+                f"unknown normalization mode {value!r}; expected {choices}") from e
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     classification_model_uri: str = DEFAULT_CLASSIFICATION_MODEL_URI
     regression_model_uri: str = DEFAULT_REGRESSION_MODEL_URI
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     allow_embedding_mismatch: bool = False
+    normalization_mode: NormalizationMode = NormalizationMode.ZERO_SHOT
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "normalization_mode",
+                           NormalizationMode.coerce(self.normalization_mode))
 
     @staticmethod
     def defaults() -> "ModelConfig":
@@ -77,4 +112,5 @@ class ModelConfig:
             "regression_model_uri": self.regression_model_uri,
             "embedding_model": self.embedding_model,
             "allow_embedding_mismatch": self.allow_embedding_mismatch,
+            "normalization_mode": self.normalization_mode.value,
         }

@@ -1,0 +1,94 @@
+{
+  "output_dir": "evaluation/runs/rel-f1-head-to-head-8192",
+  "tasks": ["rel-f1/driver-top3", "rel-f1/driver-position"],
+  "diagnostic_r2": true,
+  "dataset_sources": {
+    "rel-f1": "stanford-rdl/relbench/rel-f1"
+  },
+  "report": {
+    "protocol": [
+      "Reference checkout: `/Users/henneberger/relational-transformer` at commit `eece04847de7b52d6fe7a718c277abec7bb18c83`.",
+      "Complete official test splits: 726 `driver-top3` rows and 760 `driver-position` rows; no test subsampling.",
+      "Each neural runner requests 8,192 cells from the reference Rust sampler with local context 256, BFS width 32, 10,000 walks, walk length 20, context seed 0, and shuffle seed 0. Context fallback, if required by an OOM, is recorded and changed for that runner only.",
+      "The same official RelBench 3 scorer and keyed task rows score every submission. ROC AUC is higher-is-better; NMAE is lower-is-better.",
+      "`ours_finetuned` accepts only complete task-specific checkpoints produced by end-to-end backbone training; frozen output-head adapters are excluded from the primary comparison."
+    ],
+    "runners": {
+      "rt": "Released RT-J PyTorch classification/regression checkpoints evaluated on MPS by the reference evaluator.",
+      "xgboost": "Reference `rel2tab` SQL features plus its validation-tuned 200-tree XGBoost parameters. XGBoost runs in a pure subprocess because importing it beside the reference Torch/Rust stack crashes Apple Silicon OpenMP; arrays and predictions are unchanged.",
+      "ours": "RelativeDB C++ RT-J backbone on MPS, consuming the reference evaluator's exact sampled tensors with no task-specific fitting.",
+      "ours_finetuned": "RelativeDB native inference from a complete task-specific checkpoint whose backbone and decoders were trained end to end. Disabled until such checkpoints are supplied."
+    },
+    "limitations": [
+      "This executed slice covers one classification and one regression task from the 21-task catalog. It validates three runnable paths; the full-fine-tuned path remains disabled until complete task checkpoints exist. This is not a full-catalog quality claim.",
+      "XGBoost is pinned to 2.1.4 for this Apple Silicon run; the unpinned 3.3.0 build segfaulted in repeated label ingestion.",
+      "Wall times are end-to-end smoke measurements on one Apple Silicon host (RT/native on MPS, XGBoost on CPU), not a controlled backend-performance comparison."
+    ]
+  },
+  "runners": {
+    "rt": {
+      "enabled": true,
+      "type": "reference_rt",
+      "python": "/Users/henneberger/relativedb/.venv-eval/bin/python",
+      "pre_dir": "stanford-star/relbench-preprocessed",
+      "device": "mps",
+      "valid": false,
+      "invalid_reason": "The reference model hard-codes BF16 attention/count tensors. At 8,192 cells on MPS its predictions collapse to 46/221 distinct classification/regression values and do not agree with the 128-cell parity gate. FP32 MPS aborts inside MPSNDArray matrix multiplication, CPU flex_attention is unsupported, and no CUDA device is available on this host.",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "checkpoints": {
+        "clf": "stanford-star/rt-j/classification",
+        "reg": "stanford-star/rt-j/regression"
+      },
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "4", "--dtype", "bfloat16", "--bfs-width", "32", "--num-walks", "10000", "--walk-length", "20"],
+      "env": {
+        "PYTHONPATH": "/Users/henneberger/relational-transformer/src:/Users/henneberger/relational-transformer:/Users/henneberger/relativedb/python/src:/Users/henneberger/relativedb"
+      }
+    },
+    "xgboost": {
+      "enabled": true,
+      "type": "reference_xgboost",
+      "python": "/Users/henneberger/relativedb/.venv-eval/bin/python",
+      "pre_dir": "stanford-star/relbench-preprocessed",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "1", "--bfs-width", "32", "--num-walks", "10000", "--walk-length", "20"],
+      "env": {
+        "PYTHONPATH": "/Users/henneberger/relational-transformer/src:/Users/henneberger/relational-transformer:/Users/henneberger/relativedb/python/src:/Users/henneberger/relativedb"
+      }
+    },
+    "ours": {
+      "enabled": true,
+      "type": "reference_context_native",
+      "python": "/Users/henneberger/relativedb/.venv-eval/bin/python",
+      "pre_dir": "stanford-star/relbench-preprocessed",
+      "library": "/Users/henneberger/relativedb/cpp/build/librt_c.dylib",
+      "native_device": "mps",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "checkpoints": {
+        "clf": "hf://stanford-star/rt-j/classification",
+        "reg": "hf://stanford-star/rt-j/regression"
+      },
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "4", "--bfs-width", "32", "--num-walks", "10000", "--walk-length", "20"],
+      "env": {
+        "PYTHONPATH": "/Users/henneberger/relational-transformer/src:/Users/henneberger/relational-transformer:/Users/henneberger/relativedb/python/src:/Users/henneberger/relativedb"
+      }
+    },
+    "ours_finetuned": {
+      "enabled": false,
+      "type": "reference_context_native_full_finetuned",
+      "python": "/Users/henneberger/relativedb/.venv-eval/bin/python",
+      "pre_dir": "stanford-star/relbench-preprocessed",
+      "library": "/Users/henneberger/relativedb/cpp/build/librt_c.dylib",
+      "native_device": "mps",
+      "context_size": 8192,
+      "oom_fallback_context_sizes": [4096, 2048, 1024],
+      "task_checkpoints": {},
+      "extra_args": ["--ctx-size", "8192", "--local-ctx-size", "256", "--batch-size", "4", "--bfs-width", "32", "--num-walks", "10000", "--walk-length", "20"],
+      "env": {
+        "PYTHONPATH": "/Users/henneberger/relational-transformer/src:/Users/henneberger/relational-transformer:/Users/henneberger/relativedb/python/src:/Users/henneberger/relativedb"
+      }
+    }
+  }
+}

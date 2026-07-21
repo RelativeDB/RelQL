@@ -149,6 +149,12 @@ void rt_finetune_head_free(rt_finetune_head*);
 int rt_finetune_head_save(const rt_finetune_head*, const char* path,
                           char* err, size_t errlen);
 
+/* Preserve the initialized head's raw-feature predictions when subsequent
+ * fitting/prediction supplies z=(x-mean)/std features. */
+int rt_finetune_head_reparameterize_standardized(
+    rt_finetune_head*, const float* mean, const float* std,
+    char* err, size_t errlen);
+
 /* Full-batch Metal training over frozen features [N,512]. labels is length N.
  * Ranking uses non-negative relevance labels and group_offsets[n_groups+1];
  * other tasks ignore group_offsets/n_groups. */
@@ -167,6 +173,61 @@ int rt_finetune_head_predict(const rt_finetune_head*, int32_t N,
                              char* err, size_t errlen);
 int32_t rt_finetune_head_outputs(const rt_finetune_head*);
 int32_t rt_finetune_head_task(const rt_finetune_head*);
+
+/* ---- full-checkpoint MPS fine-tuning ----------------------------------
+ * Executes one optimizer step through the complete RT-J model. Target-cell
+ * values are labels; is_target prevents them entering the encoder and selects
+ * the reference Huber objective. The optimizer state persists on rt_model.
+ * This path is native C++/Metal and does not use Python autograd.
+ */
+int rt_model_finetune_step_metal(
+    rt_model*, int32_t B, int32_t S,
+    const int64_t* node_idxs, const int64_t* f2p,
+    const int64_t* col_idxs, const int64_t* table_idxs,
+    const uint8_t* is_padding, const int64_t* sem_types,
+    const uint8_t* is_target, const float* number_v,
+    const float* datetime_v, const float* boolean_v,
+    const float* text_v, const float* col_name_v,
+    float learning_rate, float weight_decay, float grad_clip_norm,
+    float* out_loss, float* out_grad_norm, uint64_t* out_step,
+    double* out_seconds, char* err, size_t errlen);
+
+/* Accumulating variant. apply_update=0 retains gradients without changing
+ * weights; apply_update=1 averages all retained microbatches and applies one
+ * clipped AdamW update. */
+int rt_model_finetune_microbatch_metal(
+    rt_model*, int32_t B, int32_t S,
+    const int64_t* node_idxs, const int64_t* f2p,
+    const int64_t* col_idxs, const int64_t* table_idxs,
+    const uint8_t* is_padding, const int64_t* sem_types,
+    const uint8_t* is_target, const float* number_v,
+    const float* datetime_v, const float* boolean_v,
+    const float* text_v, const float* col_name_v,
+    float learning_rate, float weight_decay, float grad_clip_norm,
+    int32_t apply_update,
+    float* out_loss, float* out_grad_norm, uint64_t* out_step,
+    uint32_t* out_accumulated_microbatches, int32_t* out_updated,
+    double* out_seconds, char* err, size_t errlen);
+
+int rt_model_finetune_optimizer_save(rt_model*, const char* path,
+                                     char* err, size_t errlen);
+int rt_model_finetune_optimizer_load(rt_model*, const char* path,
+                                     char* err, size_t errlen);
+
+int rt_model_finetune_gradient_check_metal(
+    rt_model*, int32_t B, int32_t S,
+    const int64_t* node_idxs, const int64_t* f2p,
+    const int64_t* col_idxs, const int64_t* table_idxs,
+    const uint8_t* is_padding, const int64_t* sem_types,
+    const uint8_t* is_target, const float* number_v,
+    const float* datetime_v, const float* boolean_v,
+    const float* text_v, const float* col_name_v,
+    float epsilon, float* out_max_absolute_error,
+    float* out_max_relative_error, int32_t* out_checked,
+    char* err, size_t errlen);
+
+int rt_model_save(const rt_model*, const char* path, char* err, size_t errlen);
+void rt_model_finetune_reset_optimizer(rt_model*);
 
 #ifdef __cplusplus
 }

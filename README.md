@@ -3,15 +3,13 @@
 </p>
 
 # What is RelativeDB/RelQL?
-We have dozens to hundreds of tables of data in our ecosystem. Lets say we want to predict customer churn? We could spend a great deal of time looking for all of the features we need (recent transactions, complaint calls, refunds issued, etc). Or we can have a graph search across our tables build a small subgraph, and use a pretrained model that is trained to figure it out. This is the real advantage of relativedb, we look through your whole graph of data to find what is interesting, and use a zero-shot model to make predictions. 
+RelativeDB predicts over the shape of your data.
 
-So this scales with more data. Meaning you can fine tune all of your data, and any other data you get your hands on, to improve the model.
+Given a customer, account, transaction, or any other entity, it follows the relationships across your tables and builds a local graph around it. Orders stay orders. Returns stay returns. Support calls, refunds, text, and account history keep their meaning and their connections.
 
-Try not to look at what the model does now, look at what it could do in the future. This technique can produce comparable results to things like xgboost, but isn't trained on things like multiclass identification so the results are junk without fine tuning.
+That graph is passed directly to a relational model, so adding more tables gives it more to work with instead of creating another feature-engineering project.
 
-RelativeDB is an optimized implementation of Relational Transformers (2026), surfaced as RelQL, a predictive query language for relational data. You declare the shape of your
-relational data (tables, keys, links), wire small retriever callbacks over
-whatever storage you already have, and ask questions about the **future**:
+RelativeDB is an optimized implementation of Relational Transformers, exposed through RelQL, a query language for predicting what happens next.
 
 ```sql
 PREDICT NOT EXISTS(orders.*)
@@ -23,7 +21,8 @@ FROM customers
 RelativeDB works best for large graphs, 10-100 tables. Unlike xgboost, it works well with text since all text values get encoded into latent space with the rest of the features.
 
 ## The model
-Relational Transformers work by utilizing a pretrained 22m parameter model from over 650 databases of relational data for prediction and classifications tasks. This method has been shown to scale, and remarkably, shows the emergence of zero-shot ability on novel tasks.
+
+RelativeDB runs the current RT-J checkpoint family, an approximately 86-million-parameter relational model. It can make zero-shot classification and regression predictions over a new database without fitting a task-specific model first.
 
 | Resource | Description | Date      |
 | --- | --- |-----------|
@@ -84,6 +83,16 @@ Read the [RelQL book](https://relql.com/docs/).
 | fp16 | 172 MB | 483 ms | 4.2k tok/s | identical | [rt-j-fp16](https://huggingface.co/RelativeDB/rt-j-fp16) |
 | int8 | 88 MB | 453 ms | 4.5k tok/s | ±0.01 | [rt-j-int8](https://huggingface.co/RelativeDB/rt-j-int8) |
 | int4 | 64 MB | 464 ms | 4.4k tok/s | ±0.15 | [rt-j-int4](https://huggingface.co/RelativeDB/rt-j-int4) |
+
+### Fine-tuning
+
+RelativeDB can fine-tune the complete RT-J model for a binary classification or regression task on Apple Silicon. Training runs in C++ with Metal/MPS primitives and does not use Torch. It updates the transformer, input encoders, normalization parameters, and output decoder together.
+
+Fine-tuning uses the reference sampler and keeps training, validation, and test data separate. The released zero-shot model is the starting checkpoint and the validation score is the promotion gate. A checkpoint is kept only when it improves on the best validated model. If validation gets worse, the trainer restores the best checkpoint, lowers the learning rate, and continues. Model weights and AdamW state are saved together so a stopped run can resume at a validation boundary.
+
+The physical batch is allowed to shrink for the available memory, but gradient accumulation keeps the requested effective batch unchanged. An 8,192-cell context is much more expensive than the reference script's usual 1,024-cell fine-tuning context, so long runs on an M3 can take hours.
+
+See [evaluation/README.md](evaluation/README.md#native-full-checkpoint-training) for the training command and recovery workflow. Frozen-head fitting is a separate adapter feature for multiclass and ranking tasks; it is not reported as full-model fine-tuning.
 
 ## The Python library
 

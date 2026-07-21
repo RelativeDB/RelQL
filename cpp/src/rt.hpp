@@ -120,8 +120,14 @@ struct Model {
   // indexed by Device. Created on first forward for that device; shared by
   // copies of the Model. Opaque — owned by the backend that created it.
   mutable std::shared_ptr<void> device_ctx[3];
+  // Native full-model optimizer state.  Kept separate from inference scratch
+  // because Adam moments and the forward tape persist across training steps.
+  mutable std::shared_ptr<void> training_ctx;
 
   static Model load(const std::string& safetensors_path);
+  // Write the complete mutable checkpoint in the same flat safetensors
+  // layout accepted by load().  Training checkpoints are fp32.
+  void save(const std::string& safetensors_path) const;
 };
 
 // ---- batch ---------------------------------------------------------------

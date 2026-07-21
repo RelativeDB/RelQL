@@ -29,8 +29,8 @@ class SchemaError(ValueError):
 class ColumnDef:
     """A typed feature column.
 
-    FK columns are graph edges, not columns. A primary key may be declared as a
-    column when it carries meaning; see :class:`TableDef`.
+    FK columns are graph edges unless their link opts into a feature token.
+    Primary keys are always identity-only; see :class:`TableDef`.
     """
 
     name: str
@@ -43,33 +43,30 @@ class ColumnDef:
 
 @dataclass(frozen=True)
 class LinkDef:
-    """A foreign-key link: ``from_table.fk_column -> to_table.primary_key``."""
+    """A foreign-key edge with an optional, non-targetable feature token.
+
+    ``feature_type=None`` is reference behavior: the FK is graph structure
+    only.  When set, the raw FK value is additionally emitted as a feature;
+    the edge is retained in either case. Primary keys are never features.
+    """
 
     from_table: str
     fk_column: str
     to_table: str
+    feature_type: Optional[ValueType] = None
 
     @staticmethod
-    def link(from_table: str, fk_column: str, to_table: str) -> "LinkDef":
-        return LinkDef(from_table, fk_column, to_table)
+    def link(from_table: str, fk_column: str, to_table: str,
+             feature_type: Optional[ValueType] = None) -> "LinkDef":
+        return LinkDef(from_table, fk_column, to_table, feature_type)
 
 
 @dataclass(frozen=True)
 class TableDef:
     """A table: typed feature columns + identity (PK) + optional row time.
 
-    The primary key names rows and resolves links. Whether it is *also* a
-    feature is the schema's choice, declared the same way ``time_column`` is —
-    by listing it as a column::
-
-        TableDef.new_table("users").primary_key("user_id")      # identity only
-        TableDef.new_table("products")                          # ...and a feature
-            .column("stock_code", ValueType.TEXT).primary_key("stock_code")
-
-    Declare it when the key carries meaning — a SKU, an ISBN, an airport code.
-    Leave it out for synthetic keys: autoincrement ids correlate with insertion
-    order, so feeding one to the model invites it to read the id as a tenure
-    proxy that will not survive a new id range.
+    The primary key names rows and resolves links. It is always identity-only,
+    matching reference preprocessing. Declaring it as a feature is rejected.
 
     ``time_column`` drives temporal filtering (F24) and windows.
     """
@@ -86,6 +83,10 @@ class TableDef:
                 raise SchemaError(
                     f"table {self.name!r}: duplicate column {c.name!r}")
             seen.add(c.name)
+        if self.primary_key is not None and self.primary_key in seen:
+            raise SchemaError(
+                f"table {self.name!r}: primary key {self.primary_key!r} "
+                f"cannot also be a feature column")
         if self.time_column is not None and self.time_column not in seen:
             raise SchemaError(
                 f"table {self.name!r}: time_column {self.time_column!r} "
@@ -190,7 +191,9 @@ class Schema:
             ],
             "links": [
                 {"from_table": l.from_table, "fk_column": l.fk_column,
-                 "to_table": l.to_table}
+                 "to_table": l.to_table,
+                 "feature_type": (None if l.feature_type is None
+                                  else l.feature_type.value)}
                 for l in self.links
             ],
         }
@@ -205,11 +208,13 @@ class Schema:
             return self
 
         def link(self, link_or_from, fk_column: Optional[str] = None,
-                 to_table: Optional[str] = None) -> "Schema.Builder":
+                 to_table: Optional[str] = None,
+                 feature_type: Optional[ValueType] = None) -> "Schema.Builder":
             if isinstance(link_or_from, LinkDef):
                 self._links.append(link_or_from)
             else:
-                self._links.append(LinkDef(link_or_from, fk_column, to_table))
+                self._links.append(LinkDef(link_or_from, fk_column, to_table,
+                                           feature_type))
             return self
 
         def build(self) -> "Schema":

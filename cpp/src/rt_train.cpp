@@ -75,6 +75,26 @@ FineTuneHead FineTuneHead::from_model(const Model& model, FineTuneTask task,
   return h;
 }
 
+void FineTuneHead::reparameterize_for_standardized_features(
+    const float* mean, const float* std) {
+  validate_shape(*this);
+  if (!mean || !std)
+    throw std::runtime_error("feature mean and std are required");
+  for (int c = 0; c < outputs; c++) {
+    float* w = weight.data() + (size_t)c * kDModel;
+    float shift = 0.f;
+    for (int d = 0; d < kDModel; d++) {
+      if (!(std[d] > 0.f) || !std::isfinite(std[d]) ||
+          !std::isfinite(mean[d]))
+        throw std::runtime_error("feature statistics must be finite and std > 0");
+      const float old_w = w[d];
+      shift += old_w * mean[d];
+      w[d] = old_w * std[d];
+    }
+    bias[c] += shift;
+  }
+}
+
 std::vector<float> FineTuneHead::predict(const float* features, int N) const {
   validate_shape(*this);
   if (!features || N < 0) throw std::runtime_error("invalid prediction features");
@@ -156,6 +176,11 @@ FineTuneResult fit_head_metal(FineTuneHead&, const float*, const float*, int,
                               const FineTuneOptions&) {
   throw std::runtime_error("Metal fine-tuning backend was not compiled");
 }
+FullFineTuneStep fit_model_metal_step(Model&, const Batch&,
+                                      const FullFineTuneOptions&) {
+  throw std::runtime_error("full-model Metal fine-tuning backend was not compiled");
+}
+void reset_model_metal_optimizer(Model& model) { model.training_ctx.reset(); }
 #endif
 
 }  // namespace rt
