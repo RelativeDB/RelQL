@@ -10,6 +10,7 @@ dependency (the same native library the RT-J model and RelQL parser require).
 from __future__ import annotations
 
 import math
+from types import MappingProxyType
 from typing import Any, Optional, Sequence
 
 from .csc_native import NativeCsc
@@ -40,11 +41,24 @@ class CscIndex:
 
     @staticmethod
     def build(schema: Schema, wiring: RetrieverWiring,
-              bound: TemporalBound = TemporalBound.unbounded()) -> "CscIndex":
+              bound: TemporalBound = TemporalBound.unbounded(), *,
+              allow_missing_scanners: bool = False) -> "CscIndex":
         idx = CscIndex()
         for table in schema.tables:
-            scanner = wiring.scanner(table.name)
-            rows = [r for r in scanner(table.name, bound) if bound.admits_row(r)]
+            scanner = wiring.scanners.get(table.name)
+            if scanner is None:
+                if not allow_missing_scanners:
+                    scanner = wiring.scanner(table.name)  # raises precise error
+                else:
+                    idx.rows[table.name] = []
+                    idx.dense[table.name] = {}
+                    continue
+            rows = [Row(r.table, r.id,
+                        MappingProxyType(dict(r.cells)), r.timestamp,
+                        MappingProxyType({k: tuple(v) if isinstance(v, list)
+                                          else v
+                                          for k, v in r.parents.items()}))
+                    for r in scanner(table.name, bound) if bound.admits_row(r)]
             idx.rows[table.name] = rows
             idx.dense[table.name] = {r.id: i for i, r in enumerate(rows)}
         for link in schema.links:
@@ -64,12 +78,13 @@ class CscIndex:
             pid = row.parents.get(link.fk_column)
             if pid is None:
                 continue
-            pi = parent_dense.get(pid)
-            if pi is None:
-                continue  # dangling FK: edge dropped, row still scannable
-            ep.append(pi)
-            ec.append(ci)
-            et.append(_epoch(row))
+            for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                pi = parent_dense.get(one)
+                if pi is None:
+                    continue  # dangling FK: edge dropped, row still scannable
+                ep.append(pi)
+                ec.append(ci)
+                et.append(_epoch(row))
         return NativeCsc(n_parents, ep, ec, et)
 
     # -- sampler surface ----------------------------------------------------

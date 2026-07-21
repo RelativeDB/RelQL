@@ -4,17 +4,32 @@
 **Based on:** RELATIONAL_TRANSFORMER_COMPARISON.md and the implementation/worktree reviewed there  
 **Purpose:** Convert the comparison findings into an ordered engineering and evaluation program
 
+**Updated:** 2026-07-20 after the first semantic-alignment implementation.
+Status annotations distinguish completed foundations from the remaining
+production-hardening and quality-validation work. See
+`REFERENCE_ALIGNMENT_IMPLEMENTATION.md` for the implemented API and test log.
+
 ## 1. Executive recommendation
 
 The next investment should be in the semantic path into RT-J, not in lower-level matrix multiplication.
 
-The native transformer is already the most mature part of the system: its CPU and MPS implementations agree with the current reference fixture, its attention avoids quadratic materialization, and its batching performance is good. The largest present risks and opportunities occur before and after the kernel:
+The native transformer remains the most mature part of the system. The first
+semantic-alignment batch has now removed two demonstrated correctness defects
+and introduced foundations for the third:
 
-1. A request currently helps determine its own normalization. This makes scores unstable across batch composition.
-2. Cohort evidence can alter the focal entity's historical label calculation.
-3. The sampler does not reproduce the reference model's task-row and peer-context geometry.
+1. Request-batch normalization is removed. Zero-shot normalization is
+   entity-local, while reference/statistics normalization uses persisted
+   physical-column, datetime, and task-target statistics.
+2. Focal ownership is explicit. Derived queries materialize stable timestamped
+   task rows, and every peer label is evaluated against that peer's history at
+   the legal historical cutoff.
+3. Direct targets mask physical cells. `ReferenceTraversal` is pluggable and is
+   now the default over one immutable graph snapshot. It implements the
+   reference graph walk, target/visited/fallback tiers, prioritized BFS,
+   temporal rules, stable global node IDs, and rand 0.9.1 RNG streams. The old
+   cohort BFS remains only as an explicit compatibility plugin.
 4. Ranking evaluates a broad, weakly generated candidate set and pays transformer cost for each candidate.
-5. The benchmark and release paths do not yet reliably gate regressions.
+5. Release and packaging paths do not yet reliably gate regressions.
 
 The recommended order is therefore:
 
@@ -23,11 +38,15 @@ The recommended order is therefore:
 3. **Optimize the now-stable workload.**
 4. **Add supervised calibration and hybrid fallbacks with automatic rollback.**
 
-This order matters. Performance work against batch-dependent inputs can preserve the wrong behavior more efficiently. Recall tuning against contaminated self-labels or stale benchmarks can reward leakage rather than useful signal.
+The stability foundations are now in place, so the next work should harden
+their artifacts and invariance gates, then proceed to candidate recall and
+performance. A new independent `evaluation/` harness now provides reference-
+context RT, SQL/XGBoost, native zero-shot, and native fine-tuned comparisons;
+future evaluation must continue to exclude future information.
 
 ## 2. What “recall” means in this roadmap
 
-Recall is overloaded in this system. Every improvement and benchmark should state which of these it targets:
+Recall is overloaded in this system. Every future evaluation should state which of these it targets:
 
 | Recall type | Definition | Typical failure |
 |---|---|---|
@@ -42,15 +61,13 @@ Increasing context size only addresses evidence recall, and often inefficiently.
 
 | Evidence | Implication for the roadmap |
 |---|---|
-| C7 regression changed from 0.72297 to 0.55974 when C1 joined the batch | Fixed artifacts and batch-invariance tests are release blockers |
-| C7 binary probability changed by about 0.0258 under the same condition | Classification calibration cannot be trusted until normalization is fixed |
-| A cohort changed C7's own historical count from 1 to 2 | Focal facts and demonstration facts need separate ownership |
+| Historical: C7 regression and binary outputs changed when C1 joined the batch | Resolved by per-entity zero-shot normalization; retained as motivation and a permanent invariance gate |
+| Historical: a cohort changed C7's own historical count from 1 to 2 | Resolved for self-label evaluation through `focal_row_keys`; full peer demonstration separation remains |
+| Retained verification passes after cleanup and reference alignment | Batch invariance, persisted stats, task identity, traversal injection, exact RNG/index-sampling vectors, snapshot immutability, FK/PK rules, and leakage defense have regression coverage |
 | C++ CPU/MPS max drift is about 0.00391 from PyTorch | Native optimization is not the primary correctness gap |
 | MPS 80×16 FP32 is about 0.8 ms/entity vs. 7.6 ms for 1×16 | A serving scheduler can unlock much more throughput than another kernel rewrite |
 | Q8/Q4 reduce resident memory substantially but do not improve all measured latencies | Quantization should be selected for capacity, with quality gates, not assumed to be faster |
-| Churn loses to a recency baseline on three benchmark domains | Hybridization and calibrated task heads are more promising than context growth alone |
-| Buy-it-again works on repeat domains and fails structurally on MovieLens | Candidate generation must cover novel as well as repeated items |
-| Fine-tuned heads sometimes regress badly, including future-spend MAE | Training requires validation, early stopping, and automatic fallback |
+| Head fitting currently reports training loss without a held-out promotion gate | Training requires validation, early stopping, and automatic fallback |
 | Ranking may score up to 1,000 candidates with a full sequence per candidate | Two-stage retrieval is the largest ranking performance lever |
 
 ## 4. North-star properties
@@ -83,120 +100,66 @@ The system should eventually satisfy these properties simultaneously.
 
 ## 5. Roadmap overview
 
-| ID | Improvement | Stability | Performance | Recall | Dependency |
-|---|---|---:|---:|---:|---|
-| F1 | Repair benchmark/release gates and add stage telemetry | High | Medium | High | None |
-| S1 | Persist fixed column and task statistics | Critical | Medium | High | F1 |
-| S2 | Separate focal evidence from demonstrations | Critical | Medium | High | F1 |
-| S3 | Apply per-entity temporal bounds everywhere | Critical | Low | High | F1 |
-| S4 | Introduce a stable task/target representation | High | Low | High | S1–S3 |
-| S5 | Enforce artifact compatibility and data contracts | High | Medium | Medium | F1 |
-| S6 | Make budgets token-aware and truncation explicit | High | High | High | S2 |
-| R1 | Add a seeded, tiered, task-aware sampler | High | Medium | High | S1–S6 |
-| R2 | Add similarity and label-aware cohort selection | Medium | Medium | High | R1 |
-| R3 | Build two-stage ranking candidate generation | Medium | Critical | Critical | S3, F1 |
-| R4 | Harden head training and threshold calibration | High | Low | High | S1–S4, F1 |
-| R5 | Add validated hybrid baselines/fallbacks | High | Low | High | F1, R4 |
-| R6 | Implement real horizon conditioning | High | Medium | High | S4 |
-| R7 | Version multiclass vocabularies/class retrieval | High | High | High | S3–S5 |
-| P1 | Add dynamic batching and length buckets | Medium | Critical | Neutral | S1 |
-| P2 | Batch retrieval and push down query constraints | Medium | High | Medium | S6 |
-| P3 | Cache immutable preprocessing and schema work | Medium | High | Neutral | S1, S5 |
-| P4 | Add incremental/mmap serving indexes | Medium | High | Medium | S3, S5 |
-| P5 | Select device/precision by measured policy | Medium | High | Medium | F1 |
-| P8 | Remove hidden CPU-only output paths | Medium | High | Neutral | P5 |
-| O1 | Package native wheels and restore CI/release integrity | High | Medium | Neutral | S5 |
+| ID | Improvement | Status | Stability | Performance | Recall | Dependency |
+|---|---|---|---:|---:|---:|---|
+| S1 | Persist fixed column and task statistics | Foundation complete | Critical | Medium | High | None |
+| S2 | Separate focal evidence from demonstrations | Complete for reference task rows | Critical | Medium | High | None |
+| S3 | Apply per-entity temporal bounds everywhere | Partial | Critical | Low | High | None |
+| S4 | Introduce a stable task/target representation | Complete | High | Low | High | S1–S3 |
+| S5 | Enforce artifact compatibility and data contracts | Not started | High | Medium | Medium | None |
+| S6 | Make budgets token-aware and truncation explicit | Reference cell geometry complete; provenance remains | High | High | High | S2 |
+| R1 | Add a seeded, tiered, task-aware sampler | Reference parity complete; optional FAISS/balancing remain | High | Medium | High | S1–S6 |
+| R2 | Add similarity and label-aware cohort selection | Not started | Medium | Medium | High | R1 |
+| R3 | Build two-stage ranking candidate generation | Not started | Medium | Critical | Critical | S3 |
+| R4 | Harden head training and threshold calibration | Gap confirmed by held-out regression | High | Low | High | S1–S4 |
+| R5 | Add validated hybrid baselines/fallbacks | Not started | High | Low | High | R4 |
+| R6 | Implement real horizon conditioning | Not started | High | Medium | High | S4 |
+| R7 | Version multiclass vocabularies/class retrieval | Not started | High | High | High | S3–S5 |
+| P1 | Add dynamic batching and length buckets | Not started | Medium | Critical | Neutral | S1 |
+| P2 | Batch retrieval and push down query constraints | Not started | Medium | High | Medium | S6 |
+| P3 | Cache immutable preprocessing and schema work | Not started | Medium | High | Neutral | S1, S5 |
+| P4 | Add incremental/mmap serving indexes | Not started | Medium | High | Medium | S3, S5 |
+| P5 | Select device/precision by measured policy | Partial | Medium | High | Medium | None |
+| P8 | Remove hidden CPU-only output paths | Not started | Medium | High | Neutral | P5 |
+| O1 | Package native wheels and restore CI/release integrity | Not started | High | Medium | Neutral | S5 |
 
 “Critical” indicates a likely order-of-magnitude lever or a prerequisite for trustworthy operation. “Neutral” means the change should preserve recall and requires a no-regression gate.
 
-## 6. Foundation: measurement before optimization
+## 6. Evaluation infrastructure
 
-### F1.1 Repair the benchmark entry points
-
-Immediate changes:
-
-- Attach RtNativeBackend in benchmarks/run_suite.py before suite.run.
-- Attach a backend in benchmarks/harness/audit_fixes.py, or rewrite that audit so it never enters scoring.
-- Replace the 5,000,000-cell diagnostic policy with a bounded policy appropriate to the assertion being tested.
-- Fail before context assembly when a scoring command has no model backend.
-- Mark existing findings with the commit, checkpoint, and backend that produced them; archive results that cannot be reproduced.
-
-Acceptance:
-
-- Both documented benchmark commands run from a clean checkout.
-- A missing backend fails in less than one second and before any corpus-wide context assembly.
-- Result JSON is not written after a partial or failed run.
-
-### F1.2 Record complete experiment provenance
-
-Every result artifact should include:
-
-- source commit and dirty-tree hash;
-- canonical query AST and task identifier;
-- dataset identity/checksum and temporal split;
-- schema hash and index generation;
-- checkpoint URI, resolved revision, file hash, precision, and device;
-- embedding model identity and revision;
-- statistics artifact hash and cutoff;
-- sampler policy, context seed, and candidate policy;
-- head artifact hash, training cutoff, class list, and validation result;
-- batch size, length buckets, warm/cold state, and machine metadata.
-
-This turns benchmark drift into an explainable artifact difference rather than an investigation.
-
-### F1.3 Add stage-level telemetry
-
-Measure these independently:
-
-1. query parse/validation;
-2. entity enumeration;
-3. row retrieval/index traversal;
-4. WHERE and self-label evaluation;
-5. context selection;
-6. token construction and normalization;
-7. text/schema embedding lookup;
-8. native forward;
-9. candidate reranking;
-10. result shaping.
-
-For each stage record count, p50, p95, p99, maximum, bytes, rows, cells, emitted tokens, and cache hit rate where applicable.
-
-Required context counters:
-
-- focal rows and tokens;
-- demonstration rows and tokens;
-- rows omitted by time, fanout, relation quota, and global budget;
-- relation/table coverage;
-- number of historical labeled demonstrations;
-- disconnected/tokenless nodes;
-- context and sequence truncation;
-- candidate count before/after each generation stage.
-
-### F1.4 Establish quality scorecards
-
-Do not use one “accuracy” number. Use:
-
-| Task | Primary | Secondary | Calibration/coverage |
-|---|---|---|---|
-| Binary | AUROC and PR-AUC | recall at fixed precision; precision at fixed recall | Brier score, ECE, score cardinality |
-| Regression | MAE or normalized MAE | RMSE, Spearman, tail MAE | prediction interval coverage |
-| Multiclass | macro-F1 | balanced accuracy, top-3 recall | log loss, ECE |
-| Ranking | Recall@K and NDCG@K | MAP@K, hit rate | candidate recall@M, catalog/list coverage |
-| Forecast | horizon-weighted MAE | per-horizon MAE and rank correlation | coverage by horizon |
-
-Always report naive baselines and the number of eligible/observable labels.
+The previous `benchmarks/` tree remains intentionally deleted. Its entry
+points, bespoke datasets, formats, scorecards, and historical conclusions were
+not restored. The replacement is the independent `evaluation/` package: a
+ported 21-task catalog, optional RT/SQL-XGBoost/native/native-fine-tuned
+runners, exact reference sampled tensors for both native paths, official keyed
+RelBench scoring, and Markdown/JSON reports. The executed rel-f1 pair proves
+the end-to-end path; broad quality claims still require the complete catalog,
+seeds, confidence intervals, and declared promotion thresholds.
 
 ## 7. Stability workstream
 
 ### S1. Fixed statistics artifacts
 
+**Status: foundation complete; production artifact metadata remains.**
+
 #### Problem
 
-RtNativeBackend._normalize currently derives physical and synthetic-label statistics from the sequences in the active score call unless ColumnStats happens to be attached. This makes output depend on batch composition. Fine-tuning fits physical statistics, but synthetic task-label scaling remains request-dependent.
+At the time of the original review, `RtNativeBackend._normalize` derived
+physical and synthetic-label statistics across the active score batch. This
+was the demonstrated source of batch-dependent output.
+
+Current code has two explicit modes. `ZERO_SHOT` derives statistics separately
+per entity context. `REFERENCE`/`STATISTICS` requires `ColumnStats` containing
+physical-column, global datetime, and derived-task transforms. Missing entries
+raise instead of silently falling back. Fitted adapter heads persist both the
+mode and statistics, and adapter fitting collects labels before fitting task stats.
+The current task-stat implementation applies numeric mean/std uniformly;
+task-specific transforms below remain a design and validation step.
 
 #### Design
 
-Create a versioned PreprocessingArtifact with:
+Extend the implemented `ColumnStats`/head-sidecar foundation into a versioned
+`PreprocessingArtifact` with:
 
 - per-table/per-column numeric mean and standard deviation;
 - global datetime mean and standard deviation using one documented convention;
@@ -212,12 +175,13 @@ Task transformations should be explicit:
 - multiclass: fixed ordered class vocabulary;
 - ranking: fixed candidate feature transforms; no request-derived label statistics.
 
-The backend should have only two modes:
+The backend now has the intended two modes:
 
-1. artifact-backed production mode; or
-2. explicitly named experimental in-context mode.
+1. artifact-backed `REFERENCE`/`STATISTICS` mode; and
+2. explicitly named artifact-free `ZERO_SHOT` mode.
 
-It should never fall back per column or per request without surfacing the regime in PredictionResult.
+Strict missing-stat behavior is implemented. Surfacing the active regime in
+`PredictionResult` and adding schema/task/checkpoint hashes remain.
 
 #### Acceptance
 
@@ -225,6 +189,10 @@ It should never fall back per column or per request without surfacing the regime
 - Artifact fit uses no row later than its cutoff.
 - Serialization round-trip produces bit-identical transforms.
 - Missing/incompatible artifacts fail before retrieval in production mode.
+
+Implemented regression coverage already proves per-entity zero-shot batch
+invariance and persisted-stat transform use. Order/duplicate/chunk tests and
+full artifact compatibility checks remain acceptance work.
 
 #### Expected impact
 
@@ -234,21 +202,29 @@ It should never fall back per column or per request without surfacing the regime
 
 ### S2. Separate focal evidence from demonstrations
 
+**Status: complete for the reference task-row representation.**
+
 #### Problem
 
-EntityContext.rows currently merges focal and cohort subgraphs. _self_labels evaluates the target over all rows, so cohort events can change the focal label.
+Historically, `EntityContext.rows` merged focal and cohort subgraphs and
+`_self_labels` evaluated the target over all rows. `EntityContext` now records
+`focal_row_keys`; both traversals propagate ownership, assumptions preserve it,
+and self-label evaluation uses `focal_rows_by_table()`.
 
 #### Design
 
-Represent context ownership explicitly:
+The implemented representation contains:
 
 - focal_rows: facts reachable from the focal entity;
-- demonstrations: one or more peer contexts, each with its own entity ID, rows, timestamp, and known task label;
+- demonstrations: timestamped peer task rows, each connected to its own entity
+  graph and carrying a known historical label;
 - shared_rows: optional immutable dimension rows referenced by either group.
 
-Build self-labels from focal_rows only. Materialize each peer's historical label from that peer's rows, not by mixing all peers into one row bag. Preserve node connections inside each demonstration while preventing cross-entity aggregate evaluation.
-
-If changing EntityContext is too disruptive initially, attach owner_entity_id and role to every admitted row/node and require evaluation functions to select one owner.
+Peer task rows are now materialized for configurable prior windows. FOLLOWING
+labels may see through the end of their own window but are capped at the focal
+anchor. Graph edges preserve peer ownership and the reference task-table P2F
+restriction. Richer role/provenance rendering in explain output remains useful
+but is not a sampling-parity gap.
 
 #### Acceptance
 
@@ -259,9 +235,15 @@ If changing EntityContext is too disruptive initially, attach owner_entity_id an
 
 ### S3. Per-entity temporal bounds
 
+**Status: row traversal and statistics cutoff complete; batch-wide
+class/candidate domains remain.**
+
 #### Problem
 
-Multiclass and ranking domain enumeration use the maximum anchor in a batch. Statistics and cohort selection can also become unsafe if their cutoff is not explicit.
+Multiclass and ranking domain enumeration still use the maximum anchor in a
+batch. In contrast, both traversal implementations defensively recheck every
+row against the focal `TemporalBound`, and reference statistics fitted during
+fine-tuning use the last training anchor as an explicit cutoff.
 
 #### Design
 
@@ -280,24 +262,29 @@ Multiclass and ranking domain enumeration use the maximum anchor in a batch. Sta
 
 ### S4. Stable target representation
 
+**Status: complete.**
+
 #### Problem
 
-The reference model masks a real target cell with its actual task table and column semantics. RelativeDB emits a generic task.label row. The generic representation discards schema semantics that the model consumes.
+The original implementation emitted one generic `task.label` row. Current code
+uses `TaskSpec.from_query`: it canonicalizes the validated target AST and
+derives a stable task ID/table/column. Direct entity-column autocomplete masks
+the physical cell on the entity node.
 
 #### Design
 
-Use separate paths:
+The implemented paths are:
 
 1. **Entity-column autocomplete:** mask the actual focal cell in place and retain its real table and column embedding.
-2. **Materialized tasks:** expose an explicit task table in Schema, with entity link, timestamp, and target column; mask the real task cell.
-3. **Derived RelQL targets:** compile the canonical query into a stable TaskSpec containing task name, target semantic type, entity relation, horizon, aggregation, filters, and version.
+2. **Materialized tasks:** implemented as stable timestamped task rows with an
+   entity edge and task-specific target column; the focal target is masked and
+   emitted first.
+3. **Derived RelQL targets:** implemented as a canonical `TaskSpec` whose
+   identity includes the entity, target AST, task type, horizons,
+   aggregations, and filters represented in that AST.
 
-For derived targets, first evaluate two representations:
-
-- a stable materialized task-row schema whose table/column names are user-declared; and
-- a task-specific trained head over the frozen backbone.
-
-Do not assume a hashed synthetic column phrase is understood by a checkpoint that never saw that vocabulary. Test representation alternatives on validation tasks.
+`TaskSpecFactory` remains injectable for deployments that want registry-owned
+table/column names rather than the canonical hash-derived names.
 
 #### Acceptance
 
@@ -323,13 +310,17 @@ At row ingestion:
 
 - omit None/NaN cells rather than emitting zero-value tokens;
 - validate value types against Schema;
-- reject or explicitly support list-valued FKs;
+- validate scalar/list FK value types; list FKs are supported as multiple graph
+  edges and, when opted in as features, one stable text token;
 - report dangling FKs and duplicate IDs;
 - normalize all timestamps to one UTC contract;
 - enforce stable scanner ordering or sort by a documented key;
 - report tokenless connector rows before serving.
 
 ### S6. Token-aware budgets and fail-closed behavior
+
+**Status: traversal admission is bounded and reported; unified model-token
+budget remains.**
 
 #### Problem
 
@@ -351,59 +342,52 @@ Context assembly counts row cells, not final tokens. Synthetic targets, task his
 - Emitted token count never exceeds the configured limit.
 - No separately assembled rows are discarded by an unreported tail clip.
 - Increasing a budget is monotonic in retained evidence for a fixed seed/policy.
-- Truncation rate and quality-by-truncation cohort appear in benchmark output.
+- Truncation rate and quality-by-truncation cohort are exposed to the future
+  evaluation system.
 
 ## 8. Recall workstream
 
 ### R1. Seeded, tiered, task-aware sampling
 
+**Status: reference parity complete for graph-walk sampling; optional reference
+FAISS retrieval and label balancing remain.**
+
 #### Goal
 
 Increase useful evidence per token rather than simply increasing context size.
 
-#### Proposed sampler
+#### Implemented reference contract
 
-Build every context in explicit tiers:
+`Engine(..., traversal=...)` accepts a `GraphTraversal`.
+`ReferenceTraversal` is the default and consumes a one-time immutable
+bidirectional snapshot. `BreadthFirstTraversal` explicitly preserves the old
+pull-per-hop behavior.
 
-**Tier 0 — focal neighborhood**
+The reference path now performs 10,000 length-20 walks by default over all F2P
+and temporally valid P2F neighbors, then fills context in the same three tiers:
 
-- Always retain the target/task row and focal entity features.
-- Traverse direct parents needed to interpret focal/event rows.
-- Select temporally valid children relevant to target aggregations and filters.
-- Preserve a configurable mix of recent, frequent, high-value, and rare events.
-- Reserve relation quotas so one high-fanout table cannot consume the context.
+1. target BFS;
+2. visited same-table seeds ordered by timestamp/count/random priority;
+3. randomly sampled unvisited same-table fallback.
 
-**Tier 1 — same-task demonstrations**
+Within every seed BFS, F2P uses a LIFO priority stack and P2F draws from the
+shallowest frontier. DB children are uniformly sampled to width 32. Task-table
+P2F is legal only from a same-task seed. `visited_at_depth` is shared across
+seeds, node cells emit once, and the target cell is always first.
 
-- Select peer entities with known labels before the focal anchor.
-- Retrieve each peer's self-contained local neighborhood.
-- Prefer peers similar in schema features, history shape, and graph neighborhood.
-- Allow label balancing for training and evaluation contexts using historical labels only.
-- Diversify peers so near-duplicates do not consume the demonstration budget.
+Randomness ports rand 0.9.1 `StdRng` (ChaCha12), its `seed_from_u64` PCG
+expansion, Canon integer sampling, and index sampling. Regression vectors were
+generated by a Rust oracle and match exactly.
 
-**Tier 2 — broader graph evidence**
+The remaining optional reference modes are:
 
-- Use seeded random walks or graph-frequency scores to locate informative same-table nodes.
-- Fill unused relation quotas.
-- Optionally use a FAISS/entity-embedding index for similarity retrieval.
-
-**Tier 3 — deterministic fallback**
-
-- Fill remaining capacity with temporally valid same-table rows using a seeded order.
-- Do not fall back to raw scanner order, which can encode ingestion artifacts.
+- FAISS same-table similarity in place of walk ranking;
+- historical-label balancing when assembling training/evaluation contexts.
 
 #### Determinism
 
-Derive the default context seed from:
-
-- sampler version;
-- schema/index generation;
-- canonical task ID;
-- focal entity ID;
-- anchor;
-- user-provided global seed.
-
-One seed must produce one context. Multi-seed ensembling should be an explicit quality mode that records all seeds.
+The configured context seed, step, and snapshot-global target node ID feed the
+same wrapping seed arithmetic as the reference. One seed produces one context.
 
 #### Task-aware row value
 
@@ -427,7 +411,10 @@ Never use future truth to choose focal evidence.
 
 ### R2. Similarity, diversity, and label-aware cohorts
 
-The current “first scanner rows” cohort is neither similar nor representative.
+The compatibility BFS can still fall back to first scanner rows, which are
+neither similar nor representative. `ReferenceTraversal` improves diversity
+and determinism through walk-ranked peer seeds, but it does not yet use feature
+similarity, task labels, or maximal-marginal-relevance selection.
 
 Candidate cohort signals can include:
 
@@ -477,7 +464,8 @@ Generate a temporally eligible union from several inexpensive sources:
 
 Deduplicate and record the source of every candidate. Use source quotas so popularity does not eliminate personalized or novel candidates.
 
-This directly addresses the MovieLens structural failure: a repeat-only set cannot recall a future item that has never been seen by the entity.
+This addresses the structural limitation of repeat-only retrieval: it cannot
+recall a future item that has never been seen by the entity.
 
 #### Stage 2 — lightweight pruning
 
@@ -508,59 +496,55 @@ Build candidate-conditioned RT sequences only for the retained M. Batch or chunk
 
 #### Acceptance
 
-- Candidate recall@M reaches a declared target, preferably at least 95% of the attainable relevant items on repeat-capable benchmark tasks.
+- Candidate recall@M reaches a declared target on future evaluation tasks.
 - Full RT candidates are reduced by at least 80% from the current cap without reducing final Recall@K.
 - Novel-item recall is nonzero on datasets where future novel items exist.
 - Candidate generation is temporally valid and invariant to batch composition.
 
-### R4. Harden task-head training and calibration
+### R4. Make fine-tuning safe to promote
 
-#### Problem
+**Status:** implemented for binary classification and regression on native
+C++/MPS. The old scalar frozen-head path is no longer called fine-tuning.
+`Engine.fit_head()` remains available for multiclass and ranking adapters.
 
-The current head fitter trains for a fixed epoch count and reports training loss. Local experiments show that lower training loss can coincide with much worse held-out quality.
+The full-model trainer now has the controls needed for a long run:
 
-#### Training protocol
+- it trains on the task train split and scores the validation split separately;
+- it starts with zero-shot as the best checkpoint;
+- it accumulates small physical MPS batches into the requested effective batch;
+- it clips the global gradient norm before AdamW updates;
+- it saves model weights, optimizer moments, sampler position, and validation
+  history at atomic recovery points;
+- it restores the best checkpoint and lowers the learning rate when validation
+  gets worse; and
+- it stops after the configured validation patience is exhausted.
 
-- Use time-based train/validation/test splits.
-- Fit column, task-label, and feature statistics on train only.
-- Persist the exact class vocabulary and group construction.
-- Add validation evaluation during training.
-- Use early stopping and restore best validation weights.
-- Select learning rate, weight decay, and epoch cap on validation only.
-- Support class weights or focal loss for imbalanced binary/multiclass tasks.
-- Tune regression transforms and robust losses for sparse/heavy-tailed values.
-- Use pairwise or listwise ranking losses with entity group boundaries.
-- Mine hard negatives from the stage-1 candidate generator.
-- Calibrate classification probabilities using validation-only Platt/isotonic/temperature methods as appropriate.
-- Tune thresholds for the product objective: recall at required precision, cost-weighted utility, or capacity.
+A falling training loss is not enough to ship a model. Promotion requires a
+held-out validation improvement over the current best checkpoint, valid class
+coverage, and no leakage or stability failure. Test data is used only for the
+final report after model selection. Generated checkpoints and scores remain
+private under `evaluation/runs/`.
 
-#### Automatic rollback
+The default long-context evaluation keeps 8,192 cells. On memory-limited Apple
+Silicon, only the physical microbatch is reduced; gradient accumulation keeps
+the effective batch at 32. This is deliberately slower than the reference
+script's usual 1,024-cell task fine-tuning. Performance work should focus on
+reducing Metal synchronization and improving command submission without
+changing the training contract.
 
-Never activate a fitted head merely because training loss fell. Require:
+Remaining work:
 
-- minimum validation sample size and class coverage;
-- improvement over the released zero-shot head;
-- improvement over the best declared simple baseline, or an explicit reason to ship otherwise;
-- no stability/leakage failure;
-- calibration within tolerance;
-- confidence interval or repeated-split evidence where sample size permits.
-
-If a head fails, serve the zero-shot or hybrid fallback and retain the failed artifact only for diagnosis.
-
-#### Expected recall impact
-
-- Class weighting and threshold tuning directly increase minority-class recall.
-- Validation prevents catastrophic future-spend and repeat-purchase regressions.
-- Hard negatives focus ranking capacity on confusing candidates.
-- Fixed transforms let the head learn stable distinctions instead of request-specific scaling.
+- complete substantive classification and regression runs through validation;
+- run the selected checkpoints once on the untouched test split;
+- add probability calibration and product-specific threshold selection;
+- add class weighting or focal loss where validation shows a recall benefit; and
+- extend full-model training beyond scalar tasks only after their loss and
+  grouping rules are defined against the reference implementation.
 
 ### R5. Validated hybrid models and fallbacks
 
-The benchmarks show that one-line baselines can be stronger than RT-J on specific tasks:
-
-- recency for churn;
-- persistence for activity/value;
-- popularity for some ranking domains.
+Simple domain signals—such as recency, persistence, and popularity—may be
+stronger than RT-J on particular tasks.
 
 Treat these as signals, not merely competitors.
 
@@ -628,7 +612,10 @@ Acceptance:
 
 ### P1. Dynamic batching and length bucketing
 
-The measured MPS results show a large batching opportunity: approximately 7.6 ms/entity for 1×16 FP32 versus 0.8 ms/entity for 80×16.
+Short-sequence batching is expected to provide a substantial throughput
+opportunity. The new head-to-head harness records runner wall time, but its
+current two-task execution is a functional comparison rather than a controlled
+serving-performance study.
 
 Add an inference scheduler that:
 
@@ -641,7 +628,7 @@ Add an inference scheduler that:
 - reports queue time separately from compute time;
 - supports latency and throughput service classes.
 
-Benchmark:
+Future measurement should cover:
 
 - batch sizes 1, 4, 16, 32, 80;
 - sequence buckets such as ≤32, ≤128, ≤512, ≤2,048, ≤8,192;
@@ -799,71 +786,18 @@ Acceptance:
 - Device fallback is explicit in PredictionResult telemetry.
 - CUDA is not advertised for fine-tuned/multiclass paths until end-to-end support is tested.
 
-## 10. Recall–performance tradeoff experiments
+## 10. Evaluation expansion
 
-Every sampler/ranking change should produce a Pareto curve, not one point.
-
-### Context curve
-
-Evaluate token budgets such as 256, 512, 1,024, 2,048, 4,096, and 8,192:
-
-- quality metric;
-- evidence recall;
-- relation coverage;
-- known-label demonstrations;
-- end-to-end p50/p95;
-- native forward time;
-- truncation/degraded rate.
-
-### Cohort curve
-
-Evaluate 0, 4, 16, 64, and 256 demonstrations or the closest feasible peer budgets:
-
-- quality and calibration;
-- batch stability;
-- label/diversity coverage;
-- tokens and latency.
-
-### Ranking curve
-
-Evaluate candidate M and final K:
-
-- candidate recall@M;
-- final Recall@K/NDCG;
-- forwards/entity;
-- latency/memory;
-- novel-item recall.
-
-### Seed ensemble curve
-
-Evaluate one, two, four, and eight seeded contexts:
-
-- mean quality;
-- variance across seeds;
-- calibration;
-- cost multiplier.
-
-Ship the smallest configuration on the Pareto frontier that satisfies the product quality target.
+The replacement harness deliberately retains nothing from the removed legacy
+implementation. Next, expand its current reference-context RelBench slice to
+all 21 tasks and multiple deterministic seeds, add confidence intervals and
+calibration/latency artifacts, then define promotion thresholds. Ranking and
+product-specific recall still need separate leakage-safe datasets because the
+reference catalog does not exercise those product paths.
 
 ## 11. Delivery sequence and release gates
 
 The phases below are gated by evidence, not calendar dates.
-
-### Phase 0 — trustworthy harness
-
-Deliver:
-
-- repaired benchmark entry points;
-- provenance schema;
-- stage telemetry;
-- frozen baseline results for the current behavior;
-- invariance probes promoted to automated tests.
-
-Gate:
-
-- clean-checkout benchmark commands complete;
-- failures never write successful-looking result artifacts;
-- baseline metrics and stage timings are reproducible.
 
 ### Phase 1 — semantic stability
 
@@ -881,7 +815,7 @@ Gate:
 - cohort cannot alter focal labels;
 - temporal injection audit passes across every evidence/domain path;
 - unsupported behavior fails before scoring;
-- no benchmark metric is accepted if its stability gate fails.
+- no future quality result is accepted if its stability gate fails.
 
 ### Phase 2 — representation and sampling
 
@@ -955,9 +889,9 @@ Gate:
 - release artifacts reproduce tested hashes;
 - reference and RelativeDB repositories remain clean after all automated tests.
 
-## 12. Proposed release scorecard
+## 12. Current release correctness gates
 
-These are initial engineering gates, to be replaced by product-specific service objectives when available.
+These gates are independent of the predictive evaluation harness.
 
 ### Stability gates
 
@@ -972,32 +906,9 @@ These are initial engineering gates, to be replaced by product-specific service 
 | Artifact mismatch | deterministic fail before retrieval/forward |
 | Clean wheel native smoke | pass on every supported wheel |
 
-### Performance gates
-
-| Metric | Initial direction/gate |
-|---|---|
-| Short-context MPS throughput | at least 3× current single-request throughput when batching volume exists |
-| Ranking full RT candidates | at least 80% reduction at unchanged Recall@K |
-| Retrieval calls | bulk path grows by relation/hop, not traversed row count |
-| Wasted assembled rows | zero unreported post-assembly tail discard |
-| Cache behavior | bounded size plus hit/miss/eviction telemetry |
-| Long-context/ranking overload | bounded by token/candidate admission control |
-| Quantization | use only when capacity benefit is demonstrated and quality gate passes |
-
-### Recall/quality gates
-
-| Metric | Initial gate |
-|---|---|
-| Candidate recall@M | ≥95% of attainable relevant items where feasible |
-| Ranking | beat time-aware popularity on target domains; report novel-item recall |
-| Binary | beat recency/activity baselines on PR-AUC or meet recall-at-precision objective |
-| Regression | beat persistence/global mean on declared primary metric |
-| Multiclass | improve macro-F1, not only majority-class accuracy |
-| Fine-tuned head | held-out improvement over zero-shot and declared baseline |
-| Hybrid | held-out improvement with no unacceptable subgroup regression |
-| Quantized model | no quality/calibration degradation beyond declared tolerance |
-
-The gates should not be gamed by silently excluding difficult entities. Coverage and abstention rates belong beside every quality metric.
+Predictive-quality gates now use the independent `evaluation/` harness.
+Throughput gates still require a controlled serving-performance design rather
+than the current end-to-end smoke timings.
 
 ## 13. Test strategy
 
@@ -1039,39 +950,7 @@ Inject a uniquely identifiable future:
 
 Assert zero effect at earlier anchors and expected effect after the relevant time.
 
-### 13.4 Quality tests
-
-Maintain:
-
-- tiny deterministic correctness fixtures;
-- fast sampled benchmark smoke set;
-- full three-domain temporal suite;
-- Olist/GH experiments with stable provenance;
-- at least a subset of official RelBench tasks;
-- cold-start, sparse-history, high-fanout, and long-tail slices.
-
-Quality CI should have two layers:
-
-- per-PR smoke gates with broad regression tolerances;
-- scheduled/full gates with stable datasets, confidence intervals, and stricter promotion rules.
-
-### 13.5 Performance tests
-
-Measure complete request latency, not only forward:
-
-- pinned single entity;
-- 80 short entities;
-- one medium/long context;
-- mixed-length batch;
-- ranking at each candidate stage;
-- cold model/index;
-- warm model/index;
-- concurrent short and long traffic;
-- index refresh during active reads.
-
-Fail performance tests on statistically meaningful regression over repeated trials, not one noisy sample.
-
-### 13.6 Distribution/soak tests
+### 13.4 Distribution/soak tests
 
 - build and install each platform wheel in a clean environment;
 - parse, CSC build, CPU score, and supported device score;
@@ -1085,18 +964,19 @@ Fail performance tests on statistically meaningful regression over repeated tria
 
 | Area | Primary files | Planned responsibility |
 |---|---|---|
-| Context ownership/budget | python/src/relativedb/engine.py | Focal vs. demonstration contexts, token budget, fail-fast backend check, stats |
+| Context ownership/budget | python/src/relativedb/engine.py | Implemented focal ownership; remaining peer roles, unified token budget, and stats reporting |
+| Traversal policy | python/src/relativedb/traversal.py | Pluggable BFS/reference traversal; remaining relation quotas, task-aware selection, and quality promotion |
 | Row/retrieval contracts | python/src/relativedb/retrieve.py | Bulk callbacks, row provenance, data validation, stable ordering |
 | Evaluation | python/src/relativedb/evaluate.py | Owner-scoped aggregations and temporal-safe label evaluation |
-| Preprocessing/model manifest | python/src/relativedb/model.py plus a new artifact module | Fixed statistics, task transforms, hashes, checkpoint/embedding compatibility |
-| Tensor/target construction | python/src/relativedb/rt_native.py | Stable normalization, task representation, fixed domains, candidate pipeline |
+| Preprocessing/model manifest | python/src/relativedb/model.py and rt_native.py `ColumnStats` | Implemented modes/transforms; remaining artifact hashes, counts, checkpoint/embedding compatibility |
+| Stable task identity | python/src/relativedb/task.py | Implemented canonical `TaskSpec`; remaining materialized task schemas and validation metrics |
+| Tensor/target construction | python/src/relativedb/rt_native.py | Implemented stable normalization/direct targets; remaining fixed domains and candidate pipeline |
 | Index serving | python/src/relativedb/csc.py and csc_native.py | Bulk lookup, versioned generations, time-aware domain/cohort APIs |
 | Native index ABI | cpp/src/csc_c.h/.cpp and csc.hpp/.cpp | children-many and compact/mmap-friendly index operations |
 | Native inference | cpp/src/rt_c.h/.cpp and rt.* | Scheduler-friendly token batches, device/format telemetry, broader differential fixtures |
 | Head training | cpp/src/rt_train* and rt_native.py | Validation hooks, best-weight restore, weighted/robust/ranking losses |
 | RelQL validation | python/src/relativedb/relql/* and cpp/src/relql* | Reject unsupported ablation/horizons; stable canonical TaskSpec |
-| Benchmark harness | benchmarks/harness/*, run.py, run_suite.py | Provenance, stage metrics, candidate/evidence recall, promotion gates |
-| Native tests | cpp/src/test_* and benchmarks/xlang_fixture | Expanded geometry/device/format conformance |
+| Native tests | cpp/src/test_* and cpp/testdata | Expanded geometry/device/format conformance |
 | Python tests | python/tests/* | Invariance, temporal domains, artifacts, sampler, packaging contracts |
 | Packaging/release | python/pyproject.toml, cpp/CMakeLists.txt, .github/workflows/* | Native wheels, clean install matrix, removal/restoration of stale jobs |
 | Documentation | README.md, cpp/README.md, website/* | Supported contracts, model size/format, performance and quality provenance |
@@ -1105,59 +985,63 @@ Fail performance tests on statistically meaningful regression over repeated tria
 
 This is the smallest sequence likely to improve all three objectives without a large architecture rewrite.
 
-### Change 1 — fail fast and freeze the harness
+### Change 1 — introduce PreprocessingArtifact
 
-- Fix run_suite.py and audit_fixes.py backend wiring.
-- Move backend/config validation before context assembly.
-- Add provenance and stage timers.
-- Save a current baseline.
+**Status: partially complete.**
 
-### Change 2 — introduce PreprocessingArtifact
+- Completed: persist physical column, datetime, and task-target transforms in
+  `ColumnStats` and head sidecars.
+- Completed: remove implicit request-batch normalization; zero-shot is
+  per-entity and reference mode is strict.
+- Remaining: key a first-class artifact to schema/task/checkpoint/cutoff and
+  surface its identity in results.
 
-- Persist physical column, datetime, and task-target transforms.
-- Key it to schema/task/checkpoint/cutoff.
-- Remove implicit request-batch normalization in production mode.
+### Change 2 — add invariance gates
 
-### Change 3 — add invariance gates
+**Status: partially complete.**
 
-- Promote the demonstrated batch and cohort probes into tests.
-- Add temporal class/candidate injection tests.
+- Completed: promote batch invariance, persisted-stat behavior, task identity,
+  traversal determinism/injection, and leaky-retriever defense into tests.
+- Remaining: explicit cohort-order/self-label, duplicate, pagination, chunk,
+  and temporal class/candidate injection matrices.
 - Block further quality claims until they pass.
 
-### Change 4 — partition focal and peer contexts
+### Change 3 — partition focal and peer contexts
 
-- Ensure self-labels use focal rows only.
-- Encode each peer as a separate demonstration.
-- Expose ownership in explain output.
+**Status: partially complete.**
 
-### Change 5 — unify the token budget
+- Completed: track focal row keys and ensure self-labels use focal rows only.
+- Remaining: encode each peer as a separate labeled demonstration and expose
+  ownership in explain output.
+
+### Change 4 — unify the token budget
 
 - Reserve target/focal/relation/demo tokens.
 - Stop retrieval at admission.
 - Eliminate unreported tail truncation.
 
-### Change 6 — add candidate-recall instrumentation
+### Change 5 — add candidate-recall instrumentation
 
 - Measure candidate recall@M and novel-item rate with the current candidate set.
 - This reveals whether ranking needs better retrieval, reranking, or both.
 
-### Change 7 — implement the first two-stage candidate union
+### Change 6 — implement the first two-stage candidate union
 
 - Personal repeats + co-occurrence + popularity + novel/content source.
 - Cheap score to top 100.
 - RT rerank the retained set in chunks.
 
-### Change 8 — add validation/rollback to heads
+### Change 7 — add validation/rollback to heads
 
 - Time validation split, early stopping, best checkpoint, calibration, baseline comparison.
 - Do not activate failed heads.
 
-### Change 9 — add dynamic short-sequence batching
+### Change 8 — add dynamic short-sequence batching
 
 - Start with one checkpoint/device and two or three length buckets.
 - Preserve request order and record queue time.
 
-### Change 10 — package the tested native runtime
+### Change 9 — package the tested native runtime
 
 - Produce platform wheels containing the library.
 - Add clean install smoke tests.
@@ -1166,13 +1050,21 @@ This is the smallest sequence likely to improve all three objectives without a l
 
 ### Production statistics
 
-Choose whether RelativeDB:
+**Decision made:** support both user-supplied/fitted reference statistics and
+artifact-free zero-shot operation through an explicit configuration enum.
 
-- requires scanners to fit an offline/initial serving artifact;
-- accepts a user-supplied artifact;
-- or supports both.
+Remaining production decision: whether scanners fit the reference artifact at
+engine/index initialization or deployments must always supply one. In either
+case, extend the current `ColumnStats` representation with version and
+compatibility metadata.
 
-Do not retain silent per-request fitting as the production default.
+RelativeDB now:
+
+- accepts a user-supplied `ColumnStats` artifact;
+- fits bounded statistics automatically during fine-tuning; and
+- supports explicit per-entity `ZERO_SHOT` operation without an artifact.
+
+Silent cross-entity request fitting is removed.
 
 ### Online vs. snapshot serving
 
@@ -1186,12 +1078,17 @@ A single request must observe one coherent generation.
 
 ### Task representation
 
-Choose among:
+**Decision made for the first implementation:** physical-cell masking for
+entity autocomplete and canonical stable synthetic `TaskSpec` identities for
+derived RelQL targets. `TaskSpecFactory` is injectable for an external task
+registry.
+
+Still choose, using held-out validation, when to prefer:
 
 - materialized real task table;
 - user-declared stable derived task schema;
 - task-specific head;
-- or a supported combination by query class.
+- or the implemented canonical synthetic schema.
 
 This should be decided by validation evidence, not convenience.
 
@@ -1251,9 +1148,13 @@ Full or continued pretraining may eventually be valuable, especially for a stabl
 
 ## 19. Expected outcome
 
-If the roadmap is followed in order:
+The first stability foundations—explicit normalization modes, focal label
+ownership, stable task identity, and pluggable deterministic traversal—are now
+implemented. If the remaining roadmap is followed in order:
 
-- **Stability** improves first through fixed artifacts, focal/demo separation, temporal bounds, explicit budgets, and fail-fast compatibility.
+- **Stability** advances from those foundations through versioned artifact
+  compatibility, complete peer/demo separation, per-entity domains, explicit
+  token budgets, and fail-fast loading.
 - **Recall** improves through higher-value evidence, representative demonstrations, candidate-source coverage, validated heads, calibrated thresholds, and hybrids with strong simple signals.
 - **Performance** improves through bounded work, two-stage ranking, bulk retrieval, caching, batching, and workload-aware device selection.
 

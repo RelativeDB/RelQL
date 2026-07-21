@@ -6,6 +6,14 @@
 **Reference:** `~/relational-transformer` at `eece04847de7b52d6fe7a718c277abec7bb18c83`  
 **Implementation under review:** `~/relativedb` at `c361db29d9584dcedf7bf89145d89256807333f8`, plus the existing uncommitted worktree changes listed below
 
+**Implementation update:** 2026-07-20. Sections marked “Current status” were
+reconciled after RelativeDB added configurable zero-shot/reference
+normalization, stable `TaskSpec` target identities, focal-row ownership, and a
+pluggable reference-style traversal. Historical probes remain in the report as
+evidence of the defects that motivated those changes. Implementation details
+and configuration examples are recorded in
+`REFERENCE_ALIGNMENT_IMPLEMENTATION.md`.
+
 ## 1. Purpose, scope, and interpretation
 
 This is a repository-wide comparison of Stanford's `relational-transformer` implementation with RelativeDB's implementation in this repository. It covers repository structure, data contracts, preprocessing, context sampling, tensor construction, model math, checkpoints, runtime backends, query/task semantics, training, evaluation, packaging, tests, CI, and documentation.
@@ -17,14 +25,14 @@ The two repositories are not forks. Only `.gitignore` and `README.md` occur at t
 3. every correctness or release risk found through targeted execution;
 4. an exhaustive tracked-file/subsystem disposition in Appendix A.
 
-Generated corpora, build products, caches, checkpoint payloads, notebooks' binary cell output, and untracked benchmark data are not compared byte-for-byte. They are discussed where they affect behavior or reproducibility.
+Generated corpora, build products, caches, checkpoint payloads, and notebooks'
+binary cell output are not compared byte-for-byte.
 
 ### Worktree state
 
 The reference repository was clean. This repository already contained user changes before the review:
 
 - modified: `README.md`, `python/src/relativedb/engine.py`, `python/src/relativedb/rt_native.py`, `python/tests/test_engine.py`, `python/tests/test_rt_native.py`, and `python/tests/test_xlang_parity.py`;
-- untracked: `benchmarks/gh/` and `benchmarks/olist/`.
 
 Those changes were reviewed as part of the current implementation and were not reverted or rewritten. This report is the only file added by the review.
 
@@ -34,30 +42,36 @@ RelativeDB is **not a reimplementation of the reference product**. It is a new o
 
 - The **model core is strongly conformant**. The current reference PyTorch model exactly reproduces RelativeDB's committed golden fixture, and RelativeDB's C++ CPU and MPS paths reproduce it within about `3.91e-3` maximum absolute drift.
 - The **end-to-end prediction system is not reference-equivalent**. RelativeDB changes the target-row representation, normalization, cohort construction, graph sampling, temporal handling, supported tasks, and output decoding. These differences are large enough to change predictions even when the native transformer kernel itself is correct.
-- RelativeDB adds substantial product surface absent from the reference: RelQL, online callbacks, point-in-time query planning, assumptions, explanations, native CPU/MPS/CUDA inference, quantization, ranking/multiclass adapters, and frozen-backbone head training.
-- RelativeDB omits substantial research surface present in the reference: RelBench preprocessing, rkyv/mmap datasets, the production sampler's walk/seed tiers, full-model pretraining, DDP/SWA, the official evaluator, task/config-aware checkpoint loading, legacy RT/PluRel compatibility, and the `rel2tab` baseline framework.
+- RelativeDB adds substantial product surface absent from the reference: RelQL, online callbacks, point-in-time query planning, assumptions, explanations, native CPU/MPS/CUDA inference, quantization, ranking/multiclass adapters, frozen-backbone head training, and full-checkpoint scalar-task MPS fine-tuning.
+- RelativeDB omits substantial research surface present in the reference: RelBench preprocessing, rkyv/mmap datasets, full-model pretraining, DDP/SWA, task/config-aware checkpoint loading, legacy RT/PluRel compatibility, and most of the `rel2tab` framework. Reference traversal and official evaluation are now available through the product sampler and isolated `evaluation/` adapter respectively.
 
-The highest-priority issue is outside the transformer math: **default zero-shot predictions are batch-dependent** because RelativeDB fits numeric and synthetic-label normalization from the entities in the current scoring call. The same entity produced materially different regression and classification outputs when another entity was added to the batch. That violates ordinary scoring determinism and the reference pipeline's fixed preprocessing-stat contract.
+The original review's highest-priority defects were outside the transformer
+math. Batch-dependent normalization is now removed, targets have stable task
+identities, and context construction now implements the reference sampler over
+an immutable bidirectional snapshot. Derived queries materialize timestamped
+task rows with peer labels, and the target task cell is always emitted first.
+Primary keys never become features. Foreign keys remain graph structure by
+default; RelativeDB's only intentional sampling/input extension is an opt-in,
+non-targetable FK feature token, including stable text serialization for list
+FKs while retaining every graph edge.
 
 ## 3. Prioritized findings
 
 | Priority | Finding | Evidence | Consequence |
 |---|---|---|---|
-| P0 | Default zero-shot normalization is fitted across the current scoring batch. | `python/src/relativedb/rt_native.py:1193`; live probe in §10.2 | A prediction for one entity changes when unrelated entities are added or removed. |
-| P0 | RelativeDB replaces the real task-table target cell with a generic synthetic `task.label` target. | RelativeDB sequence builder vs. `rustler/src/fly.rs:1116-1266` | The model sees different table/column semantics from the representation on which the reference was trained and evaluated. |
-| P0 | Cohort rows enter the current entity's self-label aggregation. | `python/src/relativedb/rt_native.py:993`; live probe in §10.3 | Other entities' histories can be counted as the target entity's history. |
-| P1 | Context construction is geometrically different from the reference sampler. | `python/src/relativedb/engine.py:584-655`; `rustler/src/fly.rs:1116-1739` | Kernel parity does not imply end-to-end reference parity. |
+| Resolved P0 | Default zero-shot normalization was fitted across the current scoring batch. | Historical probe in §10.2; current regression test `test_zero_shot_normalization_is_batch_invariant` | Zero-shot is now entity-local and batch invariant; reference mode uses strict persisted statistics. |
+| Resolved P0 | RelativeDB used a generic synthetic `task.label` target. | Current `python/src/relativedb/task.py`, `traversal.py`, and sequence builder | Entity-column autocomplete masks the physical cell; derived targets use canonical identities and materialized timestamped task rows with peer labels. |
+| Resolved P0 | Cohort rows entered the focal entity's self-label aggregation. | Historical probe in §10.3; current `EntityContext.focal_row_keys` | Self-label evaluation now uses the focal subgraph only. Fully separated peer demonstration objects/explain output remain future work. |
+| Resolved P1 | Context construction differed from the reference sampler. | Current `python/src/relativedb/traversal.py`; `rustler/src/fly.rs:1116-1998` | `ReferenceTraversal` is now the default and implements the reference graph walks, three seed tiers, F2P-priority/P2F-width BFS, temporal rules, cell geometry, stable node IDs, and rand 0.9.1 ChaCha12 stream. Legacy BFS is an explicit plugin. |
 | P1 | The built Python wheel does not contain or build `librt_c`. | clean wheel/install probe in §10.7 | The advertised parser, CSC, and native inference are unavailable after a normal wheel install. |
 | P1 | Forecast horizons repeat one scalar rather than making horizon-specific predictions. | `python/src/relativedb/rt_native.py:960` | A multi-horizon query returns duplicated values, not a forecast curve. |
 | P1 | `ABLATE` parses and appears in plans but is not executed. | `python/src/relativedb/engine.py:1012` | A scientifically meaningful reference ablation is currently a declared no-op. |
 | P1 | Multiclass/ranking candidate enumeration uses the maximum bound across a batch. | `python/src/relativedb/rt_native.py:1334` | Later candidates/classes can become visible to entities with earlier anchors. |
 | P1 | Checkpoint metadata is ignored and the documented embedding guard is not called. | `python/src/relativedb/model.py:64`; `rt_native.py:672-709` | Architecture/encoder mismatches can load without the intended fail-fast validation. |
 | P1 | Release workflows reference removed Rust, Java, and DuckDB trees. | `.github/workflows/release-libraries.yml`; `.github/workflows/duckdb-extension.yml` | Current release jobs cannot succeed as written. |
-| P1 | `run_suite.py` never attaches a native model backend. | `benchmarks/run_suite.py:37-44`; dataset constructors | The documented generalizability command does expensive assembly but cannot complete scoring. |
 | P2 | Package name and README install command disagree. | `python/pyproject.toml:6`; `README.md:91` | `pip install relativedb` does not match distribution name `relationdb`. |
 | P2 | Model-size and checkpoint-format documentation is inconsistent. | `README.md:26,83`; `cpp/README.md:44,195-236` | The current 86M-parameter BF16 checkpoint is described as 22M and “fp32”/171 MB. |
 | P2 | `python/pyproject.toml` names a missing package README. | `python/pyproject.toml:9` | Wheel/sdist builds warn and ship incomplete project metadata. |
-| P2 | Benchmark findings and binding claims contain stale counts/components. | `benchmarks/FINDINGS.md`; current tracked tree/tests | Published evidence is difficult to reproduce against the current implementation. |
 
 ## 4. System identity and architecture
 
@@ -71,9 +85,9 @@ The highest-priority issue is outside the transformer math: **default zero-shot 
 | Native code | Rust preprocessing and sampling extension | C++ parser, CSC, inference, quantization, and training; Metal/CUDA source |
 | Data mode | Offline RelBench/manifest/Parquet preprocessing | Live user callbacks or an in-memory CSC snapshot |
 | User task interface | Python `Task` records and scripts | RelQL strings, AST, execution API, and Python schema/retriever objects |
-| Model role | Configurable PyTorch training and inference | Hard-coded RT-J native inference; optional frozen-head adaptation |
-| Main devices | PyTorch CUDA; CPU/MPS eager possible for small examples | CPU, MPS, and optional CUDA inference; Metal head training |
-| Evaluation | Curated RelBench tasks and `rel2tab` baselines | Custom point-in-time benchmark harness plus Olist/GH/task-fit experiments |
+| Model role | Configurable PyTorch training and inference | Hard-coded RT-J native inference; native scalar full-checkpoint fine-tuning plus optional frozen-head adaptation |
+| Main devices | PyTorch CUDA; CPU/MPS eager possible for small examples | CPU, MPS, and optional CUDA inference; native MPS full-model/head training |
+| Evaluation | Curated RelBench tasks and `rel2tab` baselines | Independent `evaluation/` four-runner RelBench harness; legacy `benchmarks/` remains deleted |
 | Documentation | Markdown guides and examples | Root/product docs plus Docusaurus site |
 
 ### 4.1 Reference data flow
@@ -86,7 +100,13 @@ Full pretraining uses the same sampling stack with PyTorch optimization, distrib
 
 `Schema + Row callbacks/scanners → live retriever or CSC snapshot → RelQL validation/planning → Python context builder/tokenizer → C++ RT-J → typed query results`
 
-Fine-tuning freezes the native backbone, extracts target features, trains a small linear head on Metal, and serves that head over backbone features.
+`Engine.fit_head()` freezes the native backbone, extracts target features,
+trains a small linear head on Metal, and serves that adapter over backbone
+features. `Engine.finetune()` is a separate C++/MPS path: it differentiates
+through the encoders, sparse relational attention, every transformer block,
+normalizations, learned mask, and numeric decoder, then exports a complete
+safetensors checkpoint. Binary/regression are supported; multiclass/ranking
+remain on the explicitly named frozen adapter path.
 
 These are different system boundaries. The reference owns dataset transformation and training. RelativeDB owns online query semantics and serving.
 
@@ -101,7 +121,7 @@ These are different system boundaries. The reference owns dataset transformation
 | Core Python LOC | 3,350 in `src/rt` | 4,749 in `python/src/relativedb` |
 | Native LOC | 3,413 Rust | 7,144 C++/Metal/CUDA |
 | Core test LOC | 218 Python | 2,049 Python + 537 C++ |
-| Extra framework/benchmark LOC | 4,823 `rel2tab` + 4,127 scripts | 5,506 benchmark Python |
+| Extra research/evaluation LOC | 4,823 `rel2tab` + 4,127 scripts | About 923 Python lines in the new isolated `evaluation/` package |
 | Site/docs LOC | 856 docs/examples | 1,855 website source/docs |
 
 The LOC figures are physical line counts for the listed tracked source groups, not complexity measures.
@@ -148,7 +168,9 @@ The LOC figures are physical line counts for the listed tracked source groups, n
 - Has no manifest/Parquet preprocessor or portable serialized dataset format comparable to the reference.
 - The CSC mode snapshots all scanner output when the engine initializes; it is not a continually updated database index.
 - The public contract says null cells should be omitted. If a caller includes `None` in `Row.cells`, the tokenizer still emits a typed zero value rather than omitting the cell.
-- `Row.parents` is scalar per FK column. It does not model a list-valued FK relationship directly.
+- `Row.parents` accepts scalar and list/tuple FK identities. List FKs create
+  one graph edge per value. When FK feature emission is enabled, the whole list
+  is additionally serialized as one stable compact text token.
 
 ### 6.3 Statistics and normalization
 
@@ -162,14 +184,25 @@ The LOC figures are physical line counts for the listed tracked source groups, n
 
 **RelativeDB**
 
-- Historically/default zero-shot behavior computes normalization from the sequences in the current `score` call.
-- Current worktree code adds `ColumnStats` and fits it automatically during `Engine.finetune`, which improves physical numeric/datetime column stability for that workflow.
-- It does not automatically fit/persist physical-column statistics for normal zero-shot engine construction.
-- Even when physical `ColumnStats` is supplied, synthetic historical task-label values are normalized from the current batch.
-- Its datetime standard-deviation convention is not exactly the reference preprocessor's convention, despite “reference” language in nearby documentation.
-- Replaces zero standard deviations defensively; the reference's boolean path can retain zero variance.
+- Exposes `ModelConfig.normalization_mode` and a backend override with two
+  explicit contracts: `ZERO_SHOT` and `REFERENCE` (`STATISTICS` is an alias).
+- `ZERO_SHOT` derives numeric, boolean, datetime, and derived-label statistics
+  independently inside each entity sequence. Other entities in the request do
+  not contribute to those transforms.
+- `REFERENCE` requires `ColumnStats`; missing physical or task statistics fail
+  closed instead of falling back to request data.
+- `ColumnStats` uses sample standard deviation for numeric columns and the
+  reference Welford/population convention for the global datetime transform.
+- Adapter fitting fits physical statistics at the training cutoff, adds persisted
+  task-target statistics after labels are collected, and saves both the mode
+  and statistics with the head sidecar.
+- Zero-shot intentionally remains artifact-free and context-relative. It is
+  stable across batching, but is not numerically identical to preprocessing-
+  time reference statistics. Reference equivalence requires `REFERENCE` mode.
 
-This normalization layer is the largest demonstrated source of end-to-end nondeterminism; see §10.2.
+The batch-dependence demonstrated in §10.2 is therefore historical and now
+covered by a regression test. Artifact versioning, schema/checkpoint hashes,
+row counts, and drift management remain open.
 
 ### 6.4 Target representation
 
@@ -185,10 +218,20 @@ This is the most fundamental semantic divergence.
 
 **RelativeDB**
 
-- Builds an entity context, then creates a synthetic generic target row. Its masked `task.label` (and optional `task.timestamp`) tokens are emitted before the real context tokens.
-- Produces historical “self-labels” by evaluating the RelQL target expression over assembled context rows.
-- Therefore does not preserve the target task table's original name, target column name, task row topology, or task-table peer semantics.
-- Bare entity-column autocomplete is also routed through the generic target representation instead of masking the real entity cell in place.
+- Builds a stable `TaskSpec` from the validated target AST, entity table, and
+  task type. Formatting-equivalent queries share an identity; semantic changes
+  such as a different horizon or filter produce another identity.
+- Bare entity-column autocomplete masks the actual physical table/column cell
+  on the focal entity node, retaining the schema phrase the checkpoint expects.
+- Derived RelQL targets use deterministic task table and target column names
+  derived from the canonical identity, rather than one shared `task.label`.
+- Produces historical self-labels by evaluating the query only over
+  `focal_row_keys`, so global peer rows cannot rewrite the focal target history.
+- Derived queries materialize a focal unknown task row and configurable prior
+  task windows for every entity. Historical labels are evaluated at their own
+  cutoff, may see their FOLLOWING window, and are capped at the focal anchor.
+  Task rows connect bidirectionally to their entity and obey the reference rule
+  that task-table P2F edges are traversed only from a same-task seed.
 
 The RT-J weights can be numerically correct and still receive an out-of-distribution prompt geometry because schema/table/column semantics are part of every token.
 
@@ -196,25 +239,34 @@ The RT-J weights can be numerically correct and still receive an out-of-distribu
 
 | Behavior | Reference sampler | RelativeDB |
 |---|---|---|
-| Global context default | 8,192 cells | 8,192 counted row cells |
-| Local context default | 256 | No equivalent local neighborhood quota |
-| BFS width | 32 default evaluation width | 32 default per hop |
-| Walk ranking | 10,000 random walks, length 20 by default | None |
-| Same-table peers | Multi-tier visited/unvisited selection, stochastic fallback; optional FAISS | Cohort callback, otherwise first scanner rows |
-| Peer ordering | Recency/frequency controls, seeded randomness | Scanner order; child rows newest-first |
+| Global context default | 8,192 cells | 8,192 cells |
+| Local context default | 256 | 256 |
+| BFS width | 32 default evaluation width | 32 |
+| Walk ranking | 10,000 graph random walks, length 20 by default | 10,000 bidirectional graph walks, length 20 |
+| Same-table peers | Target BFS, walk-visited seeds, random unvisited fallback; optional FAISS | Same three tiers; FAISS remains future work |
+| Peer ordering | Timestamp desc/count desc/random tie, or count desc/random tie | Same ordering and tie stream |
 | Label balancing | Supported | Not supported in context construction |
-| Seed reproducibility | Explicit shuffle/context seeds | No sampling seed because default selection is deterministic scanner/BFS order |
-| Budget fill | Target first, then tiered BFS/peer neighborhoods until cell capacity | Entity/BFS/cohort rows, then independent token truncation |
-| Time filtering | Target-time checks on same-table seeds and P2F expansion | Defensive `TemporalBound` applied to every callback result |
+| Seed reproducibility | rand 0.9.1 `StdRng` streams derived from context/step/node | Ported rand 0.9.1 ChaCha12, PCG seed expansion, integer ranges, and index sampling; oracle-tested against Rust |
+| Budget fill | Target first, then tiered BFS/peer neighborhoods until cell capacity | Same target-first and local/global cell accounting |
+| Time filtering | Target-time checks on same-table seeds and P2F expansion | Same target-time rules plus defensive snapshot-bound checks |
 | Static rows | Admitted | Admitted |
 
 Additional RelativeDB-specific differences:
 
-- Parent rows are always followed; children are capped newest-first at each hop.
-- Cohort defaults to 256, but a cohort is empty if neither a cohort callback nor a scanner is provided. The README quick-start configuration therefore does not actually obtain the default 256 peers.
-- The cell budget counts `len(Row.cells)` plus a timestamp. It does not count the synthetic target/self-label tokens. The tokenizer later truncates to sequence length, so admitted graph context and final tensor context can differ.
-- The reference limits feature-to-parent neighbors to five and asserts its tensor shape. RelativeDB also uses five, but silently truncates a longer parent-node list.
-- RelativeDB's online retrieval provides stronger defensive rechecking of callback timestamps than the reference's parent traversal, but it also makes behavior dependent on application callback correctness and completeness.
+- `ReferenceTraversal` is the engine default. It requires scanner material from
+  which the engine builds one immutable CSC/bidirectional graph snapshot.
+  `BreadthFirstTraversal` remains available explicitly for pull-per-hop legacy
+  wiring.
+- Snapshot row values and parent maps are copied and made immutable. Physical
+  nodes keep snapshot-global IDs across focal contexts; virtual task node IDs
+  are deterministic by entity and history slot.
+- F2P is a LIFO priority frontier. P2F selects randomly from the shallowest
+  level, applies target-time validity, samples DB fanout uniformly to width 32,
+  and admits task P2F only for a same-task seed.
+- The five-parent tensor limit now fails closed instead of silently dropping
+  parent relationships.
+- PKs are identity-only. FK feature tokens are disabled by default and are the
+  sole deliberate divergence from reference preprocessing when enabled.
 
 ### 6.6 Transformer architecture: genuine parity
 
@@ -294,7 +346,9 @@ RelativeDB adds q8, q4, and f16 converted formats. Q8 is per-row; Q4 uses groups
 - q8/q4/f16 are supported on CPU/MPS; current CUDA is FP32 only.
 - The text-head extended forward used for zero-shot multiclass decoding is CPU-only.
 - Frozen target-feature extraction works on CPU/MPS; the C ABI explicitly rejects CUDA for this operation.
-- Fine-tuned head training is Metal-only. At serving time, backbone feature extraction follows the selected CPU/MPS device, then the small saved head is evaluated on CPU.
+- Frozen adapter-head training is Metal-only. At serving time, backbone feature extraction follows the selected CPU/MPS device, then the small saved head is evaluated on CPU.
+- Full-checkpoint binary/regression fine-tuning is native MPS-only. It uses MPS matrix primitives for all GEMMs and custom SIMD-group Metal kernels for the exact sparse relational masks and their backward pass; it has no Torch dependency.
+- Native training-forward, repeated-step, checkpoint, and 8,192-cell M3 evidence is recorded in `evaluation/runs/native-mps-finetune-verification.md`.
 
 ### 6.10 Task surface
 
@@ -353,14 +407,24 @@ These features are additions, not parity with reference behaviors. In particular
 
 **RelativeDB**
 
-- Does not preprocess a multi-database pretraining corpus and cannot train the backbone.
-- Extracts a frozen 512-dimensional target representation.
-- Trains only a small task head: linear regression/binary or `512 × C + C` multiclass/ranking parameters.
-- Builds labels either from supplied labels or by evaluating future RelQL windows.
-- Persists a safetensors head and sidecar metadata/statistics.
-- Does not implement DDP, optimizer resume, SWA, or reference training recipes.
+- Does not perform the reference repository's multi-database pretraining, DDP,
+  Muon, or SWA workflow.
+- Fine-tunes the complete RT-J checkpoint for binary and regression tasks with
+  native C++/MPS forward, backward, gradient clipping, and AdamW updates.
+- Uses the reference Rust sampler for task-specific train and validation
+  contexts.
+- Supports gradient accumulation, atomic model and optimizer checkpoints,
+  exact sampler-position resume, validation selection, early stopping, and
+  automatic restore-and-learning-rate-backoff when quality drops.
+- Starts validation selection from the released zero-shot checkpoint. A
+  trained model is not activated merely because its training loss decreased.
+- Keeps frozen-head fitting as a separately named adapter path for multiclass
+  and ranking tasks. Those adapters do not qualify as `ours_finetuned`.
 
-Head training is a useful product adaptation, but it is not equivalent to the full-model reference training or to continued pretraining.
+RelativeDB now supports full-model task fine-tuning, but it still does not
+replace the reference pretraining stack. These are different jobs: task
+fine-tuning adapts a released checkpoint to one target, while pretraining builds
+the shared checkpoint from many databases.
 
 ### 6.13 Evaluation and baselines
 
@@ -375,27 +439,32 @@ Head training is a useful product adaptation, but it is not equivalent to the fu
 
 **RelativeDB**
 
-- Has a point-in-time harness over MovieLens, Online Retail II, and Brightkite, with naive recency/activity/popularity baselines.
-- Has separate task-fit experiments using XGBoost, Digits, Olist, and untracked current GH/Olist work.
-- Does not use the reference sampler or official task-table evaluator, so headline numbers are not apples-to-apples with released RT-J results.
-- The committed findings state that the engine wins 4 of 10 scorable cells and that churn loses to recency on all three core datasets.
-- The findings correctly warn about possible pretraining contamination in several public datasets and weak ranking/multiclass behavior.
+- Now has a clean `evaluation/` harness, implemented independently of the
+  deleted legacy `benchmarks/` tree. It ports the reference 21-task catalog,
+  official keyed RelBench scoring, and optional `rt`, SQL/XGBoost, `ours`, and
+  `ours_finetuned` runners.
+- `ours` consumes the reference evaluator's exact Rust-sampled tensor batches.
+  `ours_finetuned` uses the same path but requires a complete task-specific
+  model checkpoint; frozen head adapters are excluded from that runner.
+- The executed two-task rel-f1 slice and its reproducible Markdown/JSON output
+  are in `evaluation/runs/rel-f1-head-to-head/`. It is integration evidence,
+  not a statistically complete 21-task quality claim.
+- Unit, integration, native conformance, and sampler/normalization tests remain
+  separate release gates.
 
-Selected local experiment results are shown below. The Olist/GH rows come from the current untracked worktree reports, while Digits comes from a committed task-fit artifact; they are evidence from different protocols, not one benchmark leaderboard.
+#### Evaluation results
 
-| Experiment | RelativeDB result | Comparator/result | Interpretation |
-|---|---:|---:|---|
-| Olist bad review, zero-shot | AUROC 0.547 | XGBoost 0.521 | Small positive comparison in this split |
-| Olist bad review, head | AUROC 0.476 | XGBoost 0.521 | Adaptation regresses |
-| Olist review stars, zero-shot | Accuracy 0.565 | XGBoost 0.548 | Accuracy higher, but macro-F1 0.144 vs. 0.176 |
-| Olist future spend, zero-shot | MAE 38.25 | XGBoost 11.35 | Large regression gap |
-| Olist future spend, head | MAE 709.64 | XGBoost 11.35 | Failed adaptation |
-| Olist repeat purchase, zero-shot | AUROC 0.630 | XGBoost 0.584 | Positive comparison |
-| Olist repeat purchase, head | AUROC 0.407 | XGBoost 0.584 | Adaptation regresses |
-| GH bot, head | AUROC 0.523 | XGBoost 0.977 | Very large gap |
-| Digits head | Accuracy 0.703 | released baseline in local report 0.10 | Head learns the synthetic task |
+Generated evaluation outputs are private local artifacts and are not committed.
+The harness records the effective context, split, checkpoint, validation history,
+and official task metric for each runner. A full-model checkpoint can enter the
+`ours_finetuned` column only after it beats the current best model on validation.
+Frozen-head diagnostics are kept separate and are never presented as full-model
+fine-tuning.
 
-The committed `task_fit/olist_results.json` also contains alternative task-fit runs with different splits/recipes; those should not be merged with the table above without recording provenance.
+The paper is useful background, but the checked-out reference repository is the
+implementation authority for sampler behavior and the current training recipe.
+A comparison with paper numbers is not a controlled reproduction unless it uses
+the same checkpoint, preprocessing split, context length, and selection rules.
 
 ### 6.14 Query planning and explainability
 
@@ -428,8 +497,6 @@ Confirmed inconsistencies in RelativeDB:
 - Root README says 22M parameters; the loaded RT-J configuration contains 85,565,091 parameters, conventionally 86M.
 - Root checkpoint table labels a 171 MB file “fp32.” The inspected upstream safetensors has 400 BF16 tensors and is 171,169,942 bytes; expanding those weights to FP32 takes about 342 MB. `cpp/README.md` explains the distinction more accurately.
 - Root install command says `pip install relativedb`; project metadata says `relationdb`.
-- `benchmarks/task_fit/README.md` repeats the 22M claim.
-- `benchmarks/FINDINGS.md` refers to current Java/Rust bindings that are absent and reports older parser corpus counts; current C++ tests pass 67 accepted and 22 rejected cases.
 - Several source/site comments refer to absent `CONTRACT.md`, `RelQL_EVOLUTION.md`, `kb/architecture.md`, and scratchpad specifications.
 - `release-libraries.yml` still packages/tests absent `rust/` and `java/`.
 - `duckdb-extension.yml` still targets absent root Cargo and `duckdb-extension/` files.
@@ -451,7 +518,8 @@ The reference's docs are narrower but internally align more closely with its cur
 | CPU native runtime | PyTorch | C++ | Different implementation |
 | MPS runtime | Eager PyTorch | Custom native backend | Addition |
 | CUDA runtime | PyTorch | Optional custom backend | Different implementation |
-| Full-model pretraining | Yes | No | Missing |
+| Full-model pretraining | Yes | Task fine-tuning only | Partial: no multi-dataset pretraining/DDP/SWA |
+| Full-model task fine-tuning | Yes | Yes, scalar tasks on native MPS | Shared goal, different implementation |
 | DDP/SWA/resume | Yes | No | Missing |
 | Frozen-head training | Not primary workflow | Yes | Addition |
 | RelBench manifest preprocessing | Yes | No | Missing |
@@ -461,7 +529,7 @@ The reference's docs are narrower but internally align more closely with its cur
 | Reference random-walk sampler | Yes | No | Missing |
 | Optional FAISS peer sampling | Yes | No | Missing |
 | Label-balanced context | Yes | No | Missing |
-| Fixed preprocessing stats | Yes | Partial/finetune only | Incomplete |
+| Fixed preprocessing stats | Yes | Yes in configurable reference mode | Shared; zero-shot mode is an intentional addition |
 | Real task-row target | Yes | No | Replaced |
 | RelQL | No | Yes | Addition |
 | Point-in-time `AS OF` | Implicit target timestamp | Explicit query feature | Addition |
@@ -473,9 +541,9 @@ The reference's docs are narrower but internally align more closely with its cur
 | Multiclass text decoding | No official task path | Yes | Addition/experimental |
 | Ranking/link prediction | Explicitly skipped | Yes | Addition/experimental |
 | Multi-horizon forecast values | No | Duplicated scalar | Incomplete addition |
-| Official RelBench evaluation | Yes | No | Missing |
-| `rel2tab` baseline framework | Yes | No | Missing |
-| Custom real-data backtests | No comparable harness | Yes | Addition |
+| Official RelBench evaluation | Yes | Yes, through `evaluation/` adapter | Ported |
+| `rel2tab` baseline framework | Yes | Optional SQL/XGBoost runner, not the full framework | Partial port |
+| Custom real-data evaluation | No comparable harness | Clean four-runner RelBench harness | Addition |
 | Context visualization UI | Yes | Explain JSON/text | Different capability |
 | Docusaurus product site | No | Yes | Addition |
 
@@ -483,7 +551,9 @@ The reference's docs are narrower but internally align more closely with its cur
 
 ### 8.1 Parameter and fixture reproduction
 
-I loaded the current reference `RelationalTransformer` using the same released RT-J checkpoint and ran RelativeDB's committed x-language golden input through it.
+I loaded the current reference `RelationalTransformer` using the same released
+RT-J checkpoint and ran RelativeDB's committed native golden input from
+`cpp/testdata` through it.
 
 - Current reference model parameters: **85,565,091**.
 - Reference PyTorch output vs. committed PyTorch golden fixture: **maximum absolute difference 0.0**.
@@ -522,19 +592,18 @@ It does **not** prove parity in:
 
 | Check | Result | Notes |
 |---|---|---|
-| RelativeDB Python tests | **214 passed** | 47.05 s; one `utcfromtimestamp` deprecation warning |
+| RelativeDB Python tests | **passed** | Post-alignment suite on 2026-07-20 |
 | RelativeDB CMake configure/build | **passed** | Current C++ tree built successfully |
-| RelQL C++ corpus | **67/67 accepted, 22/22 rejected** | `cpp/build/relql_test`, run from `cpp/` |
-| CSC C++ test | **22,502/22,502 passed** | `cpp/build/csc_test` |
+| RelQL C++ corpus | **passed** | Valid corpus accepted and invalid corpus rejected by `cpp/build/relql_test` |
+| CSC C++ test | **passed** | `cpp/build/csc_test` |
 | Native training test | **passed** | Multiclass loss 1.098612 → 0.010736; ranking 1.386294 → 0.093876 |
 | Native RT-J golden, CPU | **passed** | max drift ≈ 0.003911 |
 | Native RT-J golden, MPS | **passed** | max drift ≈ 0.003910 |
-| Reference lightweight Python tests | **7 passed** | `test_api.py` + `test_import_safety.py`; 14 PyTorch deprecation warnings |
-| Reference Rust build/tests | **built; 0 Rust unit tests** | `PYO3_PYTHON=/opt/homebrew/bin/python3.12 cargo test --locked --no-default-features` |
-| Reference full Python suite | **not fully run** | 9 tests collected; 2 require built extension/preprocess deps such as PyArrow/PluRel |
+| Reference lightweight Python tests | **passed** | `test_api.py` + `test_import_safety.py`; PyTorch deprecation warnings remain |
+| Reference Rust build/tests | **built** | `PYO3_PYTHON=/opt/homebrew/bin/python3.12 cargo test --locked --no-default-features` |
+| Reference full Python suite | **not fully run** | Some cases require built extension/preprocess dependencies such as PyArrow/PluRel |
 | RelativeDB wheel build | **built with warning** | pure `relationdb-0.1.0-py3-none-any.whl`; missing `python/README.md` |
 | Isolated installed-wheel parse | **failed as expected from package contents** | `NativeParserUnavailable: librt_c not found` |
-| Documented `run_suite.py --quick --no-stability` | **stopped after diagnosis** | loaded 3 datasets; no backend is attached; context assembly is very expensive before scoring reaches the backend check |
 
 Reference Python tests were run with the available local Python 3.14 environment plus a temporary `einops` install, outside the project's declared Python 3.12 matrix. That is sufficient for the import/API smoke checks but not a substitute for the supported Pixi environment.
 
@@ -554,7 +623,7 @@ The unit/golden suites mostly isolate components. I therefore constructed small 
 
 The probes used the current worktree and the current native checkpoint cache.
 
-### 10.2 Batch-dependent prediction
+### 10.2 Historical batch-dependent prediction — resolved
 
 For a toy churn schema, I scored entity C7 alone, entity C1 alone, and both in one call.
 
@@ -575,9 +644,17 @@ C7's normalized `age` value was 0.0 when scored alone and approximately 1.0 when
 
 After supplying the current `ColumnStats` for physical columns, C7 regression still changed from 0.7654925430 to 0.6004700681 because the generic historical task-label statistics remained batch-fitted.
 
-**Finding:** the default API is not entity-wise invariant. Batch size, filtering, pagination, and the presence of unrelated entities can alter predictions. The reference preprocessing/statistics path is batch-invariant.
+**Historical finding:** the reviewed API was not entity-wise invariant. Batch
+size, filtering, pagination, and unrelated entities could alter predictions.
 
-### 10.3 Cohort contamination of self-labels
+**Current status (2026-07-20):** resolved by per-entity zero-shot statistics
+and strict persisted reference statistics. The new regression test compares a
+focal sequence built alone and in a mixed batch and requires identical token
+values. The old checkpoint ranking golden was regenerated because its lower
+ranks encoded the removed batch-normalization behavior; raw native tensor/C
+ABI goldens were not changed.
+
+### 10.3 Historical cohort contamination of self-labels — resolved for focal labels
 
 I assembled a context for C7 in the same toy schema:
 
@@ -586,7 +663,15 @@ I assembled a context for C7 in the same toy schema:
 
 `_self_labels` evaluates the target aggregation over all `ctx.rows_by_table()` without first restricting rows to the focal entity. Cohort examples are useful as in-context demonstrations, but their event rows must not be folded into the focal entity's ground-truth expression.
 
-**Finding:** cohort construction can change the task definition, not just the evidence presented to the model.
+**Historical finding:** cohort construction could change the task definition,
+not just the evidence presented to the model.
+
+**Current status (2026-07-20):** `EntityContext` records
+`focal_row_keys`; traversal propagates focal ownership, assumptions preserve
+it, and `_self_labels` evaluates `focal_rows_by_table()`. Cohorts can still
+change model evidence and scores, as intended, but not the focal historical
+label. The remaining modeling gap is representing each peer as a separately
+labeled demonstration rather than a shared global row pool.
 
 ### 10.4 Batch-wide candidate temporal bound
 
@@ -624,28 +709,23 @@ I built `python/` into a clean temporary dist directory, installed the generated
 
 The same issue applies to the native CSC and model paths. The reference's maturin package, by contrast, is explicitly structured to compile/package `rt._rustler`.
 
-### 10.8 Generalizability harness backend
-
-`benchmarks/run.py` correctly attaches `RtNativeBackend` to its MovieLens and retail engines. `benchmarks/run_suite.py` constructs three datasets and calls `suite.run` without doing so. Each dataset constructor creates `Engine(..., model_backend=None)`.
-
-A live `--quick --no-stability` run loaded:
-
-- Online Retail: 400 entities;
-- MovieLens: 610 entities;
-- Brightkite: 400 entities.
-
-It then spent substantial time assembling a 5,000,000-cell-budget context before model scoring. I interrupted it after capturing the stack. Static control flow shows the eventual `Engine._require_backend()` failure once the first context reaches scoring.
-
-`benchmarks/harness/audit_fixes.py` has a similar default engine without a backend. It is called late in `run.py`, after normal task scoring, so the primary report can produce results before this audit fails.
-
 ## 11. Recommended remediation order
 
 ### P0 — make scoring semantically stable
 
-1. **Persist all normalization statistics.** Require dataset/preprocessing statistics for zero-shot operation, or fit once at engine/index creation. Never fit statistics from the current request batch.
-2. **Separate focal rows from demonstrations.** Evaluate RelQL self-label expressions over a focal-entity subgraph only. Keep cohort examples as separate labeled nodes.
-3. **Represent the target faithfully.** For entity autocomplete, mask the real cell in place. For aggregate/query tasks, define and validate an explicit task-table schema representation whose table/column embeddings are stable and match training.
-4. Add invariance tests:
+1. **Completed: remove request-batch normalization.** Zero-shot is entity-local;
+   reference/statistics mode consumes persisted column, datetime, and task
+   transforms and fails on missing statistics.
+2. **Partially completed: separate focal rows from demonstrations.** Self-label
+   expressions are focal-only. Separate labeled demonstration objects and
+   ownership-aware explain output remain.
+3. **Partially completed: represent the target faithfully.** Entity
+   autocomplete masks the physical cell, and derived targets use canonical
+   stable `TaskSpec` identities. Materialized user-declared task tables and
+   held-out representation comparisons remain.
+4. Invariance tests now cover batch composition, stable task identity, custom
+   traversal invocation, deterministic sampling, and temporal row filtering.
+   Continue extending them to:
    - focal result unchanged under batch permutation;
    - focal result unchanged when unrelated entities are appended;
    - self-label unchanged under cohort size/order;
@@ -662,19 +742,26 @@ It then spent substantial time assembling a 5,000,000-cell-budget context before
 
 ### P1 — restore reproducibility
 
-11. Attach the backend in `run_suite.py` and `audit_fixes.py`; lower the diagnostic context policy so backend/config errors surface before multi-million-cell assembly.
-12. Record benchmark provenance in every JSON: commit, dirty diff hash, checkpoint hash/URI, quantization, device, stats artifact, context policy, random seeds, dataset checksum, and contamination caveat.
-13. Add a reference-style evaluator adapter on at least the curated RelBench tasks. This is the only defensible way to compare end-to-end results to RT-J.
-14. Add a sampler-differential fixture: same preprocessed graph/target through Rust and RelativeDB tokenizers, with per-token tensor diffs.
+11. Expand the new independent `evaluation/` system from its executed rel-f1
+    classification/regression slice to the full 21-task catalog before making
+    broad predictive-quality claims.
+12. Keep the reference-context path as the parity gate: RT, native zero-shot,
+    and native inference from full task-fine-tuned checkpoints must consume
+    identical sampled tensors and the same official keyed scorer.
+13. Add a sampler-differential fixture: same preprocessed graph/target through
+    Rust and RelativeDB tokenizers, with per-token tensor diffs.
 
 ### P2 — release and documentation cleanup
 
-15. Choose one distribution name and align README, PyPI metadata, import examples, URLs, and artifact names.
-16. Correct 22M → 86M and distinguish 171 MB BF16-on-disk from about 342 MB expanded FP32 resident memory.
-17. Add `python/README.md` or point `readme` at an included file.
-18. Remove or restore Java/Rust/DuckDB workflows and documentation.
-19. Add a tracked license file consistent with declared metadata.
-20. Export new public types consistently; `python/src/relativedb/__init__.py` currently has duplicate lazy handling for `FineTunedHead` and does not consistently list newer public types in `__all__`.
+14. Choose one distribution name and align README, PyPI metadata, import examples, URLs, and artifact names.
+15. Correct 22M → 86M and distinguish 171 MB BF16-on-disk from about 342 MB expanded FP32 resident memory.
+16. Add `python/README.md` or point `readme` at an included file.
+17. Remove or restore Java/Rust/DuckDB workflows and documentation.
+18. Add a tracked license file consistent with declared metadata.
+19. **Completed for the new alignment API:** `NormalizationMode`,
+    `ColumnStats`, `TaskSpec`, traversal protocols/results, both built-in
+    traversals, and `FineTunedHead` are exported consistently. Keep an API
+    export test as new public types are added.
 
 ## 12. Suggested acceptance criteria for reference alignment
 
@@ -719,7 +806,6 @@ RelativeDB files reviewed in detail:
 - all Python tests;
 - all C/C++ headers and implementations, including Metal/CUDA/training/quantization;
 - CMake and C++ tests/fixtures;
-- benchmark harness, task-fit scripts, committed results/findings, and current untracked Olist/GH summaries;
 - root/product/style docs, Docusaurus configuration/content, package metadata, and workflows.
 
 ### 13.3 Execution
@@ -734,31 +820,47 @@ Commands/checks included:
 - reference Cargo build/test with an explicit Python 3.12 interpreter;
 - wheel build, isolated installation, and parser invocation;
 - targeted in-memory batch/cohort normalization probes;
-- a live quick generalizability-suite diagnostic;
 - `git diff --check` and final worktree status checks.
 
 ### 13.4 Effort boundaries
 
-I did not:
+I did not during the original review:
 
 - download and preprocess the full RelBench corpus;
-- run reference full pretraining or the 21-task GPU evaluation;
-- run every large RelativeDB benchmark to completion;
+- run reference full pretraining or the complete 21-task GPU evaluation;
 - compare CUDA output on a CUDA host;
 - assess model quality with a newly designed statistically powered dataset;
 - rewrite any implementation issue found.
 
-Those would be separate multi-hour/day experiments and, for training, require appropriate GPU resources. The report distinguishes source-proven findings, live behavioral probes, committed benchmark evidence, and limitations.
+The subsequent evaluation port did run complete test rows for a representative
+rel-f1 classification/regression pair across RT, SQL/XGBoost, native zero-shot,
+and a historical frozen-head diagnostic. See
+`evaluation/runs/rel-f1-head-to-head/results.md`. Full-catalog evaluation and
+backbone pretraining remain separate larger experiments.
 
 ## 14. Final assessment
 
-RelativeDB has a credible and well-tested native RT-J **kernel** plus a much broader predictive-query product. Its strongest engineering is the C++ inference stack: faithful architecture, shared golden fixture, multiple devices, sparse attention, and quantization. Its most important weakness is the semantic bridge into that kernel. Target construction, batch-fitted normalization, cohort self-label contamination, and non-reference sampling can dominate the small native numerical drift by orders of magnitude.
+RelativeDB has a credible and well-tested native RT-J **kernel** plus a much
+broader predictive-query product. Its strongest engineering remains the C++
+inference stack. The semantic bridge is materially stronger after the
+2026-07-20 changes: request-batch normalization and focal-label contamination
+are resolved, direct targets retain physical schema identity, derived targets
+are canonical, and traversal is pluggable with a reference-style option.
+
+The system is still not end-to-end reference-equivalent. The largest remaining
+semantic gaps are fully materialized task demonstrations in the product path,
+per-entity candidate/class domains, horizon conditioning, and full-catalog
+evaluation. Exact reference contexts and the official evaluator are now
+available in the isolated evaluation path. These should drive quality work
+rather than the two resolved invariance defects.
 
 Accordingly:
 
 - describe the current system as **“RT-J-backed”**, not end-to-end reference-equivalent;
 - treat ranking, multiclass, multi-horizon forecasting, `ABLATE`, and head adaptation as experimental until their contracts and evaluations are tightened;
-- fix batch/cohort invariance before optimizing the native runtime further;
+- keep batch and focal-label invariance as permanent release gates;
+- validate reference/statistics artifacts and the new traversal on held-out
+  tasks before making either the production default;
 - use official task rows and the reference sampler/evaluator for any claim of RT-J quality parity.
 
 The architecture can become a robust online counterpart to the research code, but the next increment of value is in data/task semantics and reproducibility, not additional GEMM optimization.
@@ -810,7 +912,7 @@ RelativeDB distributes these responsibilities across its schema/retrieval/query 
 - `rustler/src/pre.rs`: manifest/Parquet preprocessing, semantic values/statistics, adjacency, and artifact writing.
 - `rustler/src/fly.rs`: production stochastic context sampler, target emission, temporal filtering, peer tiers, optional FAISS, and Python tensor export.
 - `rustler/src/lib.rs`: PyO3 module registration.
-- `rustler/src/main.rs`: standalone preprocessing/benchmark entry.
+- `rustler/src/main.rs`: standalone preprocessing entry.
 
 RelativeDB has no matching offline preprocessor. Its nearest components are `engine.py`, `retrieve.py`, `csc.py`, and `csc_native.py`, which operate on user-supplied rows.
 
@@ -825,7 +927,12 @@ RelativeDB has no matching offline preprocessor. Its nearest components are `eng
 - `scripts/recipe_rt_j.txt`: RT-J recipe.
 - `scripts/slurm_preprocess.sh`, `scripts/slurm_pretrain.sh`: cluster launch wrappers.
 
-RelativeDB benchmark scripts exercise serving/head adaptation, not equivalent full training/evaluation jobs.
+RelativeDB now has native full-backbone task fine-tuning for scalar tasks, but
+still has no matching multi-dataset pretraining/DDP/SWA workflow. Its new
+evaluation adapter covers released RT, a selected `rel2tab` SQL/XGBoost
+baseline, native zero-shot, and full-checkpoint native fine-tuned inference,
+but not
+the reference's full research training stack.
 
 ### A.6 Reference-only `rel2tab`
 
@@ -834,7 +941,7 @@ RelativeDB benchmark scripts exercise serving/head adaptation, not equivalent fu
 - Dataset SQL features: `featurizers/sql_queries/__init__.py`, `rel_amazon.py`, `rel_avito.py`, `rel_event.py`, `rel_f1.py`, `rel_hm.py`, `rel_stack.py`, `rel_trial.py`.
 - Predictors: `predictors/__init__.py`, `identity_predictor.py`, `lgbm_predictor.py`, `linear_predictor.py`, `mean_predictor.py`, `ridge_predictor.py`, `tab_predictor.py`, `tabicl_batched_predictor.py`, `xgboost_predictor.py`, `xgboost_tuned.py`.
 
-RelativeDB has isolated XGBoost/naive comparisons in `benchmarks/`, not a reusable featurizer/predictor framework.
+RelativeDB has no maintained equivalent reusable featurizer/predictor framework.
 
 ### A.7 Reference-only tests
 
@@ -882,7 +989,6 @@ The reference has no RelQL/query-engine counterparts. Its `model.py`, `data.py`,
 - `python/tests/test_native_csc.py`: native CSC integration.
 - `python/tests/test_relql_parser.py`: parser/validation corpus and edge cases.
 - `python/tests/test_rt_native.py`: tokenizer/runtime/head/checkpoint behavior.
-- `python/tests/test_xlang_parity.py`: shared cross-language fixture parity.
 
 The reference's three test modules do not cover an equivalent product surface.
 
@@ -895,8 +1001,9 @@ The reference's three test modules do not cover an equivalent product surface.
 - C ABI: `cpp/src/rt_c.h`, `rt_c.cpp`.
 - Quantization: `cpp/src/rt_quant.hpp`, `quantize.cpp`.
 - Devices: `cpp/src/rt_metal.mm`, `rt_cuda.cu`.
-- Frozen-head training: `cpp/src/rt_train.hpp`, `rt_train.cpp`, `rt_train_metal.mm`.
-- Benchmark executable: `cpp/src/bench.cpp`.
+- Training: `cpp/src/rt_train.hpp`, `rt_train.cpp`, `rt_train_metal.mm` for
+  frozen adapters and `rt_full_train_metal.mm` for full-checkpoint scalar-task
+  forward/backward/AdamW on MPS.
 
 The reference's transformer is PyTorch; its Rust code preprocesses/samples and does not provide native transformer kernels.
 
@@ -911,46 +1018,7 @@ The reference's transformer is PyTorch; its Rust code preprocesses/samples and d
 
 The reference has no equivalent native-kernel golden or device test binaries.
 
-### A.13 RelativeDB-only benchmark harness
-
-- `benchmarks/README.md`, `FINDINGS.md`: harness instructions and committed conclusions.
-- `benchmarks/run.py`: main MovieLens/retail native-backend backtest and audits.
-- `benchmarks/run_suite.py`: three-dataset generalizability matrix; currently omits backend wiring.
-- `benchmarks/harness/__init__.py`: harness package.
-- `benchmarks/harness/datasets.py`: MovieLens, Online Retail II, and Brightkite loaders, schemas, callbacks, truth arrays.
-- `benchmarks/harness/backtest.py`: churn/count/value/ranking task execution.
-- `benchmarks/harness/metrics.py`: predictive metrics.
-- `benchmarks/harness/suite.py`: dataset/task grid and stability summaries.
-- `benchmarks/harness/audit_grammar.py`: language coverage audit.
-- `benchmarks/harness/audit_leakage.py`: point-in-time leakage audit.
-- `benchmarks/harness/audit_fixes.py`: context truncation instrumentation audit; currently creates an engine without a backend.
-
-Reference evaluation is task-table/RelBench based and has no corresponding files.
-
-### A.14 RelativeDB-only task-fit experiments
-
-- `benchmarks/task_fit/README.md`: experimental protocol/results summary.
-- `brightkite_clf_reg.py`: Brightkite classification/regression fitting.
-- `churn_rtj_with_rfm_cells.py`: churn with RFM cells.
-- `churn_spend_rtj.py`, `churn_spend_xgboost.py`: RT-J/XGBoost churn/spend comparisons.
-- `data_efficiency.py`: labeled-data scaling.
-- `digits_metal_finetune.py`: synthetic digits head experiment.
-- `olist_metal_vs_xgboost.py`: Olist head/baseline comparison.
-- `ranking_buy_it_again.py`: ranking experiment.
-- `digits_head.safetensors`, `olist_review_head.safetensors`: committed trained-head artifacts.
-- `digits_results.json`, `olist_results.json`: committed experiment outputs.
-
-The reference's comparable baseline machinery is generalized under `rel2tab`; it does not commit these RelativeDB-specific artifacts.
-
-### A.15 RelativeDB-only cross-language fixture
-
-- `benchmarks/xlang_fixture/README.md`: fixture contract.
-- `embeddings.tsv`, `movies.tsv`, `ratings.tsv`: deterministic fixture inputs.
-- `golden.json`: reference PyTorch outputs/tensors consumed by C++ and Python tests.
-
-This is the central bridge used to establish kernel conformance. The reference repository does not contain the fixture, but its current model reproduced it exactly in this review.
-
-### A.16 RelativeDB-only website
+### A.13 RelativeDB-only website
 
 - Site configuration: `website/.gitignore`, `README.md`, `docusaurus.config.ts`, `package.json`, `package-lock.json`, `tsconfig.json`, `sidebars.ts`, `sidebars-relql.ts`.
 - Content: `website/docs/intro.md`, `website/relql/index.md`.
@@ -968,9 +1036,9 @@ These are the most useful starting points for independently checking the report.
 |---|---|---|
 | Model geometry/math | `../relational-transformer/src/rt/model.py:31-135,247-576` | `cpp/src/rt.hpp:1-170`; `cpp/src/rt.cpp` |
 | Task definitions | `../relational-transformer/src/rt/tasks.py:1-160` | `python/src/relativedb/relql/ast.py`; `parser.py` |
-| Default evaluation sampler | `../relational-transformer/src/rt/eval_utils.py:164-185` | `python/src/relativedb/engine.py:252-274` |
-| Target/sampler construction | `../relational-transformer/rustler/src/fly.rs:1116-1739` | `python/src/relativedb/engine.py:584-655`; `rt_native.py:993-1290` |
-| Preprocessing/stats | `../relational-transformer/rustler/src/pre.rs` | `python/src/relativedb/rt_native.py` `ColumnStats` and `_normalize` |
+| Default evaluation sampler | `../relational-transformer/src/rt/eval_utils.py:164-185` | `python/src/relativedb/traversal.py`; `engine.py` `ContextPolicy` |
+| Target/sampler construction | `../relational-transformer/rustler/src/fly.rs:1116-1739` | `python/src/relativedb/task.py`; `traversal.py`; `rt_native.py` `_build_ctx_seq` |
+| Preprocessing/stats | `../relational-transformer/rustler/src/pre.rs` | `python/src/relativedb/rt_native.py` `ColumnStats`, `_label_stats`, and `_normalize_one` |
 | Checkpoint resolution | `../relational-transformer/src/rt/checkpoints.py:41-140` | `python/src/relativedb/rt_native.py:662-709` |
 | Embedding guard | checkpoint config consumed by model loader | `python/src/relativedb/model.py:64-72`, not called by loader |
 | Full training | `../relational-transformer/scripts/pretrain.py`; `src/rt/swa.py`; `muon.py` | `python/src/relativedb/engine.py:817-979`; `cpp/src/rt_train*` |
@@ -978,7 +1046,7 @@ These are the most useful starting points for independently checking the report.
 | Candidate bound | target-row timestamp per sampled item | `python/src/relativedb/rt_native.py:1334-1343` |
 | Ablation | `../relational-transformer/rustler/src/fly.rs:2359-2400` | `python/src/relativedb/engine.py:1007-1015` |
 | Packaging | `../relational-transformer/pyproject.toml` | `python/pyproject.toml`; `cpp/CMakeLists.txt` |
-| Evaluation | `../relational-transformer/src/rt/eval_utils.py`; `evaluator.py` | `benchmarks/harness/`; `benchmarks/task_fit/` |
+| Evaluation | `../relational-transformer/src/rt/eval_utils.py`; `evaluator.py` | `evaluation/` four-runner adapter and official scorer |
 
 ## Appendix C — terminology
 

@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence, Union
 
 import numpy as np
@@ -31,12 +33,15 @@ from .relql.ast import (AggFunc, Aggregation, Arith, BoolOp, Case, ColumnRef,
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema
+from .traversal import (BreadthFirstTraversal, GraphTraversal,
+                        ReferenceTraversal)
 
 __all__ = [
     "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
     "EntityPrediction", "PredictionResult", "ExplainResult", "ModelBackend",
     "Engine", "ExecutionError",
     "ContextTruncationWarning", "AssumptionNotAppliedWarning",
+    "GraphTraversal", "BreadthFirstTraversal", "ReferenceTraversal",
 ]
 
 # Aggregations whose value grows with the number of rows in the window, and so
@@ -211,7 +216,9 @@ def _apply_assumptions(assignments: list[tuple[str, str, Any]],
             for r in ctx.rows]
     return EntityContext(entity_id=ctx.entity_id, anchor=ctx.anchor, rows=rows,
                          truncated_children=ctx.truncated_children,
-                         hit_cell_budget=ctx.hit_cell_budget)
+                         hit_cell_budget=ctx.hit_cell_budget,
+                         focal_row_keys=ctx.focal_row_keys,
+                         node_ids=dict(ctx.node_ids))
 
 
 def _warn_inert_assumptions(assignments: list[tuple[str, str, Any]],
@@ -257,23 +264,33 @@ class ContextPolicy:
     is the global cell budget.
     """
 
-    # Defaults follow the reference RT implementation's evaluation settings:
-    # ctx_size 8192, bfs_width 32, local neighbourhood a small fraction of the
-    # window. There the remainder is filled by random walks over the database;
-    # cohort seeding is this engine's equivalent, and it is on by default
-    # because an RT context is mostly other rows. With it off, a numeric
-    # column on the entity's own row appears exactly once, so its in-context
-    # z-score is undefined and the value reaches the model as 0.0.
+    # Reference evaluation defaults (eval_utils.build_evaluator).
     max_context_cells: int = 8192
     bfs_width: int = 32
     fanouts: Optional[tuple[int, ...]] = None
     max_hops: int = 2
     cohort_size: int = 256
     prefer_latest: bool = True
+    local_context_cells: int = 256
+    num_walks: int = 10_000
+    walk_length: int = 20
+    seed: int = 0
+    # Number of prior task windows materialized when a RelQL aggregate defines
+    # a derived target table. The reference consumes pre-materialized task
+    # rows; this is the query-runtime equivalent.
+    num_history_windows: int = 3
 
     def __post_init__(self) -> None:
         if self.fanouts is not None:
             object.__setattr__(self, "fanouts", tuple(self.fanouts))
+        if self.max_context_cells <= 0:
+            raise ValueError("max_context_cells must be positive")
+        if self.local_context_cells <= 0:
+            raise ValueError("local_context_cells must be positive")
+        if self.num_walks < 0 or self.walk_length < 0:
+            raise ValueError("num_walks and walk_length cannot be negative")
+        if self.num_history_windows < 0:
+            raise ValueError("num_history_windows cannot be negative")
 
     def fanout_at(self, hop: int) -> int:
         if self.fanouts:
@@ -307,6 +324,10 @@ class EntityContext:
     rows: list[Row] = field(default_factory=list)
     truncated_children: int = 0     # children dropped by the fanout cap (F-trunc)
     hit_cell_budget: bool = False   # assembly stopped on max_context_cells
+    # Rows belonging to the focal entity's local graph, excluding global peer
+    # context. This keeps self-label construction invariant across traversals.
+    focal_row_keys: frozenset[tuple[str, Any]] = frozenset()
+    node_ids: dict[tuple[str, Any], int] = field(default_factory=dict)
 
     @property
     def row_keys(self) -> set[tuple[str, Any]]:
@@ -320,6 +341,14 @@ class EntityContext:
     def rows_by_table(self) -> dict[str, list[Row]]:
         out: dict[str, list[Row]] = {}
         for r in self.rows:
+            out.setdefault(r.table, []).append(r)
+        return out
+
+    def focal_rows_by_table(self) -> dict[str, list[Row]]:
+        selected = ([r for r in self.rows if r.key in self.focal_row_keys]
+                    if self.focal_row_keys else self.rows)
+        out: dict[str, list[Row]] = {}
+        for r in selected:
             out.setdefault(r.table, []).append(r)
         return out
 
@@ -513,6 +542,11 @@ class _RetrieverSampler:
             return [r.id for r in scanner(table, TemporalBound.unbounded())]
         return None
 
+    def all_rows(self, table: str) -> Optional[list[Row]]:
+        scanner = self.wiring.scanners.get(table)
+        return (None if scanner is None else
+                list(scanner(table, TemporalBound.unbounded())))
+
 
 class _CscSampler:
     def __init__(self, index: CscIndex):
@@ -530,6 +564,9 @@ class _CscSampler:
     def all_ids(self, table):
         return self.index.all_ids(table)
 
+    def all_rows(self, table):
+        return list(self.index.rows.get(table, ()))
+
 
 # ---------------------------------------------------------------------------
 # Engine
@@ -545,18 +582,30 @@ class Engine:
                  model_config: Optional[ModelConfig] = None,
                  model_backend: Optional[ModelBackend] = None,
                  context_policy: Optional[ContextPolicy] = None,
-                 sampler_mode: SamplerMode = SamplerMode.RETRIEVER):
+                 sampler_mode: SamplerMode = SamplerMode.RETRIEVER,
+                 traversal: Optional[GraphTraversal] = None):
         self.schema = schema
         self.wiring = wiring
         self.model_config = model_config or ModelConfig.defaults()
         self.model_backend: Optional[ModelBackend] = model_backend
         self.context_policy = context_policy or ContextPolicy()
         self.sampler_mode = sampler_mode
+        self.traversal = traversal or ReferenceTraversal()
         # The CSC snapshot is built once, here. It is immutable for the life of
         # the engine: to pick up changed data, construct a new Engine.
         self._csc_index: Optional[CscIndex] = None
+        # Reference sampling is defined over one immutable bidirectional graph
+        # snapshot. Build it even in RETRIEVER mode; explicit legacy BFS keeps
+        # the pull-per-hop retriever semantics.
         if sampler_mode is SamplerMode.CSC:
             self._csc_index = CscIndex.build(self.schema, self.wiring)
+        elif (isinstance(self.traversal, ReferenceTraversal)
+              and self.wiring.scanners):
+            # A schema-only table with no scanner is an empty table in the
+            # snapshot. At least one scanner is required to distinguish this
+            # from legacy pull-only wiring.
+            self._csc_index = CscIndex.build(
+                self.schema, self.wiring, allow_missing_scanners=True)
 
     def _require_backend(self) -> ModelBackend:
         """Scoring paths (execute, EXPLAIN ANALYZE) need a model backend; the
@@ -569,6 +618,12 @@ class Engine:
         return self.model_backend
 
     def _sampler(self):
+        if isinstance(self.traversal, ReferenceTraversal):
+            if self._csc_index is None:
+                raise ExecutionError(
+                    "reference traversal requires a TableScanner for every "
+                    "schema table so it can build one immutable graph snapshot")
+            return _CscSampler(self._csc_index)
         if self.sampler_mode is SamplerMode.CSC:
             if self._csc_index is None:
                 # Only reachable by flipping sampler_mode after construction.
@@ -583,79 +638,22 @@ class Engine:
     # -- context assembly ---------------------------------------------------
     def assemble_context(self, entity_table: str, entity_id: Any,
                          anchor: Optional[datetime],
-                         policy: Optional[ContextPolicy] = None) -> EntityContext:
-        """The hop loop: seed -> parents (always) -> children (fanout-capped,
-        newest-first), every row re-checked against the temporal bound."""
+                         policy: Optional[ContextPolicy] = None, *,
+                         query: Optional[ParsedQuery] = None) -> EntityContext:
+        """Assemble a bounded context with the configured graph traversal."""
         policy = policy or self.context_policy
         sampler = self._sampler()
         bound = (TemporalBound.at_or_before(anchor) if anchor is not None
                  else TemporalBound.unbounded())
-        ctx = EntityContext(entity_id=entity_id, anchor=bound.as_of)
-        visited: set[tuple[str, Any]] = set()
-
-        def admit(rows: list[Row]) -> list[Row]:
-            fresh = []
-            for r in rows:
-                if not bound.admits_row(r):
-                    continue  # defensive leakage guard (F24)
-                if r.key in visited:
-                    continue
-                visited.add(r.key)
-                ctx.rows.append(r)
-                fresh.append(r)
-            return fresh
-
-        seed = admit(sampler.entities(entity_table, [entity_id], bound))
-        if not seed:
-            return ctx
-        frontier: list[Row] = list(seed)
-
-        # optional cohort seeds (similar entities, Tier 1)
-        if policy.cohort_size > 0:
-            cohort_ids = sampler.cohort(entity_table, entity_id, bound,
-                                        policy.cohort_size)
-            if cohort_ids:
-                frontier += admit(sampler.entities(entity_table, cohort_ids, bound))
-
-        fk_to_parent = {t.name: {l.fk_column: l.to_table
-                                 for l in self.schema.links_from(t.name)}
-                        for t in self.schema.tables}
-
-        for hop in range(policy.effective_hops):
-            if ctx.cell_count >= policy.max_context_cells:
-                break
-            fanout = policy.fanout_at(hop)
-            next_frontier: list[Row] = []
-            # parents: always followed, batched per table
-            wanted: dict[str, list[Any]] = {}
-            for row in frontier:
-                for fk, pid in row.parents.items():
-                    ptable = fk_to_parent.get(row.table, {}).get(fk)
-                    if ptable is not None and (ptable, pid) not in visited:
-                        wanted.setdefault(ptable, []).append(pid)
-            for ptable, pids in wanted.items():
-                next_frontier += admit(sampler.entities(ptable, pids, bound))
-            # children: width-bounded, newest-first
-            for row in frontier:
-                for link in self.schema.links_to(row.table):
-                    # request one extra so we can *detect* (not just silently
-                    # apply) truncation: if the sampler returns more than the
-                    # fanout, a windowed COUNT/SUM over this context is biased
-                    # low. Surfaced via ctx.truncated_children (F-trunc).
-                    kids = sampler.children(link, row.id, bound, fanout + 1)
-                    kids = [k for k in kids if bound.admits_row(k)]
-                    if len(kids) > fanout:
-                        ctx.truncated_children += len(kids) - fanout
-                    if policy.prefer_latest:
-                        kids.sort(key=_newest_first_key)
-                    next_frontier += admit(kids[:fanout])
-                if ctx.cell_count >= policy.max_context_cells:
-                    ctx.hit_cell_budget = True
-                    break
-            frontier = next_frontier
-            if not frontier:
-                break
-        return ctx
+        result = self.traversal.traverse(
+            self.schema, sampler, entity_table, entity_id, bound, policy,
+            query=query)
+        return EntityContext(
+            entity_id=entity_id, anchor=bound.as_of, rows=list(result.rows),
+            truncated_children=result.truncated_children,
+            hit_cell_budget=result.hit_cell_budget,
+            focal_row_keys=result.focal_row_keys,
+            node_ids=dict(result.node_ids))
 
     # -- execution ----------------------------------------------------------
     def execute(self, input: Union[ExecutionInput, str], **kwargs) -> PredictionResult:
@@ -679,7 +677,7 @@ class Engine:
         contexts: list[EntityContext] = []
         for eid in ids:
             anchor = self._anchor_for(entity_table, eid, input)
-            ctx = self.assemble_context(entity_table, eid, anchor)
+            ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
             # WHERE selects who to score and is factual; the counterfactual is
             # applied afterwards, to the context that actually gets scored.
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
@@ -813,15 +811,141 @@ class Engine:
         return d.replace(tzinfo=timezone.utc)
 
     # -- EXPLAIN ------------------------------------------------------------
-    # -- fine-tuning --------------------------------------------------------
+    # -- task-head adaptation ----------------------------------------------
     def finetune(self, query: Union[str, ParsedQuery], anchors: Sequence[datetime],
+                 *, output_dir: Union[str, os.PathLike] = "finetuned_model",
+                 entity_ids: Optional[Sequence[Any]] = None,
+                 params: Optional[dict[str, Any]] = None,
+                 labels: Optional[dict] = None,
+                 epochs: int = 1, batch_size: int = 1,
+                 learning_rate: float = 1e-5,
+                 weight_decay: float = 1e-2,
+                 grad_clip_norm: float = 1.0,
+                 model_uri: Optional[str] = None):
+        """Fine-tune the complete RT-J checkpoint with native C++/MPS.
+
+        Unlike :meth:`fit_head`, this differentiates through all transformer
+        blocks, encoders, learned masks, normalization scales, and the number
+        decoder. It currently supports scalar binary/regression tasks, whose
+        labels use the reference bool-as-number/Huber training contract.
+        """
+        from .model import NormalizationMode
+        from .rt_native import (ColumnStats, FineTunedCheckpoint,
+                                RT_DEVICE_MPS, RtNativeError, load_lib,
+                                resolve_model_path)
+        backend = self._require_backend()
+        if not hasattr(backend, "_build_sequences"):
+            raise ExecutionError(
+                "full-backbone fine-tuning requires RtNativeBackend")
+        lib = load_lib(backend._lib_path)
+        if not lib.device_available(RT_DEVICE_MPS):
+            raise ExecutionError("full-model fine-tuning requires Apple MPS")
+        if not anchors:
+            raise ExecutionError("full-model fine-tuning needs at least one anchor")
+        if epochs <= 0 or batch_size <= 0:
+            raise ExecutionError("epochs and batch_size must be positive")
+        anchors = [self._coerce_anchor(a) for a in anchors]
+        pq = parse(query) if isinstance(query, str) else query
+        pq = validate(pq, self.schema).query.bind_params(params)
+        task_type = pq.task_type(self.schema)
+        if task_type not in (TaskType.BINARY_CLASSIFICATION,
+                             TaskType.REGRESSION):
+            raise ExecutionError(
+                "native full-model fine-tuning currently supports binary "
+                "classification and regression; use fit_head for multiclass/ranking")
+        model_uri = model_uri or self.model_config.model_uri_for(task_type)
+        normalization_mode = backend._mode(self.model_config)
+        task_spec = backend.task_spec(pq, task_type)
+        if normalization_mode is NormalizationMode.REFERENCE:
+            backend.column_stats = ColumnStats.fit(
+                self.schema, self.wiring,
+                TemporalBound.at_or_before(max(anchors)))
+
+        examples: list[tuple[EntityContext, float]] = []
+        span = _target_span(pq)
+        entity_table = pq.entity_key.table
+        for anchor in anchors:
+            ids = (list(entity_ids) if entity_ids is not None else
+                   self._resolve_entity_ids(
+                       pq, ExecutionInput(query=pq, anchor_time=anchor)))
+            for eid in ids:
+                if labels is not None and (eid, anchor) not in labels:
+                    continue
+                ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
+                label_ctx = (None if labels is not None else
+                             self.assemble_context(
+                                 entity_table, eid,
+                                 None if span is None else anchor + span,
+                                 query=pq))
+                y = self._scalar_label(pq, task_type, label_ctx, anchor,
+                                       labels, eid, [])
+                if y is not None:
+                    examples.append((ctx, float(y)))
+        if not examples:
+            raise ExecutionError(
+                "full-model fine-tuning produced no training examples")
+        if normalization_mode is NormalizationMode.REFERENCE:
+            backend.column_stats = backend.column_stats.with_task_values(
+                task_spec, [y for _, y in examples])
+
+        seqs = []
+        for ctx, y in examples:
+            one, mus, sds = backend._build_sequences(
+                pq, task_type, [ctx], normalization_mode=normalization_mode,
+                task_spec=task_spec)
+            seq = one[0]
+            target = (y - mus[0]) / sds[0]
+            for i, is_target in enumerate(seq.is_tgt):
+                if is_target:
+                    seq.value[i] = target
+            seqs.append(seq)
+
+        source_path = resolve_model_path(model_uri)
+        model = lib.load_model(source_path)  # independent mutable checkpoint
+        losses: list[float] = []
+        grad_norms: list[float] = []
+        total_seconds = 0.0
+        try:
+            for _ in range(epochs):
+                for start in range(0, len(seqs), batch_size):
+                    arrays = backend._collate(seqs[start:start + batch_size])
+                    result = model.finetune_step(
+                        **arrays, learning_rate=learning_rate,
+                        weight_decay=weight_decay,
+                        grad_clip_norm=grad_clip_norm)
+                    losses.append(result["loss"])
+                    grad_norms.append(result["grad_norm"])
+                    total_seconds += result["seconds"]
+        except RtNativeError as exc:
+            raise ExecutionError(str(exc)) from exc
+
+        out = Path(output_dir).expanduser().resolve()
+        out.mkdir(parents=True, exist_ok=True)
+        model.save(str(out / "model.safetensors"))
+        source_config = Path(source_path).with_name("config.json")
+        config = (json.loads(source_config.read_text())
+                  if source_config.exists() else {})
+        config["checkpoint_file"] = "model.safetensors"
+        config["finetune"] = {
+            "backend": "native-mps", "full_model": True,
+            "source_model": model_uri, "steps": len(losses),
+            "examples": len(examples), "final_loss": losses[-1],
+            "normalization_mode": normalization_mode.value,
+        }
+        (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        return FineTunedCheckpoint(
+            out, tuple(losses), tuple(grad_norms), total_seconds,
+            len(examples), len(losses), backend.column_stats,
+            normalization_mode)
+
+    def fit_head(self, query: Union[str, ParsedQuery], anchors: Sequence[datetime],
                  *, entity_ids: Optional[Sequence[Any]] = None,
                  params: Optional[dict[str, Any]] = None,
                  labels: Optional[dict] = None,
                  epochs: int = 100, learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
                  model_uri: Optional[str] = None):
-        """Train a task head for ``query`` over the frozen backbone.
+        """Fit a task head for ``query`` over the frozen backbone.
 
         The transformer is not updated; each training example is encoded once
         into its target-cell state and a small head is fitted on those. Returns
@@ -846,33 +970,42 @@ class Engine:
         backend = self._require_backend()
         if not hasattr(backend, "candidate_seqs"):
             raise ExecutionError(
-                "fine-tuning requires the native RT backend (RtNativeBackend)")
+                "task-head fitting requires the native RT backend (RtNativeBackend)")
         if not anchors:
-            raise ExecutionError("fine-tuning needs at least one anchor")
+            raise ExecutionError("task-head fitting needs at least one anchor")
         # Row timestamps are UTC-aware; naive anchors would fail to compare.
         anchors = [self._coerce_anchor(a) for a in anchors]
 
         pq = parse(query) if isinstance(query, str) else query
         pq = validate(pq, self.schema).query.bind_params(params)
         task_type = pq.task_type(self.schema)
+        if task_type not in (TaskType.MULTICLASS_CLASSIFICATION,
+                             TaskType.MULTILABEL_RANKING):
+            raise ExecutionError(
+                "frozen task-head fitting is limited to multiclass and "
+                "multilabel-ranking adapters; scalar binary/regression tasks "
+                "require full-backbone fine-tuning")
         model_uri = model_uri or self.model_config.model_uri_for(task_type)
         model = backend._model_for(model_uri)
 
-        # Fit the numeric preprocessing before encoding anything, bounded by
-        # the last training anchor. Statistics drawn from rows after it would
-        # leak the future into every scaled value — in aggregate, but really.
-        # The head carries these so serving cannot diverge from fitting.
+        from .model import NormalizationMode
         from .rt_native import ColumnStats
-        backend.column_stats = ColumnStats.fit(
-            self.schema, self.wiring, TemporalBound.at_or_before(max(anchors)))
+        normalization_mode = backend._mode(self.model_config)
+        if normalization_mode is NormalizationMode.REFERENCE:
+            # Reference preprocessing is fitted only on rows knowable during
+            # training. Target stats are added after labels are collected.
+            backend.column_stats = ColumnStats.fit(
+                self.schema, self.wiring,
+                TemporalBound.at_or_before(max(anchors)))
 
         entity_table = pq.entity_key.table
         span = _target_span(pq)
-        feats: list = []
         ys: list[float] = []
         groups: list[int] = [0]
         classes: list[Any] = []
         skipped = 0
+        scalar_examples: list[tuple[EntityContext, float]] = []
+        ranking_examples: list[tuple[EntityContext, str, list, list[float]]] = []
 
         for t in anchors:
             ids = (list(entity_ids) if entity_ids is not None
@@ -889,7 +1022,7 @@ class Engine:
                 if labels is not None and (eid, t) not in labels:
                     continue
                 # features see only what was knowable at the anchor...
-                ctx = self.assemble_context(entity_table, eid, t)
+                ctx = self.assemble_context(entity_table, eid, t, query=pq)
                 # ...the label reads the window after it, but only when the
                 # label has to be *derived*. A supplied label needs no context,
                 # and assembling one anyway doubled the cost of every fit --
@@ -897,7 +1030,8 @@ class Engine:
                 label_ctx = (None if labels is not None
                              else self.assemble_context(
                                  entity_table, eid,
-                                 None if span is None else t + span))
+                                 None if span is None else t + span,
+                                 query=pq))
                 if task_type is TaskType.MULTILABEL_RANKING:
                     parent = backend.ranking_parent_table(pq)
                     cands = backend._rank_candidates(
@@ -913,8 +1047,7 @@ class Engine:
                         # carries no ranking signal, so it is not an example.
                         skipped += 1
                         continue
-                    seqs = backend.candidate_seqs(pq, ctx, parent, cands)
-                    feats.append(backend._encode(model, seqs))
+                    ranking_examples.append((ctx, parent, cands, rel))
                     ys.extend(rel)
                     groups.append(len(ys))
                 else:
@@ -922,28 +1055,49 @@ class Engine:
                                            labels, eid, classes)
                     if y is None:
                         continue
-                    seqs, _, _ = backend._build_sequences(pq, task_type, [ctx])
-                    feats.append(backend._encode(model, seqs))
+                    scalar_examples.append((ctx, float(y)))
                     ys.append(float(y))
 
         if not ys:
             extra = (f" ({skipped} ranking groups had no positive relevance in "
                      f"the target window)" if skipped else "")
             raise ExecutionError(
-                f"fine-tuning produced no training examples — check the anchors "
+                f"task-head fitting produced no training examples — check the anchors "
                 f"and that the cohort resolves at them{extra}")
         if skipped:
             warnings.warn(
-                f"fine-tuning skipped {skipped} ranking group(s) with no "
+                f"task-head fitting skipped {skipped} ranking group(s) with no "
                 f"positive relevance in the target window; listwise loss needs "
                 f"at least one relevant candidate per group",
                 UserWarning, stacklevel=2)
+        task_spec = backend.task_spec(pq, task_type)
+        if normalization_mode is NormalizationMode.REFERENCE:
+            # A derived target is materialized as a real task column by the
+            # reference pipeline, and its transform is persisted alongside
+            # physical column transforms. Ranking relevance is binary and
+            # deliberately keeps the identity scale.
+            task_values = ([y for _, y in scalar_examples]
+                           if scalar_examples else [0.0, 1.0])
+            backend.column_stats = backend.column_stats.with_task_values(
+                task_spec, task_values)
+
+        feats: list = []
+        for ctx, _ in scalar_examples:
+            seqs, _, _ = backend._build_sequences(
+                pq, task_type, [ctx], normalization_mode=normalization_mode,
+                task_spec=task_spec)
+            feats.append(backend._encode(model, seqs))
+        for ctx, parent, cands, _ in ranking_examples:
+            seqs = backend.candidate_seqs(
+                pq, ctx, parent, cands,
+                normalization_mode=normalization_mode)
+            feats.append(backend._encode(model, seqs))
         features = np.concatenate(feats, axis=0).astype(np.float32)
         y = np.asarray(ys, np.float32)
         n_outputs = len(classes) if task_type is TaskType.MULTICLASS_CLASSIFICATION else 1
         if task_type is TaskType.MULTICLASS_CLASSIFICATION and n_outputs < 2:
             raise ExecutionError(
-                f"multiclass fine-tuning needs at least two observed classes, "
+                f"multiclass task-head fitting needs at least two observed classes, "
                 f"saw {n_outputs}")
         group_off = (np.asarray(groups, np.int32)
                      if task_type is TaskType.MULTILABEL_RANKING
@@ -953,7 +1107,8 @@ class Engine:
         return backend.fit_head(
             model, task_type, features, y, group_off, n_groups,
             epochs=epochs, learning_rate=learning_rate,
-            weight_decay=weight_decay, classes=classes)
+            weight_decay=weight_decay, classes=classes,
+            normalization_mode=normalization_mode)
 
     def _scalar_label(self, pq, task_type, label_ctx, t, labels, eid, classes):
         """The outcome the query asks about, as it actually turned out."""
@@ -1113,7 +1268,7 @@ class Engine:
         contexts: list[EntityContext] = []
         for eid in ids:
             anchor = self._anchor_for(entity_table, eid, eff_input)
-            ctx = self.assemble_context(entity_table, eid, anchor)
+            ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
                 continue
             contexts.append(_apply_assumptions(assumed, ctx))

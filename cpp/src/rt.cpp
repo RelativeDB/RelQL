@@ -323,6 +323,52 @@ Model Model::load(const std::string& path) {
   return m;
 }
 
+void Model::save(const std::string& path) const {
+  // Deterministic key order makes checkpoints reproducible and keeps diffs in
+  // metadata tooling stable.  Full-model training deliberately accepts and
+  // emits fp32 weights; a quantized inference checkpoint has discarded the
+  // precision required for optimization and must not be fine-tuned in place.
+  std::vector<std::string> keys;
+  keys.reserve(store.size());
+  for (const auto& [key, tensor] : store) {
+    if (tensor.qtype != (uint8_t)WType::F32)
+      throw std::runtime_error(
+          "cannot save a trainable checkpoint containing quantized tensor " + key);
+    keys.push_back(key);
+  }
+  std::sort(keys.begin(), keys.end());
+  uint64_t offset = 0;
+  std::ostringstream header;
+  header << '{';
+  for (size_t i = 0; i < keys.size(); i++) {
+    if (i) header << ',';
+    const Tensor& t = store.at(keys[i]);
+    const uint64_t bytes = (uint64_t)t.data.size() * sizeof(float);
+    header << '"' << keys[i] << "\":{\"dtype\":\"F32\",\"shape\":[";
+    for (size_t d = 0; d < t.shape.size(); d++) {
+      if (d) header << ',';
+      header << t.shape[d];
+    }
+    header << "],\"data_offsets\":[" << offset << ',' << offset + bytes
+           << "]}";
+    offset += bytes;
+  }
+  header << '}';
+  std::string json = header.str();
+  while (json.size() % 8) json.push_back(' ');
+  std::ofstream out(path, std::ios::binary);
+  if (!out) throw std::runtime_error("cannot create " + path);
+  const uint64_t hlen = json.size();
+  out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
+  out.write(json.data(), (std::streamsize)json.size());
+  for (const std::string& key : keys) {
+    const Tensor& t = store.at(key);
+    out.write(reinterpret_cast<const char*>(t.data.data()),
+              (std::streamsize)(t.data.size() * sizeof(float)));
+  }
+  if (!out) throw std::runtime_error("failed writing " + path);
+}
+
 // ---------------------------------------------------------------------------
 // primitives
 // ---------------------------------------------------------------------------

@@ -62,10 +62,9 @@ class TemporalBound:
 class Row:
     """One row's typed feature cells.
 
-    FK values are not cells — links are reported separately via ``parents`` so
-    the engine can traverse them as graph edges. A primary key is identity by
-    default, but may also be carried as a cell when the schema declares it as a
-    column (see :class:`~relativedb.schema.TableDef`).
+    FK values are reported via ``parents``. A schema link may opt into also
+    emitting that value as a non-targetable feature. Primary keys are identity
+    only and never emit feature tokens.
     Missing/null values: simply omit the cell — nulls emit no token.
     """
 

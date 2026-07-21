@@ -24,11 +24,14 @@ if(APPLE)
   target_link_libraries(rt "-framework Accelerate")
   target_compile_definitions(rt PRIVATE ACCELERATE_NEW_LAPACK)
   if(RT_METAL)
-    target_sources(rt PRIVATE src/rt_metal.mm src/rt_train_metal.mm)
+    target_sources(rt PRIVATE src/rt_metal.mm src/rt_train_metal.mm
+                              src/rt_full_train_metal.mm)
     target_compile_definitions(rt PUBLIC RT_METAL)
     set_source_files_properties(src/rt_metal.mm PROPERTIES
                                 COMPILE_OPTIONS "-fobjc-arc")
     set_source_files_properties(src/rt_train_metal.mm PROPERTIES
+                                COMPILE_OPTIONS "-fobjc-arc")
+    set_source_files_properties(src/rt_full_train_metal.mm PROPERTIES
                                 COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(rt "-framework Metal"
                              "-framework MetalPerformanceShaders"

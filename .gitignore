@@ -3,6 +3,7 @@
 .relativedb_history
 *.duckdb.wal
 .idea/
+.codex/
 runs/
 __pycache__/
 
@@ -10,4 +11,6 @@ __pycache__/
 benchmarks/corpus/
 benchmarks/results/
 .venv-bench/
+.venv-eval/
+evaluation/runs/
 artifacts/

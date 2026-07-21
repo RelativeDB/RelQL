@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import pytest
 
-from relativedb import (ContextPolicy, Engine, ExecutionInput, ModelConfig,
+from relativedb import (BreadthFirstTraversal, ContextPolicy, Engine, ExecutionInput, ModelConfig,
                       Row, SamplerMode, TaskType, TemporalBound)
 from relativedb.csc import CscIndex
 from relativedb.schema import LinkDef
@@ -31,7 +31,8 @@ def test_future_row_never_enters_context(churn_schema, churn_wiring):
     assert ("orders", "O1") in keys
     assert ("orders", "O2") in keys
     assert ("orders", "O4") not in keys          # 2026-07-05 > t0
-    assert ("products", "P3") not in keys        # only reachable via O4
+    # P3 may enter through a temporally valid same-table demonstration; the
+    # future event itself may never enter.
 
 
 def test_leaky_retriever_is_caught_by_engine(churn_schema):
@@ -70,7 +71,8 @@ def test_fanout_caps_children_newest_first(churn_schema, churn_wiring):
                  # cohort_size=0: this checks the fanout cap on the seed's own
                  # children; cohort entities bring their own, which is not it.
                  context_policy=ContextPolicy(fanouts=(1, 0), max_hops=2,
-                                              cohort_size=0))
+                                              cohort_size=0),
+                 traversal=BreadthFirstTraversal())
     ctx = eng.assemble_context("customers", "C7", T0)
     order_rows = [r for r in ctx.rows if r.table == "orders"]
     assert [r.id for r in order_rows] == ["O2"]  # newest admitted child only
@@ -198,8 +200,16 @@ def test_for_each_without_scanner_raises():
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
                   "FROM customers", anchor_time=T0))
-    # but pinned ids work
-    res = eng.execute(ExecutionInput(
+    # Reference traversal is snapshot-defined even for a pinned id.
+    with pytest.raises(ExecutionError, match="immutable graph snapshot"):
+        eng.execute(ExecutionInput(
+            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
+                  "FROM customers WHERE customers.customer_id IN :ids",
+            params={"ids": ['C7']}, anchor_time=T0))
+    # The explicit compatibility traversal retains pull-per-hop behavior.
+    legacy = Engine(_make_schema(), wiring, model_backend=StubBackend(),
+                    traversal=BreadthFirstTraversal())
+    res = legacy.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
               "FROM customers WHERE customers.customer_id IN :ids",
         params={"ids": ['C7']}, anchor_time=T0))
@@ -207,8 +217,7 @@ def test_for_each_without_scanner_raises():
 
 
 def test_pinned_key_selects_the_cohort_without_enumerating(churn_schema):
-    """`WHERE pk IN :ids` is pushed down: the cohort comes from the parameter,
-    so no TableScanner is needed and only those entities are scored."""
+    """Legacy pull traversal can push a pinned cohort down without scanning."""
     from relativedb import RetrieverWiring
     rows = churn_rows()
     by_id = {t: {r.id: r for r in rs} for t, rs in rows.items()}
@@ -217,7 +226,8 @@ def test_pinned_key_selects_the_cohort_without_enumerating(churn_schema):
                         [by_id[t][i] for i in ids if i in by_id[t]])
               .default_links(lambda l, p, b, lim: [])
               .build())
-    eng = Engine(_make_schema(), wiring, model_backend=StubBackend())
+    eng = Engine(_make_schema(), wiring, model_backend=StubBackend(),
+                 traversal=BreadthFirstTraversal())
     res = eng.execute(ExecutionInput(
         query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
               "FROM customers WHERE customers.customer_id IN :ids",
