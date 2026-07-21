@@ -219,7 +219,7 @@ const COMPARE_ROWS: {capability: string; cells: Record<string, Cell>}[] = [
   {
     capability: 'Small & scalable',
     cells: {
-      rt: ['yes', '22M params'],
+      rt: ['yes', '86M params'],
       gbdt: ['yes', 'tiny'],
       gnn: ['partial', 'grows'],
       llm: ['no', 'billions'],
@@ -317,7 +317,7 @@ function RelationalTransformers() {
           A transformer normally attends over word tokens. A{' '}
           <strong>relational transformer</strong> attends over a small subgraph
           of your database. The relational
-          analogue of prompting an LLM, in a 22M-parameter model that scales.
+          analogue of prompting an LLM, in a 86M-parameter model that scales.
         </p>
         <ComparisonMatrix />
         <p className={styles.sectionLede}>

@@ -3,13 +3,7 @@
 </p>
 
 # What is RelativeDB/RelQL?
-RelativeDB predicts over the shape of your data.
-
-Given a customer, account, transaction, or any other entity, it follows the relationships across your tables and builds a local graph around it. Orders stay orders. Returns stay returns. Support calls, refunds, text, and account history keep their meaning and their connections.
-
-That graph is passed directly to a relational model, so adding more tables gives it more to work with instead of creating another feature-engineering project.
-
-RelativeDB is an optimized implementation of Relational Transformers, exposed through RelQL, a query language for predicting what happens next.
+RelativeDB is an optimized implementation of Relational Transformers, exposed through RelQL, a query language for predicting what happens next:
 
 ```sql
 PREDICT NOT EXISTS(orders.*)
@@ -18,11 +12,9 @@ FROM customers
 
 *"For every customer, what is the probability they don't place an order"*.
 
-RelativeDB works best for large graphs, 10-100 tables. Unlike xgboost, it works well with text since all text values get encoded into latent space with the rest of the features.
+RelativeDB works best for large graphs, 10-100 tables, without needing any feature engineering.
 
-## The model
-
-RelativeDB runs the current RT-J checkpoint family, an approximately 86-million-parameter relational model. It can make zero-shot classification and regression predictions over a new database without fitting a task-specific model first.
+## The Model
 
 | Resource | Description | Date      |
 | --- | --- |-----------|
@@ -84,17 +76,18 @@ Read the [RelQL book](https://relql.com/docs/).
 | int8 | 88 MB | 453 ms | 4.5k tok/s | ±0.01 | [rt-j-int8](https://huggingface.co/RelativeDB/rt-j-int8) |
 | int4 | 64 MB | 464 ms | 4.4k tok/s | ±0.15 | [rt-j-int4](https://huggingface.co/RelativeDB/rt-j-int4) |
 
-### Fine-tuning
+# Benchmark snapshot
 
-RelativeDB can fine-tune the complete RT-J model for a binary classification or regression task on Apple Silicon. Training runs in C++ with Metal/MPS primitives and does not use Torch. It updates the transformer, input encoders, normalization parameters, and output decoder together.
+Tested two Formula 1 predictions: whether a driver finishes in the top three,
+and the driver's finishing position:
 
-Fine-tuning uses the reference sampler and keeps training, validation, and test data separate. The released zero-shot model is the starting checkpoint and the validation score is the promotion gate. A checkpoint is kept only when it improves on the best validated model. If validation gets worse, the trainer restores the best checkpoint, lowers the learning rate, and continues. Model weights and AdamW state are saved together so a stopped run can resume at a validation boundary.
+| Task metric and split | Reference RT-J | XGBoost | RelativeDB zero-shot | RelativeDB fine-tuned |
+|---|---:|---:|---:|---:|
+| Top-three finish, test AUROC ↑ (128 cells) | **0.711160** | 0.681974 | 0.710650 | — |
+| Top-three finish, test AUROC ↑ (8,192 cells) | MPS failed | 0.892310 | **0.913213** | — |
+| Top-three finish, validation AUROC ↑ (8,192 cells) | — | — | 0.872373 | **0.889627** |
 
-The physical batch is allowed to shrink for the available memory, but gradient accumulation keeps the requested effective batch unchanged. An 8,192-cell context is much more expensive than the reference script's usual 1,024-cell fine-tuning context, so long runs on an M3 can take hours.
-
-See [evaluation/README.md](evaluation/README.md#native-full-checkpoint-training) for the training command and recovery workflow. Frozen-head fitting is a separate adapter feature for multiclass and ranking tasks; it is not reported as full-model fine-tuning.
-
-## The Python library
+# The Python library
 
 ```bash
 pip install relativedb
