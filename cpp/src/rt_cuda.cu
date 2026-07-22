@@ -1,8 +1,11 @@
 // rt_cuda.cu — CUDA backend for RT-J inference (mirror of the Metal design).
 //
-// Dense projections run as cuBLAS SGEMMs (row-major y = x W^T via the
+// fp32 dense projections run as cuBLAS SGEMMs (row-major y = x W^T via the
 // col-major transpose trick); wo and w2 accumulate into the residual stream
-// with beta=1. Custom kernels handle the rest:
+// with beta=1. f16/q8/q4 projections run a custom qgemm (32x32 output tiles,
+// shared-memory-staged in-register dequant — the fp32 weight tile never
+// exists in DRAM), weights uploaded quantized-resident. Custom kernels
+// handle the rest:
 //  - rmsnorm_rows: one warp per row (pre-norms, d=512)
 //  - qknorm: in-place QK-RMSNorm per (token, head) on the fused qkvg buffer
 //  - attn: one block per (group, query-tile) work item; each warp owns a
@@ -13,6 +16,7 @@
 // Weights are uploaded once per model; activation/index buffers grow on
 // demand and are reused. Forwards on one model are serialized by the ctx.
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstring>
@@ -56,6 +60,87 @@ __device__ inline float warp_sum(float v) {
   for (int off = 16; off > 0; off >>= 1)
     v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
+}
+
+// y[M,N] = x[M,K] @ W[N,K]^T (+ y when ACC) with W quantized-resident — the
+// CUDA port of the Metal qgemm. WT: 1 = F16, 2 = Q8, 3 = Q4 (rt::WType).
+// One 256-thread block computes a 32x32 output tile. The K loop stages a
+// 32x32 x-tile and a 32x32 *dequantized* W-tile in shared memory (dequant
+// happens on the load from DRAM), then each thread accumulates 4 outputs of
+// its column. K and N are multiples of 32 for every RT-J projection; M
+// (tokens) is edge-guarded. Q4 note: K-chunks of 32 align exactly with Q4's
+// group size, so each staged W-row chunk touches one (scale, min) pair.
+template <int WT, bool ACC>
+__global__ void k_qgemm(const float* __restrict__ x,
+                        const uint8_t* __restrict__ w,
+                        const uint8_t* __restrict__ ws, float* __restrict__ y,
+                        int M, int N, int K) {
+  __shared__ float Xt[32][33];
+  __shared__ float Wt[32][33];
+  const int n0 = blockIdx.x * 32, m0 = blockIdx.y * 32;
+  const int tx = threadIdx.x, ty = threadIdx.y;  // block is (32, 8)
+  const int tid = ty * 32 + tx;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+  for (int k0 = 0; k0 < K; k0 += 32) {
+    for (int i = tid; i < 32 * 32; i += 256) {         // stage x tile
+      int r = i / 32, c = i % 32;
+      Xt[r][c] = (m0 + r < M) ? x[(size_t)(m0 + r) * K + k0 + c] : 0.f;
+    }
+    if (WT == 3) {
+      // One byte contains two adjacent Q4 weights. Have one thread unpack and
+      // dequantize both values, halving payload/scale reads and loop work.
+      for (int i = tid; i < 32 * 16; i += 256) {
+        int n = i / 16, p = i % 16;
+        size_t gn = (size_t)(n0 + n);
+        const __half* sh = reinterpret_cast<const __half*>(ws) +
+                           (gn * (K >> 5) + (k0 >> 5)) * 2;
+        uint8_t b = w[gn * (size_t)(K >> 1) + (k0 >> 1) + p];
+        float scale = __half2float(sh[0]), bias = __half2float(sh[1]);
+        Wt[n][2 * p] = scale * (float)(b & 0xf) + bias;
+        Wt[n][2 * p + 1] = scale * (float)(b >> 4) + bias;
+      }
+    } else if (WT == 1) {
+      // Two adjacent halves per thread as one vectorized half2 load, widened
+      // with a single __half22float2 (K is even; rows are half2-aligned).
+      for (int i = tid; i < 32 * 16; i += 256) {
+        int n = i / 16, p = i % 16;
+        size_t gn = (size_t)(n0 + n);
+        __half2 h = reinterpret_cast<const __half2*>(
+            w + gn * (size_t)K * 2)[(k0 >> 1) + p];
+        float2 f = __half22float2(h);
+        Wt[n][2 * p] = f.x;
+        Wt[n][2 * p + 1] = f.y;
+      }
+    } else {
+      for (int i = tid; i < 32 * 32; i += 256) {       // stage + convert W
+        int n = i / 32, kk = i % 32;
+        size_t gn = (size_t)(n0 + n);
+        Wt[n][kk] =
+            reinterpret_cast<const float*>(ws)[gn] *
+            (float)reinterpret_cast<const int8_t*>(w)[gn * K + k0 + kk];
+      }
+    }
+    __syncthreads();
+    for (int kk = 0; kk < 32; kk++) {
+      float wv = Wt[tx][kk];
+#pragma unroll
+      for (int i = 0; i < 4; i++) acc[i] += Xt[ty + 8 * i][kk] * wv;
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int r = ty + 8 * i;
+    if (m0 + r < M) {
+      float* d = y + (size_t)(m0 + r) * N + n0 + tx;
+      if (ACC)
+        *d += acc[i];
+      else
+        *d = acc[i];
+    }
+  }
 }
 
 // out[row] = rmsnorm(in[row]) * scale, rows of length n. One warp per row.
@@ -167,9 +252,19 @@ __global__ void k_head(const float* __restrict__ x,
   if (lane == 0) yhat[row] = dec_b + d;
 }
 
+// Weight on the GPU: fp32 buffer (cuBLAS path) or quantized payload + scales
+// (custom qgemm path). Uploaded once per model.
+struct GpuWeight {
+  WType type{};
+  float* f32 = nullptr;                // F32 payload
+  uint8_t* q = nullptr;                // F16/Q8/Q4 payload
+  uint8_t* s = nullptr;                // Q8/Q4 scales
+  int out = 0, in = 0;
+};
+
 struct BlockWeights {
-  float *wqkvg[3], *wo[3];             // per attention type (col, feat, nbr)
-  float *w1, *w2, *w3;
+  GpuWeight wqkvg[3], wo[3];           // per attention type (col, feat, nbr)
+  GpuWeight w1, w2, w3;
   float* norm[4];
   float *q_norm[3], *k_norm[3], *head_scale[3];
 };
@@ -187,10 +282,10 @@ struct CudaCtx {
   int *qidx[3] = {}, *kidx[3] = {};
   AttnWorkGpu* work[3] = {};
   size_t cap_bs = 0, cap_q[3] = {}, cap_k[3] = {}, cap_w[3] = {};
-  std::vector<float*> owned;           // every cudaMalloc for cleanup
+  std::vector<void*> owned;            // every cudaMalloc for cleanup
 
   ~CudaCtx() {
-    for (float* p : owned) cudaFree(p);
+    for (void* p : owned) cudaFree(p);
     for (float* p : {x, xn, qkvg, att, ffa, ffb, yhat, tap}) cudaFree(p);
     for (int a = 0; a < 3; a++) {
       cudaFree(qidx[a]);
@@ -210,35 +305,54 @@ float* dev_upload(CudaCtx* ctx, const float* p, size_t n) {
   return d;
 }
 
+uint8_t* dev_upload_bytes(CudaCtx* ctx, const uint8_t* p, size_t bytes) {
+  uint8_t* d = nullptr;
+  RT_CU(cudaMalloc(&d, bytes));
+  RT_CU(cudaMemcpy(d, p, bytes, cudaMemcpyHostToDevice));
+  ctx->owned.push_back(d);
+  return d;
+}
+
+GpuWeight upload_weight(CudaCtx* ctx, const Weight& w) {
+  GpuWeight g;
+  g.type = w.type;
+  g.out = w.out;
+  g.in = w.in;
+  if (w.type == WType::F32) {
+    g.f32 = dev_upload(ctx, w.f32, (size_t)w.out * w.in);
+    return g;
+  }
+  // qgemm requires 32-aligned projection shapes (true for every RT-J weight).
+  if (w.in % 32 != 0 || w.out % 32 != 0)
+    throw std::runtime_error("rt/cuda: quantized weight dims must be "
+                             "multiples of 32");
+  g.q = dev_upload_bytes(ctx, w.q, row_bytes(w.type, w.in) * (size_t)w.out);
+  size_t sb = scale_bytes(w.type, w.in) * (size_t)w.out;
+  if (sb) g.s = dev_upload_bytes(ctx, w.qs, sb);
+  return g;
+}
+
 CudaCtx* make_ctx(const Model& m) {
   auto* ctx = new CudaCtx();
   try {
     RT_CU(cudaStreamCreate(&ctx->stream));
     RT_CUBLAS(cublasCreate(&ctx->blas));
     RT_CUBLAS(cublasSetStream(ctx->blas, ctx->stream));
-    // fp32 only for now — quantized checkpoints run on CPU/MPS.
-    auto f32 = [](const Weight& w) {
-      if (w.type != WType::F32)
-        throw std::runtime_error(
-            "rt/cuda: quantized checkpoints are not supported on the CUDA "
-            "backend yet — use device cpu/mps or the fp32 checkpoint");
-      return w.f32;
-    };
     for (int b = 0; b < kBlocks; b++) {
       const Block& blk = m.blocks[b];
       BlockWeights& g = ctx->blk[b];
       for (int a = 0; a < 3; a++) {
-        g.wqkvg[a] = dev_upload(ctx, f32(blk.attn[a].wqkvg), (size_t)kC4 * kD);
-        g.wo[a] = dev_upload(ctx, f32(blk.attn[a].wo), (size_t)kD * kD);
+        g.wqkvg[a] = upload_weight(ctx, blk.attn[a].wqkvg);
+        g.wo[a] = upload_weight(ctx, blk.attn[a].wo);
         g.q_norm[a] = dev_upload(ctx, blk.attn[a].q_norm, kHeadDim);
         g.k_norm[a] = dev_upload(ctx, blk.attn[a].k_norm, kHeadDim);
         g.head_scale[a] = dev_upload(ctx, blk.attn[a].head_scale, kHeads);
         g.norm[a] = dev_upload(ctx, blk.norm[a], kD);
       }
       g.norm[3] = dev_upload(ctx, blk.norm[3], kD);
-      g.w1 = dev_upload(ctx, f32(blk.w1), (size_t)kDFF * kD);
-      g.w2 = dev_upload(ctx, f32(blk.w2), (size_t)kD * kDFF);
-      g.w3 = dev_upload(ctx, f32(blk.w3), (size_t)kDFF * kD);
+      g.w1 = upload_weight(ctx, blk.w1);
+      g.w2 = upload_weight(ctx, blk.w2);
+      g.w3 = upload_weight(ctx, blk.w3);
     }
     ctx->norm_out = dev_upload(ctx, m.norm_out, kD);
     ctx->dec_w = dev_upload(ctx, m.dec_number.w, kD);
@@ -257,6 +371,45 @@ void gemm(CudaCtx& ctx, const float* x, const float* w, float* y, int M, int N,
   const float alpha = 1.f;
   RT_CUBLAS(cublasSgemm(ctx.blas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, w,
                         K, x, K, &beta, y, N));
+}
+
+// Projection dispatch: fp32 uses cuBLAS SGEMM; f16/q8/q4 run the custom
+// qgemm with the weight kept quantized-resident. beta is only ever 0 or 1.
+void proj(CudaCtx& ctx, const float* x, const GpuWeight& w, float* y, int M,
+          float beta) {
+  if (w.type == WType::F32) {
+    gemm(ctx, x, w.f32, y, M, w.out, w.in, beta);
+    return;
+  }
+  const dim3 grid((unsigned)(w.out / 32), (unsigned)((M + 31) / 32));
+  const dim3 block(32, 8);
+  const bool acc = beta != 0.f;
+  cudaStream_t st = ctx.stream;
+  switch (w.type) {
+    case WType::F16:
+      if (acc)
+        k_qgemm<1, true><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
+                                                 w.in);
+      else
+        k_qgemm<1, false><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
+                                                  w.in);
+      break;
+    case WType::Q8:
+      if (acc)
+        k_qgemm<2, true><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
+                                                 w.in);
+      else
+        k_qgemm<2, false><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
+                                                  w.in);
+      break;
+    default:  // Q4
+      if (acc)
+        k_qgemm<3, true><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
+                                                 w.in);
+      else
+        k_qgemm<3, false><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
+                                                  w.in);
+  }
 }
 
 template <typename T>
@@ -369,7 +522,7 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     const BlockWeights& gw = ctx.blk[blk_i];
     for (int a = 0; a < 3; a++) {
       k_rmsnorm_rows<<<(int)BS, 32, 0, st>>>(ctx.x, ctx.xn, gw.norm[a], kD);
-      gemm(ctx, ctx.xn, gw.wqkvg[a], ctx.qkvg, (int)BS, kC4, kD, 0.f);
+      proj(ctx, ctx.xn, gw.wqkvg[a], ctx.qkvg, (int)BS, 0.f);
       k_qknorm<<<(int)BS * 16, 32, 0, st>>>(ctx.qkvg, gw.q_norm[a],
                                             gw.k_norm[a]);
       RT_CU(cudaMemsetAsync(ctx.att, 0, BS * kD * sizeof(float), st));
@@ -379,15 +532,15 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
             gw.head_scale[a]);
       k_gate_mul<<<blocks_for(BS * kD), kThreads, 0, st>>>(ctx.att, ctx.qkvg,
                                                            BS * kD);
-      gemm(ctx, ctx.att, gw.wo[a], ctx.x, (int)BS, kD, kD, 1.f);
+      proj(ctx, ctx.att, gw.wo[a], ctx.x, (int)BS, 1.f);
     }
     // FFN: x += w2( silu(w1 xn) * w3 xn )
     k_rmsnorm_rows<<<(int)BS, 32, 0, st>>>(ctx.x, ctx.xn, gw.norm[3], kD);
-    gemm(ctx, ctx.xn, gw.w1, ctx.ffa, (int)BS, kDFF, kD, 0.f);
-    gemm(ctx, ctx.xn, gw.w3, ctx.ffb, (int)BS, kDFF, kD, 0.f);
+    proj(ctx, ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
+    proj(ctx, ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
     k_swiglu<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(ctx.ffa, ctx.ffb,
                                                          BS * kDFF);
-    gemm(ctx, ctx.ffa, gw.w2, ctx.x, (int)BS, kD, kDFF, 1.f);
+    proj(ctx, ctx.ffa, gw.w2, ctx.x, (int)BS, 1.f);
     if (blk_i == 0 && debug_taps)
       RT_CU(cudaMemcpyAsync(ctx.tap, ctx.x, BS * kD * sizeof(float),
                             cudaMemcpyDeviceToDevice, st));

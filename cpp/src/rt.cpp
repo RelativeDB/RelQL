@@ -719,6 +719,74 @@ bool matmul_q8_pair(const float* x, const Weight& w0, float* y0,
   }
   return false;
 }
+
+// F16 weights stream from DRAM as IEEE half — half the fp32 traffic — and
+// widen in-register (vcvt) right next to the fp32 FMA, so neither a scratch
+// dequant pass nor the fp32 weight row ever exists in memory. Activations
+// stay fp32, so numerics match the dequantize-then-GEMM reference up to
+// summation order. Same loop order as the SDOT kernel: a 4-row weight strip
+// stays hot in L1 across the activation block.
+//
+// Only used for micro-batches (rows <= kF16NeonMaxRows): measured on M4,
+// streaming NEON wins 2.7x at M=1 and 1.2x at M=4, but the tile-dequant +
+// Accelerate path wins 3x by M=16 and 12x by M=128 — AMX outruns the NEON
+// FMA units as soon as the dequant cost is amortized over enough rows.
+// Escape hatch env RT_NO_F16_NEON forces tile-dequant (mirrors RT_NO_I8MM).
+constexpr int kF16NeonMaxRows = 4;
+bool use_f16_neon() {
+  static const bool v = [] {
+    const char* e = std::getenv("RT_NO_F16_NEON");
+    return !(e && e[0] == '1');
+  }();
+  return v;
+}
+
+void matmul_f16_neon(const float* x, const Weight& w, float* y, int rows) {
+  const float16_t* wq = reinterpret_cast<const float16_t*>(w.q);
+  const int K = w.in;                        // 512/2048: multiples of 8
+  constexpr int kNTile = 32, kRBlk = 16;
+  const int tiles = (w.out + kNTile - 1) / kNTile;
+  Pool::get().run(Pool::get().size(), tiles, [&](int, int t) {
+    const int n0 = t * kNTile, n1 = std::min(n0 + kNTile, w.out);
+    for (int r0 = 0; r0 < rows; r0 += kRBlk) {
+      const int r1 = std::min(r0 + kRBlk, rows);
+      for (int n = n0; n < n1; n += 4) {
+        const float16_t* w0 = wq + (size_t)n * K;
+        const float16_t* w1 = w0 + K;
+        const float16_t* w2 = w1 + K;
+        const float16_t* w3 = w2 + K;
+        for (int r = r0; r < r1; r++) {
+          const float* xr = x + (size_t)r * K;
+          // two accumulators per output row: independent FMA chains for the
+          // low/high half of each 8-wide weight load
+          float32x4_t a0 = vdupq_n_f32(0.f), b0 = a0, a1 = a0, b1 = a0;
+          float32x4_t a2 = a0, b2 = a0, a3 = a0, b3 = a0;
+          for (int k = 0; k < K; k += 8) {
+            const float32x4_t xlo = vld1q_f32(xr + k);
+            const float32x4_t xhi = vld1q_f32(xr + k + 4);
+            const float16x8_t v0 = vld1q_f16(w0 + k);
+            const float16x8_t v1 = vld1q_f16(w1 + k);
+            const float16x8_t v2 = vld1q_f16(w2 + k);
+            const float16x8_t v3 = vld1q_f16(w3 + k);
+            a0 = vfmaq_f32(a0, xlo, vcvt_f32_f16(vget_low_f16(v0)));
+            b0 = vfmaq_f32(b0, xhi, vcvt_high_f32_f16(v0));
+            a1 = vfmaq_f32(a1, xlo, vcvt_f32_f16(vget_low_f16(v1)));
+            b1 = vfmaq_f32(b1, xhi, vcvt_high_f32_f16(v1));
+            a2 = vfmaq_f32(a2, xlo, vcvt_f32_f16(vget_low_f16(v2)));
+            b2 = vfmaq_f32(b2, xhi, vcvt_high_f32_f16(v2));
+            a3 = vfmaq_f32(a3, xlo, vcvt_f32_f16(vget_low_f16(v3)));
+            b3 = vfmaq_f32(b3, xhi, vcvt_high_f32_f16(v3));
+          }
+          float* yr = y + (size_t)r * w.out + n;
+          yr[0] = vaddvq_f32(vaddq_f32(a0, b0));
+          yr[1] = vaddvq_f32(vaddq_f32(a1, b1));
+          yr[2] = vaddvq_f32(vaddq_f32(a2, b2));
+          yr[3] = vaddvq_f32(vaddq_f32(a3, b3));
+        }
+      }
+    }
+  });
+}
 #endif
 
 // y[rows,out] = x[rows,in] @ W^T for a quantization-aware Weight.
@@ -742,6 +810,11 @@ void matmul_w(const float* x, const Weight& w, float* y, int rows,
   }
   if (w.type == WType::Q8 && w.out % 4 == 0 && w.in % 16 == 0) {
     matmul_q8_sdot(x, w, y, rows);
+    return;
+  }
+  if (w.type == WType::F16 && rows <= kF16NeonMaxRows && use_f16_neon() &&
+      w.out % 4 == 0 && w.in % 8 == 0) {
+    matmul_f16_neon(x, w, y, rows);
     return;
   }
 #endif

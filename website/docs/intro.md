@@ -33,7 +33,7 @@ PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers
 Requires Python 3.10+.
 
 ```bash
-pip install relationdb
+pip install relativedb
 ```
 
 import Tabs from '@theme/Tabs';
@@ -98,7 +98,7 @@ traits, usually closures):
 | `LinkRetriever` | `(link, parent_id, bound, limit) → rows` | Children along one FK link, newest-first |
 | `CohortRetriever` *(optional)* | `(table, anchor, bound, limit) → ids` | Similar entities for in-context examples |
 | `TableScanner` *(optional)* | `(table, bound) → row stream` | Bulk streaming. Enables whole-table `FROM` and CSC mode |
-| `StatsProvider` *(optional)* | — | Normalization statistics |
+| `StatsProvider` *(optional)* | — | Normalization statistics (Python: pass `ColumnStats` to the backend) |
 
 ### Rows
 
@@ -110,7 +110,7 @@ schema declares it as a column.
 :::caution
 A row whose table declares no feature columns emits no tokens. A token-less row
 that others link through is a dead end: nothing below it reaches the prediction,
-and every entity scores alike. The engine raises `ContextConnectivityWarning`
+and every entity scores alike. The engine emits a `ContextConnectivityWarning`
 when it detects this. Give the table a feature column, or declare its primary
 key as one.
 :::
@@ -122,9 +122,9 @@ code, an ISBN, an airport code), declare it as a column too, the same way you
 declare a `time_column`. The engine then emits it as a feature cell:
 
 ```python
-TableDef.new_table("users").primary_key("user_id")          # identity only
-TableDef.new_table("products")                              # ...and a feature
-    .column("stock_code", ValueType.TEXT).primary_key("stock_code")
+TableDef.new_table("users").primary_key("user_id")           # identity only
+(TableDef.new_table("products")                              # ...and a feature
+    .column("stock_code", ValueType.TEXT).primary_key("stock_code"))
 ```
 
 Leave synthetic keys out. Autoincrement IDs track insertion order, so the model
@@ -199,7 +199,7 @@ a new engine.
 
 `ContextPolicy` supports two geometries:
 
-- per-hop fanouts, e.g. `fanouts(64, 64)`
+- per-hop fanouts, e.g. `fanouts=(64, 64)`
 - a uniform `bfs_width` under a global `max_context_cells` budget
 
 See [Choose a sampler mode](#choose-a-sampler-mode) for a decision guide.
@@ -248,7 +248,7 @@ baseline, M-series laptop), scoring every customer:
 | relativedb, CSC sampler | 0.66 s | ~15,000 entities/s |
 | naive per-entity pandas loop | 57.4 s | ~174 entities/s |
 
-(Reproduce with `examples/bench_naive_vs_csc.py`.) The CSC index turns each
+The CSC index turns each
 "latest *w* children ≤ anchor" expansion into a binary search plus a tail
 slice, and its build cost is paid once per snapshot.
 
@@ -265,9 +265,10 @@ you can fit a small task head over the **frozen** transformer. Nothing in the tr
 changes, so the engine encodes each example once into its target-cell state and
 fits a ~2 KB adapter quickly.
 
-This is not full-model fine-tuning. `Engine.finetune()` is disabled, and scalar
-binary/regression adapters are rejected; those tasks require an externally
-trained complete checkpoint until end-to-end training is implemented.
+This is not full-model fine-tuning. `fit_head` covers **multiclass and
+ranking** only; scalar binary/regression tasks reject the frozen adapter and go
+through `Engine.finetune()` instead, which trains the complete backbone
+natively (requires Apple MPS).
 
 ```python
 head = engine.fit_head(
@@ -299,8 +300,8 @@ head learns from the future it is meant to predict.
 
 ### What to expect
 
-- Works for all four task types. The head replaces the checkpoint's zero-shot
-  head only for the task it was trained on.
+- The head replaces the checkpoint's zero-shot head only for the task it was
+  trained on.
 - Fitting requires **Metal**. Inference on a trained head is plain CPU, so an
   adapter trained on a Mac serves anywhere.
 - Ranking groups with no relevant candidate in the window carry no signal and

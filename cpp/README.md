@@ -118,6 +118,9 @@ pass the same golden-parity and batching-invariance tests.
 - **CUDA** (`-DRT_CUDA=ON`, needs the CUDA toolkit): the same design with
   cuBLAS SGEMMs (β=1 residual accumulation) and warp-level mirrors of the
   Metal kernels (warp per (query, head) pair, `__shfl_xor_sync` reductions).
+  f16/q8/q4 projections run a CUDA port of the Metal `qgemm` (32×32
+  shared-memory tiles, in-register dequant on the DRAM load, half2 loads for
+  f16); weights stay quantized-resident.
 
 ## Optimization design (idioms from llama.cpp / vllm)
 
@@ -161,9 +164,14 @@ latency/tails, while 64-row tiles reuse each staged weight panel across twice
 as many rows. K-chunks are staged in threadgroup memory with **in-register
 dequant on the DRAM load**, accumulated via `simdgroup_float8x8` MMA
 (K-chunks of 32 align with
-Q4's group size, so each staged row-chunk touches one scale pair). fp32
-checkpoints take the exact same code paths as before (Accelerate / MPS).
-CPU and MPS produce identical drift per format; CUDA is fp32-only for now.
+Q4's group size, so each staged row-chunk touches one scale pair). CUDA runs
+the same qgemm design as a `k_qgemm` kernel (verified against the reference
+dequant numerically; pending a run on CUDA hardware). fp32 checkpoints take
+the exact same code paths as before (Accelerate / MPS / cuBLAS). On CPU, f16
+micro-batches (≤4 rows) skip the dequant pass and stream half weights
+through a NEON widening kernel (2–3x at M=1; above that the AMX GEMM wins
+and tile-dequant is used — `RT_NO_F16_NEON=1` forces tile-dequant). CPU and
+MPS produce identical drift per format.
 
 Both RT-J checkpoints have all three variants next to their HF-cache
 originals (`.../rt-j/snapshots/<hash>/{classification,regression}/
@@ -213,12 +221,15 @@ cmake -B build -S . && cmake --build build -j        # add -DRT_CUDA=ON for CUDA
   Activations are fp32 except the CPU q8 path: it quantizes them to int8 and
   runs SMMLA (i8mm) or SDOT (int8×int8) — a quarter of the weight bandwidth.
   Metal attention uses flash split-K for long key lists. Remaining wins:
-  quantized formats on the CUDA backend, int8/fp16 compute on the GPU, and
-  fusing the CPU activation-quantization into the preceding RMSNorm.
-- The CUDA backend mirrors the golden-verified Metal design but has not been
-  compiled or run yet (no CUDA toolchain on the dev machine) — build with
-  `-DRT_CUDA=ON` and run `rt_test --device cuda` on the first CUDA box to
-  confirm golden parity.
+  int8/fp16 tensor-core compute on the GPU, flash split-K attention on CUDA,
+  and fusing the CPU activation-quantization into the preceding RMSNorm.
+- The CUDA backend mirrors the golden-verified Metal design (all four weight
+  formats) but has not been compiled or run yet (no CUDA toolchain on the
+  dev machine) — build with `-DRT_CUDA=ON` and run `rt_test --device cuda`
+  (fp32/f16/q8 `--quantized`, q4 `--tol 100`) on the first CUDA box to
+  confirm golden parity. The `k_qgemm` dequant/tiling logic is already
+  verified numerically against the CPU reference via a line-by-line CPU
+  emulation over the real quantized checkpoints.
 - Feed from the relativedb engines: the `Batch` struct is exactly the token
   batch the Java/Python/Rust samplers assemble, so this library is a natural
   native `ModelBackend` behind `relativedb-ffi`.
