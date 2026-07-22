@@ -14,3 +14,10 @@ benchmarks/results/
 .venv-eval/
 evaluation/runs/
 artifacts/
+
+# python packaging artifacts (native lib is bundled at wheel-build time)
+python/dist/
+python/build/
+python/src/relativedb.egg-info/
+python/src/relativedb/librt_c.*
+python/src/relativedb/rt_c.dll

@@ -28,11 +28,15 @@ class NativeCscUnavailable(RuntimeError):
 def _candidate_paths() -> list[Path]:
     env = os.environ.get("RELATIVEDB_RT_LIB")
     here = Path(__file__).resolve()
-    # repo root: .../python/src/relativedb/csc_native.py -> parents[3]
-    root = here.parents[3]
     names = ["librt_c.dylib", "librt_c.so", "librt_c.dll", "rt_c.dll"]
     out = [Path(env)] if env else []
-    out += [root / "cpp" / "build" / n for n in names]
+    # in-package drop-in: installed wheels ship the library next to this file
+    out += [here.parent / n for n in names]
+    # sibling C++ build tree of a monorepo checkout
+    # (.../python/src/relativedb/csc_native.py -> repo root is parents[3])
+    if len(here.parents) > 3:
+        root = here.parents[3]
+        out += [root / "cpp" / "build" / n for n in names]
     return out
 
 

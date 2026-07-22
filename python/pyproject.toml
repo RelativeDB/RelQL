@@ -27,5 +27,12 @@ dev = ["pytest>=7"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The native engine (librt_c) is bundled into the wheel when present next to
+# the package sources (see build_wheel.sh); rt_native/csc_native look for it
+# in-package first. setup.py tags the wheel platform-specific iff bundled;
+# librt_c is loaded via ctypes so any CPython 3 works (py3-none-<platform>).
+[tool.setuptools.package-data]
+relativedb = ["librt_c.dylib", "librt_c.so", "librt_c.dll", "rt_c.dll"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
