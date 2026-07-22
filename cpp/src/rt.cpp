@@ -700,8 +700,13 @@ void matmul_q8_smmla(const float* x, const Weight& w, float* y, int rows) {
 
 // w1 and w3 consume the same normalized FFN input. Quantize/pack that panel
 // once and feed both projections instead of repeating the activation pass.
+bool matmul_q4_pair(const float* x, const Weight& w0, float* y0,
+                    const Weight& w1, float* y1, int rows);
+
 bool matmul_q8_pair(const float* x, const Weight& w0, float* y0,
                     const Weight& w1, float* y1, int rows) {
+  if (w0.type == WType::Q4 || w1.type == WType::Q4)
+    return matmul_q4_pair(x, w0, y0, w1, y1, rows);
   if (w0.type != WType::Q8 || w1.type != WType::Q8 || w0.in != w1.in)
     return false;
   if (cpu_has_i8mm() && w0.out % 8 == 0 && w1.out % 8 == 0 &&
@@ -718,6 +723,164 @@ bool matmul_q8_pair(const float* x, const Weight& w0, float* y0,
     return true;
   }
   return false;
+}
+
+// ---- Q4 SDOT path ---------------------------------------------------------
+// Q4 rows are asymmetric per 32-group: w = s_g * nib + m_g. With per-row
+// int8 activations (xq, scale sx) and exact fp32 per-group activation sums
+// S_g precomputed at quantization time,
+//   y = sum_g [ sx * s_g * (xq_g . nib_g) + m_g * S_g ]
+// so the bulk multiply runs int8 x int8 on the sdot units and the nibble
+// payload streams straight from DRAM (an eighth of fp32 traffic) with no
+// dequant pass. Activations are stored deinterleaved per 32-group (16
+// even-index bytes then 16 odd) so the two nibble planes of one 16-byte
+// weight load dot against contiguous vectors. Activation quantization noise
+// matches the Q8 path (absmax/127); the m_g * S_g term stays exact.
+// Escape hatch env RT_NO_Q4_SDOT forces the tile-dequant path.
+bool use_q4_sdot() {
+  static const bool v = [] {
+    const char* e = std::getenv("RT_NO_Q4_SDOT");
+    return !(e && e[0] == '1');
+  }();
+  return v;
+}
+
+struct Q4Activations {
+  int rows = 0, K = 0;
+  std::vector<int8_t> q;               // [rows, K] deinterleaved per 32-group
+  std::vector<float> scales;           // per row
+  std::vector<float> gsums;            // [rows, K/32] fp32 group sums of x
+};
+
+Q4Activations quantize_q4_rows(const float* x, int rows, int K) {
+  Q4Activations a;
+  a.rows = rows;
+  a.K = K;
+  a.q.resize((size_t)rows * K);
+  a.scales.resize(rows);
+  a.gsums.resize((size_t)rows * (K / 32));
+  Pool::get().run(Pool::get().size(), rows, [&](int, int r) {
+    const float* xr = x + (size_t)r * K;
+    const float amax = q8_absmax(xr, K);
+    const float s = amax > 0.f ? amax / 127.f : 1.f;
+    a.scales[r] = s;
+    const float inv = 1.f / s;
+    int8_t* q = &a.q[(size_t)r * K];
+    float* gs = &a.gsums[(size_t)r * (K / 32)];
+    for (int g = 0; g < K / 32; g++) {
+      const float* xg = xr + g * 32;
+      int8_t tmp[32];
+      for (int k = 0; k < 32; k += 8)
+        vst1_s8(tmp + k, quantize_q8x8(xg + k, inv));
+      const int8x16x2_t de = vld2q_s8(tmp);       // split even/odd indices
+      vst1q_s8(q + g * 32, de.val[0]);
+      vst1q_s8(q + g * 32 + 16, de.val[1]);
+      float32x4_t sum = vld1q_f32(xg);
+      for (int k = 4; k < 32; k += 4) sum = vaddq_f32(sum, vld1q_f32(xg + k));
+      gs[g] = vaddvq_f32(sum);
+    }
+  });
+  return a;
+}
+
+void matmul_q4_sdot_packed(const Q4Activations& a, const Weight& w, float* y) {
+  assert(a.K == w.in);
+  const int rows = a.rows, K = a.K, G = K / 32;   // K: multiple of 32
+  const size_t rb = (size_t)K / 2, sb = (size_t)G * 4;
+  constexpr int kNTile = 32, kRBlk = 16, kGMax = 64;  // K <= 2048
+  const int tiles = (w.out + kNTile - 1) / kNTile;
+  Pool::get().run(Pool::get().size(), tiles, [&](int, int t) {
+    const int n0 = t * kNTile, n1 = std::min(n0 + kNTile, w.out);
+    const int8x16_t mask = vdupq_n_s8(0x0f);
+    // hoist fp16 scale conversion once per tile (32 rows x G groups)
+    float sg[kNTile][kGMax], mg[kNTile][kGMax];
+    for (int n = n0; n < n1; n++) {
+      const uint16_t* sh =
+          reinterpret_cast<const uint16_t*>(w.qs + (size_t)n * sb);
+      for (int g = 0; g < G; g++) {
+        sg[n - n0][g] = half_to_float(sh[2 * g]);
+        mg[n - n0][g] = half_to_float(sh[2 * g + 1]);
+      }
+    }
+    // The asymmetric min term sum_g m_g * S_g is a dense [rows, G] @ [N, G]^T
+    // product: seed this y tile with it through the fp32 GEMM (AMX on Apple)
+    // so the int8 loop below only adds the sdot part.
+    math::gemm_nt(a.gsums.data(), &mg[0][0], y + n0, rows, n1 - n0, G, G,
+                  kGMax, w.out);
+    // same blocking as the q8 sdot kernel: a 4-row weight strip stays hot in
+    // L1 across a 16-row activation block, activation loads shared by the
+    // strip. Per-group dots stay in int32 lanes and are folded with one
+    // vectorized fma per (row, group); the only horizontal reduce is one
+    // vaddvq per output element.
+    for (int r0 = 0; r0 < rows; r0 += kRBlk) {
+      const int r1 = std::min(r0 + kRBlk, rows);
+      for (int n = n0; n < n1; n += 4) {
+        const uint8_t* w0 = w.q + (size_t)n * rb;
+        const uint8_t* w1 = w0 + rb;
+        const uint8_t* w2 = w1 + rb;
+        const uint8_t* w3 = w2 + rb;
+        const float *s0 = sg[n - n0], *s1 = sg[n - n0 + 1];
+        const float *s2 = sg[n - n0 + 2], *s3 = sg[n - n0 + 3];
+        for (int r = r0; r < r1; r++) {
+          const int8_t* xr = &a.q[(size_t)r * K];
+          float32x4_t f0 = vdupq_n_f32(0.f), f1 = f0, f2 = f0, f3 = f0;
+          for (int g = 0; g < G; g++) {
+            const int8x16_t xe = vld1q_s8(xr + g * 32);
+            const int8x16_t xo = vld1q_s8(xr + g * 32 + 16);
+            const uint8x16_t b0 = vld1q_u8(w0 + g * 16);
+            const uint8x16_t b1 = vld1q_u8(w1 + g * 16);
+            const uint8x16_t b2 = vld1q_u8(w2 + g * 16);
+            const uint8x16_t b3 = vld1q_u8(w3 + g * 16);
+            int32x4_t d0 = vdotq_s32(
+                vdotq_s32(vdupq_n_s32(0), xe,
+                          vandq_s8(vreinterpretq_s8_u8(b0), mask)),
+                xo, vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)));
+            int32x4_t d1 = vdotq_s32(
+                vdotq_s32(vdupq_n_s32(0), xe,
+                          vandq_s8(vreinterpretq_s8_u8(b1), mask)),
+                xo, vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)));
+            int32x4_t d2 = vdotq_s32(
+                vdotq_s32(vdupq_n_s32(0), xe,
+                          vandq_s8(vreinterpretq_s8_u8(b2), mask)),
+                xo, vreinterpretq_s8_u8(vshrq_n_u8(b2, 4)));
+            int32x4_t d3 = vdotq_s32(
+                vdotq_s32(vdupq_n_s32(0), xe,
+                          vandq_s8(vreinterpretq_s8_u8(b3), mask)),
+                xo, vreinterpretq_s8_u8(vshrq_n_u8(b3, 4)));
+            f0 = vfmaq_n_f32(f0, vcvtq_f32_s32(d0), s0[g]);
+            f1 = vfmaq_n_f32(f1, vcvtq_f32_s32(d1), s1[g]);
+            f2 = vfmaq_n_f32(f2, vcvtq_f32_s32(d2), s2[g]);
+            f3 = vfmaq_n_f32(f3, vcvtq_f32_s32(d3), s3[g]);
+          }
+          const float sx = a.scales[r];
+          float* yr = y + (size_t)r * w.out + n;
+          yr[0] += sx * vaddvq_f32(f0);
+          yr[1] += sx * vaddvq_f32(f1);
+          yr[2] += sx * vaddvq_f32(f2);
+          yr[3] += sx * vaddvq_f32(f3);
+        }
+      }
+    }
+  });
+}
+
+void matmul_q4_sdot(const float* x, const Weight& w, float* y, int rows) {
+  auto a = quantize_q4_rows(x, rows, w.in);
+  matmul_q4_sdot_packed(a, w, y);
+}
+
+// w1/w3 share the same normalized FFN input: quantize the activation panel
+// once. Declared above matmul_q8_pair, which routes Q4 pairs here.
+bool matmul_q4_pair(const float* x, const Weight& w0, float* y0,
+                    const Weight& w1, float* y1, int rows) {
+  if (w0.type != WType::Q4 || w1.type != WType::Q4 || w0.in != w1.in ||
+      !use_q4_sdot() || w0.out % 4 != 0 || w1.out % 4 != 0 ||
+      w0.in % 32 != 0 || w0.in / 32 > 64)
+    return false;
+  auto a = quantize_q4_rows(x, rows, w0.in);
+  matmul_q4_sdot_packed(a, w0, y0);
+  matmul_q4_sdot_packed(a, w1, y1);
+  return true;
 }
 
 // F16 weights stream from DRAM as IEEE half — half the fp32 traffic — and
@@ -810,6 +973,11 @@ void matmul_w(const float* x, const Weight& w, float* y, int rows,
   }
   if (w.type == WType::Q8 && w.out % 4 == 0 && w.in % 16 == 0) {
     matmul_q8_sdot(x, w, y, rows);
+    return;
+  }
+  if (w.type == WType::Q4 && use_q4_sdot() && w.out % 4 == 0 &&
+      w.in % 32 == 0 && w.in / 32 <= 64) {
+    matmul_q4_sdot(x, w, y, rows);
     return;
   }
   if (w.type == WType::F16 && rows <= kF16NeonMaxRows && use_f16_neon() &&

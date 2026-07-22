@@ -2,10 +2,12 @@
 //
 // fp32 dense projections run as cuBLAS SGEMMs (row-major y = x W^T via the
 // col-major transpose trick); wo and w2 accumulate into the residual stream
-// with beta=1. f16/q8/q4 projections run a custom qgemm (32x32 output tiles,
-// shared-memory-staged in-register dequant — the fp32 weight tile never
-// exists in DRAM), weights uploaded quantized-resident. Custom kernels
-// handle the rest:
+// with beta=1. q8 projections run true int8: activations quantize per row on
+// device (absmax/127, like the CPU SDOT path) and the GEMM runs int8 x int8
+// on the dp4a units with scales folded in at the epilogue. f16/q4 run a
+// custom qgemm (32x32 output tiles, shared-memory-staged in-register
+// dequant — the fp32 weight tile never exists in DRAM). All quantized
+// weights stay quantized-resident. Custom kernels handle the rest:
 //  - rmsnorm_rows: one warp per row (pre-norms, d=512)
 //  - qknorm: in-place QK-RMSNorm per (token, head) on the fused qkvg buffer
 //  - attn: one block per (group, query-tile) work item; each warp owns a
@@ -139,6 +141,79 @@ __global__ void k_qgemm(const float* __restrict__ x,
         *d += acc[i];
       else
         *d = acc[i];
+    }
+  }
+}
+
+// Per-row int8 activation quantization (absmax/127, mirrors the CPU SDOT
+// path). One warp per row; scale written per row.
+__global__ void k_quant_rows(const float* __restrict__ x,
+                             int8_t* __restrict__ q, float* __restrict__ qs,
+                             int K) {
+  int row = blockIdx.x;
+  int lane = threadIdx.x;
+  const float* xr = x + (size_t)row * K;
+  float amax = 0.f;
+  for (int i = lane; i < K; i += 32) amax = fmaxf(amax, fabsf(xr[i]));
+  for (int off = 16; off > 0; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  const float s = amax > 0.f ? amax / 127.f : 1.f;
+  const float inv = 1.f / s;
+  int8_t* qr = q + (size_t)row * K;
+  for (int i = lane; i < K; i += 32) qr[i] = (int8_t)__float2int_rn(xr[i] * inv);
+  if (lane == 0) qs[row] = s;
+}
+
+// True-int8 GEMM for Q8 weights: y[M,N] (+)= (sx_m * sw_n) * (xq_m . wq_n),
+// int8 x int8 dot products on the dp4a units. Same 32x32 tiling as k_qgemm
+// but tiles are staged as packed int32 (4 bytes/lane) and the K loop runs
+// dp4a; the int32 accumulator is exact (|dot| <= 127*127*K < 2^31 for
+// K <= 2048) and scales fold in once at the epilogue. K, N multiples of 32;
+// M edge-guarded.
+template <bool ACC>
+__global__ void k_qgemm_i8(const int8_t* __restrict__ xq,
+                           const float* __restrict__ xs,
+                           const uint8_t* __restrict__ w,
+                           const uint8_t* __restrict__ ws,
+                           float* __restrict__ y, int M, int N, int K) {
+  __shared__ int Xt[32][9];            // 32 int8 = 8 ints per row, +1 pad
+  __shared__ int Wt[32][9];
+  const int n0 = blockIdx.x * 32, m0 = blockIdx.y * 32;
+  const int tx = threadIdx.x, ty = threadIdx.y;  // block is (32, 8)
+  const int tid = ty * 32 + tx;
+  int acc[4] = {0, 0, 0, 0};
+
+  for (int k0 = 0; k0 < K; k0 += 32) {
+    {                                   // one int (4 bytes) per thread
+      int r = tid / 8, c = tid % 8;
+      Xt[r][c] = (m0 + r < M)
+                     ? reinterpret_cast<const int*>(
+                           xq + (size_t)(m0 + r) * K + k0)[c]
+                     : 0;
+      Wt[r][c] = reinterpret_cast<const int*>(
+          w + (size_t)(n0 + r) * K + k0)[c];
+    }
+    __syncthreads();
+    for (int kk = 0; kk < 8; kk++) {
+      int wv = Wt[tx][kk];
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        acc[i] = __dp4a(Xt[ty + 8 * i][kk], wv, acc[i]);
+    }
+    __syncthreads();
+  }
+
+  const float sw = reinterpret_cast<const float*>(ws)[n0 + tx];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int r = ty + 8 * i;
+    if (m0 + r < M) {
+      float* d = y + (size_t)(m0 + r) * N + n0 + tx;
+      float v = xs[m0 + r] * sw * (float)acc[i];
+      if (ACC)
+        *d += v;
+      else
+        *d = v;
     }
   }
 }
@@ -279,6 +354,8 @@ struct CudaCtx {
   // grow-on-demand activation / index buffers
   float *x = nullptr, *xn = nullptr, *qkvg = nullptr, *att = nullptr;
   float *ffa = nullptr, *ffb = nullptr, *yhat = nullptr, *tap = nullptr;
+  int8_t* xq = nullptr;                // int8 activations for Q8 projections
+  float* xqs = nullptr;                // per-row activation scales
   int *qidx[3] = {}, *kidx[3] = {};
   AttnWorkGpu* work[3] = {};
   size_t cap_bs = 0, cap_q[3] = {}, cap_k[3] = {}, cap_w[3] = {};
@@ -286,7 +363,8 @@ struct CudaCtx {
 
   ~CudaCtx() {
     for (void* p : owned) cudaFree(p);
-    for (float* p : {x, xn, qkvg, att, ffa, ffb, yhat, tap}) cudaFree(p);
+    for (float* p : {x, xn, qkvg, att, ffa, ffb, yhat, tap, xqs}) cudaFree(p);
+    cudaFree(xq);
     for (int a = 0; a < 3; a++) {
       cudaFree(qidx[a]);
       cudaFree(kidx[a]);
@@ -373,8 +451,10 @@ void gemm(CudaCtx& ctx, const float* x, const float* w, float* y, int M, int N,
                         K, x, K, &beta, y, N));
 }
 
-// Projection dispatch: fp32 uses cuBLAS SGEMM; f16/q8/q4 run the custom
-// qgemm with the weight kept quantized-resident. beta is only ever 0 or 1.
+// Projection dispatch: fp32 uses cuBLAS SGEMM; q8 quantizes activations on
+// device and runs the true-int8 dp4a GEMM (mirrors the CPU SDOT path);
+// f16/q4 run the dequant-in-register qgemm. Weights stay quantized-resident.
+// beta is only ever 0 or 1.
 void proj(CudaCtx& ctx, const float* x, const GpuWeight& w, float* y, int M,
           float beta) {
   if (w.type == WType::F32) {
@@ -395,12 +475,13 @@ void proj(CudaCtx& ctx, const float* x, const GpuWeight& w, float* y, int M,
                                                   w.in);
       break;
     case WType::Q8:
+      k_quant_rows<<<M, 32, 0, st>>>(x, ctx.xq, ctx.xqs, w.in);
       if (acc)
-        k_qgemm<2, true><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
-                                                 w.in);
+        k_qgemm_i8<true><<<grid, block, 0, st>>>(ctx.xq, ctx.xqs, w.q, w.s, y,
+                                                 M, w.out, w.in);
       else
-        k_qgemm<2, false><<<grid, block, 0, st>>>(x, w.q, w.s, y, M, w.out,
-                                                  w.in);
+        k_qgemm_i8<false><<<grid, block, 0, st>>>(ctx.xq, ctx.xqs, w.q, w.s,
+                                                  y, M, w.out, w.in);
       break;
     default:  // Q4
       if (acc)
@@ -496,6 +577,12 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     if (ctx.yhat) RT_CU(cudaFree(ctx.yhat));
     ctx.yhat = nullptr;
     RT_CU(cudaMalloc(&ctx.yhat, BS * sizeof(float)));
+    if (ctx.xq) RT_CU(cudaFree(ctx.xq));
+    ctx.xq = nullptr;
+    RT_CU(cudaMalloc(&ctx.xq, BS * (size_t)kDFF));
+    if (ctx.xqs) RT_CU(cudaFree(ctx.xqs));
+    ctx.xqs = nullptr;
+    RT_CU(cudaMalloc(&ctx.xqs, BS * sizeof(float)));
     ctx.cap_bs = BS;
   }
   for (int a = 0; a < 3; a++) {

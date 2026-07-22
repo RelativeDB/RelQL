@@ -118,9 +118,10 @@ pass the same golden-parity and batching-invariance tests.
 - **CUDA** (`-DRT_CUDA=ON`, needs the CUDA toolkit): the same design with
   cuBLAS SGEMMs (β=1 residual accumulation) and warp-level mirrors of the
   Metal kernels (warp per (query, head) pair, `__shfl_xor_sync` reductions).
-  f16/q8/q4 projections run a CUDA port of the Metal `qgemm` (32×32
-  shared-memory tiles, in-register dequant on the DRAM load, half2 loads for
-  f16); weights stay quantized-resident.
+  q8 projections run true int8: device-side per-row activation quantization
+  plus a dp4a GEMM with scales folded at the epilogue. f16/q4 run a CUDA
+  port of the Metal `qgemm` (32×32 shared-memory tiles, in-register dequant
+  on the DRAM load, half2 loads for f16); weights stay quantized-resident.
 
 ## Optimization design (idioms from llama.cpp / vllm)
 
@@ -156,9 +157,13 @@ input-side error would otherwise propagate through all 12 blocks:
 | **q4** | uint4, groups of 32, f16 (scale, min)/group with min-MSE clip search (`U8` + `<name>.q4_scale`); `wo`/`ffn.w2` stay q8 (Q4_K_M-style — their error lands on the residual stream) | 64 MB | 1.5e-1 (scores keep sign + ranking) |
 
 **Weights stay quantized-resident** — this is not load-time dequantization.
-On CPU, `matmul_w` dequantizes 64-row weight tiles into per-thread scratch
-(hot in cache) right before the Accelerate/portable GEMM, so DRAM weight
-traffic is the quantized payload. On Metal, quantized projections skip MPS
+On CPU, q8 and q4 both run true int8 (activations quantized per row,
+absmax/127): q8 on the SMMLA/SDOT units, q4 by unpacking nibble planes to
+int8 in-register and folding the asymmetric `m_g * sum(x_g)` term through a
+small fp32 GEMM (`RT_NO_Q4_SDOT=1` forces tile-dequant). f16 dequantizes
+64-row weight tiles into per-thread scratch (hot in cache) right before the
+Accelerate/portable GEMM, so DRAM weight traffic is always the quantized
+payload. On Metal, quantized projections skip MPS
 entirely and run a custom `qgemm`: 32-row tiles below 128 tokens favor
 latency/tails, while 64-row tiles reuse each staged weight panel across twice
 as many rows. K-chunks are staged in threadgroup memory with **in-register
