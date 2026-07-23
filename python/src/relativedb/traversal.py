@@ -775,6 +775,77 @@ class ReferenceTraversal:
         return TraversalResult(tuple(ordered), frozenset(focal), 0, full,
                                node_ids)
 
+    def cohort_targets(self, entity_table, entity_ids, anchor, task_spec,
+                       *, history: int = 3):
+        """Cohort rows for shared-context scoring, from the shared build.
+
+        Returns ``(targets, inject_rows, extra_node_ids)`` — one target row
+        key per entity, the rows to guarantee inside the shared context (each
+        entity's target row, entity row, and its ``history`` most recent
+        labeled task rows), and node ids for rows not already mapped — or
+        ``None`` when no shared state matches this anchor (caller falls back
+        to per-entity scoring).
+        """
+        table = task_spec.table_name
+        wanted = set(entity_ids)
+        state = getattr(self, "_shared_state", None)
+        if (state is not None and state.get("cutoff") == anchor
+                and state.get("sampling_table") == table):
+            by_key = state["by_key"]
+            focal_rows: dict = {}
+            history_of: dict = {}
+            for row in state["rows_by_table"].get(table, ()):
+                did = row.parents.get("__entity__")
+                if did not in wanted:
+                    continue
+                if row.timestamp == anchor:
+                    focal_rows.setdefault(did, row)
+                elif (row.timestamp is not None and row.timestamp < anchor
+                      and task_spec.target_column in row.cells):
+                    history_of.setdefault(did, []).append(row)
+            if set(focal_rows) != wanted:
+                return None
+            targets, inject = [], []
+            for eid in entity_ids:
+                row = by_key.get(focal_rows[eid].key, focal_rows[eid])
+                targets.append((eid, row.key))
+                inject.append(row)
+                entity_row = by_key.get((entity_table, eid))
+                if entity_row is not None:
+                    inject.append(entity_row)
+                hist = sorted(history_of.get(eid, ()),
+                              key=lambda r: r.timestamp, reverse=True)
+                inject.extend(hist[:history])
+            return targets, inject, {}
+        state = getattr(self, "_inline_state", None)
+        if (state is not None and state.get("anchor") == anchor
+                and state.get("sampling_table") == table):
+            by_key = state["by_key"]
+            meta = state["entity_meta"]
+            targets, inject = [], []
+            extra_node_ids: dict = {}
+            for eid in entity_ids:
+                m = meta.get(eid)
+                if m is None:
+                    return None
+                entity_i, _ = m
+                trow = Row(table, (eid, anchor, "target"), {},
+                           timestamp=anchor, parents={"__entity__": eid})
+                targets.append((eid, trow.key))
+                inject.append(trow)
+                extra_node_ids[trow.key] = (
+                    state["task_base"] + entity_i * state["task_stride"])
+                entity_row = by_key.get((entity_table, eid))
+                if entity_row is not None:
+                    inject.append(entity_row)
+                hist = [r for r in state["rows_by_table"].get(table, ())
+                        if r.parents.get("__entity__") == eid
+                        and r.timestamp is not None]
+                hist.sort(key=lambda r: r.timestamp, reverse=True)
+                inject.extend(hist[:history])
+            return targets, inject, extra_node_ids
+        return None
+
     def _factory_shared_build(self, schema, graph, entity_table, bound,
                               query, task_spec, supplied):
         """Build the entity-invariant graph state for a factory task graph.

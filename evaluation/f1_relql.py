@@ -58,6 +58,18 @@ TASKS = {
         classification=True,
         per_entity_anchor=False,
     ),
+    "driver-top3": RelqlTask(
+        name="driver-top3",
+        query=(
+            "PREDICT COUNT(results.* WHERE results.positionOrder <= 3) "
+            "OVER (30 DAYS FOLLOWING) > 0 FROM drivers "
+            "WHERE drivers.driverId IN :ids RETURN PROBABILITY"
+        ),
+        id_column="driverId",
+        target_column="qualifying",
+        classification=True,
+        per_entity_anchor=False,
+    ),
     "qualifying-position": RelqlTask(
         name="qualifying-position",
         query=(
@@ -443,10 +455,12 @@ def build_engine(dataset, task: RelqlTask, *, context_size: int = 128,
     )
 
 
-def execute_group(engine: Engine, task: RelqlTask, ids, anchor: datetime):
+def execute_group(engine: Engine, task: RelqlTask, ids, anchor: datetime,
+                  shared: bool = False):
     return engine.execute(ExecutionInput(
         query=task.query,
         anchor_time=_python_value(anchor),
         per_entity_anchor=task.per_entity_anchor,
         params={"ids": [_python_value(value) for value in ids]},
+        shared_context=shared,
     ))

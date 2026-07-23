@@ -78,7 +78,7 @@ def _gate(engine, spec, frame, context_size: int) -> dict:
 
 
 def run_one(dataset, name: str, output: Path, library: str | None,
-            context_size: int) -> dict:
+            context_size: int, shared: bool = False) -> dict:
     from relbench import load_task
 
     spec = TASKS[name]
@@ -98,7 +98,8 @@ def run_one(dataset, name: str, output: Path, library: str | None,
         warnings.simplefilter("always")
         for group_index, (date, group) in enumerate(groups, 1):
             result = execute_group(engine, spec,
-                                   group[spec.id_column].tolist(), date)
+                                   group[spec.id_column].tolist(), date,
+                                   shared=shared)
             for prediction in result.predictions:
                 value = (prediction.probability if spec.classification
                          else prediction.value)
@@ -129,6 +130,7 @@ def run_one(dataset, name: str, output: Path, library: str | None,
         "query": spec.query,
         "context_size": context_size,
         "batch_size": 4,
+        "shared_context": shared,
         "fine_tuned": False,
         "elapsed_seconds": time.perf_counter() - started,
         "scores": scores,
@@ -151,13 +153,15 @@ def main() -> None:
                         default=list(TASKS))
     parser.add_argument("--library", default="cpp/build/librt_c.dylib")
     parser.add_argument("--context-size", type=int, default=128)
+    parser.add_argument("--shared", action="store_true",
+                        help="score each cohort in one shared context")
     args = parser.parse_args()
 
     from relbench import load_dataset
     dataset = load_dataset(DATASET)
     output = Path(args.output)
     records = [run_one(dataset, name, output, args.library,
-                       args.context_size)
+                       args.context_size, shared=args.shared)
                for name in args.tasks]
     (output / "relativedb-results.json").write_text(
         json.dumps(records, indent=2, default=str) + "\n")

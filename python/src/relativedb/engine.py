@@ -124,6 +124,16 @@ def _target_span(pq: ParsedQuery):
     return None
 
 
+def _pure_pin(where: Any, entity_key: ColumnRef) -> bool:
+    """True when every WHERE leaf is a primary-key pin — i.e. the clause
+    selects the cohort and nothing else, so shared-context scoring applies
+    it fully by construction."""
+    if isinstance(where, LogicalOp) and where.op is BoolOp.AND:
+        return (_pure_pin(where.left, entity_key)
+                and _pure_pin(where.right, entity_key))
+    return _pinned_ids(where, entity_key) is not None
+
+
 def _pinned_ids(where: Any, entity_key: ColumnRef) -> Optional[list[Any]]:
     """The cohort a WHERE clause pins the primary key to, or None if it
     doesn't pin one.
@@ -315,6 +325,12 @@ class ExecutionInput:
     # `:name` bindings for the query text — the anchor (`AS OF :t`), the
     # cohort (`WHERE t.pk IN :ids`), and any other parameterized literal.
     params: Optional[dict[str, Any]] = None
+    # Score the whole cohort inside ONE shared context: every entity's target
+    # is masked in the same sequence and read from its own token, so cohort
+    # members never see each other's outcomes (strictly less exposure than
+    # per-entity scoring) and a cohort costs one forward instead of N.
+    # Scalar tasks with a shared anchor and a key-pinned WHERE only.
+    shared_context: bool = False
 
 
 @dataclass
@@ -678,6 +694,14 @@ class Engine:
         assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
         backend = self._require_backend()
 
+        if input.shared_context:
+            result = self._execute_shared(pq, input, task_type, model_uri,
+                                          entity_table, ids, backend)
+            if result is not None:
+                return result
+            # No shared state matched (e.g. unsupported traversal); fall
+            # through to per-entity scoring.
+
         def build_context(eid) -> Optional[EntityContext]:
             anchor = self._anchor_for(entity_table, eid, input)
             ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
@@ -752,6 +776,71 @@ class Engine:
                                   model_uri, self.model_config)
         _warn_inert_assumptions(assumed, contexts)
         stats = self._collect_stats(pq, task_type, contexts)
+        return PredictionResult(task_type=task_type,
+                                predictions=tuple(preds),
+                                model_uri=model_uri, stats=stats)
+
+    def _execute_shared(self, pq: ParsedQuery, input: ExecutionInput,
+                        task_type: TaskType, model_uri: str,
+                        entity_table: str, ids: list[Any],
+                        backend) -> Optional[PredictionResult]:
+        """Score the cohort in one shared context (one forward per cohort).
+
+        Returns None when the traversal has no matching shared state, in
+        which case the caller falls back to per-entity scoring.
+        """
+        if task_type not in (TaskType.BINARY_CLASSIFICATION,
+                             TaskType.REGRESSION):
+            raise ExecutionError(
+                "shared_context supports binary classification and "
+                "regression targets")
+        if pq.assuming is not None:
+            raise ExecutionError("shared_context does not support ASSUMING")
+        if input.per_entity_anchor:
+            raise ExecutionError(
+                "shared_context requires one shared anchor for the cohort")
+        if pq.where is not None and not _pure_pin(pq.where, pq.entity_key):
+            raise ExecutionError(
+                "shared_context supports WHERE only as a primary-key pin "
+                "(pk = :id / pk IN :ids); other filters need per-entity "
+                "scoring")
+        if not ids:
+            return PredictionResult(task_type=task_type, predictions=(),
+                                    model_uri=model_uri,
+                                    stats={"entities_scored": 0})
+        if (not hasattr(self.traversal, "cohort_targets")
+                or not hasattr(backend, "score_shared")):
+            raise ExecutionError(
+                "shared_context requires the reference traversal and the "
+                "native RT backend")
+        seed = ids[0]
+        anchor = self._anchor_for(entity_table, seed, input)
+        ctx = self.assemble_context(entity_table, seed, anchor, query=pq)
+        task_spec = backend.task_spec(pq, task_type)
+        got = self.traversal.cohort_targets(entity_table, list(ids), anchor,
+                                            task_spec)
+        if got is None:
+            return None
+        targets, inject, extra_node_ids = got
+        # Guarantee cohort rows a place in the context: right after the focal
+        # target, so the sequence budget truncates low-relevance tail rows
+        # instead of them.
+        have = {r.key for r in ctx.rows}
+        fresh: list[Row] = []
+        for row in inject:
+            if row.key not in have:
+                fresh.append(row)
+                have.add(row.key)
+        if fresh:
+            ctx.rows = ([ctx.rows[0]] + fresh + ctx.rows[1:] if ctx.rows
+                        else fresh)
+        if extra_node_ids:
+            ctx.node_ids.update(extra_node_ids)
+        preds = backend.score_shared(pq, task_type, ctx, targets, model_uri,
+                                     self.model_config)
+        stats = self._collect_stats(pq, task_type, [ctx])
+        stats["entities_scored"] = len(preds)
+        stats["shared_context_forwards"] = 1
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
                                 model_uri=model_uri, stats=stats)

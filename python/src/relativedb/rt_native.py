@@ -370,6 +370,19 @@ class RtLib:
             f32p,                            # out_target_scores
             ctypes.c_char_p, ctypes.c_size_t]
 
+        # Per-token number-head output (multi-target scoring); absent from
+        # older libraries, in which case shared-context scoring is refused.
+        if hasattr(lib, "rt_forward_tokens_device"):
+            lib.rt_forward_tokens_device.restype = ctypes.c_int
+            lib.rt_forward_tokens_device.argtypes = [
+                ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+                f64p, f64p, f64p, f64p,          # node, f2p, col, table
+                u8p, f64p, u8p,                  # is_padding, sem_types, is_target
+                f32p, f32p, f32p, f32p, f32p,    # number, datetime, boolean, text, col_name
+                ctypes.c_int32, ctypes.c_int32,  # n_threads, device
+                f32p,                            # out_token_scores [B*S]
+                ctypes.c_char_p, ctypes.c_size_t]
+
         # ---- frozen-backbone fine-tuning (see rt_c.h) ----------------------
         # The transformer stays frozen; only a small task head is trained, on
         # its final target-cell states [N, 512].
@@ -785,6 +798,36 @@ class RtModel:
                 f"rt_forward failed ({rc}): "
                 f"{err.value.decode('utf-8', 'replace')}")
         return out
+
+    def forward_tokens(self, *, node_idxs, f2p, col_idxs, table_idxs,
+                       is_padding, sem_types, is_target, number_v, datetime_v,
+                       boolean_v, text_v, col_name_v, n_threads: int = 0,
+                       device: int = RT_DEVICE_CPU) -> np.ndarray:
+        """Number-head output for every token ``[B, S]`` in pre-sort order.
+
+        Lets one sequence carry several masked targets, each read at its own
+        cell (shared-context multi-target scoring)."""
+        if not hasattr(self._native._lib, "rt_forward_tokens_device"):
+            raise RtNativeUnavailableError(
+                "librt_c is too old for shared-context scoring "
+                "(rt_forward_tokens_device missing); rebuild the native library")
+        (B, S, node_idxs, f2p, col_idxs, table_idxs, is_padding, sem_types,
+         is_target, number_v, datetime_v, boolean_v, text_v, col_name_v
+         ) = self._prep(node_idxs, f2p, col_idxs, table_idxs, is_padding,
+                        sem_types, is_target, number_v, datetime_v, boolean_v,
+                        text_v, col_name_v)
+        out = np.zeros(B * S, np.float32)
+        err = ctypes.create_string_buffer(512)
+        rc = self._native._lib.rt_forward_tokens_device(
+            self._handle, B, S, node_idxs, f2p, col_idxs, table_idxs,
+            is_padding, sem_types, is_target, number_v, datetime_v,
+            boolean_v, text_v, col_name_v, int(n_threads), int(device),
+            out, err, len(err))
+        if rc != 0:
+            raise RtNativeError(
+                f"rt_forward_tokens_device failed ({rc}): "
+                f"{err.value.decode('utf-8', 'replace')}")
+        return out.reshape(B, S)
 
     def encode_targets(self, *, node_idxs, f2p, col_idxs, table_idxs,
                        is_padding, sem_types, is_target, number_v, datetime_v,
@@ -1209,6 +1252,109 @@ class RtNativeBackend:
     def _encode(self, model: RtModel, seqs: list["_Seq"]) -> np.ndarray:
         """Frozen-backbone features ``[len(seqs), 512]`` for these sequences."""
         return self._forward_batched(model, seqs, encode=True)
+
+    def score_shared(self, query: ParsedQuery, task_type: TaskType,
+                     ctx: EntityContext,
+                     targets: list[tuple[Any, tuple[str, Any]]],
+                     model_uri: str,
+                     config: ModelConfig) -> list[EntityPrediction]:
+        """Score every cohort target inside one shared context.
+
+        ``targets`` is ``[(entity_id, target_row_key), ...]`` with the first
+        entry being the entity the context was assembled for. Each target's
+        label cell is masked (flipped when the row carries one, appended when
+        it does not), and one forward reads each prediction at its own token
+        through the per-token number head. Peers' labels are therefore never
+        visible to each other — strictly less outcome exposure than scoring
+        the same cohort one entity at a time.
+        """
+        if task_type not in (TaskType.BINARY_CLASSIFICATION,
+                             TaskType.REGRESSION):
+            raise RtNativeError(
+                "shared-context scoring supports binary classification and "
+                "regression targets")
+        ret = query.ret
+        ret_kind = ret.kind if ret is not None else None
+        mode = self._mode(config)
+        model = self._model_for(model_uri)
+        task_spec = self.task_spec(query, task_type)
+        fk_to_parent = self._fk_to_parent()
+        labels: list[float] = []
+        seq, node_of, _, tgt_idx = self._build_ctx_seq(
+            query, task_type, ctx, fk_to_parent, labels, task_spec=task_spec)
+        stats = self._label_stats(seq, labels, task_spec, mode)
+        self._normalize_one(seq, task_spec, stats, mode)
+
+        tcol = (task_spec.target_column, task_spec.table_name)
+        node_to_entity = {}
+        for eid, key in targets:
+            node = node_of.get(key)
+            if node is None:
+                raise RtNativeError(
+                    f"shared-context target row {key!r} is not part of the "
+                    f"assembled context")
+            node_to_entity[node] = eid
+        # Mask existing label cells; remember which target nodes have one.
+        seen_nodes = set()
+        first_cell_of_node: dict[int, int] = {}
+        for s in range(len(seq)):
+            n = seq.node[s]
+            if n in node_to_entity and n not in first_cell_of_node:
+                first_cell_of_node[n] = s
+            if n in node_to_entity and seq.col[s] == tcol:
+                seq.is_tgt[s] = True
+                seq.value[s] = 0.0
+                seen_nodes.add(n)
+        # Targets whose row carries no label cell (synthesized target rows)
+        # get a fresh masked cell right after the focal target, with the f2p
+        # of a sibling cell of the same row (captured before inserting, since
+        # inserts shift positions).
+        pending = [(n, eid) for n, eid in node_to_entity.items()
+                   if n not in seen_nodes]
+        for n, eid in pending:
+            if first_cell_of_node.get(n) is None:
+                raise RtNativeError(
+                    f"shared-context target for entity {eid!r} emitted no "
+                    f"cells; its row was truncated out of the context")
+        pending_f2p = {n: list(seq.f2p[first_cell_of_node[n]])
+                       for n, _ in pending}
+        for n, eid in pending:
+            at = tgt_idx + 1
+            seq.node.insert(at, n)
+            seq.f2p.insert(at, pending_f2p[n])
+            seq.col.insert(at, tcol)
+            seq.tab.insert(at, task_spec.table_name)
+            seq.sem.insert(at, SEM_NUMBER)
+            seq.is_tgt.insert(at, True)
+            seq.value.insert(at, 0.0)
+
+        yhat = self._forward_tokens(model, seq)
+        preds: list[EntityPrediction] = []
+        emitted = set()
+        for s in range(len(seq)):
+            if not seq.is_tgt[s]:
+                continue
+            eid = node_to_entity.get(seq.node[s])
+            if eid is None or eid in emitted:
+                continue
+            emitted.add(eid)
+            v = float(yhat[s])
+            if task_type is TaskType.BINARY_CLASSIFICATION:
+                p = 1.0 / (1.0 + math.exp(-v))
+                preds.append(self._shape_binary(eid, ret_kind, p))
+            else:
+                preds.append(EntityPrediction(eid, value=v * stats[1] + stats[0]))
+        missing = [eid for eid, _ in targets if eid not in emitted]
+        if missing:
+            raise RtNativeError(
+                f"shared-context scoring produced no prediction for "
+                f"{missing[:3]!r}")
+        return preds
+
+    def _forward_tokens(self, model: RtModel, seq: "_Seq") -> np.ndarray:
+        kw = self._collate([seq])
+        kw["n_threads"] = self.n_threads
+        return model.forward_tokens(device=self._resolve_device(), **kw)[0]
 
     def _forward_batched(self, model: RtModel, seqs: list["_Seq"], **kwargs):
         """Run bounded physical forwards while preserving logical ordering."""
