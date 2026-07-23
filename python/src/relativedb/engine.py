@@ -835,6 +835,19 @@ class Engine:
             ctx.rows = head + front + rest
         if extra_node_ids:
             ctx.node_ids.update(extra_node_ids)
+        # Experiment knob: cap the shared context's cell count. The cohort
+        # block sits at the front, so only the low-relevance tail is dropped.
+        trim = int(os.environ.get("RELATIVEDB_SHARED_TRIM_CELLS", "0") or 0)
+        if trim > 0:
+            cells = 0
+            kept: list[Row] = []
+            for row in ctx.rows:
+                kept.append(row)
+                cells += len(row.cells) + (1 if row.timestamp is not None
+                                           else 0)
+                if cells >= trim:
+                    break
+            ctx.rows = kept
         payload = backend.prepare_shared(pq, task_type, ctx, targets,
                                          model_uri, self.model_config)
         stats = self._collect_stats(pq, task_type, [ctx])
