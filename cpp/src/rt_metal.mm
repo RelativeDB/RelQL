@@ -230,45 +230,82 @@ struct AttnWork {
   float logkv;   // log(clamp_min(bf16(nk), 1))
 };
 
-// One threadgroup per work item; each simdgroup takes (query, head) pairs and
-// streams the key list with an online softmax. q/k in qkvg are already
-// QK-normed; v sits at +1024. Output rows in att (query scaling folds
-// head_scale * logkv / head_dim into q).
+// Tiled attention. Work items carry at most kMQ queries (host sub-tiles the
+// kQTile prep items). One threadgroup = 8 simdgroups; simdgroup s owns the
+// (query, head) pairs {s, s+8, s+16, ...} with their online-softmax state in
+// registers. Key/value rows are staged into threadgroup memory kTKx512 at a
+// time by all 256 threads, so each staged row serves every query and head in
+// the item instead of being re-streamed per (query, head). Per pair, keys
+// are still visited in ascending order with the same q0/q1 lane layout and
+// simd_sum reduction as the untiled kernel, so the arithmetic sequence per
+// pair is unchanged.
+constant uint kMQ = 8;    // queries per work item (host-side sub-tiling)
+constant uint kTK = 6;    // keys staged per tile (2 * kTK * 512 floats)
+
 kernel void attn(device const float* qkvg [[buffer(0)]],
                  device float* att [[buffer(1)]],
                  device const int* qidx [[buffer(2)]],
                  device const int* kidx [[buffer(3)]],
                  device const AttnWork* work [[buffer(4)]],
                  device const float* head_scale [[buffer(5)]],
+                 threadgroup float* Kt [[threadgroup(0)]],
+                 threadgroup float* Vt [[threadgroup(1)]],
                  uint tg [[threadgroup_position_in_grid]],
+                 uint tid [[thread_index_in_threadgroup]],
                  uint sg [[simdgroup_index_in_threadgroup]],
-                 uint nsg [[simdgroups_per_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
   const AttnWork w = work[tg];
-  for (uint p = sg; p < uint(w.tq) * 8; p += nsg) {
-    uint r = p / 8, h = p % 8;
-    uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
-    device const float* q = qkvg + (ulong)qrowi * 2048 + h * 64;
-    float qscale = head_scale[h] * w.logkv / 64.0f;
-    float q0 = q[2 * lane] * qscale;
-    float q1 = q[2 * lane + 1] * qscale;
-    float mx = -INFINITY, den = 0.0f, a0 = 0.0f, a1 = 0.0f;
-    for (int j = 0; j < w.nk; j++) {
-      uint krowi = uint(w.rowbase + kidx[w.kstart + j]);
-      device const float* k = qkvg + (ulong)krowi * 2048 + 512 + h * 64;
-      float score = simd_sum(q0 * k[2 * lane] + q1 * k[2 * lane + 1]);
-      device const float* v = k + 512;
-      float nm = max(mx, score);
-      float corr = exp(mx - nm);
-      float wt = exp(score - nm);
-      den = den * corr + wt;
-      a0 = a0 * corr + wt * v[2 * lane];
-      a1 = a1 * corr + wt * v[2 * lane + 1];
-      mx = nm;
+  const uint npair = uint(w.tq) * 8;
+  float q0v[kMQ], q1v[kMQ], mx[kMQ], den[kMQ], a0[kMQ], a1[kMQ];
+  ulong orow[kMQ];
+  for (uint s = 0; s < kMQ; s++) {
+    mx[s] = -INFINITY; den[s] = 0.0f; a0[s] = 0.0f; a1[s] = 0.0f;
+    uint p = sg + s * 8;
+    if (p < npair) {
+      uint r = p / 8, h = p % 8;
+      uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
+      device const float* q = qkvg + (ulong)qrowi * 2048 + h * 64;
+      float qscale = head_scale[h] * w.logkv / 64.0f;
+      q0v[s] = q[2 * lane] * qscale;
+      q1v[s] = q[2 * lane + 1] * qscale;
+      orow[s] = (ulong)qrowi * 512 + h * 64;
     }
-    device float* o = att + (ulong)qrowi * 512 + h * 64;
-    o[2 * lane] = a0 / den;
-    o[2 * lane + 1] = a1 / den;
+  }
+  for (int k0 = 0; k0 < w.nk; k0 += int(kTK)) {
+    const int kn = min(int(kTK), w.nk - k0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < uint(kn) * 512; i += 256) {
+      uint j = i / 512, d = i % 512;
+      ulong krow =
+          (ulong)uint(w.rowbase + kidx[w.kstart + k0 + int(j)]) * 2048;
+      Kt[j * 512 + d] = qkvg[krow + 512 + d];
+      Vt[j * 512 + d] = qkvg[krow + 1024 + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = 0; j < kn; j++) {
+      for (uint s = 0; s < kMQ; s++) {
+        uint p = sg + s * 8;
+        if (p >= npair) continue;
+        uint h = p % 8;
+        threadgroup const float* k = Kt + j * 512 + h * 64;
+        float score = simd_sum(q0v[s] * k[2 * lane] + q1v[s] * k[2 * lane + 1]);
+        threadgroup const float* v = Vt + j * 512 + h * 64;
+        float nm = max(mx[s], score);
+        float corr = exp(mx[s] - nm);
+        float wt = exp(score - nm);
+        den[s] = den[s] * corr + wt;
+        a0[s] = a0[s] * corr + wt * v[2 * lane];
+        a1[s] = a1[s] * corr + wt * v[2 * lane + 1];
+        mx[s] = nm;
+      }
+    }
+  }
+  for (uint s = 0; s < kMQ; s++) {
+    uint p = sg + s * 8;
+    if (p >= npair) continue;
+    device float* o = att + orow[s];
+    o[2 * lane] = a0[s] / den[s];
+    o[2 * lane + 1] = a1[s] / den[s];
   }
 }
 
@@ -299,36 +336,64 @@ kernel void attn_part(device const float* qkvg [[buffer(0)]],
                       device const int* kidx [[buffer(3)]],
                       device const AttnPWork* work [[buffer(4)]],
                       device const float* head_scale [[buffer(5)]],
+                      threadgroup float* Kt [[threadgroup(0)]],
+                      threadgroup float* Vt [[threadgroup(1)]],
                       uint tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]],
-                      uint nsg [[simdgroups_per_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
   const AttnPWork w = work[tg];
-  for (uint p = sg; p < uint(w.tq) * 8; p += nsg) {
-    uint r = p / 8, h = p % 8;
-    uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
-    device const float* q = qkvg + (ulong)qrowi * 2048 + h * 64;
-    float qscale = head_scale[h] * w.logkv / 64.0f;
-    float q0 = q[2 * lane] * qscale;
-    float q1 = q[2 * lane + 1] * qscale;
-    float mx = -INFINITY, den = 0.0f, a0 = 0.0f, a1 = 0.0f;
-    for (int j = 0; j < w.nk; j++) {
-      uint krowi = uint(w.rowbase + kidx[w.kstart + j]);
-      device const float* k = qkvg + (ulong)krowi * 2048 + 512 + h * 64;
-      float score = simd_sum(q0 * k[2 * lane] + q1 * k[2 * lane + 1]);
-      device const float* v = k + 512;
-      float nm = max(mx, score);
-      float corr = exp(mx - nm);
-      float wt = exp(score - nm);
-      den = den * corr + wt;
-      a0 = a0 * corr + wt * v[2 * lane];
-      a1 = a1 * corr + wt * v[2 * lane + 1];
-      mx = nm;
+  const uint npair = uint(w.tq) * 8;
+  float q0v[kMQ], q1v[kMQ], mx[kMQ], den[kMQ], a0[kMQ], a1[kMQ];
+  for (uint s = 0; s < kMQ; s++) {
+    mx[s] = -INFINITY; den[s] = 0.0f; a0[s] = 0.0f; a1[s] = 0.0f;
+    uint p = sg + s * 8;
+    if (p < npair) {
+      uint r = p / 8, h = p % 8;
+      uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
+      device const float* q = qkvg + (ulong)qrowi * 2048 + h * 64;
+      float qscale = head_scale[h] * w.logkv / 64.0f;
+      q0v[s] = q[2 * lane] * qscale;
+      q1v[s] = q[2 * lane + 1] * qscale;
     }
+  }
+  for (int k0 = 0; k0 < w.nk; k0 += int(kTK)) {
+    const int kn = min(int(kTK), w.nk - k0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < uint(kn) * 512; i += 256) {
+      uint j = i / 512, d = i % 512;
+      ulong krow =
+          (ulong)uint(w.rowbase + kidx[w.kstart + k0 + int(j)]) * 2048;
+      Kt[j * 512 + d] = qkvg[krow + 512 + d];
+      Vt[j * 512 + d] = qkvg[krow + 1024 + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = 0; j < kn; j++) {
+      for (uint s = 0; s < kMQ; s++) {
+        uint p = sg + s * 8;
+        if (p >= npair) continue;
+        uint h = p % 8;
+        threadgroup const float* k = Kt + j * 512 + h * 64;
+        float score = simd_sum(q0v[s] * k[2 * lane] + q1v[s] * k[2 * lane + 1]);
+        threadgroup const float* v = Vt + j * 512 + h * 64;
+        float nm = max(mx[s], score);
+        float corr = exp(mx[s] - nm);
+        float wt = exp(score - nm);
+        den[s] = den[s] * corr + wt;
+        a0[s] = a0[s] * corr + wt * v[2 * lane];
+        a1[s] = a1[s] * corr + wt * v[2 * lane + 1];
+        mx[s] = nm;
+      }
+    }
+  }
+  for (uint s = 0; s < kMQ; s++) {
+    uint p = sg + s * 8;
+    if (p >= npair) continue;
+    uint r = p / 8, h = p % 8;
     device float* o = partials + w.part + (ulong)(r * 8 + h) * 66;
-    if (lane == 0) { o[0] = mx; o[1] = den; }
-    o[2 + 2 * lane] = a0;
-    o[2 + 2 * lane + 1] = a1;
+    if (lane == 0) { o[0] = mx[s]; o[1] = den[s]; }
+    o[2 + 2 * lane] = a0[s];
+    o[2 + 2 * lane + 1] = a1[s];
   }
 }
 
@@ -439,6 +504,8 @@ struct AttnRWorkGpu {
 // size, each streamed by an independent threadgroup (flash-decoding).
 constexpr int kFlashChunk = 256;
 constexpr int kFlashSplit = 512;   // only split when nk exceeds this
+constexpr int kHostMQ = 8;         // queries per tiled-attention work item
+constexpr int kTGStage = 6 * 512 * 4;  // bytes per staged K or V tile (kTK)
 
 // Weight on the GPU: fp32 buffer (MPS GEMM path) or quantized payload +
 // scales (custom qgemm path). Uploaded once per model.
@@ -680,8 +747,14 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
         const int tq = W.q1 - W.q0;
         const int ks = kbase[W.b] + G.koff[W.g];
         const int nk = G.koff[W.g + 1] - G.koff[W.g];
+        // The tiled kernels take at most kHostMQ queries per item (their
+        // per-pair softmax state lives in registers), so prep's kQTile items
+        // are sub-tiled here. Partials keep the original item layout; a
+        // sub-item writes at query offset `sub` within its chunk's block.
         if (nk <= kFlashSplit) {
-          wflat[a].push_back({qs, tq, ks, nk, W.b * S, W.logkv});
+          for (int sub = 0; sub < tq; sub += kHostMQ)
+            wflat[a].push_back({qs + sub, std::min(kHostMQ, tq - sub), ks, nk,
+                                W.b * S, W.logkv});
           continue;
         }
         const int nchunks = (nk + kFlashChunk - 1) / kFlashChunk;
@@ -689,8 +762,10 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
         for (int c = 0; c < nchunks; c++) {
           const int c0 = c * kFlashChunk;
           const int cnk = std::min(kFlashChunk, nk - c0);
-          pflat[a].push_back({qs, tq, ks + c0, cnk, W.b * S, W.logkv,
-                              item_base + c * (tq * 8 * 66)});
+          for (int sub = 0; sub < tq; sub += kHostMQ)
+            pflat[a].push_back({qs + sub, std::min(kHostMQ, tq - sub),
+                                ks + c0, cnk, W.b * S, W.logkv,
+                                item_base + c * (tq * 8 * 66) + sub * 8 * 66});
         }
         rflat[a].push_back({qs, tq, W.b * S, item_base, nchunks});
         poff += (size_t)nchunks * tq * 8 * 66;
@@ -900,8 +975,10 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           [aenc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
           [aenc setBuffer:ctx.work[a] offset:0 atIndex:4];
           [aenc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [aenc setThreadgroupMemoryLength:kTGStage atIndex:0];
+          [aenc setThreadgroupMemoryLength:kTGStage atIndex:1];
           [aenc dispatchThreadgroups:MTLSizeMake(wflat[a].size(), 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+              threadsPerThreadgroup:MTLSizeMake(32 * 8, 1, 1)];
           stage("attn_small");
         }
         if (!rflat[a].empty()) {          // flash split-K large groups
@@ -914,8 +991,10 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           [penc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
           [penc setBuffer:ctx.pwork[a] offset:0 atIndex:4];
           [penc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [penc setThreadgroupMemoryLength:kTGStage atIndex:0];
+          [penc setThreadgroupMemoryLength:kTGStage atIndex:1];
           [penc dispatchThreadgroups:MTLSizeMake(pflat[a].size(), 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+              threadsPerThreadgroup:MTLSizeMake(32 * 8, 1, 1)];
           buffer_barrier();
           [penc setComputePipelineState:ctx.p_attn_reduce];
           [penc setBuffer:ctx.partials offset:0 atIndex:0];
