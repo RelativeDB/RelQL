@@ -1137,7 +1137,7 @@ class RtNativeBackend:
                  embedder: Optional[TextEmbedder] = None,
                  n_threads: int = 0,
                  num_history_windows: int = 3,
-                 max_seq_len: int = 8192,      # reference eval ctx_size
+                 max_seq_len: int = 2048,      # reference eval uses 8192
                  column_stats: Optional["ColumnStats"] = None,
                  normalization_mode: Optional[NormalizationMode | str] = None,
                  task_spec_factory: Optional[TaskSpecFactory] = None,

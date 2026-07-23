@@ -264,8 +264,10 @@ class ContextPolicy:
     is the global cell budget.
     """
 
-    # Reference evaluation defaults (eval_utils.build_evaluator).
-    max_context_cells: int = 8192
+    # Geometry follows the reference evaluator (eval_utils.build_evaluator);
+    # the default cell budget is 2048 — pass max_context_cells=8192 to match
+    # the reference evaluation context size.
+    max_context_cells: int = 2048
     bfs_width: int = 32
     fanouts: Optional[tuple[int, ...]] = None
     max_hops: int = 2

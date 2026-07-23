@@ -166,7 +166,7 @@ def test_reference_index_sampling_matches_rand_oracle(length, amount, expected):
 def test_reference_defaults_match_evaluator_geometry():
     p = ContextPolicy()
     assert (p.max_context_cells, p.local_context_cells, p.bfs_width,
-            p.num_walks, p.walk_length) == (8192, 256, 32, 10_000, 20)
+            p.num_walks, p.walk_length) == (2048, 256, 32, 10_000, 20)
 
 
 def test_reference_graph_is_an_immutable_engine_snapshot(churn_schema):
