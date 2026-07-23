@@ -854,23 +854,69 @@ class Engine:
         stats["shared_context_forwards"] = 1
         return ("ok", payload, stats)
 
-    def _shared_anchor_groups(self, input: ExecutionInput, entity_table: str,
-                              ids: list[Any]) -> Optional[list[list[Any]]]:
-        """Split a cohort into groups whose anchors are exactly equal.
+    def _shared_anchor_groups(self, pq: ParsedQuery, input: ExecutionInput,
+                              entity_table: str, ids: list[Any],
+                              backend) -> list[list[Any]]:
+        """Split a cohort into groups whose anchors are exactly equal, then
+        into chunks whose injected block fits the context.
 
-        With a shared anchor there is one group. With per-entity anchors,
-        entities whose anchors compare equal — e.g. every row of one event —
-        legitimately share a context, so each equality class becomes its own
-        shared-context cohort (first-seen order). No approximation: anchors
+        With a shared anchor there is one anchor group. With per-entity
+        anchors, entities whose anchors compare equal — e.g. every row of
+        one event — legitimately share a context (first-seen order); anchors
         that differ by any amount stay separate.
+
+        Chunk sizing is measured, not guessed: each member's injected rows
+        (target, entity row, recent task history) are fetched once per
+        anchor group and their actual cell cost caps the chunk so the
+        injected block stays within a third of the context budget — wide
+        entity tables previously filled most of the context with the cohort
+        itself, starving the walk-selected rows (labeled peers included)
+        that the prediction feeds on.
         """
         if not input.per_entity_anchor:
-            return [ids]
-        groups: dict[Any, list[Any]] = {}
-        for eid in ids:
-            groups.setdefault(
-                self._anchor_for(entity_table, eid, input), []).append(eid)
-        return list(groups.values())
+            groups = [ids]
+        else:
+            by_anchor: dict[Any, list[Any]] = {}
+            for eid in ids:
+                by_anchor.setdefault(
+                    self._anchor_for(entity_table, eid, input), []).append(eid)
+            groups = list(by_anchor.values())
+        out: list[list[Any]] = []
+        for group in groups:
+            limit = self._cohort_chunk_limit(pq, input, entity_table, group,
+                                             backend)
+            out.extend(group[i:i + limit]
+                       for i in range(0, len(group), limit))
+        return out
+
+    def _cohort_chunk_limit(self, pq: ParsedQuery, input: ExecutionInput,
+                            entity_table: str, group: list[Any],
+                            backend) -> int:
+        """Members per shared-context chunk, from measured injection cost."""
+        budget = max(1, self.context_policy.max_context_cells // 3)
+        if len(group) <= 1:
+            return 1
+        try:
+            seed = group[0]
+            anchor = self._anchor_for(entity_table, seed, input)
+            # Warms the traversal's shared state for this anchor; chunk 1
+            # reuses the same cached build.
+            self.assemble_context(entity_table, seed, anchor, query=pq)
+            task_spec = backend.task_spec(pq, pq.task_type(self.schema))
+            got = self.traversal.cohort_targets(
+                entity_table, list(group), anchor, task_spec,
+                history=self.context_policy.num_history_windows)
+        except Exception:
+            got = None
+        if got is None:
+            # No shared state: the caller will fall back to per-entity
+            # scoring anyway; any split works.
+            return max(1, budget // 32)
+        targets, inject, _ = got
+        cells = sum(len(r.cells) + (1 if r.timestamp is not None else 0)
+                    for r in inject)
+        avg = max(1.0, cells / max(1, len(targets)))
+        return max(1, int(budget // avg))
 
     def _execute_shared(self, pq: ParsedQuery, input: ExecutionInput,
                         task_type: TaskType, model_uri: str,
@@ -883,7 +929,8 @@ class Engine:
         """
         preds: list[EntityPrediction] = []
         stats: dict = {"entities_scored": 0, "shared_context_forwards": 0}
-        for group in self._shared_anchor_groups(input, entity_table, ids):
+        for group in self._shared_anchor_groups(pq, input, entity_table,
+                                                ids, backend):
             tag, payload, group_stats = self._prepare_shared(
                 pq, input, task_type, model_uri, entity_table, group, backend)
             if tag == "empty":
@@ -946,7 +993,8 @@ class Engine:
                     pq, inp, task_type, model_uri, table, ids = resolved
                     prepared = []
                     fell_back = False
-                    for group in self._shared_anchor_groups(inp, table, ids):
+                    for group in self._shared_anchor_groups(
+                            pq, inp, table, ids, self.model_backend):
                         tag, payload, stats = self._prepare_shared(
                             pq, inp, task_type, model_uri, table, group,
                             self.model_backend)
