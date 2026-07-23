@@ -94,6 +94,49 @@ with warnings.catch_warnings():
             pq = pq_template.bind_params({"ids": [seed]})
             ctx = engine.assemble_context(pq.entity_key.table, seed, anchor,
                                           query=pq)
+            # Coverage-aware seeding: the cohort's test task rows (and their
+            # entity rows, so the masked targets keep parent edges) are part
+            # of the context by construction. They go right after the focal
+            # target, so the sequence budget truncates low-relevance tail
+            # rows instead of them.
+            state = getattr(engine.traversal, "_shared_state", None)
+            if state is not None:
+                by_key = state["by_key"]
+                have = {r.key for r in ctx.rows}
+                inject = []
+                task_rows = state["rows_by_table"][spec.name]
+                cohort = set(remaining)
+                # Each cohort member's own labeled task history (self-labels)
+                # is the strongest per-entity signal; collect the most recent
+                # few per member along with its test row and entity row.
+                history_of: dict = {}
+                for row in task_rows:
+                    did = row.parents.get("__entity__")
+                    if (did in cohort and row.timestamp is not None
+                            and row.timestamp < ctx.anchor
+                            and spec.target_column in row.cells):
+                        history_of.setdefault(did, []).append(row)
+                for row in task_rows:
+                    if (isinstance(row.id, tuple) and row.id
+                            and row.id[0] == "test"
+                            and row.timestamp == ctx.anchor
+                            and row.parents.get("__entity__") in cohort):
+                        did = row.parents.get("__entity__")
+                        ekey = (pq.entity_key.table, did)
+                        if row.key not in have:
+                            inject.append(by_key[row.key])
+                            have.add(row.key)
+                        if ekey not in have and ekey in by_key:
+                            inject.append(by_key[ekey])
+                            have.add(ekey)
+                        hist = sorted(history_of.get(did, ()),
+                                      key=lambda r: r.timestamp, reverse=True)
+                        for h in hist[:3]:
+                            if h.key not in have:
+                                inject.append(by_key[h.key])
+                                have.add(h.key)
+                if inject:
+                    ctx.rows = [ctx.rows[0]] + inject + ctx.rows[1:]
             fk_to_parent = backend._fk_to_parent()
             task_spec = backend.task_spec(pq, task_type)
             labels = []
