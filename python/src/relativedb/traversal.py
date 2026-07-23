@@ -850,42 +850,81 @@ class ReferenceTraversal:
     def _factory_overlay(self, state, target_key) -> None:
         """Recompute the anchor-dependent members of a shared state in place:
         the temporal filter, walk neighbor CSR, and eligibility — everything
-        downstream of the focal cutoff. No-op when the cutoff is unchanged."""
+        downstream of the focal cutoff. No-op when the cutoff is unchanged.
+
+        Implementation note: the overlay is a vectorized mask over a
+        precomputed all-edges array rather than a strictly incremental
+        (append-only) update. A time-ascending anchor sequence does make edge
+        admissibility grow monotonically, but the new edges land in the
+        middle of their nodes' CSR segments, so an append-only update would
+        still have to re-lay-out the arrays; masking costs the same O(edges)
+        at numpy speed and — unlike an incremental update — assumes NOTHING
+        about anchor order. Callers may present anchors in any order;
+        ``test_shared_overlay.py`` asserts exact equality against a reference
+        rebuild for shuffled, repeated, and None cutoffs.
+
+        Exactness: the mask keeps edges in their canonical per-node order
+        (parents first, then time-sorted children), identical to the filtered
+        rebuild. Timestamps compare as float64 epoch seconds; distinct
+        microsecond-resolution datetimes stay distinct at that precision and
+        equal datetimes map to equal floats, so every ``<=`` decision matches
+        the datetime comparison.
+        """
         cutoff_row = state["by_key"].get(target_key)
         cutoff = cutoff_row.timestamp if cutoff_row is not None else None
         if "cutoff" in state and state["cutoff"] == cutoff:
             return
 
+        core = state.get("_overlay_core")
+        if core is None:
+            rows = state["rows"]
+            parents = state["parents"]
+            p2f_walk = state["p2f_walk"]
+            node_pos = state["node_pos"]
+            sampling_table = state["sampling_table"]
+            flat: list[int] = []
+            edge_ts: list[float] = []
+            seg = np.empty(len(rows) + 1, dtype=np.int64)
+            seg[0] = 0
+            for i, row in enumerate(rows):
+                for parent in parents(row):
+                    flat.append(node_pos[parent.key])
+                    edge_ts.append(-math.inf)   # parents are always admitted
+                for child in p2f_walk.get(row.key, ()):
+                    flat.append(node_pos[child.key])
+                    edge_ts.append(-math.inf if child.timestamp is None
+                                   else child.timestamp.timestamp())
+                seg[i + 1] = len(flat)
+            # NaN marks never-eligible rows (wrong table): NaN <= cutoff is
+            # false for every cutoff, including the unbounded one, whereas
+            # +inf would wrongly admit them when cutoff itself is +inf.
+            elig_ts = np.asarray([
+                (-math.inf if row.timestamp is None
+                 else row.timestamp.timestamp())
+                if row.table == sampling_table else math.nan
+                for row in rows], dtype=np.float64)
+            core = {
+                "flat": np.asarray(flat, dtype=np.int32),
+                "edge_ts": np.asarray(edge_ts, dtype=np.float64),
+                "seg": seg,
+                "elig_ts": elig_ts,
+            }
+            state["_overlay_core"] = core
+
+        cutoff_f = math.inf if cutoff is None else cutoff.timestamp()
+        mask = core["edge_ts"] <= cutoff_f
+        kept = np.concatenate(([0], np.cumsum(mask, dtype=np.int64)))
+        offsets = kept[core["seg"]].astype(np.int32)
+
         def temporally_valid(row):
             return (row.timestamp is None or cutoff is None
                     or row.timestamp <= cutoff)
 
-        rows = state["rows"]
-        parents = state["parents"]
-        p2f_walk = state["p2f_walk"]
-        node_pos = state["node_pos"]
-        sampling_table = state["sampling_table"]
-        # Canonical CSR over every node in stable `rows` order. The walk only
-        # ever reaches nodes connected to its start, so covering the full
-        # node set (instead of a per-entity BFS discovery) yields identical
-        # counts.
-        offsets = np.empty(len(rows) + 1, dtype=np.int32)
-        offsets[0] = 0
-        flat: list[int] = []
-        for i, row in enumerate(rows):
-            for parent in parents(row):
-                flat.append(node_pos[parent.key])
-            for child in p2f_walk.get(row.key, ()):
-                if temporally_valid(child):
-                    flat.append(node_pos[child.key])
-            offsets[i + 1] = len(flat)
         state["cutoff"] = cutoff
         state["temporally_valid"] = temporally_valid
         state["offsets"] = offsets
-        state["neighbors"] = np.asarray(flat, dtype=np.int32)
-        state["eligible_base"] = np.asarray([
-            row.table == sampling_table and temporally_valid(row)
-            for row in rows], dtype=np.uint8)
+        state["neighbors"] = np.ascontiguousarray(core["flat"][mask])
+        state["eligible_base"] = (core["elig_ts"] <= cutoff_f).astype(np.uint8)
 
     def _factory_shared_build(self, schema, graph, entity_table, bound,
                               query, task_spec, supplied):
