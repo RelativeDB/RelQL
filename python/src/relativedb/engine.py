@@ -794,9 +794,9 @@ class Engine:
                 "regression targets")
         if pq.assuming is not None:
             raise ExecutionError("shared_context does not support ASSUMING")
-        if input.per_entity_anchor:
-            raise ExecutionError(
-                "shared_context requires one shared anchor for the cohort")
+        # per_entity_anchor cohorts are handled by the caller: it groups ids
+        # whose anchors are exactly equal and prepares each group separately,
+        # so within this call every id shares the seed's anchor.
         if pq.where is not None and not _pure_pin(pq.where, pq.entity_key):
             raise ExecutionError(
                 "shared_context supports WHERE only as a primary-key pin "
@@ -854,27 +854,50 @@ class Engine:
         stats["shared_context_forwards"] = 1
         return ("ok", payload, stats)
 
+    def _shared_anchor_groups(self, input: ExecutionInput, entity_table: str,
+                              ids: list[Any]) -> Optional[list[list[Any]]]:
+        """Split a cohort into groups whose anchors are exactly equal.
+
+        With a shared anchor there is one group. With per-entity anchors,
+        entities whose anchors compare equal — e.g. every row of one event —
+        legitimately share a context, so each equality class becomes its own
+        shared-context cohort (first-seen order). No approximation: anchors
+        that differ by any amount stay separate.
+        """
+        if not input.per_entity_anchor:
+            return [ids]
+        groups: dict[Any, list[Any]] = {}
+        for eid in ids:
+            groups.setdefault(
+                self._anchor_for(entity_table, eid, input), []).append(eid)
+        return list(groups.values())
+
     def _execute_shared(self, pq: ParsedQuery, input: ExecutionInput,
                         task_type: TaskType, model_uri: str,
                         entity_table: str, ids: list[Any],
                         backend) -> Optional[PredictionResult]:
-        """Score the cohort in one shared context (one forward per cohort).
+        """Score the cohort in shared contexts (one forward per anchor group).
 
         Returns None when the traversal has no matching shared state, in
         which case the caller falls back to per-entity scoring.
         """
-        tag, payload, stats = self._prepare_shared(
-            pq, input, task_type, model_uri, entity_table, ids, backend)
-        if tag == "empty":
-            return PredictionResult(task_type=task_type, predictions=(),
-                                    model_uri=model_uri,
-                                    stats={"entities_scored": 0})
-        if tag == "fallback":
-            return None
-        yhat = payload["model"].forward_tokens(
-            device=backend._resolve_device(), **payload["kw"])[0]
-        preds = backend.finish_shared(payload, yhat)
-        stats["entities_scored"] = len(preds)
+        preds: list[EntityPrediction] = []
+        stats: dict = {"entities_scored": 0, "shared_context_forwards": 0}
+        for group in self._shared_anchor_groups(input, entity_table, ids):
+            tag, payload, group_stats = self._prepare_shared(
+                pq, input, task_type, model_uri, entity_table, group, backend)
+            if tag == "empty":
+                continue
+            if tag == "fallback":
+                return None
+            yhat = payload["model"].forward_tokens(
+                device=backend._resolve_device(), **payload["kw"])[0]
+            group_preds = backend.finish_shared(payload, yhat)
+            preds.extend(group_preds)
+            for key, value in group_stats.items():
+                if isinstance(value, (int, float)):
+                    stats[key] = stats.get(key, 0) + value
+            stats["entities_scored"] += len(group_preds)
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
                                 model_uri=model_uri, stats=stats)
@@ -921,17 +944,25 @@ class Engine:
                         feed.put(("serial", idx, None, None, None))
                         continue
                     pq, inp, task_type, model_uri, table, ids = resolved
-                    tag, payload, stats = self._prepare_shared(
-                        pq, inp, task_type, model_uri, table, ids,
-                        self.model_backend)
-                    if tag == "ok":
-                        feed.put(("ok", idx, payload, stats,
-                                  (task_type, model_uri)))
-                    elif tag == "empty":
+                    prepared = []
+                    fell_back = False
+                    for group in self._shared_anchor_groups(inp, table, ids):
+                        tag, payload, stats = self._prepare_shared(
+                            pq, inp, task_type, model_uri, table, group,
+                            self.model_backend)
+                        if tag == "fallback":
+                            fell_back = True
+                            break
+                        if tag == "ok":
+                            prepared.append((payload, stats))
+                    if fell_back:
+                        feed.put(("serial", idx, None, None, None))
+                    elif not prepared:
                         feed.put(("empty", idx, None, None,
                                   (task_type, model_uri)))
                     else:
-                        feed.put(("serial", idx, None, None, None))
+                        feed.put(("ok", idx, prepared, None,
+                                  (task_type, model_uri)))
                 feed.put(("done", None, None, None, None))
             except BaseException as error:
                 feed.put(("error", error, None, None, None))
@@ -956,13 +987,22 @@ class Engine:
                         task_type=task_type, predictions=(),
                         model_uri=model_uri, stats={"entities_scored": 0})
                     continue
-                yhat = payload["model"].forward_tokens(
-                    device=backend._resolve_device(), **payload["kw"])[0]
-                preds = backend.finish_shared(payload, yhat)
-                stats["entities_scored"] = len(preds)
+                preds: list[EntityPrediction] = []
+                merged: dict = {"entities_scored": 0,
+                                "shared_context_forwards": 0}
+                for group_payload, group_stats in payload:
+                    yhat = group_payload["model"].forward_tokens(
+                        device=backend._resolve_device(),
+                        **group_payload["kw"])[0]
+                    group_preds = backend.finish_shared(group_payload, yhat)
+                    preds.extend(group_preds)
+                    for key, value in group_stats.items():
+                        if isinstance(value, (int, float)):
+                            merged[key] = merged.get(key, 0) + value
+                    merged["entities_scored"] += len(group_preds)
                 results[idx] = PredictionResult(
                     task_type=task_type, predictions=tuple(preds),
-                    model_uri=model_uri, stats=stats)
+                    model_uri=model_uri, stats=merged)
         finally:
             stop.set()
             while producer.is_alive():
