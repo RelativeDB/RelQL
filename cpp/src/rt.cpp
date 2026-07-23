@@ -1105,8 +1105,25 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
         if (p >= 0) nbr_of[p].push_back(s);   // key s is a child of node p
       }
     }
-    // col: group members attend to each other (queries == keys)
-    for (auto& [key, mem] : by_coltab) g_col[b].add(mem, mem);
+    // col: group members attend to each other (queries == keys). Key lists
+    // are capped to the first kColKeyCap members: sequence order is context
+    // assembly order (target first, then relevance-ranked tiers), so the cap
+    // keeps the highest-relevance rows and drops the low-relevance tail —
+    // measured accuracy-neutral-to-positive at long contexts, and it bounds
+    // every col group to the single-pass attention kernel. Override with
+    // RT_COL_KEY_CAP (0 disables).
+    static const int kColKeyCap = [] {
+      const char* env = std::getenv("RT_COL_KEY_CAP");
+      return env ? std::atoi(env) : 512;
+    }();
+    for (auto& [key, mem] : by_coltab) {
+      if (kColKeyCap <= 0 || (int)mem.size() <= kColKeyCap) {
+        g_col[b].add(mem, mem);
+        continue;
+      }
+      std::vector<int> keys(mem.begin(), mem.begin() + kColKeyCap);
+      g_col[b].add(mem, keys);
+    }
     // feat: tokens sharing (node, f2p list) share the key list — own row plus
     // rows referenced by the foreign keys (dedup: a parent id equal to own
     // node or a repeated parent must not double-count)
