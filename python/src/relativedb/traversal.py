@@ -268,6 +268,19 @@ class ReferenceTraversal:
 
     def traverse(self, schema, graph, entity_table, entity_id, bound, policy,
                  *, query=None) -> TraversalResult:
+        if query is not None:
+            probe_spec = self.task_spec_factory(query, query.task_type(schema))
+            if isinstance(probe_spec, TaskSpec) and not probe_spec.direct_target:
+                # Derived-task graphs are invariant across the entities of one
+                # anchor except for the focal task row; share the graph build
+                # instead of reconstructing it per entity.
+                if self.task_graph_factory is not None:
+                    return self._traverse_factory_shared(
+                        schema, graph, entity_table, entity_id, bound, policy,
+                        query=query, task_spec=probe_spec)
+                return self._traverse_inline_shared(
+                    schema, graph, entity_table, entity_id, bound, policy,
+                    query=query, task_spec=probe_spec)
         rows_by_table = {t.name: (graph.all_rows(t.name) or [])
                          for t in schema.tables}
         rows = [r for t in schema.tables for r in rows_by_table[t.name]]
@@ -761,6 +774,772 @@ class ReferenceTraversal:
         node_ids = tuple(node_id_map.items())
         return TraversalResult(tuple(ordered), frozenset(focal), 0, full,
                                node_ids)
+
+    def _factory_shared_build(self, schema, graph, entity_table, bound,
+                              query, task_spec, supplied):
+        """Build the entity-invariant graph state for a factory task graph.
+
+        Everything here depends only on (graph snapshot, anchor, task) — not
+        on which entity is focal — and mirrors the corresponding build in
+        :meth:`traverse` exactly, including fixture-order verification. The
+        native walk is label-invariant (its RNG consumes only neighbor-list
+        lengths and per-node order), so one canonical CSR serves every focal
+        entity of the anchor.
+        """
+        if (not isinstance(supplied, tuple) or len(supplied) not in (3, 4, 5)):
+            raise TypeError(
+                "task_graph_factory must return "
+                "(rows, node_ids, target_key[, p2f_order[, f2p_order]])")
+        supplied_rows, supplied_ids, target_key = supplied[:3]
+        reference_p2f_order = supplied[3] if len(supplied) >= 4 else None
+        reference_f2p_order = supplied[4] if len(supplied) == 5 else None
+        task_rows = list(supplied_rows)
+        task_node_ids = dict(supplied_ids)
+        if target_key not in task_node_ids:
+            raise RuntimeError(
+                "materialized task graph did not assign the focal "
+                "task row a stable node id")
+        sampling_table = task_spec.table_name
+
+        rows_by_table = {t.name: list(graph.all_rows(t.name) or [])
+                         for t in schema.tables}
+        rows = [r for t in schema.tables for r in rows_by_table[t.name]]
+        physical_node_ids = {r.key: i for i, r in enumerate(rows)}
+        materialized_by_table: dict[str, list[Row]] = {}
+        for task_row in task_rows:
+            materialized_by_table.setdefault(
+                task_row.table, []).append(task_row)
+        rows_by_table.update(materialized_by_table)
+        rows = rows + task_rows
+        by_key = {r.key: r for r in rows}
+        target = by_key.get(target_key)
+        cutoff = target.timestamp if target is not None else None
+
+        links_from = {t.name: {l.fk_column: l for l in schema.links_from(t.name)}
+                      for t in schema.tables}
+        p2f: dict[tuple[str, Any], list[Row]] = {}
+        p2f_walk: dict[tuple[str, Any], list[Row]] = {}
+        isolated_task = all(not row.parents
+                            for row in rows_by_table.get(sampling_table, ()))
+        edge_rows = (rows_by_table[sampling_table] if isolated_task else rows)
+        for row in edge_rows:
+            if row.table == sampling_table and "__entity__" in row.parents:
+                p2f.setdefault(
+                    (entity_table, row.parents["__entity__"]), []).append(row)
+                p2f_walk.setdefault(
+                    (entity_table, row.parents["__entity__"]), []).append(row)
+            for fk, pid in row.parents.items():
+                if fk.startswith("__parent__:"):
+                    parent_table = fk.split(":", 1)[1]
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        p2f_walk.setdefault((parent_table, one), []).append(row)
+                    continue
+                link = links_from.get(row.table, {}).get(fk)
+                if link is not None:
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        p2f.setdefault((link.to_table, one), []).append(row)
+                        p2f_walk.setdefault((link.to_table, one), []).append(row)
+
+        def order_children(parent_key, children):
+            if reference_p2f_order is None:
+                children.sort(key=lambda row: (
+                    row.timestamp is not None,
+                    row.timestamp.timestamp()
+                    if row.timestamp is not None else 0.0))
+                return
+            expected = reference_p2f_order.get(parent_key)
+            if expected is None:
+                if children:
+                    raise RuntimeError(
+                        f"reference p2f order is missing parent {parent_key!r}")
+                return
+            rank = {key: index for index, key in enumerate(expected)}
+            actual = {row.key for row in children}
+            if actual != set(expected):
+                missing = set(expected) - actual
+                extra = actual - set(expected)
+                raise RuntimeError(
+                    f"reference p2f order disagrees at {parent_key!r}: "
+                    f"missing={sorted(map(str, missing))[:3]}, "
+                    f"extra={sorted(map(str, extra))[:3]}")
+            children.sort(key=lambda row: rank[row.key])
+
+        for parent_key, children in p2f_walk.items():
+            order_children(parent_key, children)
+        for parent_key, children in p2f.items():
+            if reference_p2f_order is None:
+                order_children(parent_key, children)
+            else:
+                expected = reference_p2f_order.get(parent_key)
+                if expected is None:
+                    raise RuntimeError(
+                        f"reference p2f order is missing parent {parent_key!r}")
+                rank = {key: index for index, key in enumerate(expected)}
+                unknown = [row.key for row in children if row.key not in rank]
+                if unknown:
+                    raise RuntimeError(
+                        f"reference p2f order is missing children for "
+                        f"{parent_key!r}: {unknown[:3]!r}")
+                children.sort(key=lambda row: rank[row.key])
+
+        parents_cache: dict[tuple[str, Any], tuple[Row, ...]] = {}
+
+        def parents(row):
+            cached = parents_cache.get(row.key)
+            if cached is not None:
+                return cached
+            out = []
+            if row.table == sampling_table:
+                entity = by_key.get((entity_table,
+                                     row.parents.get("__entity__")))
+                if entity is not None:
+                    out.append(entity)
+            for fk, pid in row.parents.items():
+                if fk.startswith("__parent__:"):
+                    parent_table = fk.split(":", 1)[1]
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        parent = by_key.get((parent_table, one))
+                        if parent is not None:
+                            out.append(parent)
+                    continue
+                link = links_from.get(row.table, {}).get(fk)
+                if link:
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        parent = by_key.get((link.to_table, one))
+                        if parent is not None:
+                            out.append(parent)
+            result = tuple(out)
+            if reference_f2p_order is not None:
+                expected = reference_f2p_order.get(row.key, ())
+                if {parent.key for parent in result} != set(expected):
+                    raise RuntimeError(
+                        f"reference f2p order disagrees at {row.key!r}")
+                rank = {key: index for index, key in enumerate(expected)}
+                result = tuple(sorted(result, key=lambda parent: rank[parent.key]))
+            parents_cache[row.key] = result
+            return result
+
+        def temporally_valid(row):
+            return (row.timestamp is None or cutoff is None
+                    or row.timestamp <= cutoff)
+
+        # Canonical CSR over every node in stable `rows` order. The walk only
+        # ever reaches nodes connected to its start, so covering the full node
+        # set (instead of a per-entity BFS discovery) yields identical counts.
+        node_pos = {row.key: i for i, row in enumerate(rows)}
+        neighbor_lists = []
+        for row in rows:
+            neighbor_lists.append(tuple(parents(row)) + tuple(
+                r for r in p2f_walk.get(row.key, ())
+                if temporally_valid(r)))
+        offsets = np.empty(len(rows) + 1, dtype=np.int32)
+        offsets[0] = 0
+        flat: list[int] = []
+        for i, nbrs in enumerate(neighbor_lists):
+            flat.extend(node_pos[row.key] for row in nbrs)
+            offsets[i + 1] = len(flat)
+        neighbors_array = np.asarray(flat, dtype=np.int32)
+        eligible_base = np.asarray([
+            row.table == sampling_table and temporally_valid(row)
+            for row in rows], dtype=np.uint8)
+        node_keys = [row.key for row in rows]
+
+        return {
+            "graph_id": id(getattr(graph, "index", graph)),
+            "supplied_ids_id": id(supplied_ids),
+            "p2f_order_id": id(reference_p2f_order),
+            "f2p_order_id": id(reference_f2p_order),
+            "task_spec_id": (task_spec.id, task_spec.table_name,
+                             task_spec.target_column),
+            "cutoff": cutoff,
+            "sampling_table": sampling_table,
+            "rows_by_table": rows_by_table,
+            "rows": rows,
+            "physical_node_ids": physical_node_ids,
+            "task_node_ids": task_node_ids,
+            "by_key": by_key,
+            "p2f": p2f,
+            "parents": parents,
+            "temporally_valid": temporally_valid,
+            "node_pos": node_pos,
+            "offsets": offsets,
+            "neighbors": neighbors_array,
+            "eligible_base": eligible_base,
+            "node_keys": node_keys,
+            "tasklist_pos": {row.key: i for i, row in enumerate(task_rows)},
+            "node_ids": tuple({**physical_node_ids, **task_node_ids}.items()),
+            "db_tables": {table.name for table in schema.tables},
+            "masked_key": target_key,
+        }
+
+    def _traverse_factory_shared(self, schema, graph, entity_table, entity_id,
+                                 bound, policy, *, query,
+                                 task_spec) -> TraversalResult:
+        anchor = bound.as_of
+        supplied = self.task_graph_factory(task_spec, entity_id, anchor)
+        if (not isinstance(supplied, tuple) or len(supplied) not in (3, 4, 5)):
+            raise TypeError(
+                "task_graph_factory must return "
+                "(rows, node_ids, target_key[, p2f_order[, f2p_order]])")
+        materialized, supplied_ids, target_key = supplied[:3]
+
+        state = self._shared_state if hasattr(self, "_shared_state") else None
+        if (state is None
+                or state["graph_id"] != id(getattr(graph, "index", graph))
+                or state["supplied_ids_id"] != id(supplied_ids)
+                or state["p2f_order_id"] != (
+                    id(supplied[3]) if len(supplied) >= 4 else id(None))
+                or state["task_spec_id"] != (
+                    task_spec.id, task_spec.table_name,
+                    task_spec.target_column)
+                or target_key not in state["tasklist_pos"]
+                or materialized[state["tasklist_pos"][target_key]].key
+                    != target_key):
+            state = self._factory_shared_build(
+                schema, graph, entity_table, bound, query, task_spec, supplied)
+            self._shared_state = state
+
+        by_key = state["by_key"]
+        pos = state["tasklist_pos"]
+        # Swap the focal row for its masked copy; restore the previous focal
+        # entity's unmasked row (the current factory output carries it).
+        prior = state["masked_key"]
+        if prior is not None and prior != target_key and prior in pos:
+            by_key[prior] = materialized[pos[prior]]
+        by_key[target_key] = materialized[pos[target_key]]
+        state["masked_key"] = target_key
+
+        target = by_key.get(target_key)
+        if target is None or not bound.admits_row(target):
+            return TraversalResult()
+        if target.timestamp != state["cutoff"]:
+            # Different anchor (per-entity-anchor tasks): rebuild the shared
+            # state around this cutoff.
+            state = self._factory_shared_build(
+                schema, graph, entity_table, bound, query, task_spec, supplied)
+            self._shared_state = state
+            by_key = state["by_key"]
+            target = by_key[target_key]
+
+        task_node_ids = state["task_node_ids"]
+        physical_node_ids = state["physical_node_ids"]
+        eligible = state["eligible_base"].copy()
+        eligible[state["node_pos"][target_key]] = 0
+        return self._shared_tail(
+            schema, policy,
+            task_spec=task_spec,
+            target=target,
+            target_node_idx=task_node_ids[target_key],
+            target_position=state["node_pos"][target_key],
+            by_key=by_key,
+            get_children=state["p2f"].get,
+            parents=state["parents"],
+            temporally_valid=state["temporally_valid"],
+            fallback_rows=state["rows_by_table"][state["sampling_table"]],
+            db_tables=state["db_tables"],
+            sampling_table=state["sampling_table"],
+            offsets=state["offsets"],
+            neighbors=state["neighbors"],
+            eligible=eligible,
+            node_keys=state["node_keys"],
+            node_id_of=lambda key: task_node_ids.get(
+                key, physical_node_ids.get(key)),
+            node_ids=state["node_ids"])
+
+    def _shared_tail(self, schema, policy, *, task_spec, target,
+                     target_node_idx, target_position, by_key, get_children,
+                     parents, temporally_valid, fallback_rows, db_tables,
+                     sampling_table, offsets, neighbors, eligible, node_keys,
+                     node_id_of, node_ids) -> TraversalResult:
+        """Walk + tiering + BFS emission over a prepared shared graph.
+
+        Mirrors the tail of :meth:`traverse` exactly; every input that varies
+        with the focal entity is passed in explicitly.
+        """
+        context_seed = _StdRng(policy.seed).u64()
+        step_seed = _StdRng(context_seed).u64()
+        bfs_rng = _StdRng((step_seed + target_node_idx
+                           + 0xB0B0_B0B0_B0B0_B0B0) & _U64)
+        fallback_rng = _StdRng((step_seed + target_node_idx
+                                + 0xA5A5_A5A5_A5A5_A5A5) & _U64)
+
+        from .rt_native import load_lib
+        native_lib = load_lib()._lib
+        counts = np.zeros(len(node_keys), dtype=np.uint32)
+        rc = native_lib.rt_reference_walk_counts(
+            len(node_keys), offsets, neighbors,
+            target_position, eligible,
+            (step_seed + target_node_idx + 0xD0D0_D0D0_D0D0_D0D0) & _U64,
+            policy.num_walks, policy.walk_length, counts)
+        if rc:
+            raise RuntimeError("native reference walk rejected its graph")
+        visits = {node_keys[i]: int(count)
+                  for i, count in enumerate(counts) if count}
+
+        visit_keys = list(visits)
+        if visit_keys:
+            seeds = np.asarray([
+                (step_seed + node_id_of(key)) & _U64
+                for key in visit_keys], dtype=np.uint64)
+            tie_values = np.empty(len(seeds), dtype=np.uint64)
+            rc = native_lib.rt_stdrng_first_u64_batch(
+                seeds, len(seeds), tie_values)
+            if rc:
+                raise RuntimeError("native tie RNG rejected its seeds")
+            tie = dict(zip(visit_keys, map(int, tie_values)))
+        else:
+            tie = {}
+        if policy.prefer_latest:
+            def peer_key(key):
+                row = by_key[key]
+                ts = row.timestamp.timestamp() if row.timestamp else -math.inf
+                return (-ts, -visits[key], tie[key])
+        else:
+            def peer_key(key):
+                return (-visits[key], tie[key])
+
+        def has_seed_label(row: Row) -> bool:
+            value = row.cells.get(task_spec.target_column)
+            return value is not None and not (
+                isinstance(value, float) and math.isnan(value))
+
+        tier1 = [key for key in sorted(visits, key=peer_key)
+                 if has_seed_label(by_key[key])]
+        visited_depth: dict[tuple[str, Any], int] = {}
+        emitted: set[tuple[str, Any]] = set()
+        ordered: list[Row] = []
+        focal: set[tuple[str, Any]] = set()
+        cells = 1  # target cell is emitted separately and first
+        full = False
+
+        def cell_count(row):
+            if row.table == sampling_table:
+                return (len(row.cells)
+                        + (1 if row.timestamp is not None
+                           and task_spec.time_column not in row.cells else 0)
+                        + (1 if row.key == target.key
+                           and task_spec.target_column not in row.cells else 0))
+            table = schema.require_table(row.table)
+            declared = {c.name for c in table.columns}
+            n = sum(1 for c, v in row.cells.items()
+                    if c in declared and c != table.primary_key and v is not None)
+            n += sum(1 for l in schema.links_from(row.table)
+                     if l.feature_type is not None
+                     and row.parents.get(l.fk_column) is not None)
+            return n
+
+        def extend(seed, is_focal=False):
+            nonlocal cells, full
+            local_cells = 0
+            f2p_stack: list[tuple[int, Row]] = []
+            p2f_levels: list[list[Row]] = [[seed]]
+            while True:
+                if f2p_stack:
+                    depth, row = f2p_stack.pop()
+                else:
+                    depth = next((i for i, level in enumerate(p2f_levels) if level), -1)
+                    if depth < 0:
+                        return
+                    level = p2f_levels[depth]
+                    selected = bfs_rng.range(len(level))
+                    level[selected], level[-1] = level[-1], level[selected]
+                    row = level.pop()
+                # Adjacency lists hold the graph-build-time objects; the focal
+                # mask swap lives in by_key, so resolve through it.
+                row = by_key.get(row.key, row)
+                previous = visited_depth.get(row.key)
+                if previous is not None and previous <= depth:
+                    continue
+                cost = cell_count(row)
+                local_cells += cost
+                if local_cells >= policy.local_context_cells:
+                    return
+                visited_depth[row.key] = depth
+                if row.key not in emitted:
+                    emitted_cost = cost
+                    if row.key == target.key:
+                        emitted_cost = max(0, emitted_cost - 1)
+                    if cells >= policy.max_context_cells:
+                        full = True
+                        return
+                    emitted.add(row.key)
+                    ordered.append(row)
+                    cells += emitted_cost
+                    if cells >= policy.max_context_cells:
+                        full = True
+                    if is_focal:
+                        focal.add(row.key)
+                for parent in parents(row):
+                    f2p_stack.append((depth + 1, parent))
+                seed_cutoff = seed.timestamp
+                valid_kids = [
+                    r for r in (get_children(row.key) or [])
+                    if r.timestamp is None or (
+                        seed_cutoff is not None and r.timestamp <= seed_cutoff)]
+                task_kids = [r for r in valid_kids
+                             if r.table not in db_tables
+                             and r.table == seed.table]
+                db_kids = [r for r in valid_kids if r.table in db_tables]
+                if len(db_kids) > policy.bfs_width:
+                    selected_kids = _rand_sample(
+                        bfs_rng, len(db_kids), policy.bfs_width)
+                    db_kids = [db_kids[i] for i in selected_kids]
+                kids = task_kids + db_kids
+                while len(p2f_levels) <= depth + 1:
+                    p2f_levels.append([])
+                p2f_levels[depth + 1].extend(kids)
+
+        extend(target, True)
+        for key in tier1:
+            if full:
+                break
+            extend(by_key[key], False)
+        if not full:
+            amount = min(max(policy.max_context_cells - cells, 0),
+                         len(fallback_rows))
+            fallback = [fallback_rows[i].key for i in
+                        _rand_sample(fallback_rng, len(fallback_rows), amount)]
+            for key in fallback:
+                if full:
+                    break
+                row = by_key[key]
+                if (key == target.key or key in visits
+                        or not temporally_valid(row)
+                        or not has_seed_label(row)):
+                    continue
+                extend(row, False)
+        return TraversalResult(tuple(ordered), frozenset(focal), 0, full,
+                               node_ids)
+
+    def _inline_shared_build(self, schema, graph, entity_table, bound, policy,
+                             query, task_spec):
+        """Entity-invariant build for engine-materialized derived tasks.
+
+        Mirrors the inline (no task_graph_factory) build in :meth:`traverse`:
+        self-label history rows are evaluated for every entity of the table —
+        they depend only on (anchor, query) — while the focal target row is
+        synthesized per entity by the caller.
+        """
+        from .relql.ast import TaskType as _TaskType
+        anchor = bound.as_of
+        sampling_table = task_spec.table_name
+        task_type = query.task_type(schema)
+
+        rows_by_table = {t.name: list(graph.all_rows(t.name) or [])
+                         for t in schema.tables}
+        rows = [r for t in schema.tables for r in rows_by_table[t.name]]
+        physical_node_ids = {r.key: i for i, r in enumerate(rows)}
+
+        span = next((a.window.span()
+                     for a in query.target_aggregations
+                     if a.window is not None), None)
+        task_rows: list[Row] = []
+        task_node_ids: dict[tuple[str, Any], int] = {}
+        entity_rows = rows_by_table.get(entity_table, [])
+        task_base = len(physical_node_ids)
+        task_stride = policy.num_history_windows + 1
+        agg_tables = {a.column.table
+                      for a in query.target_aggregations
+                      if a.column.table != entity_table}
+        key_index = {r.key: r for r in rows}
+        owners_memo: dict[tuple, frozenset] = {}
+
+        def owners(row) -> frozenset:
+            got = owners_memo.get(row.key)
+            if got is not None:
+                return got
+            owners_memo[row.key] = frozenset()   # cycle guard
+            out: set = set()
+            for link in schema.links_from(row.table):
+                pid = row.parents.get(link.fk_column)
+                pids = (pid if isinstance(pid, (list, tuple))
+                        else (pid,))
+                for one in pids:
+                    if one is None:
+                        continue
+                    if link.to_table == entity_table:
+                        out.add(one)
+                    else:
+                        parent = key_index.get(
+                            (link.to_table, one))
+                        if parent is not None:
+                            out |= owners(parent)
+            owners_memo[row.key] = frozenset(out)
+            return owners_memo[row.key]
+
+        # (entity_i, insertion index of the entity's would-be target row in
+        # task_rows) — the focal target is synthesized per entity later.
+        entity_meta: dict[Any, tuple[int, int]] = {}
+        for entity_i, entity in enumerate(entity_rows):
+            entity_meta[entity.id] = (entity_i, len(task_rows))
+            if anchor is None or span is None:
+                continue
+            for k in range(1, policy.num_history_windows + 1):
+                ts = anchor - span * k
+                label_cutoff = min(anchor, ts + span)
+                visible = {}
+                for name, table_rows in rows_by_table.items():
+                    vis = [r for r in table_rows
+                           if r.timestamp is None
+                           or r.timestamp <= label_cutoff]
+                    if name in agg_tables:
+                        vis = [r for r in vis
+                               if entity.id in owners(r)]
+                    visible[name] = vis
+                if task_type is _TaskType.BINARY_CLASSIFICATION:
+                    value = 1.0 if eval_bool(
+                        query.target, visible, entity.cells, ts) else 0.0
+                else:
+                    value = eval_value(query.target, visible,
+                                       entity.cells, ts)
+                    if isinstance(value, bool):
+                        value = 1.0 if value else 0.0
+                    if not isinstance(value, (int, float)):
+                        continue
+                history = Row(
+                    sampling_table, (entity.id, ts, k),
+                    {task_spec.target_column: value}, timestamp=ts,
+                    parents={"__entity__": entity.id})
+                task_rows.append(history)
+                task_node_ids[history.key] = (
+                    task_base + entity_i * task_stride + k)
+        materialized_by_table: dict[str, list[Row]] = {}
+        for task_row in task_rows:
+            materialized_by_table.setdefault(
+                task_row.table, []).append(task_row)
+        rows_by_table.update(materialized_by_table)
+        rows_by_table.setdefault(sampling_table, [])
+        rows = rows + task_rows
+        by_key = {r.key: r for r in rows}
+
+        links_from = {t.name: {l.fk_column: l for l in schema.links_from(t.name)}
+                      for t in schema.tables}
+        p2f: dict[tuple[str, Any], list[Row]] = {}
+        p2f_walk: dict[tuple[str, Any], list[Row]] = {}
+        # In the per-entity build the focal target row always carries an
+        # __entity__ edge, so the task table is never isolated; edges are
+        # built over every row.
+        for row in rows:
+            if row.table == sampling_table and "__entity__" in row.parents:
+                p2f.setdefault(
+                    (entity_table, row.parents["__entity__"]), []).append(row)
+                p2f_walk.setdefault(
+                    (entity_table, row.parents["__entity__"]), []).append(row)
+            for fk, pid in row.parents.items():
+                if fk.startswith("__parent__:"):
+                    parent_table = fk.split(":", 1)[1]
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        p2f_walk.setdefault((parent_table, one), []).append(row)
+                    continue
+                link = links_from.get(row.table, {}).get(fk)
+                if link is not None:
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        p2f.setdefault((link.to_table, one), []).append(row)
+                        p2f_walk.setdefault((link.to_table, one), []).append(row)
+
+        def sort_key(row):
+            return (row.timestamp is not None,
+                    row.timestamp.timestamp()
+                    if row.timestamp is not None else 0.0)
+
+        for children in p2f_walk.values():
+            children.sort(key=sort_key)
+        for children in p2f.values():
+            children.sort(key=sort_key)
+
+        parents_cache: dict[tuple[str, Any], tuple[Row, ...]] = {}
+
+        def parents(row):
+            cached = parents_cache.get(row.key)
+            if cached is not None:
+                return cached
+            out = []
+            if row.table == sampling_table:
+                entity = by_key.get((entity_table,
+                                     row.parents.get("__entity__")))
+                if entity is not None:
+                    out.append(entity)
+            for fk, pid in row.parents.items():
+                if fk.startswith("__parent__:"):
+                    parent_table = fk.split(":", 1)[1]
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        parent = by_key.get((parent_table, one))
+                        if parent is not None:
+                            out.append(parent)
+                    continue
+                link = links_from.get(row.table, {}).get(fk)
+                if link:
+                    for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                        parent = by_key.get((link.to_table, one))
+                        if parent is not None:
+                            out.append(parent)
+            result = tuple(out)
+            parents_cache[row.key] = result
+            return result
+
+        def temporally_valid(row):
+            return (row.timestamp is None or anchor is None
+                    or row.timestamp <= anchor)
+
+        node_pos = {row.key: i for i, row in enumerate(rows)}
+        neighbor_lists = []
+        for row in rows:
+            neighbor_lists.append(tuple(parents(row)) + tuple(
+                r for r in p2f_walk.get(row.key, ())
+                if temporally_valid(r)))
+        offsets = np.empty(len(rows) + 1, dtype=np.int32)
+        offsets[0] = 0
+        flat: list[int] = []
+        for i, nbrs in enumerate(neighbor_lists):
+            flat.extend(node_pos[row.key] for row in nbrs)
+            offsets[i + 1] = len(flat)
+        neighbors_array = np.asarray(flat, dtype=np.int32)
+        eligible_base = np.asarray([
+            row.table == sampling_table and temporally_valid(row)
+            for row in rows], dtype=np.uint8)
+        node_keys = [row.key for row in rows]
+        n_parents = [len(parents(row)) for row in rows]
+
+        return {
+            "graph_id": id(getattr(graph, "index", graph)),
+            "anchor": anchor,
+            "query_text": getattr(query, "text", None),
+            "task_spec_id": (task_spec.id, task_spec.table_name,
+                             task_spec.target_column),
+            "num_history_windows": policy.num_history_windows,
+            "sampling_table": sampling_table,
+            "span": span,
+            "task_base": task_base,
+            "task_stride": task_stride,
+            "entity_meta": entity_meta,
+            "rows_by_table": rows_by_table,
+            "rows": rows,
+            "physical_node_ids": physical_node_ids,
+            "task_node_ids": task_node_ids,
+            "by_key": by_key,
+            "p2f": p2f,
+            "p2f_walk": p2f_walk,
+            "parents": parents,
+            "parents_cache": parents_cache,
+            "temporally_valid": temporally_valid,
+            "sort_key": sort_key,
+            "node_pos": node_pos,
+            "offsets": offsets,
+            "neighbors": neighbors_array,
+            "eligible_base": eligible_base,
+            "node_keys": node_keys,
+            "n_parents": n_parents,
+            "node_ids": tuple({**physical_node_ids, **task_node_ids}.items()),
+            "db_tables": {table.name for table in schema.tables},
+        }
+
+    def _traverse_inline_shared(self, schema, graph, entity_table, entity_id,
+                                bound, policy, *, query,
+                                task_spec) -> TraversalResult:
+        import bisect
+        anchor = bound.as_of
+        state = getattr(self, "_inline_state", None)
+        if (state is None
+                or state["graph_id"] != id(getattr(graph, "index", graph))
+                or state["anchor"] != anchor
+                or state["query_text"] != getattr(query, "text", None)
+                or state["task_spec_id"] != (
+                    task_spec.id, task_spec.table_name,
+                    task_spec.target_column)
+                or state["num_history_windows"] != policy.num_history_windows):
+            state = self._inline_shared_build(
+                schema, graph, entity_table, bound, policy, query, task_spec)
+            self._inline_state = state
+
+        meta = state["entity_meta"].get(entity_id)
+        if meta is None:
+            return TraversalResult()
+        entity_i, block_start = meta
+        sampling_table = state["sampling_table"]
+        target = Row(sampling_table, (entity_id, anchor, "target"), {},
+                     timestamp=anchor, parents={"__entity__": entity_id})
+        if not bound.admits_row(target):
+            return TraversalResult()
+        target_key = target.key
+        tid = state["task_base"] + entity_i * state["task_stride"]
+
+        by_key = state["by_key"]
+        task_node_ids = state["task_node_ids"]
+        physical_node_ids = state["physical_node_ids"]
+        parents_cache = state["parents_cache"]
+        p2f = state["p2f"]
+        p2f_walk = state["p2f_walk"]
+        sort_key = state["sort_key"]
+        entity_key = (entity_table, entity_id)
+
+        # Patched adjacency views (copy only the focal entity's lists).
+        tkey = sort_key(target)
+        base_children = p2f.get(entity_key, [])
+        insert_at = bisect.bisect_right([sort_key(r) for r in base_children],
+                                        tkey)
+        patched_children = (base_children[:insert_at] + [target]
+                           + base_children[insert_at:])
+
+        def get_children(key):
+            if key == entity_key:
+                return patched_children
+            return p2f.get(key)
+
+        # CSR delta: append the target node; splice its edge into the focal
+        # entity's neighbor segment at the same position the per-entity build
+        # would have produced (after every temporally valid child — ties by
+        # insertion order all precede the target).
+        e = state["node_pos"][entity_key]
+        walk_children = p2f_walk.get(entity_key, [])
+        valid_keys = [sort_key(r) for r in walk_children
+                      if state["temporally_valid"](r)]
+        local = state["n_parents"][e] + bisect.bisect_right(valid_keys, tkey)
+        g = int(state["offsets"][e]) + local
+        n_nodes = len(state["node_keys"])
+        offsets = state["offsets"]
+        neighbors = state["neighbors"]
+        new_neighbors = np.concatenate([
+            neighbors[:g], np.asarray([n_nodes], dtype=np.int32),
+            neighbors[g:], np.asarray([e], dtype=np.int32)])
+        new_offsets = np.concatenate([
+            offsets[:e + 1], offsets[e + 1:] + np.int32(1),
+            np.asarray([offsets[-1] + 2], dtype=np.int32)]).astype(np.int32)
+        eligible = np.append(state["eligible_base"], np.uint8(0))
+        node_keys = state["node_keys"] + [target_key]
+
+        fallback_base = state["rows_by_table"][sampling_table]
+        fallback_rows = (fallback_base[:block_start] + [target]
+                         + fallback_base[block_start:])
+
+        def node_id_of(key):
+            if key == target_key:
+                return tid
+            return task_node_ids.get(key, physical_node_ids.get(key))
+
+        by_key[target_key] = target
+        try:
+            return self._shared_tail(
+                schema, policy,
+                task_spec=task_spec,
+                target=target,
+                target_node_idx=tid,
+                target_position=n_nodes,
+                by_key=by_key,
+                get_children=get_children,
+                parents=state["parents"],
+                temporally_valid=state["temporally_valid"],
+                fallback_rows=fallback_rows,
+                db_tables=state["db_tables"],
+                sampling_table=sampling_table,
+                offsets=new_offsets,
+                neighbors=new_neighbors,
+                eligible=eligible,
+                node_keys=node_keys,
+                node_id_of=node_id_of,
+                node_ids=state["node_ids"] + ((target_key, tid),))
+        finally:
+            del by_key[target_key]
+            parents_cache.pop(target_key, None)
 
 
 class _PolicyView:

@@ -77,10 +77,11 @@ class Row:
     def __post_init__(self) -> None:
         if self.timestamp is not None:
             object.__setattr__(self, "timestamp", _to_utc(self.timestamp))
+        # `key` is read hundreds of millions of times during reference
+        # traversal; precompute it instead of building a tuple per access.
+        object.__setattr__(self, "key", (self.table, self.id))
 
-    @property
-    def key(self) -> tuple[str, Any]:
-        return (self.table, self.id)
+    key: tuple[str, Any] = field(init=False, repr=False, compare=False)
 
     def to_json_dict(self) -> dict:
         """The Row JSON shape shared with the ``relativedb-ffi`` C ABI."""
