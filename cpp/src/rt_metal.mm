@@ -27,10 +27,14 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -733,6 +737,11 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
 
     id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
 
+    // RT_METAL_PROFILE=1: serialize the forward at stage boundaries and
+    // report per-stage wall time. Purely diagnostic; adds sync overhead.
+    const bool profile = std::getenv("RT_METAL_PROFILE") != nullptr;
+    std::map<std::string, double> prof;
+
     auto gemm = [&](id<MTLBuffer> a, id<MTLBuffer> w, id<MTLBuffer> c, int M,
                     int N, int K, float beta, MPSDataType wtype) {
       auto key = std::make_tuple(M, N, K, (int)beta);
@@ -778,6 +787,19 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     };
     auto buffer_barrier = [&] {
       if (enc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+    // Stage boundary: in profile mode, serialize (commit + wait) and
+    // attribute the elapsed wall time to `label`; a no-op otherwise, so the
+    // production forward stays one command buffer.
+    auto stage = [&](const char* label) {
+      if (!profile) return;
+      end_compute();
+      auto t0 = std::chrono::steady_clock::now();
+      [cb commit];
+      [cb waitUntilCompleted];
+      prof[label] += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      cb = [ctx.queue commandBuffer];
     };
 
     // Projection dispatch: fp32/f16 use native MPS GEMM (MPS accepts mixed
@@ -838,9 +860,11 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
         [cenc setBuffer:ctx.att offset:0 atIndex:3];
         [cenc setBytes:&n length:4 atIndex:4];
         simdrows(ctx.p_rms_clear, BS, cenc);
+        stage("elementwise");
         buffer_barrier();
         // fused qkvg projection
         proj(ctx.xn, gw.wqkvg[a], ctx.qkvg, (int)BS, 0.f);
+        stage("gemm_qkvg");
         buffer_barrier();
         // qk-norm + attention + gating
         cenc = compute();
@@ -850,47 +874,55 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
         [cenc setBuffer:gw.k_norm[a] offset:0 atIndex:2];
         [cenc dispatchThreadgroups:MTLSizeMake(BS * 16, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        stage("elementwise");
         buffer_barrier();
         if (!wflat[a].empty()) {          // single-pass small groups
-          [enc setComputePipelineState:ctx.p_attn];
-          [enc setBuffer:ctx.qkvg offset:0 atIndex:0];
-          [enc setBuffer:ctx.att offset:0 atIndex:1];
-          [enc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
-          [enc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
-          [enc setBuffer:ctx.work[a] offset:0 atIndex:4];
-          [enc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
-          [enc dispatchThreadgroups:MTLSizeMake(wflat[a].size(), 1, 1)
+          id<MTLComputeCommandEncoder> aenc = compute();
+          [aenc setComputePipelineState:ctx.p_attn];
+          [aenc setBuffer:ctx.qkvg offset:0 atIndex:0];
+          [aenc setBuffer:ctx.att offset:0 atIndex:1];
+          [aenc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
+          [aenc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
+          [aenc setBuffer:ctx.work[a] offset:0 atIndex:4];
+          [aenc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [aenc dispatchThreadgroups:MTLSizeMake(wflat[a].size(), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+          stage("attn_small");
         }
         if (!rflat[a].empty()) {          // flash split-K large groups
           // serial encoder: part -> reduce is implicitly ordered
-          [enc setComputePipelineState:ctx.p_attn_part];
-          [enc setBuffer:ctx.qkvg offset:0 atIndex:0];
-          [enc setBuffer:ctx.partials offset:0 atIndex:1];
-          [enc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
-          [enc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
-          [enc setBuffer:ctx.pwork[a] offset:0 atIndex:4];
-          [enc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
-          [enc dispatchThreadgroups:MTLSizeMake(pflat[a].size(), 1, 1)
+          id<MTLComputeCommandEncoder> penc = compute();
+          [penc setComputePipelineState:ctx.p_attn_part];
+          [penc setBuffer:ctx.qkvg offset:0 atIndex:0];
+          [penc setBuffer:ctx.partials offset:0 atIndex:1];
+          [penc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
+          [penc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
+          [penc setBuffer:ctx.pwork[a] offset:0 atIndex:4];
+          [penc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [penc dispatchThreadgroups:MTLSizeMake(pflat[a].size(), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
           buffer_barrier();
-          [enc setComputePipelineState:ctx.p_attn_reduce];
-          [enc setBuffer:ctx.partials offset:0 atIndex:0];
-          [enc setBuffer:ctx.att offset:0 atIndex:1];
-          [enc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
-          [enc setBuffer:ctx.rwork[a] offset:0 atIndex:3];
-          [enc dispatchThreadgroups:MTLSizeMake(rflat[a].size(), 1, 1)
+          [penc setComputePipelineState:ctx.p_attn_reduce];
+          [penc setBuffer:ctx.partials offset:0 atIndex:0];
+          [penc setBuffer:ctx.att offset:0 atIndex:1];
+          [penc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
+          [penc setBuffer:ctx.rwork[a] offset:0 atIndex:3];
+          [penc dispatchThreadgroups:MTLSizeMake(rflat[a].size(), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+          stage("attn_split");
         }
         buffer_barrier();
-        [enc setComputePipelineState:ctx.p_gate];
-        [enc setBuffer:ctx.att offset:0 atIndex:0];
-        [enc setBuffer:ctx.qkvg offset:0 atIndex:1];
-        [enc dispatchThreads:MTLSizeMake(BS * kD, 1, 1)
+        cenc = compute();
+        [cenc setComputePipelineState:ctx.p_gate];
+        [cenc setBuffer:ctx.att offset:0 atIndex:0];
+        [cenc setBuffer:ctx.qkvg offset:0 atIndex:1];
+        [cenc dispatchThreads:MTLSizeMake(BS * kD, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        stage("elementwise");
         buffer_barrier();
         // x += att @ wo^T
         proj(ctx.att, gw.wo[a], ctx.x, (int)BS, 1.f);
+        stage("gemm_wo");
       }
       // FFN: x += w2( silu(w1 xn) * w3 xn )
       buffer_barrier();
@@ -901,9 +933,11 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       [fenc setBuffer:gw.norm[3] offset:0 atIndex:2];
       [fenc setBytes:&n length:4 atIndex:3];
       simdrows(ctx.p_rms, BS, fenc);
+      stage("elementwise");
       buffer_barrier();
       if (gw.w13.w) {
         proj(ctx.xn, gw.w13, ctx.ff13, (int)BS, 0.f);
+        stage("gemm_ffn");
         buffer_barrier();
         fenc = compute();
         [fenc setComputePipelineState:ctx.p_swiglu_packed];
@@ -912,6 +946,7 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       } else {
         proj(ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
         proj(ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
+        stage("gemm_ffn");
         buffer_barrier();
         fenc = compute();
         [fenc setComputePipelineState:ctx.p_swiglu];
@@ -920,8 +955,10 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       }
       [fenc dispatchThreads:MTLSizeMake(BS * kDFF, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      stage("elementwise");
       buffer_barrier();
       proj(ctx.ffa, gw.w2, ctx.x, (int)BS, 1.f);
+      stage("gemm_ffn");
       if (blk_i == 0 && debug_taps) {
         end_compute();
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -946,6 +983,7 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     [henc dispatchThreadgroups:MTLSizeMake(BS, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     end_compute();
+    stage("head");
 
     [cb commit];
     [cb waitUntilCompleted];
@@ -953,6 +991,15 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       throw std::runtime_error(
           std::string("rt/metal: command buffer failed: ") +
           (cb.error ? cb.error.localizedDescription.UTF8String : "?"));
+    if (profile) {
+      double total = 0;
+      for (const auto& kv : prof) total += kv.second;
+      fprintf(stderr, "[rt-metal-profile] B=%d S=%d total=%.1fms\n",
+              B, S, total);
+      for (const auto& kv : prof)
+        fprintf(stderr, "  %-12s %9.1fms (%4.1f%%)\n", kv.first.c_str(),
+                kv.second, 100.0 * kv.second / total);
+    }
 
     std::memcpy(out.yhat_number.data(), ctx.yhat.contents, BS * 4);
     if (want_target_features) {

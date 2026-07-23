@@ -1441,7 +1441,25 @@ bool device_available(Device d) {
 
 Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
   Output out;
+  // RT_FORWARD_PROFILE=1: coarse prepare-vs-blocks wall split to stderr.
+  const bool fprof = std::getenv("RT_FORWARD_PROFILE") != nullptr;
+  auto t0 = std::chrono::steady_clock::now();
   detail::Prepared prep = detail::prepare(m, batch, out, opts.debug_taps);
+  if (fprof) {
+    fprintf(stderr, "[rt-forward] prepare %.1fms\n",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count());
+    t0 = std::chrono::steady_clock::now();
+  }
+  struct BlocksTimer {
+    bool on; std::chrono::steady_clock::time_point t;
+    ~BlocksTimer() {
+      if (on)
+        fprintf(stderr, "[rt-forward] blocks  %.1fms\n",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t).count());
+    }
+  } bt{fprof, t0};
   switch (opts.device) {
     case Device::CPU:
       detail::run_blocks_cpu(m, prep, out, opts.n_threads, opts.debug_taps,
