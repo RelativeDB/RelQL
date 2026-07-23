@@ -2,7 +2,7 @@
 id: intro
 title: The relativedb engine
 slug: /
-description: "The complete engine guide: install, concepts, how-to, and the language libraries, in one page."
+description: "The complete engine guide: install, concepts, how-to, and the Python library, in one page."
 ---
 
 # What is relativedb?
@@ -89,8 +89,7 @@ result = engine.execute(ExecutionInput(
 ## Retrievers
 
 The engine never touches a database. It asks **your** code for rows through
-five small interfaces (Java: async interfaces; Python: plain callables; Rust:
-traits, usually closures):
+four small interfaces, each a plain Python callable:
 
 | Interface | Signature (conceptual) | Role |
 |---|---|---|
@@ -98,7 +97,9 @@ traits, usually closures):
 | `LinkRetriever` | `(link, parent_id, bound, limit) → rows` | Children along one FK link, newest-first |
 | `CohortRetriever` *(optional)* | `(table, anchor, bound, limit) → ids` | Similar entities for in-context examples |
 | `TableScanner` *(optional)* | `(table, bound) → row stream` | Bulk streaming. Enables whole-table `FROM` and CSC mode |
-| `StatsProvider` *(optional)* | — | Normalization statistics (Python: pass `ColumnStats` to the backend) |
+
+(Normalization statistics are not a retriever: pass a `ColumnStats` to the
+model backend.)
 
 ### Rows
 
@@ -200,7 +201,24 @@ a new engine.
 `ContextPolicy` supports two geometries:
 
 - per-hop fanouts, e.g. `fanouts=(64, 64)`
-- a uniform `bfs_width` under a global `max_context_cells` budget
+- a uniform `bfs_width` (default 32) under a global `max_context_cells`
+  budget (default 2048)
+
+All of it is configurable from the Python API. The model backend has a
+matching token-sequence cap, `max_seq_len` (default 2048; the reference
+evaluation runs at 8192):
+
+```python
+from relativedb import ContextPolicy, Engine, RtNativeBackend
+
+engine = Engine(schema, wiring,
+    context_policy=ContextPolicy(max_context_cells=8192, bfs_width=64),
+    model_backend=RtNativeBackend(schema=schema, max_seq_len=8192))
+```
+
+Larger budgets admit more history per entity and cost latency; keep
+`max_seq_len` at or above `max_context_cells` so assembled context is not
+truncated at the model boundary.
 
 See [Choose a sampler mode](#choose-a-sampler-mode) for a decision guide.
 

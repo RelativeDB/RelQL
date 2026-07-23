@@ -87,7 +87,7 @@ const config: Config = {
           items: [
             {label: 'Getting started', to: '/docs/#installation'},
             {label: 'RelQL language', to: '/relql/'},
-            {label: 'How-to guides', to: '/docs/#predict-churn'},
+            {label: 'How-to guides', to: '/docs/#quickstart'},
           ],
         },
         {
@@ -101,10 +101,8 @@ const config: Config = {
         {
           title: 'Libraries',
           items: [
-            {label: 'Python', to: '/docs/#python-library'},
-            {label: 'Java', to: '/docs/#java-library'},
-            {label: 'Rust', to: '/docs/#rust-library'},
-            {label: 'C++ inference engine', to: '/docs/#c-inference-engine-rtcpp'},
+            {label: 'Python', to: '/docs/'},
+            {label: 'C++ inference engine', href: 'https://github.com/RelativeDB/RelQL/tree/main/cpp'},
           ],
         },
       ],
@@ -113,7 +111,7 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['java', 'rust', 'sql', 'bash'],
+      additionalLanguages: ['sql', 'bash'],
     },
   } satisfies Preset.ThemeConfig,
 };

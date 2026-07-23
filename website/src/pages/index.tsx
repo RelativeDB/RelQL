@@ -324,7 +324,7 @@ function RelationalTransformers() {
           RelativeDB ships RT-J inference as a highly optimized,
           dependency-light C++ engine, with several quantized models for highly
           constrained environments.{' '}
-          <Link to="/docs/#relational-transformers">Read more →</Link>
+          <Link to="https://arxiv.org/abs/2510.06377">Read more →</Link>
         </p>
       </div>
     </section>
