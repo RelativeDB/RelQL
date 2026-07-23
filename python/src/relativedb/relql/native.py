@@ -36,11 +36,16 @@ class NativeParserUnavailable(RuntimeError):
 def _candidate_paths() -> list[Path]:
     env = os.environ.get("RELATIVEDB_RT_LIB")
     here = Path(__file__).resolve()
-    # repo root: .../python/src/relativedb/relql/native.py -> parents[4]
-    root = here.parents[4]
     names = ["librt_c.dylib", "librt_c.so", "librt_c.dll", "rt_c.dll"]
     out = [Path(env)] if env else []
-    out += [root / "cpp" / "build" / n for n in names]
+    # in-package drop-in: installed wheels ship the library in the parent
+    # relativedb package, next to rt_native.py
+    out += [here.parents[1] / n for n in names]
+    # sibling C++ build tree of a monorepo checkout
+    # (.../python/src/relativedb/relql/native.py -> repo root is parents[4])
+    if len(here.parents) > 4:
+        root = here.parents[4]
+        out += [root / "cpp" / "build" / n for n in names]
     return out
 
 
