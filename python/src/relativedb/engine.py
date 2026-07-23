@@ -331,6 +331,12 @@ class ExecutionInput:
     # per-entity scoring) and a cohort costs one forward instead of N.
     # Scalar tasks with a shared anchor and a key-pinned WHERE only.
     shared_context: bool = False
+    # Zero-inflation hurdle for regression targets: the engine also scores
+    # the derived existence question (target > 0, RETURN PROBABILITY) on the
+    # same cohort and predicts exactly 0 wherever that probability falls
+    # below this gate. The gate is a protocol hyperparameter — tune it on a
+    # validation split, never on test.
+    hurdle_gate: Optional[float] = None
 
 
 @dataclass
@@ -694,6 +700,10 @@ class Engine:
         assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
         backend = self._require_backend()
 
+        if input.hurdle_gate is not None:
+            return self._execute_hurdle(pq, input, task_type, model_uri,
+                                        entity_table, ids)
+
         if input.shared_context:
             result = self._execute_shared(pq, input, task_type, model_uri,
                                           entity_table, ids, backend)
@@ -778,6 +788,41 @@ class Engine:
         stats = self._collect_stats(pq, task_type, contexts)
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
+                                model_uri=model_uri, stats=stats)
+
+    def _execute_hurdle(self, pq: ParsedQuery, input: ExecutionInput,
+                        task_type: TaskType, model_uri: str,
+                        entity_table: str, ids: list[Any]) -> PredictionResult:
+        """Zero-inflation hurdle: gate the regression prediction with the
+        derived existence probability.
+
+        Two passes over the same cohort: the regression query as written,
+        and a synthesized ``<target> > 0 ... RETURN PROBABILITY`` variant.
+        The final value is the regression prediction where the existence
+        probability clears ``hurdle_gate``, else exactly 0 — the composition
+        that lets a continuous head and a calibrated-ranking head jointly
+        model a zero-inflated target."""
+        from .relql.ast import Condition, Operator, ReturnSpec
+        if task_type is not TaskType.REGRESSION:
+            raise ExecutionError(
+                "hurdle_gate applies to regression targets only")
+        reg = self.execute(replace(input, query=pq, hurdle_gate=None))
+        clf_pq = replace(
+            pq,
+            target=Condition(left=pq.target, op=Operator.GT, right=0),
+            ret=ReturnSpec("PROBABILITY"))
+        clf = self.execute(replace(input, query=clf_pq, hurdle_gate=None))
+        prob = {p.id: p.probability for p in clf.predictions}
+        gated = tuple(
+            EntityPrediction(p.id,
+                             value=(p.value
+                                    if prob.get(p.id, 1.0) > input.hurdle_gate
+                                    else 0.0))
+            for p in reg.predictions)
+        stats = dict(reg.stats)
+        stats["hurdle_gate"] = input.hurdle_gate
+        stats["hurdle_zeroed"] = sum(1 for p in gated if p.value == 0.0)
+        return PredictionResult(task_type=task_type, predictions=gated,
                                 model_uri=model_uri, stats=stats)
 
     def _prepare_shared(self, pq: ParsedQuery, input: ExecutionInput,
