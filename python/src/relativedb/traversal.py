@@ -776,15 +776,16 @@ class ReferenceTraversal:
                                node_ids)
 
     def cohort_targets(self, entity_table, entity_ids, anchor, task_spec,
-                       *, history: int = 3):
+                       *, history: int):
         """Cohort rows for shared-context scoring, from the shared build.
 
         Returns ``(targets, inject_rows, extra_node_ids)`` — one target row
         key per entity, the rows to guarantee inside the shared context (each
         entity's target row, entity row, and its ``history`` most recent
-        labeled task rows), and node ids for rows not already mapped — or
-        ``None`` when no shared state matches this anchor (caller falls back
-        to per-entity scoring).
+        labeled task rows — callers pass
+        ``ContextPolicy.num_history_windows``), and node ids for rows not
+        already mapped — or ``None`` when no shared state matches this anchor
+        (caller falls back to per-entity scoring).
         """
         table = task_spec.table_name
         wanted = set(entity_ids)
@@ -846,6 +847,46 @@ class ReferenceTraversal:
             return targets, inject, extra_node_ids
         return None
 
+    def _factory_overlay(self, state, target_key) -> None:
+        """Recompute the anchor-dependent members of a shared state in place:
+        the temporal filter, walk neighbor CSR, and eligibility — everything
+        downstream of the focal cutoff. No-op when the cutoff is unchanged."""
+        cutoff_row = state["by_key"].get(target_key)
+        cutoff = cutoff_row.timestamp if cutoff_row is not None else None
+        if "cutoff" in state and state["cutoff"] == cutoff:
+            return
+
+        def temporally_valid(row):
+            return (row.timestamp is None or cutoff is None
+                    or row.timestamp <= cutoff)
+
+        rows = state["rows"]
+        parents = state["parents"]
+        p2f_walk = state["p2f_walk"]
+        node_pos = state["node_pos"]
+        sampling_table = state["sampling_table"]
+        # Canonical CSR over every node in stable `rows` order. The walk only
+        # ever reaches nodes connected to its start, so covering the full
+        # node set (instead of a per-entity BFS discovery) yields identical
+        # counts.
+        offsets = np.empty(len(rows) + 1, dtype=np.int32)
+        offsets[0] = 0
+        flat: list[int] = []
+        for i, row in enumerate(rows):
+            for parent in parents(row):
+                flat.append(node_pos[parent.key])
+            for child in p2f_walk.get(row.key, ()):
+                if temporally_valid(child):
+                    flat.append(node_pos[child.key])
+            offsets[i + 1] = len(flat)
+        state["cutoff"] = cutoff
+        state["temporally_valid"] = temporally_valid
+        state["offsets"] = offsets
+        state["neighbors"] = np.asarray(flat, dtype=np.int32)
+        state["eligible_base"] = np.asarray([
+            row.table == sampling_table and temporally_valid(row)
+            for row in rows], dtype=np.uint8)
+
     def _factory_shared_build(self, schema, graph, entity_table, bound,
                               query, task_spec, supplied):
         """Build the entity-invariant graph state for a factory task graph.
@@ -864,13 +905,31 @@ class ReferenceTraversal:
         supplied_rows, supplied_ids, target_key = supplied[:3]
         reference_p2f_order = supplied[3] if len(supplied) >= 4 else None
         reference_f2p_order = supplied[4] if len(supplied) == 5 else None
+        sampling_table = task_spec.table_name
+
+        # The graph core — rows, adjacency, fixture verification, parent
+        # resolution — is anchor-invariant; only the temporal filter (walk
+        # neighbor lists, CSR, eligibility) depends on the anchor. Reuse the
+        # core across anchors and rebuild just the overlay.
+        prior = getattr(self, "_shared_state", None)
+        if (prior is not None
+                and prior.get("graph_id") == id(getattr(graph, "index", graph))
+                and prior.get("supplied_ids_id") == id(supplied_ids)
+                and prior.get("p2f_order_id") == id(reference_p2f_order)
+                and prior.get("f2p_order_id") == id(reference_f2p_order)
+                and prior.get("task_spec_id") == (
+                    task_spec.id, task_spec.table_name,
+                    task_spec.target_column)
+                and target_key in prior.get("tasklist_pos", ())):
+            self._factory_overlay(prior, target_key)
+            return prior
+
         task_rows = list(supplied_rows)
         task_node_ids = dict(supplied_ids)
         if target_key not in task_node_ids:
             raise RuntimeError(
                 "materialized task graph did not assign the focal "
                 "task row a stable node id")
-        sampling_table = task_spec.table_name
 
         rows_by_table = {t.name: list(graph.all_rows(t.name) or [])
                          for t in schema.tables}
@@ -990,39 +1049,16 @@ class ReferenceTraversal:
             parents_cache[row.key] = result
             return result
 
-        def temporally_valid(row):
-            return (row.timestamp is None or cutoff is None
-                    or row.timestamp <= cutoff)
-
-        # Canonical CSR over every node in stable `rows` order. The walk only
-        # ever reaches nodes connected to its start, so covering the full node
-        # set (instead of a per-entity BFS discovery) yields identical counts.
         node_pos = {row.key: i for i, row in enumerate(rows)}
-        neighbor_lists = []
-        for row in rows:
-            neighbor_lists.append(tuple(parents(row)) + tuple(
-                r for r in p2f_walk.get(row.key, ())
-                if temporally_valid(r)))
-        offsets = np.empty(len(rows) + 1, dtype=np.int32)
-        offsets[0] = 0
-        flat: list[int] = []
-        for i, nbrs in enumerate(neighbor_lists):
-            flat.extend(node_pos[row.key] for row in nbrs)
-            offsets[i + 1] = len(flat)
-        neighbors_array = np.asarray(flat, dtype=np.int32)
-        eligible_base = np.asarray([
-            row.table == sampling_table and temporally_valid(row)
-            for row in rows], dtype=np.uint8)
         node_keys = [row.key for row in rows]
 
-        return {
+        state = {
             "graph_id": id(getattr(graph, "index", graph)),
             "supplied_ids_id": id(supplied_ids),
             "p2f_order_id": id(reference_p2f_order),
             "f2p_order_id": id(reference_f2p_order),
             "task_spec_id": (task_spec.id, task_spec.table_name,
                              task_spec.target_column),
-            "cutoff": cutoff,
             "sampling_table": sampling_table,
             "rows_by_table": rows_by_table,
             "rows": rows,
@@ -1030,18 +1066,17 @@ class ReferenceTraversal:
             "task_node_ids": task_node_ids,
             "by_key": by_key,
             "p2f": p2f,
+            "p2f_walk": p2f_walk,
             "parents": parents,
-            "temporally_valid": temporally_valid,
             "node_pos": node_pos,
-            "offsets": offsets,
-            "neighbors": neighbors_array,
-            "eligible_base": eligible_base,
             "node_keys": node_keys,
             "tasklist_pos": {row.key: i for i, row in enumerate(task_rows)},
             "node_ids": tuple({**physical_node_ids, **task_node_ids}.items()),
             "db_tables": {table.name for table in schema.tables},
             "masked_key": target_key,
         }
+        self._factory_overlay(state, target_key)
+        return state
 
     def _traverse_factory_shared(self, schema, graph, entity_table, entity_id,
                                  bound, policy, *, query,

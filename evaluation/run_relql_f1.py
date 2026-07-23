@@ -96,10 +96,24 @@ def run_one(dataset, name: str, output: Path, library: str | None,
     groups = list(target.groupby("date", sort=False))
     with warnings.catch_warnings(record=True) as seen:
         warnings.simplefilter("always")
+        if shared:
+            from relativedb import ExecutionInput
+            batch = [ExecutionInput(
+                query=spec.query,
+                anchor_time=_python_value(date),
+                per_entity_anchor=spec.per_entity_anchor,
+                params={"ids": [_python_value(v)
+                                for v in group[spec.id_column]]},
+                shared_context=True,
+            ) for date, group in groups]
+            outcomes = engine.execute_many(batch)
+        else:
+            outcomes = None
         for group_index, (date, group) in enumerate(groups, 1):
-            result = execute_group(engine, spec,
-                                   group[spec.id_column].tolist(), date,
-                                   shared=shared)
+            result = (outcomes[group_index - 1] if outcomes is not None
+                      else execute_group(engine, spec,
+                                         group[spec.id_column].tolist(), date,
+                                         shared=shared))
             for prediction in result.predictions:
                 value = (prediction.probability if spec.classification
                          else prediction.value)

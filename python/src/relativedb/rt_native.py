@@ -1268,6 +1268,22 @@ class RtNativeBackend:
         visible to each other — strictly less outcome exposure than scoring
         the same cohort one entity at a time.
         """
+        payload = self.prepare_shared(query, task_type, ctx, targets,
+                                      model_uri, config)
+        yhat = payload["model"].forward_tokens(
+            device=self._resolve_device(), **payload["kw"])[0]
+        return self.finish_shared(payload, yhat)
+
+    def prepare_shared(self, query: ParsedQuery, task_type: TaskType,
+                       ctx: EntityContext,
+                       targets: list[tuple[Any, tuple[str, Any]]],
+                       model_uri: str, config: ModelConfig) -> dict:
+        """The Python half of shared-context scoring: sequence assembly,
+        target masking, normalization, and collation. The returned payload's
+        ``kw``/``model`` feed :meth:`RtModel.forward_tokens`;
+        :meth:`finish_shared` shapes that forward's output. Split so a caller
+        can overlap the next cohort's preparation with the current forward.
+        """
         if task_type not in (TaskType.BINARY_CLASSIFICATION,
                              TaskType.REGRESSION):
             raise RtNativeError(
@@ -1328,7 +1344,22 @@ class RtNativeBackend:
             seq.is_tgt.insert(at, True)
             seq.value.insert(at, 0.0)
 
-        yhat = self._forward_tokens(model, seq)
+        kw = self._collate([seq])
+        kw["n_threads"] = self.n_threads
+        return {
+            "kw": kw, "model": model, "seq": seq,
+            "node_to_entity": node_to_entity, "stats": stats,
+            "targets": targets, "task_type": task_type,
+            "ret_kind": ret_kind,
+        }
+
+    def finish_shared(self, payload: dict,
+                      yhat: np.ndarray) -> list[EntityPrediction]:
+        seq = payload["seq"]
+        node_to_entity = payload["node_to_entity"]
+        task_type = payload["task_type"]
+        stats = payload["stats"]
+        ret_kind = payload["ret_kind"]
         preds: list[EntityPrediction] = []
         emitted = set()
         for s in range(len(seq)):
@@ -1344,17 +1375,12 @@ class RtNativeBackend:
                 preds.append(self._shape_binary(eid, ret_kind, p))
             else:
                 preds.append(EntityPrediction(eid, value=v * stats[1] + stats[0]))
-        missing = [eid for eid, _ in targets if eid not in emitted]
+        missing = [eid for eid, _ in payload["targets"] if eid not in emitted]
         if missing:
             raise RtNativeError(
                 f"shared-context scoring produced no prediction for "
                 f"{missing[:3]!r}")
         return preds
-
-    def _forward_tokens(self, model: RtModel, seq: "_Seq") -> np.ndarray:
-        kw = self._collate([seq])
-        kw["n_threads"] = self.n_threads
-        return model.forward_tokens(device=self._resolve_device(), **kw)[0]
 
     def _forward_batched(self, model: RtModel, seqs: list["_Seq"], **kwargs):
         """Run bounded physical forwards while preserving logical ordering."""

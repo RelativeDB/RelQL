@@ -780,15 +780,13 @@ class Engine:
                                 predictions=tuple(preds),
                                 model_uri=model_uri, stats=stats)
 
-    def _execute_shared(self, pq: ParsedQuery, input: ExecutionInput,
+    def _prepare_shared(self, pq: ParsedQuery, input: ExecutionInput,
                         task_type: TaskType, model_uri: str,
-                        entity_table: str, ids: list[Any],
-                        backend) -> Optional[PredictionResult]:
-        """Score the cohort in one shared context (one forward per cohort).
-
-        Returns None when the traversal has no matching shared state, in
-        which case the caller falls back to per-entity scoring.
-        """
+                        entity_table: str, ids: list[Any], backend):
+        """Python half of shared-context execution: validate, assemble the
+        shared context, inject cohort rows, and build the collated payload.
+        Returns ``("ok", payload, stats)``, ``("empty", None, None)``, or
+        ``("fallback", None, None)`` when no shared state matches."""
         if task_type not in (TaskType.BINARY_CLASSIFICATION,
                              TaskType.REGRESSION):
             raise ExecutionError(
@@ -805,11 +803,9 @@ class Engine:
                 "(pk = :id / pk IN :ids); other filters need per-entity "
                 "scoring")
         if not ids:
-            return PredictionResult(task_type=task_type, predictions=(),
-                                    model_uri=model_uri,
-                                    stats={"entities_scored": 0})
+            return ("empty", None, None)
         if (not hasattr(self.traversal, "cohort_targets")
-                or not hasattr(backend, "score_shared")):
+                or not hasattr(backend, "prepare_shared")):
             raise ExecutionError(
                 "shared_context requires the reference traversal and the "
                 "native RT backend")
@@ -817,10 +813,11 @@ class Engine:
         anchor = self._anchor_for(entity_table, seed, input)
         ctx = self.assemble_context(entity_table, seed, anchor, query=pq)
         task_spec = backend.task_spec(pq, task_type)
-        got = self.traversal.cohort_targets(entity_table, list(ids), anchor,
-                                            task_spec)
+        got = self.traversal.cohort_targets(
+            entity_table, list(ids), anchor, task_spec,
+            history=self.context_policy.num_history_windows)
         if got is None:
-            return None
+            return ("fallback", None, None)
         targets, inject, extra_node_ids = got
         # Guarantee cohort rows a place in the context: right after the focal
         # target, so the sequence budget truncates low-relevance tail rows
@@ -838,14 +835,134 @@ class Engine:
             ctx.rows = head + front + rest
         if extra_node_ids:
             ctx.node_ids.update(extra_node_ids)
-        preds = backend.score_shared(pq, task_type, ctx, targets, model_uri,
-                                     self.model_config)
+        payload = backend.prepare_shared(pq, task_type, ctx, targets,
+                                         model_uri, self.model_config)
         stats = self._collect_stats(pq, task_type, [ctx])
-        stats["entities_scored"] = len(preds)
         stats["shared_context_forwards"] = 1
+        return ("ok", payload, stats)
+
+    def _execute_shared(self, pq: ParsedQuery, input: ExecutionInput,
+                        task_type: TaskType, model_uri: str,
+                        entity_table: str, ids: list[Any],
+                        backend) -> Optional[PredictionResult]:
+        """Score the cohort in one shared context (one forward per cohort).
+
+        Returns None when the traversal has no matching shared state, in
+        which case the caller falls back to per-entity scoring.
+        """
+        tag, payload, stats = self._prepare_shared(
+            pq, input, task_type, model_uri, entity_table, ids, backend)
+        if tag == "empty":
+            return PredictionResult(task_type=task_type, predictions=(),
+                                    model_uri=model_uri,
+                                    stats={"entities_scored": 0})
+        if tag == "fallback":
+            return None
+        yhat = payload["model"].forward_tokens(
+            device=backend._resolve_device(), **payload["kw"])[0]
+        preds = backend.finish_shared(payload, yhat)
+        stats["entities_scored"] = len(preds)
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
                                 model_uri=model_uri, stats=stats)
+
+    def execute_many(self, inputs) -> list[PredictionResult]:
+        """Execute several inputs, overlapping each shared-context cohort's
+        Python-side preparation (context assembly, masking, collation) with
+        the previous cohort's model forward. Inputs that are not
+        shared-context — or any preparation that cannot use the shared path —
+        are executed serially through :meth:`execute`.
+        """
+        inputs = [ExecutionInput(query=i) if isinstance(i, str) else i
+                  for i in inputs]
+        backend = self.model_backend
+        if (backend is None or not hasattr(backend, "prepare_shared")
+                or len(inputs) < 2
+                or not all(i.shared_context for i in inputs)):
+            return [self.execute(i) for i in inputs]
+
+        import queue as _queue
+        import threading
+        feed: _queue.Queue = _queue.Queue(maxsize=2)
+        stop = threading.Event()
+
+        def resolve(inp):
+            pq = (parse(inp.query) if isinstance(inp.query, str)
+                  else inp.query)
+            if pq.explain is not None:
+                return None
+            pq = validate(pq, self.schema).query.bind_params(inp.params)
+            inp = replace(inp, anchor_time=self._effective_anchor(pq, inp))
+            task_type = pq.task_type(self.schema)
+            model_uri = self.model_config.model_uri_for(task_type)
+            ids = self._resolve_entity_ids(pq, inp)
+            return pq, inp, task_type, model_uri, pq.entity_key.table, ids
+
+        def produce():
+            try:
+                for idx, inp in enumerate(inputs):
+                    if stop.is_set():
+                        return
+                    resolved = resolve(inp)
+                    if resolved is None:
+                        feed.put(("serial", idx, None, None, None))
+                        continue
+                    pq, inp, task_type, model_uri, table, ids = resolved
+                    tag, payload, stats = self._prepare_shared(
+                        pq, inp, task_type, model_uri, table, ids,
+                        self.model_backend)
+                    if tag == "ok":
+                        feed.put(("ok", idx, payload, stats,
+                                  (task_type, model_uri)))
+                    elif tag == "empty":
+                        feed.put(("empty", idx, None, None,
+                                  (task_type, model_uri)))
+                    else:
+                        feed.put(("serial", idx, None, None, None))
+                feed.put(("done", None, None, None, None))
+            except BaseException as error:
+                feed.put(("error", error, None, None, None))
+
+        results: list[Optional[PredictionResult]] = [None] * len(inputs)
+        serial: list[int] = []
+        producer = threading.Thread(target=produce, daemon=True)
+        producer.start()
+        try:
+            while True:
+                tag, idx, payload, stats, meta = feed.get()
+                if tag == "error":
+                    raise idx
+                if tag == "done":
+                    break
+                if tag == "serial":
+                    serial.append(idx)
+                    continue
+                task_type, model_uri = meta
+                if tag == "empty":
+                    results[idx] = PredictionResult(
+                        task_type=task_type, predictions=(),
+                        model_uri=model_uri, stats={"entities_scored": 0})
+                    continue
+                yhat = payload["model"].forward_tokens(
+                    device=backend._resolve_device(), **payload["kw"])[0]
+                preds = backend.finish_shared(payload, yhat)
+                stats["entities_scored"] = len(preds)
+                results[idx] = PredictionResult(
+                    task_type=task_type, predictions=tuple(preds),
+                    model_uri=model_uri, stats=stats)
+        finally:
+            stop.set()
+            while producer.is_alive():
+                try:
+                    feed.get_nowait()
+                except _queue.Empty:
+                    producer.join(timeout=0.05)
+        # Inputs the shared path could not serve run serially afterwards,
+        # with the producer thread quiesced (traversal state is not
+        # thread-safe against concurrent assembly).
+        for idx in serial:
+            results[idx] = self.execute(inputs[idx])
+        return results
 
     def _collect_stats(self, pq: ParsedQuery, task_type: TaskType,
                        contexts: list[EntityContext]) -> dict:
