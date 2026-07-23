@@ -315,6 +315,43 @@ class ReferenceTraversal:
                     entity_rows = rows_by_table.get(entity_table, [])
                     task_base = len(physical_node_ids)
                     task_stride = policy.num_history_windows + 1
+                    # Self-label history windows are evaluated per entity, but
+                    # eval_* aggregates over every row of the aggregated table
+                    # it is handed (it expects a per-entity label context).
+                    # Scope those tables to rows owned by the entity — via the
+                    # FK chain up to the entity table — or every entity's
+                    # window would be labeled with the whole cohort's outcomes
+                    # (e.g. NOT EXISTS(orders.*) would be 0 for everyone
+                    # whenever anyone ordered).
+                    agg_tables = {a.column.table
+                                  for a in query.target_aggregations
+                                  if a.column.table != entity_table}
+                    key_index = {r.key: r for r in rows}
+                    owners_memo: dict[tuple, frozenset] = {}
+
+                    def owners(row) -> frozenset:
+                        got = owners_memo.get(row.key)
+                        if got is not None:
+                            return got
+                        owners_memo[row.key] = frozenset()   # cycle guard
+                        out: set = set()
+                        for link in schema.links_from(row.table):
+                            pid = row.parents.get(link.fk_column)
+                            pids = (pid if isinstance(pid, (list, tuple))
+                                    else (pid,))
+                            for one in pids:
+                                if one is None:
+                                    continue
+                                if link.to_table == entity_table:
+                                    out.add(one)
+                                else:
+                                    parent = key_index.get(
+                                        (link.to_table, one))
+                                    if parent is not None:
+                                        out |= owners(parent)
+                        owners_memo[row.key] = frozenset(out)
+                        return owners_memo[row.key]
+
                     for entity_i, entity in enumerate(entity_rows):
                         # Unknown focal target at the requested anchor.
                         if entity.id == entity_id:
@@ -333,11 +370,15 @@ class ReferenceTraversal:
                             # after its own task timestamp, but never after the
                             # focal prediction anchor.
                             label_cutoff = min(anchor, ts + span)
-                            visible = {
-                                name: [r for r in table_rows
+                            visible = {}
+                            for name, table_rows in rows_by_table.items():
+                                vis = [r for r in table_rows
                                        if r.timestamp is None
                                        or r.timestamp <= label_cutoff]
-                                for name, table_rows in rows_by_table.items()}
+                                if name in agg_tables:
+                                    vis = [r for r in vis
+                                           if entity.id in owners(r)]
+                                visible[name] = vis
                             if task_type is TaskType.BINARY_CLASSIFICATION:
                                 value = 1.0 if eval_bool(
                                     query.target, visible, entity.cells, ts) else 0.0

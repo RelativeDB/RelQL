@@ -222,3 +222,42 @@ def test_fk_feature_is_opt_in_while_pk_never_emits(churn_schema):
     assert ("customer_id", "orders") in seq.col
     assert ("customer_id", "customers") not in seq.col
     assert opted.require_table("orders").column("customer_id") is None
+
+
+def test_history_window_labels_are_scoped_to_the_owning_entity(churn_schema):
+    """Self-label windows must aggregate only the entity's own child rows.
+
+    Regression: eval_* aggregates over every row it is handed, so unscoped
+    windows labeled NOT EXISTS(orders.*) as 0 for every customer whenever
+    anyone in the sampled cohort had ordered — degenerate in-context
+    examples. C9 has never ordered (every window must be 1.0); C7 ordered in
+    Mar and May 2026 (windows covering those months must be 0.0).
+    """
+    from relativedb import parse, validate
+
+    wiring = in_memory_wiring(churn_rows())
+    engine = Engine(churn_schema, wiring,
+                    context_policy=ContextPolicy(num_history_windows=3),
+                    traversal=ReferenceTraversal())
+    pq = validate(parse(
+        "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
+        "FROM customers WHERE customers.customer_id IN :ids"),
+        churn_schema).query.bind_params({"ids": ["C7"]})
+    ctx = engine.assemble_context("customers", "C7", dt("2026-07-01"),
+                                  query=pq)
+
+    def labels(cid):
+        out = {}
+        for r in ctx.rows:
+            if r.table == "task_customers" and r.id[0] == cid and r.cells:
+                (value,) = r.cells.values()
+                out[r.timestamp] = value
+        return out
+
+    c9 = labels("C9")
+    assert c9 and all(v == 1.0 for v in c9.values()), c9
+    c7 = labels("C7")
+    # windows anchored 90/180 days before 2026-07-01 cover C7's May and
+    # Mar orders respectively
+    assert c7[dt("2026-04-02")] == 0.0
+    assert c7[dt("2026-01-02")] == 0.0
