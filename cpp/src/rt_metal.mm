@@ -248,6 +248,8 @@ kernel void attn(device const float* qkvg [[buffer(0)]],
                  device const int* kidx [[buffer(3)]],
                  device const AttnWork* work [[buffer(4)]],
                  device const float* head_scale [[buffer(5)]],
+                 device const float* q_norm [[buffer(6)]],
+                 device const float* k_norm [[buffer(7)]],
                  threadgroup float* Kt [[threadgroup(0)]],
                  threadgroup float* Vt [[threadgroup(1)]],
                  uint tg [[threadgroup_position_in_grid]],
@@ -265,9 +267,12 @@ kernel void attn(device const float* qkvg [[buffer(0)]],
       uint r = p / 8, h = p % 8;
       uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
       device const float* q = qkvg + (ulong)qrowi * 2048 + h * 64;
+      // Fused QK-RMSNorm (query half): normalize once per pair at load.
+      float r0 = q[2 * lane], r1 = q[2 * lane + 1];
+      float inv = 1.0f / sqrt(simd_sum(r0 * r0 + r1 * r1) / 64.0f + kEps);
       float qscale = head_scale[h] * w.logkv / 64.0f;
-      q0v[s] = q[2 * lane] * qscale;
-      q1v[s] = q[2 * lane + 1] * qscale;
+      q0v[s] = r0 * inv * q_norm[2 * lane] * qscale;
+      q1v[s] = r1 * inv * q_norm[2 * lane + 1] * qscale;
       orow[s] = (ulong)qrowi * 512 + h * 64;
     }
   }
@@ -280,6 +285,17 @@ kernel void attn(device const float* qkvg [[buffer(0)]],
           (ulong)uint(w.rowbase + kidx[w.kstart + k0 + int(j)]) * 2048;
       Kt[j * 512 + d] = qkvg[krow + 512 + d];
       Vt[j * 512 + d] = qkvg[krow + 1024 + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Fused QK-RMSNorm (key half): normalize the staged tile in place, one
+    // simdgroup per (key, head) segment.
+    for (uint seg = sg; seg < uint(kn) * 8; seg += 8) {
+      uint j = seg / 8, h = seg % 8;
+      threadgroup float* kk = Kt + j * 512 + h * 64;
+      float a = kk[2 * lane], b = kk[2 * lane + 1];
+      float invk = 1.0f / sqrt(simd_sum(a * a + b * b) / 64.0f + kEps);
+      kk[2 * lane] = a * invk * k_norm[2 * lane];
+      kk[2 * lane + 1] = b * invk * k_norm[2 * lane + 1];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int j = 0; j < kn; j++) {
@@ -303,9 +319,17 @@ kernel void attn(device const float* qkvg [[buffer(0)]],
   for (uint s = 0; s < kMQ; s++) {
     uint p = sg + s * 8;
     if (p >= npair) continue;
+    // Fused output gate: att *= 2*sigmoid(g). Each (query, head) segment is
+    // written by exactly one pair of one group, so gating at the write is
+    // equivalent to the separate gate pass.
+    uint r = p / 8, h = p % 8;
+    ulong grow = (ulong)uint(w.rowbase + qidx[w.qstart + int(r)]) * 2048
+                 + 1536 + h * 64;
+    float g0 = 2.0f / (1.0f + exp(-qkvg[grow + 2 * lane]));
+    float g1 = 2.0f / (1.0f + exp(-qkvg[grow + 2 * lane + 1]));
     device float* o = att + orow[s];
-    o[2 * lane] = a0[s] / den[s];
-    o[2 * lane + 1] = a1[s] / den[s];
+    o[2 * lane] = a0[s] / den[s] * g0;
+    o[2 * lane + 1] = a1[s] / den[s] * g1;
   }
 }
 
@@ -336,6 +360,8 @@ kernel void attn_part(device const float* qkvg [[buffer(0)]],
                       device const int* kidx [[buffer(3)]],
                       device const AttnPWork* work [[buffer(4)]],
                       device const float* head_scale [[buffer(5)]],
+                      device const float* q_norm [[buffer(6)]],
+                      device const float* k_norm [[buffer(7)]],
                       threadgroup float* Kt [[threadgroup(0)]],
                       threadgroup float* Vt [[threadgroup(1)]],
                       uint tg [[threadgroup_position_in_grid]],
@@ -352,9 +378,11 @@ kernel void attn_part(device const float* qkvg [[buffer(0)]],
       uint r = p / 8, h = p % 8;
       uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
       device const float* q = qkvg + (ulong)qrowi * 2048 + h * 64;
+      float r0 = q[2 * lane], r1 = q[2 * lane + 1];
+      float inv = 1.0f / sqrt(simd_sum(r0 * r0 + r1 * r1) / 64.0f + kEps);
       float qscale = head_scale[h] * w.logkv / 64.0f;
-      q0v[s] = q[2 * lane] * qscale;
-      q1v[s] = q[2 * lane + 1] * qscale;
+      q0v[s] = r0 * inv * q_norm[2 * lane] * qscale;
+      q1v[s] = r1 * inv * q_norm[2 * lane + 1] * qscale;
     }
   }
   for (int k0 = 0; k0 < w.nk; k0 += int(kTK)) {
@@ -366,6 +394,17 @@ kernel void attn_part(device const float* qkvg [[buffer(0)]],
           (ulong)uint(w.rowbase + kidx[w.kstart + k0 + int(j)]) * 2048;
       Kt[j * 512 + d] = qkvg[krow + 512 + d];
       Vt[j * 512 + d] = qkvg[krow + 1024 + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Fused QK-RMSNorm (key half): normalize the staged tile in place, one
+    // simdgroup per (key, head) segment.
+    for (uint seg = sg; seg < uint(kn) * 8; seg += 8) {
+      uint j = seg / 8, h = seg % 8;
+      threadgroup float* kk = Kt + j * 512 + h * 64;
+      float a = kk[2 * lane], b = kk[2 * lane + 1];
+      float invk = 1.0f / sqrt(simd_sum(a * a + b * b) / 64.0f + kEps);
+      kk[2 * lane] = a * invk * k_norm[2 * lane];
+      kk[2 * lane + 1] = b * invk * k_norm[2 * lane + 1];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int j = 0; j < kn; j++) {
@@ -409,6 +448,7 @@ kernel void attn_reduce(device const float* partials [[buffer(0)]],
                         device float* att [[buffer(1)]],
                         device const int* qidx [[buffer(2)]],
                         device const AttnRWork* work [[buffer(3)]],
+                        device const float* qkvg [[buffer(4)]],
                         uint tg [[threadgroup_position_in_grid]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint nsg [[simdgroups_per_threadgroup]],
@@ -429,9 +469,13 @@ kernel void attn_reduce(device const float* partials [[buffer(0)]],
       o1 += pc[2 + 2 * lane + 1] * f;
     }
     uint qrowi = uint(w.rowbase + qidx[w.qstart + int(r)]);
+    // Fused output gate (see attn).
+    ulong grow = (ulong)qrowi * 2048 + 1536 + h * 64;
+    float g0 = 2.0f / (1.0f + exp(-qkvg[grow + 2 * lane]));
+    float g1 = 2.0f / (1.0f + exp(-qkvg[grow + 2 * lane + 1]));
     device float* o = att + (ulong)qrowi * 512 + h * 64;
-    o[2 * lane] = o0 / l;
-    o[2 * lane + 1] = o1 / l;
+    o[2 * lane] = o0 / l * g0;
+    o[2 * lane + 1] = o1 / l * g1;
   }
 }
 
@@ -956,16 +1000,8 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
         proj(ctx.xn, gw.wqkvg[a], ctx.qkvg, (int)BS, 0.f);
         stage("gemm_qkvg");
         buffer_barrier();
-        // qk-norm + attention + gating
-        cenc = compute();
-        [cenc setComputePipelineState:ctx.p_qknorm];
-        [cenc setBuffer:ctx.qkvg offset:0 atIndex:0];
-        [cenc setBuffer:gw.q_norm[a] offset:0 atIndex:1];
-        [cenc setBuffer:gw.k_norm[a] offset:0 atIndex:2];
-        [cenc dispatchThreadgroups:MTLSizeMake(BS * 16, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        stage("elementwise");
-        buffer_barrier();
+        // Attention with fused QK-RMSNorm and output gating (no separate
+        // qknorm/gate passes).
         if (!wflat[a].empty()) {          // single-pass small groups
           id<MTLComputeCommandEncoder> aenc = compute();
           [aenc setComputePipelineState:ctx.p_attn];
@@ -975,6 +1011,8 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           [aenc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
           [aenc setBuffer:ctx.work[a] offset:0 atIndex:4];
           [aenc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [aenc setBuffer:gw.q_norm[a] offset:0 atIndex:6];
+          [aenc setBuffer:gw.k_norm[a] offset:0 atIndex:7];
           [aenc setThreadgroupMemoryLength:kTGStage atIndex:0];
           [aenc setThreadgroupMemoryLength:kTGStage atIndex:1];
           [aenc dispatchThreadgroups:MTLSizeMake(wflat[a].size(), 1, 1)
@@ -991,6 +1029,8 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           [penc setBuffer:ctx.kidx[a] offset:0 atIndex:3];
           [penc setBuffer:ctx.pwork[a] offset:0 atIndex:4];
           [penc setBuffer:gw.head_scale[a] offset:0 atIndex:5];
+          [penc setBuffer:gw.q_norm[a] offset:0 atIndex:6];
+          [penc setBuffer:gw.k_norm[a] offset:0 atIndex:7];
           [penc setThreadgroupMemoryLength:kTGStage atIndex:0];
           [penc setThreadgroupMemoryLength:kTGStage atIndex:1];
           [penc dispatchThreadgroups:MTLSizeMake(pflat[a].size(), 1, 1)
@@ -1001,18 +1041,11 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
           [penc setBuffer:ctx.att offset:0 atIndex:1];
           [penc setBuffer:ctx.qidx[a] offset:0 atIndex:2];
           [penc setBuffer:ctx.rwork[a] offset:0 atIndex:3];
+          [penc setBuffer:ctx.qkvg offset:0 atIndex:4];
           [penc dispatchThreadgroups:MTLSizeMake(rflat[a].size(), 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
           stage("attn_split");
         }
-        buffer_barrier();
-        cenc = compute();
-        [cenc setComputePipelineState:ctx.p_gate];
-        [cenc setBuffer:ctx.att offset:0 atIndex:0];
-        [cenc setBuffer:ctx.qkvg offset:0 atIndex:1];
-        [cenc dispatchThreads:MTLSizeMake(BS * kD, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        stage("elementwise");
         buffer_barrier();
         // x += att @ wo^T
         proj(ctx.att, gw.wo[a], ctx.x, (int)BS, 1.f);
