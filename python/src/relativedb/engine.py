@@ -676,19 +676,82 @@ class Engine:
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, input)
         assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
-        contexts: list[EntityContext] = []
-        for eid in ids:
+        backend = self._require_backend()
+
+        def build_context(eid) -> Optional[EntityContext]:
             anchor = self._anchor_for(entity_table, eid, input)
             ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
             # WHERE selects who to score and is factual; the counterfactual is
             # applied afterwards, to the context that actually gets scored.
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
-                continue
-            contexts.append(_apply_assumptions(assumed, ctx))
+                return None
+            return _apply_assumptions(assumed, ctx)
+
+        # Scoring normalizes each sequence independently, so a cohort can be
+        # scored in scoring-batch-sized chunks with identical results. Overlap
+        # the next chunk's context assembly (pure Python) with the current
+        # chunk's model forward (native, releases the GIL) for the scalar
+        # tasks whose score path is a plain batched forward.
+        chunk_size = getattr(backend, "batch_size", None) or 0
+        pipeline = (chunk_size > 0 and len(ids) > chunk_size
+                    and task_type in (TaskType.BINARY_CLASSIFICATION,
+                                      TaskType.REGRESSION,
+                                      TaskType.FORECASTING))
+        contexts: list[EntityContext] = []
+        preds: list[EntityPrediction] = []
+        if pipeline:
+            import queue as _queue
+            import threading
+            feed: _queue.Queue = _queue.Queue(maxsize=2)
+            stop = threading.Event()
+
+            def produce():
+                try:
+                    buf: list[EntityContext] = []
+                    for eid in ids:
+                        if stop.is_set():
+                            return
+                        ctx = build_context(eid)
+                        if ctx is None:
+                            continue
+                        buf.append(ctx)
+                        if len(buf) == chunk_size:
+                            feed.put(("chunk", buf))
+                            buf = []
+                    if buf:
+                        feed.put(("chunk", buf))
+                    feed.put(("done", None))
+                except BaseException as error:   # surfaced on the main thread
+                    feed.put(("error", error))
+
+            producer = threading.Thread(target=produce, daemon=True)
+            producer.start()
+            try:
+                while True:
+                    kind, payload = feed.get()
+                    if kind == "error":
+                        raise payload
+                    if kind == "done":
+                        break
+                    contexts.extend(payload)
+                    preds.extend(backend.score(pq, task_type, payload,
+                                               model_uri, self.model_config))
+            finally:
+                stop.set()
+                while producer.is_alive():
+                    try:
+                        feed.get_nowait()
+                    except _queue.Empty:
+                        producer.join(timeout=0.05)
+        else:
+            for eid in ids:
+                ctx = build_context(eid)
+                if ctx is not None:
+                    contexts.append(ctx)
+            preds = backend.score(pq, task_type, contexts,
+                                  model_uri, self.model_config)
         _warn_inert_assumptions(assumed, contexts)
         stats = self._collect_stats(pq, task_type, contexts)
-        preds = self._require_backend().score(pq, task_type, contexts,
-                                              model_uri, self.model_config)
         return PredictionResult(task_type=task_type,
                                 predictions=tuple(preds),
                                 model_uri=model_uri, stats=stats)
