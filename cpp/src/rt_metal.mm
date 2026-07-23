@@ -699,6 +699,21 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
     }
     const size_t part_max =
         std::max({part_floats[0], part_floats[1], part_floats[2], (size_t)1});
+    if (std::getenv("RT_METAL_PROFILE")) {
+      // Work volume: each (query, head) streams its group's key list, so
+      // key-visit count Σ tq·nk bounds both FLOPs and K/V traffic.
+      const char* names[3] = {"col ", "feat", "nbr "};
+      for (int a = 0; a < 3; a++) {
+        double small_kv = 0, split_kv = 0;
+        for (const auto& w : wflat[a]) small_kv += (double)w.tq * w.nk;
+        for (const auto& p : pflat[a]) split_kv += (double)p.tq * p.nk;
+        fprintf(stderr,
+                "[rt-attn-work] %s small_items=%zu split_items=%zu "
+                "small_qk=%.2fM split_qk=%.2fM\n",
+                names[a], wflat[a].size(), pflat[a].size(), small_kv / 1e6,
+                split_kv / 1e6);
+      }
+    }
 
     // ---- buffers ----------------------------------------------------------
     ensure(ctx.dev, ctx.x, BS * kD * 4);
