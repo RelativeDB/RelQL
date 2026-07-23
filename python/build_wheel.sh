@@ -19,20 +19,29 @@ rm -f src/relativedb/librt_c.dylib src/relativedb/librt_c.so \
 # sdist first, while the tree is pure source
 "$PY" -m build --sdist
 
-# native library -> package -> platform wheel. Pin the macOS deployment
-# target so the wheel installs on more than the build host's OS release
-# (rt_metal guards newer APIs with @available).
+# native library -> package -> platform wheel. macOS builds target 13.0
+# (rt_metal guards newer APIs with @available) as a universal arm64 +
+# x86_64 dylib, so one wheel serves both Mac architectures. setup.py reads
+# the wheel's platform tag straight from the bundled dylib — no
+# environment variables involved.
+MAC_FLAGS=""
 case "$(uname)" in Darwin)
-  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}" ;;
+  MAC_FLAGS='-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_OSX_ARCHITECTURES=arm64;x86_64' ;;
 esac
-cmake -S ../cpp -B ../cpp/build -DCMAKE_BUILD_TYPE=Release \
-  ${MACOSX_DEPLOYMENT_TARGET:+-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET} \
+# The dedicated wheel build tree keeps arch/deployment flags from fighting
+# the development build in cpp/build.
+BUILD_DIR=../cpp/build-wheel
+rm -rf "$BUILD_DIR"
+cmake -S ../cpp -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release $MAC_FLAGS \
   >/dev/null
-cmake --build ../cpp/build -j --target rt_c
-for f in ../cpp/build/librt_c.dylib ../cpp/build/librt_c.so \
-         ../cpp/build/rt_c.dll; do
+cmake --build "$BUILD_DIR" -j --target rt_c
+for f in "$BUILD_DIR"/librt_c.dylib "$BUILD_DIR"/librt_c.so \
+         "$BUILD_DIR"/rt_c.dll; do
   [ -f "$f" ] && cp "$f" src/relativedb/
 done
+case "$(uname)" in Darwin)
+  echo "dylib architectures: $(lipo -archs src/relativedb/librt_c.dylib)" ;;
+esac
 "$PY" -m build --wheel
 
 echo

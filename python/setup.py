@@ -9,6 +9,8 @@ back to RELATIVEDB_RT_LIB / the monorepo build tree at runtime.
 """
 
 import os
+import re
+import subprocess
 
 from setuptools import setup
 from setuptools.dist import Distribution
@@ -40,11 +42,25 @@ class bdist_wheel(_bdist_wheel):
         # below the interpreter's own build target; the bundled dylib is
         # compiled for MACOSX_DEPLOYMENT_TARGET (build_wheel.sh), so let that
         # drive the platform tag.
-        target = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
-        if target and plat.startswith("macosx_"):
-            major, _, minor = target.partition(".")
-            arch = plat.rsplit("_", 1)[-1]
-            plat = f"macosx_{major}_{int(minor or 0)}_{arch}"
+        if plat.startswith("macosx_"):
+            # The bundled dylib is the single source of truth for the
+            # platform tag: its Mach-O headers record both the architectures
+            # it was built for and its minimum macOS version.
+            dylib = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "src", "relativedb", "librt_c.dylib")
+            archs = subprocess.run(
+                ["lipo", "-archs", dylib],
+                check=True, capture_output=True, text=True).stdout.split()
+            arch = ("universal2" if {"arm64", "x86_64"} <= set(archs)
+                    else archs[0])
+            info = subprocess.run(
+                ["otool", "-l", dylib],
+                check=True, capture_output=True, text=True).stdout
+            minos = re.search(r"minos (\d+)\.(\d+)", info)
+            if not minos:
+                raise RuntimeError(
+                    f"could not read minimum macOS version from {dylib}")
+            plat = f"macosx_{minos.group(1)}_{int(minos.group(2))}_{arch}"
         return "py3", "none", plat
 
 

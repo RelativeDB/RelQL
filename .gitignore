@@ -22,3 +22,4 @@ python/src/relativedb.egg-info/
 python/src/relativedb/librt_c.*
 python/src/relativedb/rt_c.dll
 .env
+cpp/build-wheel/

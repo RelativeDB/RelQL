@@ -90,11 +90,19 @@ pip install relativedb
 ```
 
 <details>
-<summary><b>Quickstart: 90-day churn from your own DataFrames</b></summary>
+<summary><b>Quickstart: 90-day churn, copy-paste runnable</b></summary>
+
+Retrievers are plain callables over your own storage — here an in-memory
+dict stands in for your database. The first run downloads the pretrained
+checkpoint and text encoder from Hugging Face.
 
 ```python
-from relativedb import (Schema, TableDef, LinkDef, ValueType,
-                        RetrieverWiring, Engine, ExecutionInput, RtNativeBackend)
+from datetime import datetime, timezone
+from relativedb import (Schema, TableDef, LinkDef, ValueType, Row,
+                        RetrieverWiring, Engine, ExecutionInput,
+                        RtNativeBackend)
+
+dt = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
 
 schema = (Schema.new_schema()
     .table(TableDef.new_table("customers")
@@ -108,19 +116,52 @@ schema = (Schema.new_schema()
     .link(LinkDef("orders", "customer_id", "customers"))
     .build())
 
-wiring = (RetrieverWiring.new_wiring()
-    .entities("customers", lambda table, ids, bound: customer_dao.by_ids(ids))
-    .entities("orders",    lambda table, ids, bound: order_dao.by_ids(ids, bound))
-    .default_links(lambda link, parent_id, bound, limit:
-                   order_dao.recent_by_customer(parent_id, bound.as_of, limit))
-    .build())
+ROWS = {
+    "customers": [
+        Row("customers", "C1", {"age": 34.0, "signup_date": dt("2026-02-10")}),
+        Row("customers", "C7", {"age": 52.0, "signup_date": dt("2026-01-20")}),
+        Row("customers", "C9", {"age": 27.0, "signup_date": dt("2026-03-05")}),
+    ],
+    "orders": [
+        Row("orders", "O1", {"qty": 1.0, "order_date": dt("2026-03-10")},
+            timestamp=dt("2026-03-10"), parents={"customer_id": "C7"}),
+        Row("orders", "O2", {"qty": 2.0, "order_date": dt("2026-05-02")},
+            timestamp=dt("2026-05-02"), parents={"customer_id": "C7"}),
+        Row("orders", "O3", {"qty": 1.0, "order_date": dt("2026-06-20")},
+            timestamp=dt("2026-06-20"), parents={"customer_id": "C1"}),
+    ],
+}
+BY_ID = {t: {r.id: r for r in rs} for t, rs in ROWS.items()}
+
+def entity(table, ids, bound):
+    rows = (BY_ID[table].get(i) for i in ids)
+    return [r for r in rows if r is not None and bound.admits_row(r)]
+
+def links(link, parent_id, bound, limit):
+    kids = [r for r in ROWS[link.from_table]
+            if r.parents.get(link.fk_column) == parent_id
+            and bound.admits_row(r)]
+    kids.sort(key=lambda r: (r.timestamp is None,
+                             -(r.timestamp.timestamp() if r.timestamp else 0)))
+    return kids[:limit]
+
+def make_scanner(table):
+    def scan(t, bound):
+        return (r for r in ROWS[table] if bound.admits_row(r))
+    return scan
+
+wiring = RetrieverWiring.new_wiring().default_links(links)
+for t in ROWS:
+    wiring.entities(t, entity)
+    wiring.scanner(t, make_scanner(t))
+wiring = wiring.build()
 
 engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
 result = engine.execute(ExecutionInput(
-    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
-          "WHERE customers.customer_id IN :ids",
-    params={"ids": ["C7"]},   # the cohort; drop the WHERE to score every customer
-    anchor_time=t0))
+    query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers",
+    anchor_time=dt("2026-07-01")))
+for p in result.predictions:
+    print(f"customer {p.id}: P(churn in 90 days) = {p.probability:.3f}")
 ```
 
 </details>
