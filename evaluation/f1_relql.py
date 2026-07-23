@@ -437,6 +437,15 @@ def build_engine(dataset, task: RelqlTask, *, context_size: int = 128,
         return (materialized, task_node_ids, key, reference_p2f_order,
                 reference_f2p_order)
 
+    traversal = ReferenceTraversal(
+        task_spec_factory=task_spec_factory,
+        task_graph_factory=task_graph_factory)
+    # Shared-context cohorts need each member's focal task row; the
+    # materialization above already indexes them, including for isolated
+    # task tables whose rows carry no entity edge.
+    traversal.task_focal_keys = (
+        lambda spec_, eid, anchor: focal_lookup.get(
+            (_python_value(eid), _python_value(anchor))))
     return Engine(
         schema, wiring,
         model_config=ModelConfig(normalization_mode=NormalizationMode.REFERENCE),
@@ -449,9 +458,7 @@ def build_engine(dataset, task: RelqlTask, *, context_size: int = 128,
             walk_length=20,
             seed=0,
         ),
-        traversal=ReferenceTraversal(
-            task_spec_factory=task_spec_factory,
-            task_graph_factory=task_graph_factory),
+        traversal=traversal,
     )
 
 

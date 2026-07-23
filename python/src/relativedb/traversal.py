@@ -790,25 +790,43 @@ class ReferenceTraversal:
         table = task_spec.table_name
         wanted = set(entity_ids)
         state = getattr(self, "_shared_state", None)
-        if (state is not None and state.get("cutoff") == anchor
-                and state.get("sampling_table") == table):
+        if state is not None and state.get("sampling_table") == table:
             by_key = state["by_key"]
-            focal_rows: dict = {}
+            # Two ways to find each entity's focal task row: an explicit
+            # resolver installed next to task_graph_factory (required for
+            # isolated task tables, whose rows carry no __entity__ edge and
+            # often no timestamp), else a scan over __entity__/timestamp for
+            # edge-linked tasks.
+            resolver = getattr(self, "task_focal_keys", None)
+            focal_keys: dict = {}
             history_of: dict = {}
+            if resolver is not None:
+                for eid in entity_ids:
+                    key = resolver(task_spec, eid, anchor)
+                    if key is None or key not in by_key:
+                        return None
+                    focal_keys[eid] = key
             for row in state["rows_by_table"].get(table, ()):
                 did = row.parents.get("__entity__")
                 if did not in wanted:
                     continue
-                if row.timestamp == anchor:
-                    focal_rows.setdefault(did, row)
-                elif (row.timestamp is not None and row.timestamp < anchor
-                      and task_spec.target_column in row.cells):
+                if resolver is None and row.timestamp == anchor:
+                    focal_keys.setdefault(did, row.key)
+                elif (row.timestamp is not None
+                      and (anchor is None or row.timestamp < anchor)
+                      and task_spec.target_column in row.cells
+                      and row.key != focal_keys.get(did)):
                     history_of.setdefault(did, []).append(row)
-            if set(focal_rows) != wanted:
+            if set(focal_keys) != wanted:
                 return None
+            # Every focal row in the group must share the state's cutoff —
+            # they get one temporal overlay.
+            cutoff = state.get("cutoff")
             targets, inject = [], []
             for eid in entity_ids:
-                row = by_key.get(focal_rows[eid].key, focal_rows[eid])
+                row = by_key[focal_keys[eid]]
+                if row.timestamp != cutoff:
+                    return None
                 targets.append((eid, row.key))
                 inject.append(row)
                 entity_row = by_key.get((entity_table, eid))
