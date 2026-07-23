@@ -824,16 +824,18 @@ class Engine:
         targets, inject, extra_node_ids = got
         # Guarantee cohort rows a place in the context: right after the focal
         # target, so the sequence budget truncates low-relevance tail rows
-        # instead of them.
-        have = {r.key for r in ctx.rows}
-        fresh: list[Row] = []
+        # instead of them. Rows already present move to the front (a copy
+        # left in the tail would be the one truncation cuts).
+        front: list[Row] = []
+        front_keys: set = set()
         for row in inject:
-            if row.key not in have:
-                fresh.append(row)
-                have.add(row.key)
-        if fresh:
-            ctx.rows = ([ctx.rows[0]] + fresh + ctx.rows[1:] if ctx.rows
-                        else fresh)
+            if row.key not in front_keys:
+                front.append(row)
+                front_keys.add(row.key)
+        if front:
+            head = [r for r in ctx.rows[:1] if r.key not in front_keys]
+            rest = [r for r in ctx.rows[1:] if r.key not in front_keys]
+            ctx.rows = head + front + rest
         if extra_node_ids:
             ctx.node_ids.update(extra_node_ids)
         preds = backend.score_shared(pq, task_type, ctx, targets, model_uri,
