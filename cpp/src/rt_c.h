@@ -126,6 +126,20 @@ int rt_forward_device(const rt_model*, int32_t B, int32_t S,
                       int32_t n_threads, int32_t device,
                       float* out_target_scores, char* err, size_t errlen);
 
+/* Same as rt_forward_device but writes the number-head output for EVERY
+ * token, in the caller's pre-sort token order (out_token_scores is B*S
+ * floats). Lets one sequence carry several masked targets and read each
+ * target's score at its own cell. */
+int rt_forward_tokens_device(const rt_model*, int32_t B, int32_t S,
+                             const int64_t* node_idxs, const int64_t* f2p,
+                             const int64_t* col_idxs, const int64_t* table_idxs,
+                             const uint8_t* is_padding, const int64_t* sem_types,
+                             const uint8_t* is_target, const float* number_v,
+                             const float* datetime_v, const float* boolean_v,
+                             const float* text_v, const float* col_name_v,
+                             int32_t n_threads, int32_t device,
+                             float* out_token_scores, char* err, size_t errlen);
+
 /* ---- frozen-backbone fine-tuning --------------------------------------
  *
  * The transformer is used as a frozen relational feature extractor. This
