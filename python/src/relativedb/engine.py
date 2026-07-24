@@ -13,23 +13,21 @@ retriever must not leak the future into context).
 from __future__ import annotations
 
 import json
-import math
 import os
 import warnings
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence, Union
 
-import numpy as np
-
+from . import training as _training
+from .anchors import coerce_anchor, effective_anchor, parse_anchor_date
 from .csc import CscIndex
-from .evaluate import eval_bool, eval_value
+from .errors import ExecutionError
+from .evaluate import eval_bool
 from .model import ModelConfig
-from .relql.ast import (AggFunc, Aggregation, Arith, BoolOp, Case, ColumnRef,
-                      Condition, Explain, Func, Lit, LogicalOp, Not, Operator,
-                      ParsedQuery, TaskType, Window, _find_aggregations)
+from .plan import QueryPlan, assumptions, build_plan, pinned_ids, pure_pin
+from .relql.ast import AggFunc, Explain, ParsedQuery, TaskType
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema
@@ -48,162 +46,6 @@ __all__ = [
 # are biased low when the fanout cap drops children. (FIRST/LAST/MIN/MAX and
 # the DISTINCT/LIST variants are far less sensitive to a dropped tail.)
 _COUNTING_AGGS = frozenset({AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG})
-
-# Default output form per task type (contract Part B, `plan.output`), used
-# when the query has no explicit RETURN spec.
-_TASK_DEFAULT_OUTPUT = {
-    TaskType.REGRESSION: "value",
-    TaskType.BINARY_CLASSIFICATION: "probability",
-    TaskType.MULTICLASS_CLASSIFICATION: "class",
-    TaskType.MULTILABEL_RANKING: "ranked",
-    TaskType.FORECASTING: "value-per-horizon",
-}
-
-
-def _num(x: float):
-    """JSON-safe numeric: pass finite floats through, stringify infinities."""
-    if isinstance(x, float) and math.isinf(x):
-        return "inf" if x > 0 else "-inf"
-    return x
-
-
-def _window_str(w: Window) -> str:
-    s = f"OVER ({_num(w.start)}, {_num(w.end)}] {w.unit.value}"
-    if w.horizons > 1:
-        s += f" HORIZONS {w.horizons}"
-    return s
-
-
-def _lit_str(v: Any) -> str:
-    if isinstance(v, str):
-        return repr(v)
-    if isinstance(v, tuple):
-        return "(" + ", ".join(_lit_str(x) for x in v) + ")"
-    if isinstance(v, datetime):
-        return v.isoformat()
-    return str(v)
-
-
-def _expr_str(e: Any) -> str:
-    """Normalized human-readable rendering of a target/where expression."""
-    if isinstance(e, ColumnRef):
-        return str(e)
-    if isinstance(e, Lit):
-        return _lit_str(e.value)
-    if isinstance(e, Aggregation):
-        s = f"{e.func.value}({e.column})"
-        if e.window is not None:
-            s += " " + _window_str(e.window)
-        return s
-    if isinstance(e, Condition):
-        rhs = (_expr_str(e.right_expr) if e.right_expr is not None
-               else _lit_str(e.right))
-        return f"{_expr_str(e.left)} {e.op.value} {rhs}"
-    if isinstance(e, LogicalOp):
-        return f"({_expr_str(e.left)} {e.op.value} {_expr_str(e.right)})"
-    if isinstance(e, Not):
-        return f"NOT ({_expr_str(e.expr)})"
-    if isinstance(e, Arith):
-        return f"({_expr_str(e.left)} {e.op} {_expr_str(e.right)})"
-    if isinstance(e, Func):
-        return f"{e.name}(" + ", ".join(_expr_str(a) for a in e.args) + ")"
-    if isinstance(e, Case):
-        parts = " ".join(f"WHEN {_expr_str(c)} THEN {_expr_str(t)}"
-                         for c, t in e.whens)
-        els = f" ELSE {_expr_str(e.else_)}" if e.else_ is not None else ""
-        return f"CASE {parts}{els} END"
-    return str(e)
-
-
-def _target_span(pq: ParsedQuery):
-    """How far past the anchor the target's window reaches — the bound the
-    label context needs. None when the frame is unbounded."""
-    for a in pq.target_aggregations:
-        if a.window is not None:
-            return a.window.span()
-    return None
-
-
-def _pure_pin(where: Any, entity_key: ColumnRef) -> bool:
-    """True when every WHERE leaf is a primary-key pin — i.e. the clause
-    selects the cohort and nothing else, so shared-context scoring applies
-    it fully by construction."""
-    if isinstance(where, LogicalOp) and where.op is BoolOp.AND:
-        return (_pure_pin(where.left, entity_key)
-                and _pure_pin(where.right, entity_key))
-    return _pinned_ids(where, entity_key) is not None
-
-
-def _pinned_ids(where: Any, entity_key: ColumnRef) -> Optional[list[Any]]:
-    """The cohort a WHERE clause pins the primary key to, or None if it
-    doesn't pin one.
-
-    Only conjunctive top-level predicates count: `pk = v` and `pk IN (...)`
-    joined by AND. Under an OR (or a NOT) the clause no longer restricts the
-    cohort on its own, so there is nothing safe to push down and we fall back
-    to enumerating. Several ANDed pk predicates intersect.
-    """
-    if where is None:
-        return None
-    if isinstance(where, LogicalOp) and where.op is BoolOp.AND:
-        left = _pinned_ids(where.left, entity_key)
-        right = _pinned_ids(where.right, entity_key)
-        if left is None:
-            return right
-        if right is None:
-            return left
-        keep = set(right)
-        return [v for v in left if v in keep]      # intersect, order-stable
-    if not isinstance(where, Condition):
-        return None
-    if not (isinstance(where.left, ColumnRef)
-            and where.left.table == entity_key.table
-            and where.left.column == entity_key.column):
-        return None
-    if where.right_expr is not None:
-        return None                                 # unbound param / expression
-    if where.op is Operator.EQ:
-        return [where.right]
-    if where.op is Operator.IN:
-        return list(where.right)
-    return None
-
-
-def _assumptions(expr: Any) -> list[tuple[str, str, Any]]:
-    """The `(table, column, value)` assignments an ASSUMING clause states.
-
-    Only shapes with one concrete answer qualify: `column = literal`, and those
-    joined by AND. An inequality, an `IN`, an `OR`/`NOT`, or an aggregate
-    condition constrains the world without saying what it *is* — there is no
-    single context that satisfies it — so those raise rather than being quietly
-    dropped.
-    """
-    if isinstance(expr, LogicalOp) and expr.op is BoolOp.AND:
-        return _assumptions(expr.left) + _assumptions(expr.right)
-    if (isinstance(expr, Condition) and expr.op is Operator.EQ
-            and isinstance(expr.left, ColumnRef)
-            and expr.left.column != "*"
-            and expr.right_expr is None
-            and not isinstance(expr.right, tuple)):
-        return [(expr.left.table, expr.left.column, expr.right)]
-    raise ExecutionError(
-        f"ASSUMING {_expr_str(expr)!r} cannot be applied: a counterfactual "
-        f"must assign concrete values — `column = literal`, optionally joined "
-        f"by AND. Inequalities, IN, OR/NOT and aggregate conditions describe a "
-        f"set of possible worlds rather than one, so the engine cannot build "
-        f"the context they imply.")
-
-
-def _assuming_plan(expr: Any) -> Optional[str]:
-    """How EXPLAIN renders the counterfactual. EXPLAIN must describe any query
-    that parses, so an inapplicable clause is reported, not raised."""
-    if expr is None:
-        return None
-    try:
-        return ", ".join(f"{t}.{c} := {_lit_str(v)}"
-                         for t, c, v in _assumptions(expr))
-    except ExecutionError:
-        return "cannot be applied (see warnings)"
 
 
 def _apply_assumptions(assignments: list[tuple[str, str, Any]],
@@ -250,9 +92,6 @@ def _warn_inert_assumptions(assignments: list[tuple[str, str, Any]],
 class AssumptionNotAppliedWarning(UserWarning):
     """An ASSUMING assignment targeted a table absent from the context."""
 
-
-class ExecutionError(RuntimeError):
-    pass
 
 
 class ContextTruncationWarning(UserWarning):
@@ -693,18 +532,21 @@ class Engine:
         # Bind the effective anchor (AS OF) before any assembly/scoring so it
         # threads through the temporal bound and pseudo-anchors unchanged.
         input = replace(input, anchor_time=self._effective_anchor(pq, input))
-        task_type = pq.task_type(self.schema)
-        model_uri = self.model_config.model_uri_for(task_type)
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, input)
-        assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
+        assumed = assumptions(pq.assuming) if pq.assuming is not None else []
         backend = self._require_backend()
+        # One plan, built here and acted on below. EXPLAIN builds the same one
+        # from the same inputs, so what it prints is what runs.
+        plan = self._plan(pq, input, input.anchor_time, cohort_size=len(ids))
+        task_type = plan.task_type
+        model_uri = plan.model_uri
 
-        if input.hurdle_gate is not None:
+        if plan.strategy == "hurdle":
             return self._execute_hurdle(pq, input, task_type, model_uri,
                                         entity_table, ids)
 
-        if input.shared_context:
+        if plan.strategy == "shared-context":
             result = self._execute_shared(pq, input, task_type, model_uri,
                                           entity_table, ids, backend)
             if result is not None:
@@ -726,11 +568,8 @@ class Engine:
         # the next chunk's context assembly (pure Python) with the current
         # chunk's model forward (native, releases the GIL) for the scalar
         # tasks whose score path is a plain batched forward.
-        chunk_size = getattr(backend, "batch_size", None) or 0
-        pipeline = (chunk_size > 0 and len(ids) > chunk_size
-                    and task_type in (TaskType.BINARY_CLASSIFICATION,
-                                      TaskType.REGRESSION,
-                                      TaskType.FORECASTING))
+        chunk_size = plan.scoring_batch_size or 0
+        pipeline = bool(plan.pipelined)
         contexts: list[EntityContext] = []
         preds: list[EntityPrediction] = []
         if pipeline:
@@ -842,7 +681,7 @@ class Engine:
         # per_entity_anchor cohorts are handled by the caller: it groups ids
         # whose anchors are exactly equal and prepares each group separately,
         # so within this call every id shares the seed's anchor.
-        if pq.where is not None and not _pure_pin(pq.where, pq.entity_key):
+        if pq.where is not None and not pure_pin(pq.where, pq.entity_key):
             raise ExecutionError(
                 "shared_context supports WHERE only as a primary-key pin "
                 "(pk = :id / pk IN :ids); other filters need per-entity "
@@ -1160,7 +999,7 @@ class Engine:
         and no enumeration happens. Anything else needs the table enumerated
         and filtered, which requires a TableScanner.
         """
-        pinned = _pinned_ids(pq.where, pq.entity_key)
+        pinned = pinned_ids(pq.where, pq.entity_key)
         if pinned is not None:
             return pinned
         ids = self._sampler().all_ids(pq.entity_key.table)
@@ -1184,384 +1023,65 @@ class Engine:
         return anchor
 
     # -- AS OF: resolve the effective anchor --------------------------------
+    # The rules live in relativedb.anchors (pure, no engine state). These stay
+    # as methods because callers and subclasses already use them.
     def _effective_anchor(self, pq: ParsedQuery,
                           input: ExecutionInput) -> Optional[datetime]:
-        """Resolve the effective anchor from the query's ``AS OF`` clause
-        (contract Part A). Absent/NOW -> ``anchor_time`` (the execution
-        anchor, NOT wall clock); DATE -> parsed date (overrides); PARAM ->
-        ``params[name]``, else ``anchor_time``, else a clear error."""
-        ao = pq.as_of
-        if ao is None or ao.kind == "now":
-            return input.anchor_time
-        if ao.kind == "date":
-            return self._parse_anchor_date(ao.value)
-        if ao.kind == "param":
-            name = ao.value
-            params = input.params or {}
-            if name in params:
-                return self._coerce_anchor(params[name])
-            if input.anchor_time is not None:
-                return input.anchor_time
-            raise ExecutionError(
-                f"AS OF :{name} — no value bound for parameter {name!r} "
-                f"(supply ExecutionInput.params={{{name!r}: <datetime>}}) and "
-                f"no anchor_time fallback is available")
-        raise ExecutionError(f"unknown AS OF kind {ao.kind!r}")
+        return effective_anchor(pq.as_of, input.anchor_time, input.params)
 
-    @staticmethod
-    def _coerce_anchor(v: Any) -> datetime:
-        if isinstance(v, datetime):
-            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
-        if isinstance(v, str):
-            return Engine._parse_anchor_date(v)
-        raise ExecutionError(
-            f"AS OF param must bind to a datetime or date string, got {v!r}")
-
-    @staticmethod
-    def _parse_anchor_date(text: Optional[str]) -> datetime:
-        s = (text or "").strip()
-        fmt = "%Y-%m-%d %H:%M:%S" if " " in s else "%Y-%m-%d"
-        try:
-            d = datetime.strptime(s, fmt)
-        except ValueError as e:
-            raise ExecutionError(
-                f"AS OF: cannot parse date {text!r} "
-                f"(expected YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'): {e}")
-        return d.replace(tzinfo=timezone.utc)
+    _coerce_anchor = staticmethod(coerce_anchor)
+    _parse_anchor_date = staticmethod(parse_anchor_date)
 
     # -- EXPLAIN ------------------------------------------------------------
     # -- task-head adaptation ----------------------------------------------
-    def finetune(self, query: Union[str, ParsedQuery], anchors: Sequence[datetime],
-                 *, output_dir: Union[str, os.PathLike] = "finetuned_model",
-                 entity_ids: Optional[Sequence[Any]] = None,
-                 params: Optional[dict[str, Any]] = None,
-                 labels: Optional[dict] = None,
-                 epochs: int = 1, batch_size: int = 1,
-                 learning_rate: float = 1e-5,
-                 weight_decay: float = 1e-2,
-                 grad_clip_norm: float = 1.0,
-                 model_uri: Optional[str] = None):
-        """Fine-tune the complete RT-J checkpoint with native C++/MPS.
+    # -- task-head adaptation ----------------------------------------------
+    # Implemented in relativedb.training; these stay methods so the public
+    # API (engine.fit_head(...), engine.finetune(...)) is unchanged.
+    def finetune(self, *args, **kwargs):
+        """Finetune the full model on labelled anchors. See
+        :func:`relativedb.training.finetune`."""
+        return _training.finetune(self, *args, **kwargs)
 
-        Unlike :meth:`fit_head`, this differentiates through all transformer
-        blocks, encoders, learned masks, normalization scales, and the number
-        decoder. It currently supports scalar binary/regression tasks, whose
-        labels use the reference bool-as-number/Huber training contract.
+    def fit_head(self, *args, **kwargs):
+        """Fit a task head on labelled anchors. See
+        :func:`relativedb.training.fit_head`."""
+        return _training.fit_head(self, *args, **kwargs)
+
+    def _scalar_label(self, *args, **kwargs):
+        return _training._scalar_label(self, *args, **kwargs)
+
+    def _ranking_relevance(self, *args, **kwargs):
+        return _training._ranking_relevance(self, *args, **kwargs)
+
+    def _sampler_kind(self) -> str:
+        """Which sampler _sampler() will hand back, as a plan-facing name."""
+        if isinstance(self.traversal, ReferenceTraversal):
+            return "csc"
+        return "csc" if self.sampler_mode is SamplerMode.CSC else "retriever"
+
+    def _plan(self, pq: ParsedQuery, input: ExecutionInput,
+              effective: Optional[datetime], *,
+              cohort_size: Optional[int] = None) -> QueryPlan:
+        """Build the plan for one query. Both execute() and explain() go
+        through here, which is what keeps EXPLAIN honest.
+
+        ``cohort_size`` is passed by execute(), which has already resolved the
+        entity ids. explain() leaves it None unless the WHERE pins the cohort,
+        because enumerating a table to describe a query would be a surprising
+        cost -- the plan reports those fields as unknown instead of guessing.
         """
-        from .model import NormalizationMode
-        from .rt_native import (ColumnStats, FineTunedCheckpoint,
-                                RT_DEVICE_MPS, RtNativeError, load_lib,
-                                resolve_model_path)
-        backend = self._require_backend()
-        if not hasattr(backend, "_build_sequences"):
-            raise ExecutionError(
-                "full-backbone fine-tuning requires RtNativeBackend")
-        lib = load_lib(backend._lib_path)
-        if not lib.device_available(RT_DEVICE_MPS):
-            raise ExecutionError("full-model fine-tuning requires Apple MPS")
-        if not anchors:
-            raise ExecutionError("full-model fine-tuning needs at least one anchor")
-        if epochs <= 0 or batch_size <= 0:
-            raise ExecutionError("epochs and batch_size must be positive")
-        anchors = [self._coerce_anchor(a) for a in anchors]
-        pq = parse(query) if isinstance(query, str) else query
-        pq = validate(pq, self.schema).query.bind_params(params)
         task_type = pq.task_type(self.schema)
-        if task_type not in (TaskType.BINARY_CLASSIFICATION,
-                             TaskType.REGRESSION):
-            raise ExecutionError(
-                "native full-model fine-tuning currently supports binary "
-                "classification and regression; use fit_head for multiclass/ranking")
-        model_uri = model_uri or self.model_config.model_uri_for(task_type)
-        normalization_mode = backend._mode(self.model_config)
-        task_spec = backend.task_spec(pq, task_type)
-        if normalization_mode is NormalizationMode.REFERENCE:
-            backend.column_stats = ColumnStats.fit(
-                self.schema, self.wiring,
-                TemporalBound.at_or_before(max(anchors)))
-
-        examples: list[tuple[EntityContext, float]] = []
-        span = _target_span(pq)
-        entity_table = pq.entity_key.table
-        for anchor in anchors:
-            ids = (list(entity_ids) if entity_ids is not None else
-                   self._resolve_entity_ids(
-                       pq, ExecutionInput(query=pq, anchor_time=anchor)))
-            for eid in ids:
-                if labels is not None and (eid, anchor) not in labels:
-                    continue
-                ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
-                label_ctx = (None if labels is not None else
-                             self.assemble_context(
-                                 entity_table, eid,
-                                 None if span is None else anchor + span,
-                                 query=pq))
-                y = self._scalar_label(pq, task_type, label_ctx, anchor,
-                                       labels, eid, [])
-                if y is not None:
-                    examples.append((ctx, float(y)))
-        if not examples:
-            raise ExecutionError(
-                "full-model fine-tuning produced no training examples")
-        if normalization_mode is NormalizationMode.REFERENCE:
-            backend.column_stats = backend.column_stats.with_task_values(
-                task_spec, [y for _, y in examples])
-
-        seqs = []
-        for ctx, y in examples:
-            one, mus, sds = backend._build_sequences(
-                pq, task_type, [ctx], normalization_mode=normalization_mode,
-                task_spec=task_spec)
-            seq = one[0]
-            target = (y - mus[0]) / sds[0]
-            for i, is_target in enumerate(seq.is_tgt):
-                if is_target:
-                    seq.value[i] = target
-            seqs.append(seq)
-
-        source_path = resolve_model_path(model_uri)
-        model = lib.load_model(source_path)  # independent mutable checkpoint
-        losses: list[float] = []
-        grad_norms: list[float] = []
-        total_seconds = 0.0
-        try:
-            for _ in range(epochs):
-                for start in range(0, len(seqs), batch_size):
-                    arrays = backend._collate(seqs[start:start + batch_size])
-                    result = model.finetune_step(
-                        **arrays, learning_rate=learning_rate,
-                        weight_decay=weight_decay,
-                        grad_clip_norm=grad_clip_norm)
-                    losses.append(result["loss"])
-                    grad_norms.append(result["grad_norm"])
-                    total_seconds += result["seconds"]
-        except RtNativeError as exc:
-            raise ExecutionError(str(exc)) from exc
-
-        out = Path(output_dir).expanduser().resolve()
-        out.mkdir(parents=True, exist_ok=True)
-        model.save(str(out / "model.safetensors"))
-        source_config = Path(source_path).with_name("config.json")
-        config = (json.loads(source_config.read_text())
-                  if source_config.exists() else {})
-        config["checkpoint_file"] = "model.safetensors"
-        config["finetune"] = {
-            "backend": "native-mps", "full_model": True,
-            "source_model": model_uri, "steps": len(losses),
-            "examples": len(examples), "final_loss": losses[-1],
-            "normalization_mode": normalization_mode.value,
-        }
-        (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-        return FineTunedCheckpoint(
-            out, tuple(losses), tuple(grad_norms), total_seconds,
-            len(examples), len(losses), backend.column_stats,
-            normalization_mode)
-
-    def fit_head(self, query: Union[str, ParsedQuery], anchors: Sequence[datetime],
-                 *, entity_ids: Optional[Sequence[Any]] = None,
-                 params: Optional[dict[str, Any]] = None,
-                 labels: Optional[dict] = None,
-                 epochs: int = 100, learning_rate: float = 1e-3,
-                 weight_decay: float = 1e-4,
-                 model_uri: Optional[str] = None):
-        """Fit a task head for ``query`` over the frozen backbone.
-
-        The transformer is not updated; each training example is encoded once
-        into its target-cell state and a small head is fitted on those. Returns
-        a :class:`~relativedb.rt_native.FineTunedHead` — inspect its losses,
-        ``save(path)`` it, and serve it by passing ``head=`` to
-        :class:`~relativedb.rt_native.RtNativeBackend`.
-
-        ``anchors`` are past cut-off times. For each one the context is bounded
-        at the anchor — exactly as at prediction time — while the **label** is
-        read from what actually happened in the target's window after it. So
-        the query defines its own supervision and no labels need supplying.
-
-        Pass ``labels`` to override that: ``{(entity_id, anchor): value}``, or
-        for ranking ``{(entity_id, anchor): {candidate_id: relevance}}``. When
-        given, it also *selects* the examples — a pair it does not name is
-        skipped rather than derived — so passing every row's own timestamp as
-        an anchor and labelling only the diagonal trains each entity at its own
-        cut-off instead of at a cut-off shared with rows it predates.
-        """
-        from .rt_native import (FT_MULTICLASS, FT_RANKING, FineTunedHead,
-                                RtNativeError)
-        backend = self._require_backend()
-        if not hasattr(backend, "candidate_seqs"):
-            raise ExecutionError(
-                "task-head fitting requires the native RT backend (RtNativeBackend)")
-        if not anchors:
-            raise ExecutionError("task-head fitting needs at least one anchor")
-        # Row timestamps are UTC-aware; naive anchors would fail to compare.
-        anchors = [self._coerce_anchor(a) for a in anchors]
-
-        pq = parse(query) if isinstance(query, str) else query
-        pq = validate(pq, self.schema).query.bind_params(params)
-        task_type = pq.task_type(self.schema)
-        if task_type not in (TaskType.MULTICLASS_CLASSIFICATION,
-                             TaskType.MULTILABEL_RANKING):
-            raise ExecutionError(
-                "frozen task-head fitting is limited to multiclass and "
-                "multilabel-ranking adapters; scalar binary/regression tasks "
-                "require full-backbone fine-tuning")
-        model_uri = model_uri or self.model_config.model_uri_for(task_type)
-        model = backend._model_for(model_uri)
-
-        from .model import NormalizationMode
-        from .rt_native import ColumnStats
-        normalization_mode = backend._mode(self.model_config)
-        if normalization_mode is NormalizationMode.REFERENCE:
-            # Reference preprocessing is fitted only on rows knowable during
-            # training. Target stats are added after labels are collected.
-            backend.column_stats = ColumnStats.fit(
-                self.schema, self.wiring,
-                TemporalBound.at_or_before(max(anchors)))
-
-        entity_table = pq.entity_key.table
-        span = _target_span(pq)
-        ys: list[float] = []
-        groups: list[int] = [0]
-        classes: list[Any] = []
-        skipped = 0
-        scalar_examples: list[tuple[EntityContext, float]] = []
-        ranking_examples: list[tuple[EntityContext, str, list, list[float]]] = []
-
-        for t in anchors:
-            ids = (list(entity_ids) if entity_ids is not None
-                   else self._resolve_entity_ids(
-                       pq, ExecutionInput(query=pq, anchor_time=t)))
-            for eid in ids:
-                # A supplied ``labels`` dict IS the training set: it names the
-                # (entity, anchor) pairs that are examples, and pairs it does
-                # not name are not examples. That is what lets every row carry
-                # its own anchor -- pass each row's timestamp and label the
-                # diagonal -- which is the shape a RelBench train table has.
-                # Without it a shared anchor either hides the entities after it
-                # or shows the ones before it their own outcome.
-                if labels is not None and (eid, t) not in labels:
-                    continue
-                # features see only what was knowable at the anchor...
-                ctx = self.assemble_context(entity_table, eid, t, query=pq)
-                # ...the label reads the window after it, but only when the
-                # label has to be *derived*. A supplied label needs no context,
-                # and assembling one anyway doubled the cost of every fit --
-                # unbounded, when the target names no window.
-                label_ctx = (None if labels is not None
-                             else self.assemble_context(
-                                 entity_table, eid,
-                                 None if span is None else t + span,
-                                 query=pq))
-                if task_type is TaskType.MULTILABEL_RANKING:
-                    parent = backend.ranking_parent_table(pq)
-                    cands = backend._rank_candidates(
-                        parent, TemporalBound.at_or_before(t) if t
-                        else TemporalBound.unbounded())
-                    if not cands:
-                        continue
-                    rel = self._ranking_relevance(pq, label_ctx, t, cands,
-                                                  labels, eid)
-                    if not any(r > 0 for r in rel):
-                        # listwise cross-entropy needs a positive in the group;
-                        # an entity that interacted with nothing in the window
-                        # carries no ranking signal, so it is not an example.
-                        skipped += 1
-                        continue
-                    ranking_examples.append((ctx, parent, cands, rel))
-                    ys.extend(rel)
-                    groups.append(len(ys))
-                else:
-                    y = self._scalar_label(pq, task_type, label_ctx, t,
-                                           labels, eid, classes)
-                    if y is None:
-                        continue
-                    scalar_examples.append((ctx, float(y)))
-                    ys.append(float(y))
-
-        if not ys:
-            extra = (f" ({skipped} ranking groups had no positive relevance in "
-                     f"the target window)" if skipped else "")
-            raise ExecutionError(
-                f"task-head fitting produced no training examples — check the anchors "
-                f"and that the cohort resolves at them{extra}")
-        if skipped:
-            warnings.warn(
-                f"task-head fitting skipped {skipped} ranking group(s) with no "
-                f"positive relevance in the target window; listwise loss needs "
-                f"at least one relevant candidate per group",
-                UserWarning, stacklevel=2)
-        task_spec = backend.task_spec(pq, task_type)
-        if normalization_mode is NormalizationMode.REFERENCE:
-            # A derived target is materialized as a real task column by the
-            # reference pipeline, and its transform is persisted alongside
-            # physical column transforms. Ranking relevance is binary and
-            # deliberately keeps the identity scale.
-            task_values = ([y for _, y in scalar_examples]
-                           if scalar_examples else [0.0, 1.0])
-            backend.column_stats = backend.column_stats.with_task_values(
-                task_spec, task_values)
-
-        feats: list = []
-        for ctx, _ in scalar_examples:
-            seqs, _, _ = backend._build_sequences(
-                pq, task_type, [ctx], normalization_mode=normalization_mode,
-                task_spec=task_spec)
-            feats.append(backend._encode(model, seqs))
-        for ctx, parent, cands, _ in ranking_examples:
-            seqs = backend.candidate_seqs(
-                pq, ctx, parent, cands,
-                normalization_mode=normalization_mode)
-            feats.append(backend._encode(model, seqs))
-        features = np.concatenate(feats, axis=0).astype(np.float32)
-        y = np.asarray(ys, np.float32)
-        n_outputs = len(classes) if task_type is TaskType.MULTICLASS_CLASSIFICATION else 1
-        if task_type is TaskType.MULTICLASS_CLASSIFICATION and n_outputs < 2:
-            raise ExecutionError(
-                f"multiclass task-head fitting needs at least two observed classes, "
-                f"saw {n_outputs}")
-        group_off = (np.asarray(groups, np.int32)
-                     if task_type is TaskType.MULTILABEL_RANKING
-                     else np.zeros(1, np.int32))
-        n_groups = (len(groups) - 1
-                    if task_type is TaskType.MULTILABEL_RANKING else 0)
-        return backend.fit_head(
-            model, task_type, features, y, group_off, n_groups,
-            epochs=epochs, learning_rate=learning_rate,
-            weight_decay=weight_decay, classes=classes,
-            normalization_mode=normalization_mode)
-
-    def _scalar_label(self, pq, task_type, label_ctx, t, labels, eid, classes):
-        """The outcome the query asks about, as it actually turned out."""
-        if labels is not None and (eid, t) in labels:
-            v = labels[(eid, t)]
-        else:
-            rows = label_ctx.rows_by_table()
-            cells = label_ctx.entity_cells(pq.entity_key.table)
-            if task_type is TaskType.BINARY_CLASSIFICATION:
-                v = 1.0 if eval_bool(pq.target, rows, cells, t) else 0.0
-            else:
-                v = eval_value(pq.target, rows, cells, t)
-        if task_type is TaskType.MULTICLASS_CLASSIFICATION:
-            if v is None:
-                return None
-            if v not in classes:
-                classes.append(v)
-            return float(classes.index(v))
-        if isinstance(v, bool):
-            return 1.0 if v else 0.0
-        if not isinstance(v, (int, float)):
-            return None
-        return float(v)
-
-    def _ranking_relevance(self, pq, label_ctx, t, candidates, labels, eid):
-        """Per-candidate relevance: which candidate ids actually turned up in
-        the target's window after the anchor."""
-        if labels is not None and (eid, t) in labels:
-            given = labels[(eid, t)] or {}
-            return [float(given.get(c.id, 0.0)) for c in candidates]
-        observed = eval_value(pq.target, label_ctx.rows_by_table(),
-                              label_ctx.entity_cells(pq.entity_key.table), t)
-        seen = {str(x) for x in (observed or [])}
-        return [1.0 if str(c.id) in seen else 0.0 for c in candidates]
+        backend = self.model_backend
+        batch = getattr(backend, "batch_size", None) if backend else None
+        return build_plan(
+            self.schema, pq, input,
+            effective=effective,
+            traversal=self.traversal,
+            sampler=self._sampler_kind(),
+            model_uri=self.model_config.model_uri_for(task_type),
+            cohort_size=cohort_size,
+            scoring_batch_size=batch,
+        )
 
     def explain(self, input: Union[ExecutionInput, str], **kwargs) -> ExplainResult:
         """Explain a query without (PLAN/CONTEXT) or with (ANALYZE) scoring.
@@ -1577,7 +1097,9 @@ class Engine:
         fmt = (ex.format or "TEXT").upper()
         effective = self._effective_anchor(pq, input)
 
-        plan = self._build_plan(pq, input, effective)
+        # The same planner execute() uses, so EXPLAIN describes the run that
+        # would actually happen rather than a separately-derived description.
+        plan = self._plan(pq, input, effective).to_dict()
         context: Optional[dict] = None
         predictions: Optional[tuple[EntityPrediction, ...]] = None
 
@@ -1597,85 +1119,6 @@ class Engine:
         return ExplainResult(mode=mode, format=fmt, plan=plan,
                              context=context, predictions=predictions)
 
-    def _build_plan(self, pq: ParsedQuery, input: ExecutionInput,
-                    effective: Optional[datetime]) -> dict:
-        task_type = pq.task_type(self.schema)
-        # entity selector: the cohort a pinned primary key names, else the
-        # whole table
-        pinned = _pinned_ids(pq.where, pq.entity_key)
-        selector = pinned if pinned is not None else "ALL"
-        # output form
-        if pq.ret is not None:
-            output = pq.ret.kind.lower()
-        else:
-            output = _TASK_DEFAULT_OUTPUT[task_type]
-        # windows across target / where / assuming
-        windows: list[dict] = []
-        self._collect_windows(pq.target_aggregations, "target", windows)
-        if pq.where is not None:
-            self._collect_windows(_find_aggregations(pq.where), "where", windows)
-        if pq.assuming is not None:
-            self._collect_windows(_find_aggregations(pq.assuming), "assuming",
-                                  windows)
-        # as_of provenance
-        ao = pq.as_of
-        if ao is None or ao.kind == "now":
-            source = "execution-anchor"
-        elif ao.kind == "date":
-            source = "query-date"
-        else:
-            source = "query-param"
-        as_of = {
-            "source": source,
-            "value": effective.isoformat() if effective is not None else None,
-        }
-        if ao is not None and ao.kind == "param":
-            as_of["param"] = ao.value
-
-        warnings_: list[str] = []
-        if pq.assuming is not None:
-            # surfaces as an error at execute() if it cannot be applied
-            try:
-                _assumptions(pq.assuming)
-            except ExecutionError as e:
-                warnings_.append(str(e))
-
-        return {
-            "target": _expr_str(pq.target),
-            "task_type": task_type.value,
-            "entity": {
-                "table": pq.entity_key.table,
-                "pk": pq.entity_key.column,
-                "selector": selector,
-            },
-            "output": output,
-            "windows": windows,
-            "where_present": pq.where is not None,
-            "assuming_present": pq.assuming is not None,
-            "assuming": _assuming_plan(pq.assuming),
-            "as_of": as_of,
-            "ablations": [{"table": a.name, "note": "declared, not applied"}
-                          for a in pq.ablations],
-            "warnings": warnings_,
-        }
-
-    def _collect_windows(self, aggs, role: str, out: list[dict]) -> None:
-        for a in aggs:
-            w = a.window
-            if w is None:
-                continue
-            t = self.schema.table(a.column.table)
-            out.append({
-                "table": a.column.table,
-                "time_column": t.time_column if t is not None else None,
-                "start": _num(w.start),
-                "end": _num(w.end),
-                "unit": w.unit.value,
-                "horizons": w.horizons,
-                "step": _num(w.step) if w.step is not None else None,
-                "role": role,
-            })
-
     def _assemble_report(self, pq: ParsedQuery, input: ExecutionInput,
                          effective: Optional[datetime]):
         """Assemble per-entity context via the normal path (no scoring) and
@@ -1683,7 +1126,7 @@ class Engine:
         eff_input = replace(input, anchor_time=effective)
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, eff_input)
-        assumed = _assumptions(pq.assuming) if pq.assuming is not None else []
+        assumed = assumptions(pq.assuming) if pq.assuming is not None else []
         contexts: list[EntityContext] = []
         for eid in ids:
             anchor = self._anchor_for(entity_table, eid, eff_input)
