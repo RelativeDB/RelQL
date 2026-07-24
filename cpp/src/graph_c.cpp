@@ -53,6 +53,29 @@ rel_graph* rel_graph_build(int64_t n_nodes, const double* node_ts,
 
 void rel_graph_free(rel_graph* g) { delete g; }
 
+int64_t rel_graph_n_nodes(const rel_graph* g) {
+  return g ? g->g.n_nodes() : 0;
+}
+
+int64_t rel_graph_n_edges(const rel_graph* g) {
+  return g ? g->g.n_edges() : 0;
+}
+
+int rel_graph_adjacency(const rel_graph* g, int want_children,
+                        int64_t* out_offsets, int64_t* out_values,
+                        char* err, size_t errlen) {
+  try {
+    if (!g) throw std::runtime_error("null graph");
+    if (!out_offsets || !out_values)
+      throw std::runtime_error("null output buffer");
+    g->g.adjacency(want_children != 0, out_offsets, out_values);
+    return 0;
+  } catch (const std::exception& e) {
+    set_err(err, errlen, e.what());
+    return 1;
+  }
+}
+
 int rel_graph_assemble(const rel_graph* handle, int64_t target, double cutoff_ts,
                        const uint8_t* eligible, int32_t max_context_cells,
                        int32_t local_context_cells, int32_t bfs_width,

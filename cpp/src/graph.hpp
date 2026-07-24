@@ -53,6 +53,15 @@ class Graph {
         const std::int64_t* edge_parent, const std::int64_t* edge_child);
 
   std::int64_t n_nodes() const { return n_nodes_; }
+  std::int64_t n_edges() const { return (std::int64_t)p2f_.size(); }
+
+  // Copy out the adjacency this class built and ordered. Bindings need it for
+  // their own retriever surfaces, and exporting it is what keeps the ordering
+  // single-sourced: a binding that rebuilt the same CSR would be a second
+  // implementation of the rule that decides which rows a context sees.
+  // `out_offsets` has room for n_nodes+1, `out_values` for n_edges.
+  void adjacency(bool children, std::int64_t* out_offsets,
+                 std::int64_t* out_values) const;
 
   // Assemble one context. `target` is the focal node; `eligible` marks nodes
   // the walk may land on (length n_nodes, 1 = eligible); `cutoff_ts` bounds

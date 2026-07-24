@@ -61,6 +61,14 @@ def _load() -> Optional[ctypes.CDLL]:
                     i64p, i64p, ctypes.c_char_p, ctypes.c_size_t]
                 lib.rel_graph_free.restype = None
                 lib.rel_graph_free.argtypes = [ctypes.c_void_p]
+                lib.rel_graph_n_nodes.restype = ctypes.c_int64
+                lib.rel_graph_n_nodes.argtypes = [ctypes.c_void_p]
+                lib.rel_graph_n_edges.restype = ctypes.c_int64
+                lib.rel_graph_n_edges.argtypes = [ctypes.c_void_p]
+                lib.rel_graph_adjacency.restype = ctypes.c_int
+                lib.rel_graph_adjacency.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, i64p, i64p,
+                    ctypes.c_char_p, ctypes.c_size_t]
                 lib.rel_graph_assemble.restype = ctypes.c_int
                 lib.rel_graph_assemble.argtypes = [
                     ctypes.c_void_p, ctypes.c_int64, ctypes.c_double,
@@ -112,6 +120,28 @@ class NativeGraph:
                 err.value.decode("utf-8", "replace") or "rel_graph_build failed")
         self._handle = handle
         self.n_nodes = n_nodes
+
+    def adjacency(self, children: bool = True):
+        """The ordered CSR the graph built: (offsets, values).
+
+        Read back rather than rebuilt on this side. The order children are
+        visited in decides which rows a context sees, so a binding that
+        recomputed it would be a second implementation of that rule.
+        """
+        if self._handle is None:
+            raise NativeGraphUnavailable("graph already freed")
+        n_nodes = self._lib.rel_graph_n_nodes(ctypes.c_void_p(self._handle))
+        n_edges = self._lib.rel_graph_n_edges(ctypes.c_void_p(self._handle))
+        offsets = np.empty(n_nodes + 1, dtype=np.int64)
+        values = np.empty(max(int(n_edges), 1), dtype=np.int64)
+        err = ctypes.create_string_buffer(_ERR)
+        rc = self._lib.rel_graph_adjacency(
+            ctypes.c_void_p(self._handle), 1 if children else 0,
+            offsets, values, err, _ERR)
+        if rc != 0:
+            raise RuntimeError(
+                err.value.decode("utf-8", "replace") or "adjacency failed")
+        return offsets, values[:int(n_edges)]
 
     def assemble(self, target: int, cutoff_ts: float, eligible, policy,
                  fallback_base: int = 0, fallback_n: int = 0,

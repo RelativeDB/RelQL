@@ -32,6 +32,17 @@ rel_graph* rel_graph_build(int64_t n_nodes, const double* node_ts,
 
 void rel_graph_free(rel_graph*);
 
+/* Node and edge counts, for sizing the adjacency buffers. */
+int64_t rel_graph_n_nodes(const rel_graph*);
+int64_t rel_graph_n_edges(const rel_graph*);
+
+/* Copy out the ordered adjacency. want_children != 0 gives children-of-node,
+ * otherwise parents-of-node. out_offsets needs n_nodes+1 entries, out_values
+ * needs n_edges. Ordering is the graph's, so a binding never rebuilds it. */
+int rel_graph_adjacency(const rel_graph*, int want_children,
+                        int64_t* out_offsets, int64_t* out_values,
+                        char* err, size_t errlen);
+
 /* Assemble one context around `target`. `eligible` (length n_nodes, 1 = the
  * walk may land here) turns on the peer-ranking walk; pass NULL for the
  * target's neighbourhood alone. `cutoff_ts` bounds which rows are visible.

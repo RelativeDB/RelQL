@@ -285,11 +285,16 @@ class ColumnarStore:
         return pos
 
     def _build_edges(self) -> None:
-        """Parent lists (f2p) and child CSR (p2f), both in canonical order:
-        children of one parent sort by (has-timestamp, timestamp, position) —
-        the same order the row-object path produces."""
-        heads: list[np.ndarray] = []      # child node -> parent node edges
-        tails: list[np.ndarray] = []
+        """Resolve foreign keys to (parent, child) node id pairs.
+
+        Resolution is wiring -- it turns the caller's key values into node ids
+        -- so it belongs here. The ORDER those edges are then visited in is
+        not: children of one parent must be seen by timestamp, and that rule
+        decides which rows a context sees. The native graph owns it, and this
+        side reads the result back rather than recomputing it.
+        """
+        heads: list = []      # parent node ids
+        tails: list = []      # child node ids
         for name in self.order:
             table = self._table(name)
             child_base = self.base[name]
@@ -297,35 +302,41 @@ class ColumnarStore:
                 parent = self._table(parent_name)
                 pos = self._resolve_parents(table, fk, parent)
                 ok = pos >= 0
-                child_nodes = np.nonzero(ok)[0] + child_base
-                parent_nodes = pos[ok] + self.base[parent_name]
-                heads.append(parent_nodes)
-                tails.append(child_nodes)
+                tails.append(np.nonzero(ok)[0] + child_base)
+                heads.append(pos[ok] + self.base[parent_name])
         if heads:
-            parent_of_edge = np.concatenate(heads)
-            child_of_edge = np.concatenate(tails)
+            self.edge_parent = np.concatenate(heads).astype(np.int64)
+            self.edge_child = np.concatenate(tails).astype(np.int64)
         else:
-            parent_of_edge = np.empty(0, dtype=np.int64)
-            child_of_edge = np.empty(0, dtype=np.int64)
+            self.edge_parent = np.empty(0, dtype=np.int64)
+            self.edge_child = np.empty(0, dtype=np.int64)
+        self._adjacency: dict = {}
 
-        # p2f CSR: children grouped by parent, ordered by
-        # (has_ts, ts, child position) — matching the stable row-path sort.
-        child_ts = self.node_ts[child_of_edge]
-        has_ts = ~np.isnan(child_ts)
-        ts_key = np.where(has_ts, child_ts, -np.inf)
-        order = np.lexsort((child_of_edge, ts_key, has_ts, parent_of_edge))
-        self.p2f_child = child_of_edge[order].astype(np.int64)
-        self.p2f_parent_sorted = parent_of_edge[order]
-        counts = np.bincount(parent_of_edge, minlength=self.n_nodes)
-        self.p2f_offsets = np.concatenate(
-            ([0], np.cumsum(counts))).astype(np.int64)
+    def _csr(self, children: bool):
+        """The ordered adjacency, read back from the native graph and cached."""
+        got = self._adjacency.get(children)
+        if got is None:
+            got = self.native_graph().adjacency(children=children)
+            self._adjacency[children] = got
+        return got
 
-        # f2p: parents per child, in fk-declaration order.
-        forder = np.lexsort((parent_of_edge, child_of_edge))
-        self.f2p_parent = parent_of_edge[forder].astype(np.int64)
-        fcounts = np.bincount(child_of_edge, minlength=self.n_nodes)
-        self.f2p_offsets = np.concatenate(
-            ([0], np.cumsum(fcounts))).astype(np.int64)
+    # The CSR arrays, named as before so callers and the conformance harness
+    # keep working -- but now the graph's, not a second copy built here.
+    @property
+    def p2f_offsets(self) -> np.ndarray:
+        return self._csr(True)[0]
+
+    @property
+    def p2f_child(self) -> np.ndarray:
+        return self._csr(True)[1]
+
+    @property
+    def f2p_offsets(self) -> np.ndarray:
+        return self._csr(False)[0]
+
+    @property
+    def f2p_parent(self) -> np.ndarray:
+        return self._csr(False)[1]
 
     def native_graph(self):
         """The native graph, built once. Node ids are this store's numbering,
@@ -339,7 +350,7 @@ class ColumnarStore:
                 is_task[base:base + self._table(name).n] = 1
             self._native_graph = NativeGraph(
                 self.node_ts, self.node_cells, self.node_table_idx, is_task,
-                self.p2f_parent_sorted, self.p2f_child)
+                self.edge_parent, self.edge_child)
         return self._native_graph
 
     # ------------------------------------------------------------------

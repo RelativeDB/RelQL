@@ -115,6 +115,14 @@ Graph::Graph(std::int64_t n_nodes, const double* node_ts,
   }
 }
 
+void Graph::adjacency(bool children, std::int64_t* out_offsets,
+                      std::int64_t* out_values) const {
+  const auto& off = children ? p2f_off_ : f2p_off_;
+  const auto& val = children ? p2f_ : f2p_;
+  std::copy(off.begin(), off.end(), out_offsets);
+  std::copy(val.begin(), val.end(), out_values);
+}
+
 std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
                              const std::uint8_t* eligible,
                              const Policy& policy, std::int64_t fallback_base,
