@@ -121,7 +121,8 @@ target_link_libraries(csc PUBLIC rt_flags)
 
 add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
                         src/schema.cpp src/analyze.cpp src/plan.cpp src/json.cpp
-                        src/csc_c.cpp src/csc.cpp src/graph.cpp)
+                        src/csc_c.cpp src/csc.cpp
+                        src/graph.cpp src/graph_c.cpp)
 target_link_libraries(rt_c PRIVATE rt)
 target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)

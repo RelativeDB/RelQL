@@ -60,8 +60,13 @@ class Graph {
   // (caller-allocated, length >= max_nodes) and a 1/0 focal flag per emitted
   // node into `out_focal`. Returns how many were written, or -1 if the target
   // is out of range.
+  // `fallback_base`/`fallback_n` name the task table's contiguous node range.
+  // When the target and its walk tier leave the context short of the budget,
+  // rows are sampled from that range to pad it -- the stage the reference
+  // traversal ends with. Pass fallback_n = 0 to skip it.
   std::int32_t assemble(std::int64_t target, double cutoff_ts,
                         const std::uint8_t* eligible, const Policy& policy,
+                        std::int64_t fallback_base, std::int64_t fallback_n,
                         std::int64_t* out_nodes, std::uint8_t* out_focal,
                         std::int32_t max_nodes) const;
 

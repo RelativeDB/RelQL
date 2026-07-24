@@ -25,7 +25,12 @@ from .parser import RelqlSyntaxError
 
 __all__ = ["parse_native", "native_available", "NativeParserUnavailable"]
 
-_OUT = 1 << 16   # 64 KiB JSON buffer — far beyond any real query's AST
+# Starting JSON buffer. It is no longer "far beyond any real query": the
+# analyze payload carries the logical plan, whose selector echoes the pinned
+# cohort, and a cohort of a few thousand ids overruns 64 KiB. The C ABI returns
+# 2 for "too small", so callers grow and retry rather than guessing a ceiling.
+_OUT = 1 << 16
+_OUT_MAX = 1 << 26        # 64 MiB: a real query's payload cannot reach this
 _ERR = 1024
 
 
@@ -134,14 +139,20 @@ def analyze_native(query: str, schema_json: str, params_json: str = "",
         raise NativeParserUnavailable(_load_failed or "librt_c unavailable")
     if not isinstance(query, str) or not query.strip():
         raise RelqlSyntaxError("empty query")
-    out = ctypes.create_string_buffer(_OUT)
     err = ctypes.create_string_buffer(_ERR)
-    rc = lib.relql_analyze(query.encode("utf-8"),
-                           schema_json.encode("utf-8"),
-                           # "" and "{}" mean different things (do not bind
-                           # vs bind with nothing supplied), so no `or`.
-                           params_json.encode("utf-8"),
-                           out, _OUT, err, _ERR)
+    size = _OUT
+    while True:
+        out = ctypes.create_string_buffer(size)
+        rc = lib.relql_analyze(query.encode("utf-8"),
+                               schema_json.encode("utf-8"),
+                               # "" and "{}" mean different things (do not bind
+                               # vs bind with nothing supplied), so no `or`.
+                               params_json.encode("utf-8"),
+                               out, size, err, _ERR)
+        if rc == 2 and size < _OUT_MAX:
+            size *= 4                       # too small: grow and retry
+            continue
+        break
     if rc != 0:
         from .parser import RelqlValidationError
         msg = err.value.decode("utf-8", "replace") or "analyze failed"

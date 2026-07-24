@@ -81,7 +81,7 @@ std::vector<std::int64_t> assemble(const relgraph::Graph& g, std::int64_t target
   std::vector<std::int64_t> nodes(4096);
   std::vector<std::uint8_t> focal(4096);
   const std::int32_t n =
-      g.assemble(target, cutoff, nullptr, p, nodes.data(), focal.data(), 4096);
+      g.assemble(target, cutoff, nullptr, p, 0, 0, nodes.data(), focal.data(), 4096);
   if (n < 0) return {};
   nodes.resize(n);
   if (focal_out) { focal.resize(n); *focal_out = focal; }
@@ -177,9 +177,9 @@ void test_out_of_range_target() {
   std::vector<std::int64_t> nodes(16);
   std::vector<std::uint8_t> focal(16);
   auto p = policy();
-  ok(g.assemble(-1, 1e18, nullptr, p, nodes.data(), focal.data(), 16) == -1,
+  ok(g.assemble(-1, 1e18, nullptr, p, 0, 0, nodes.data(), focal.data(), 16) == -1,
      "a negative target is rejected");
-  ok(g.assemble(f.n_nodes, 1e18, nullptr, p, nodes.data(), focal.data(), 16) == -1,
+  ok(g.assemble(f.n_nodes, 1e18, nullptr, p, 0, 0, nodes.data(), focal.data(), 16) == -1,
      "a target past the end is rejected");
 }
 
@@ -192,7 +192,7 @@ void test_output_is_capped_not_overrun() {
   std::vector<std::int64_t> nodes(5, -1);
   std::vector<std::uint8_t> focal(5, 0);
   const std::int32_t n =
-      g.assemble(0, 1e18, nullptr, loose, nodes.data(), focal.data(), 5);
+      g.assemble(0, 1e18, nullptr, loose, 0, 0, nodes.data(), focal.data(), 5);
   ok(n >= 0 && n <= 5, "the emitted count respects the caller's buffer");
 }
 
@@ -214,7 +214,7 @@ void test_walk_tiering_engages() {
   std::vector<std::uint8_t> eligible(f.n_nodes, 1);
   std::vector<std::int64_t> nodes(4096);
   std::vector<std::uint8_t> focal(4096);
-  const std::int32_t n = g.assemble(0, 1e18, eligible.data(), p, nodes.data(),
+  const std::int32_t n = g.assemble(0, 1e18, eligible.data(), p, 0, 0, nodes.data(),
                                     focal.data(), 4096);
   std::vector<std::int64_t> with(nodes.begin(), nodes.begin() + n);
 
@@ -244,10 +244,10 @@ void test_prefer_latest_changes_tier_order() {
   std::vector<std::int64_t> a(4096), b(4096);
   std::vector<std::uint8_t> fa(4096), fb(4096);
   const std::int32_t na =
-      g.assemble(0, 1e18, eligible.data(), p, a.data(), fa.data(), 4096);
+      g.assemble(0, 1e18, eligible.data(), p, 0, 0, a.data(), fa.data(), 4096);
   p.prefer_latest = false;
   const std::int32_t nb =
-      g.assemble(0, 1e18, eligible.data(), p, b.data(), fb.data(), 4096);
+      g.assemble(0, 1e18, eligible.data(), p, 0, 0, b.data(), fb.data(), 4096);
   ok(na > 0 && nb > 0, "both orderings produce a context");
   ok(std::vector<std::int64_t>(a.begin(), a.begin() + na) !=
          std::vector<std::int64_t>(b.begin(), b.begin() + nb),

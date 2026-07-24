@@ -53,13 +53,16 @@ std::vector<std::int32_t> rand_sample(relrng::StdRng091& rng,
     out.assign(idx.begin(), idx.begin() + amount);
     return out;
   }
-  // Floyd: the reference path for the small samples a context takes.
-  std::unordered_set<std::int32_t> seen;
+  // Floyd, in rand's variant -- NOT the textbook form. On a collision it
+  // overwrites the EXISTING occurrence with j and still appends t, where the
+  // textbook version substitutes j for t. The two draw the same numbers and
+  // return different sequences, which is a silent divergence in every context
+  // the fallback stage pads.
   out.reserve(amount);
-  for (std::int32_t i = length - amount; i < length; ++i) {
-    std::int32_t t = (std::int32_t)rng.range((std::uint32_t)(i + 1));
-    if (seen.count(t)) t = i;
-    seen.insert(t);
+  for (std::int32_t j = length - amount; j < length; ++j) {
+    const std::int32_t t = (std::int32_t)rng.range((std::uint32_t)(j + 1));
+    auto it = std::find(out.begin(), out.end(), t);
+    if (it != out.end()) *it = j;
     out.push_back(t);
   }
   return out;
@@ -97,6 +100,8 @@ Graph::Graph(std::int64_t n_nodes, const double* node_ts,
     f2p_[fat[edge_child[e]]++] = edge_parent[e];
     p2f_[pat[edge_parent[e]]++] = edge_child[e];
   }
+  for (std::int64_t c = 0; c < n_nodes; ++c)
+    std::sort(f2p_.begin() + f2p_off_[c], f2p_.begin() + f2p_off_[c + 1]);
   for (std::int64_t p = 0; p < n_nodes; ++p) {
     auto lo = p2f_.begin() + p2f_off_[p], hi = p2f_.begin() + p2f_off_[p + 1];
     std::stable_sort(lo, hi, [&](std::int64_t a, std::int64_t b) {
@@ -112,7 +117,8 @@ Graph::Graph(std::int64_t n_nodes, const double* node_ts,
 
 std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
                              const std::uint8_t* eligible,
-                             const Policy& policy, std::int64_t* out_nodes,
+                             const Policy& policy, std::int64_t fallback_base,
+                             std::int64_t fallback_n, std::int64_t* out_nodes,
                              std::uint8_t* out_focal,
                              std::int32_t max_nodes) const {
   if (target < 0 || target >= n_nodes_) return -1;
@@ -215,6 +221,7 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
   // recency when prefer_latest, with a per-node RNG draw breaking ties -- the
   // same three keys, in the same order, as the traversal this replaces.
   std::vector<std::int64_t> tier1;
+  std::unordered_set<std::int64_t> visits;
   if (eligible) {
     std::vector<std::int32_t> off(n_nodes_ + 1, 0);
     std::vector<std::int32_t> flat;
@@ -246,7 +253,7 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
       }
     }
     for (std::int64_t n = 0; n < n_nodes_; ++n)
-      if (counts[n]) tier1.push_back(n);
+      if (counts[n]) { tier1.push_back(n); visits.insert(n); }
     std::vector<std::uint64_t> tie(tier1.size());
     for (std::size_t i = 0; i < tier1.size(); ++i)
       tie[i] = relrng::StdRng091(
@@ -255,15 +262,18 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
     for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
     const bool latest = policy.prefer_latest;
     std::stable_sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) {
-      if (counts[tier1[a]] != counts[tier1[b]])
-        return counts[tier1[a]] > counts[tier1[b]];
       if (latest) {
+        // Recency is the PRIMARY key when prefer_latest: numpy's lexsort
+        // treats its last argument as primary, so ordering counts first was
+        // a different ranking, not a cosmetic difference.
         const double ta = std::isnan(ts_[tier1[a]])
             ? -std::numeric_limits<double>::infinity() : ts_[tier1[a]];
         const double tb = std::isnan(ts_[tier1[b]])
             ? -std::numeric_limits<double>::infinity() : ts_[tier1[b]];
         if (ta != tb) return ta > tb;
       }
+      if (counts[tier1[a]] != counts[tier1[b]])
+        return counts[tier1[a]] > counts[tier1[b]];
       return tie[a] < tie[b];
     });
     std::vector<std::int64_t> ranked;
@@ -276,6 +286,23 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
   for (std::int64_t node : tier1) {
     if (full) break;
     extend(node, false);
+  }
+
+  // ---- fallback: pad a short context from the task table ------------------
+  if (!full && fallback_n > 0) {
+    relrng::StdRng091 fallback_rng(
+        (step_seed + (std::uint64_t)target + 0xA5A5A5A5A5A5A5A5ULL) & kU64);
+    const std::int32_t amount = (std::int32_t)std::min<std::int64_t>(
+        std::max(policy.max_context_cells - cells, 0), fallback_n);
+    auto sel = rand_sample(fallback_rng, (std::int32_t)fallback_n, amount);
+    for (std::int32_t pos : sel) {
+      if (full) break;
+      const std::int64_t node = fallback_base + pos;
+      if (node == target || visits.count(node)) continue;
+      if (!(std::isnan(ts_[node]) || ts_[node] <= cutoff_ts)) continue;
+      if (eligible && !eligible[node]) continue;
+      extend(node, false);
+    }
   }
 
   const std::int32_t n =
