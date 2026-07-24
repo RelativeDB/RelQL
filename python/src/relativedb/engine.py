@@ -131,6 +131,13 @@ class ContextPolicy:
     # a derived target table. The reference consumes pre-materialized task
     # rows; this is the query-runtime equivalent.
     num_history_windows: int = 3
+    # Members per shared-context chunk. None sizes it from the measured cost of
+    # injecting the cohort's rows; 0 puts the whole cohort in one forward; a
+    # positive value fixes the split. Chunking has no counterpart in the
+    # reference implementation -- it scores each item in its own context -- so
+    # this is a relativedb protocol knob, and how a cohort is split changes
+    # every member's context and therefore its prediction.
+    cohort_chunk: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.fanouts is not None:
@@ -143,6 +150,8 @@ class ContextPolicy:
             raise ValueError("num_walks and walk_length cannot be negative")
         if self.num_history_windows < 0:
             raise ValueError("num_history_windows cannot be negative")
+        if self.cohort_chunk is not None and self.cohort_chunk < 0:
+            raise ValueError("cohort_chunk cannot be negative (0 = one chunk)")
 
     def fanout_at(self, hop: int) -> int:
         if self.fanouts:
@@ -705,7 +714,11 @@ class Engine:
     def _cohort_chunk_limit(self, pq: ParsedQuery, input: ExecutionInput,
                             entity_table: str, group: list[Any],
                             backend) -> int:
-        """Members per shared-context chunk, from measured injection cost."""
+        """Members per shared-context chunk, from measured injection cost
+        unless ``ContextPolicy.cohort_chunk`` fixes it."""
+        configured = self.context_policy.cohort_chunk
+        if configured is not None:
+            return len(group) if configured <= 0 else configured
         budget = max(1, self.context_policy.max_context_cells // 3)
         if len(group) <= 1:
             return 1

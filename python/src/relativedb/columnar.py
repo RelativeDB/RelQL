@@ -25,55 +25,148 @@ Usage (an "option": pick your context-population backend per Engine):
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import math
 from typing import Any, Callable, Optional
 
 import numpy as np
-import pandas as pd
 
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema
 from .task import TaskSpec
-from .traversal import TraversalResult, _StdRng, _rand_sample, _U64
+# The walk and BFS run in C++ now (cpp/src/graph.cpp), so the RNG and
+# sampling helpers this module used to need are gone with them.
+from .traversal import TraversalResult
 
 __all__ = ["ColumnarStore", "ColumnarTraversal"]
 
 
-# Microseconds per second. The unit is REQUESTED rather than inferred: the
-# original divided by a hardcoded 1e9, correct only for datetime64[ns], and
-# pandas >= 3 defaults to microseconds -- which silently placed every timestamp
-# 1000x too early, so no temporal bound held and the focal lookup never matched.
-# Asking for datetime64[us] explicitly cannot drift with a library default.
-_US_PER_SEC = 1e6
+# datetime64 ticks per second, by resolution code. The unit is read off the
+# dtype rather than assumed: the original divided by a hardcoded 1e9, right
+# only for datetime64[ns], and pandas >= 3 defaults to microseconds -- which
+# put every timestamp 1000x too early so no temporal bound held.
+_TICKS_PER_SEC = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9,
+                  "m": 1.0 / 60, "h": 1.0 / 3600, "D": 1.0 / 86400}
 
 
-def _epoch_seconds(series) -> np.ndarray:
-    """A datetime column -> float64 epoch seconds, NaN where missing."""
-    values = pd.to_datetime(series, utc=True)
-    arr = values.to_numpy(dtype="datetime64[us]")
-    out = arr.astype("int64").astype(np.float64) / _US_PER_SEC
+def _column(frame: Any, name: str) -> np.ndarray:
+    """One column as a numpy array, from a DataFrame or a dict of arrays.
+
+    Duck-typed on purpose: pandas, polars and pyarrow all expose to_numpy(),
+    and a plain dict of numpy arrays needs nothing. Ingest is the binding's
+    job, so it accepts whatever the caller already has -- but the store holds
+    numpy from here on, and imports no dataframe library.
+    """
+    col = frame[name]
+    to_numpy = getattr(col, "to_numpy", None)
+    return np.asarray(to_numpy() if to_numpy is not None else col)
+
+
+def _columns_of(frame: Any) -> list:
+    cols = getattr(frame, "columns", None)
+    return list(cols if cols is not None else frame.keys())
+
+
+def _n_rows(frame: Any) -> int:
+    cols = _columns_of(frame)
+    return len(_column(frame, cols[0])) if cols else 0
+
+
+def _epoch_seconds(values) -> np.ndarray:
+    """A datetime-ish column -> float64 epoch seconds, NaN where missing."""
+    arr = np.asarray(values)
+    if arr.dtype == object:
+        out = np.empty(len(arr), dtype=np.float64)
+        for i, v in enumerate(arr):
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                out[i] = np.nan
+            elif isinstance(v, datetime):
+                out[i] = v.timestamp()
+            elif isinstance(v, np.datetime64):
+                out[i] = (np.nan if np.isnat(v) else
+                          np.datetime64(v, "us").astype("int64") / 1e6)
+            else:
+                out[i] = float(v)
+        return out
+    if not np.issubdtype(arr.dtype, np.datetime64):
+        return arr.astype(np.float64)
+    unit = np.datetime_data(arr.dtype)[0]
+    per_sec = _TICKS_PER_SEC.get(unit)
+    if per_sec is None:                        # exotic resolution
+        arr = arr.astype("datetime64[us]")
+        per_sec = _TICKS_PER_SEC["us"]
+    out = arr.astype("int64").astype(np.float64) / per_sec
     out[np.isnat(arr)] = np.nan
     return out
+
+
+def _is_missing(v: Any) -> bool:
+    """Scalar null test without pandas: None, NaN, or NaT."""
+    if v is None:
+        return True
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return False
+    if isinstance(v, float) and math.isnan(v):
+        return True
+    if isinstance(v, np.datetime64):
+        return bool(np.isnat(v))
+    if isinstance(v, np.floating):
+        return bool(np.isnan(v))
+    return False
+
+
+def _notna_mask(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values)
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return ~np.isnat(arr)
+    if np.issubdtype(arr.dtype, np.floating):
+        return ~np.isnan(arr)
+    if arr.dtype == object:
+        return np.array([not _is_missing(v) for v in arr], dtype=bool)
+    return np.ones(len(arr), dtype=bool)
+
+
+def _scalar(v: Any) -> Any:
+    """numpy scalar -> python scalar; datetime64 -> aware datetime."""
+    if isinstance(v, np.datetime64):
+        secs = np.datetime64(v, "us").astype("int64") / 1e6
+        return datetime.fromtimestamp(secs, timezone.utc)
+    if isinstance(v, np.generic):
+        return v.item()
+    return v
 
 
 class _Table:
     """One table's columns plus the derived vectors the traversal needs."""
 
-    def __init__(self, name: str, frame: pd.DataFrame, pkey: Optional[str],
-                 time_col: Optional[str], feature_cols: list[str],
-                 fk_cols: dict[str, str]):
+    def __init__(self, name: str, frame: Any, pkey: Optional[str],
+                 time_col: Optional[str], feature_cols: list,
+                 fk_cols: dict):
         self.name = name
-        self.frame = frame.reset_index(drop=True)
         self.pkey = pkey
         self.time_col = time_col
         self.feature_cols = feature_cols
         self.fk_cols = fk_cols            # fk column -> parent table
-        self.n = len(self.frame)
-        self.ids = (self.frame[pkey].to_numpy() if pkey is not None
+        self.n = _n_rows(frame)
+        present = set(_columns_of(frame))
+        wanted = set(feature_cols) | set(fk_cols)
+        if pkey is not None:
+            wanted.add(pkey)
+        if time_col is not None:
+            wanted.add(time_col)
+        # Columns are pulled into numpy once; the source frame is not kept, so
+        # nothing downstream depends on a dataframe library's semantics.
+        self.cols: dict = {c: _column(frame, c) for c in wanted if c in present}
+        self.ids = (self.cols[pkey] if pkey is not None and pkey in self.cols
                     else np.arange(self.n))
-        self.id_index = pd.Index(self.ids)
-        if time_col is not None and time_col in self.frame:
-            self.ts = _epoch_seconds(self.frame[time_col])
+        # Built lazily: only scalar lookups (node_of, the entity retriever)
+        # need it, and they are per-query. Link resolution is vectorized
+        # instead -- see positions_of.
+        self._id_pos: Optional[dict] = None
+        self._sorted: Optional[tuple] = None
+        if time_col is not None and time_col in self.cols:
+            self.ts = _epoch_seconds(self.cols[time_col])
         else:
             self.ts = np.full(self.n, np.nan)
         # Non-null feature cell count per row, plus timestamp-as-cell when
@@ -81,8 +174,35 @@ class _Table:
         # row cell accounting).
         counts = np.zeros(self.n, dtype=np.int32)
         for col in feature_cols:
-            counts += self.frame[col].notna().to_numpy(dtype=np.int32)
+            if col in self.cols:
+                counts += _notna_mask(self.cols[col]).astype(np.int32)
         self.cell_counts = counts
+
+    @property
+    def id_pos(self) -> dict:
+        if self._id_pos is None:
+            pos: dict = {}
+            for i, v in enumerate(self.ids):
+                pos.setdefault(_scalar(v), i)
+            self._id_pos = pos
+        return self._id_pos
+
+    def positions_of(self, values: np.ndarray) -> np.ndarray:
+        """Ids -> row positions, -1 where absent. Vectorized: a Python loop
+        here is O(edges) and dominated the build (pandas did this with
+        Index.get_indexer, and dropping pandas must not drop the vectorization
+        with it)."""
+        values = np.asarray(values)
+        if self._sorted is None:
+            order = np.argsort(self.ids, kind="stable")
+            self._sorted = (order, np.asarray(self.ids)[order])
+        order, sorted_ids = self._sorted
+        if len(sorted_ids) == 0:
+            return np.full(len(values), -1, dtype=np.int64)
+        idx = np.searchsorted(sorted_ids, values)
+        idx_clipped = np.clip(idx, 0, len(sorted_ids) - 1)
+        hit = sorted_ids[idx_clipped] == values
+        return np.where(hit, order[idx_clipped], -1).astype(np.int64)
 
 
 class ColumnarStore:
@@ -95,8 +215,8 @@ class ColumnarStore:
     physical tables first, then task tables.
     """
 
-    def __init__(self, schema: Schema, frames: dict[str, pd.DataFrame], *,
-                 task_frames: Optional[dict[str, pd.DataFrame]] = None,
+    def __init__(self, schema: Schema, frames: dict, *,
+                 task_frames: Optional[dict] = None,
                  task_links: Optional[dict[str, tuple[str, str, str]]] = None):
         self.schema = schema
         self.tables: dict[str, _Table] = {}
@@ -106,13 +226,14 @@ class ColumnarStore:
                        for l in schema.links_from(tdef.name)}
             self.tables[tdef.name] = _Table(
                 tdef.name, frame, tdef.primary_key, tdef.time_column,
-                [c.name for c in tdef.columns if c.name in frame.columns],
+                [c.name for c in tdef.columns
+                 if c.name in set(_columns_of(frame))],
                 fk_cols)
         self.task_tables: dict[str, _Table] = {}
         self.task_links = dict(task_links or {})
         for name, frame in (task_frames or {}).items():
             entity_table, entity_col, time_col = self.task_links[name]
-            cells = [c for c in frame.columns if c != entity_col]
+            cells = [c for c in _columns_of(frame) if c != entity_col]
             self.task_tables[name] = _Table(
                 name, frame, None, time_col, cells, {entity_col: entity_table})
 
@@ -154,10 +275,13 @@ class ColumnarStore:
     def _resolve_parents(self, table: _Table, fk: str,
                          parent: _Table) -> np.ndarray:
         """fk column values -> parent node positions (-1 where unmatched)."""
-        pos = parent.id_index.get_indexer(table.frame[fk])
-        isna = table.frame[fk].isna().to_numpy()
-        pos = pos.astype(np.int64)
-        pos[isna] = -1
+        if fk not in table.cols:
+            return np.full(table.n, -1, dtype=np.int64)
+        values = table.cols[fk]
+        pos = parent.positions_of(values)
+        missing = ~_notna_mask(values)
+        if missing.any():
+            pos = np.where(missing, -1, pos)
         return pos
 
     def _build_edges(self) -> None:
@@ -229,8 +353,8 @@ class ColumnarStore:
 
     def node_of(self, table: str, entity_id: Any) -> Optional[int]:
         t = self._table(table)
-        pos = t.id_index.get_indexer([entity_id])[0]
-        return None if pos < 0 else self.base[table] + int(pos)
+        pos = t.id_pos.get(_scalar(entity_id))
+        return None if pos is None else self.base[table] + int(pos)
 
     def table_of(self, node: int) -> str:
         return self.order[self.node_table_idx[node]]
@@ -243,31 +367,29 @@ class ColumnarStore:
         name = self.table_of(node)
         table = self._table(name)
         pos = node - self.base[name]
-        rec = table.frame.iloc[pos]
+        # Index the stored column arrays directly. frame.iloc[pos] built a
+        # pandas Series for every materialized row -- on the one path this
+        # module exists to make cheap.
         cells = {}
         for col in table.feature_cols:
-            v = rec[col]
-            if pd.isna(v) if not isinstance(v, (list, tuple, np.ndarray)) \
-                    else False:
+            if col not in table.cols:
                 continue
-            if isinstance(v, np.generic):
-                v = v.item()
-            if isinstance(v, pd.Timestamp):
-                v = v.to_pydatetime()
-            cells[col] = v
+            v = table.cols[col][pos]
+            if _is_missing(v):
+                continue
+            cells[col] = _scalar(v)
         ts = None
         if not math.isnan(self.node_ts[node]):
-            ts = pd.Timestamp(self.node_ts[node], unit="s",
-                              tz="UTC").to_pydatetime()
+            ts = datetime.fromtimestamp(float(self.node_ts[node]),
+                                        timezone.utc)
         parents = {}
         for fk, parent_name in table.fk_cols.items():
-            v = rec[fk]
-            if not (pd.isna(v) if not isinstance(v, (list, tuple, np.ndarray))
-                    else False):
-                parents[fk if name in self.tables else "__entity__"] = (
-                    v.item() if isinstance(v, np.generic) else v)
-        rid = (table.ids[pos].item()
-               if isinstance(table.ids[pos], np.generic) else table.ids[pos])
+            if fk not in table.cols:
+                continue
+            v = table.cols[fk][pos]
+            if not _is_missing(v):
+                parents[fk if name in self.tables else "__entity__"] = _scalar(v)
+        rid = _scalar(table.ids[pos])
         row = Row(name, rid, cells, ts, parents)
         self._row_cache[node] = row
         return row
@@ -282,8 +404,9 @@ class ColumnarStore:
         def entity(table, ids, bound: TemporalBound):
             out = []
             t = store._table(table)
-            for pos in t.id_index.get_indexer(list(ids)):
-                if pos < 0:
+            for eid in ids:
+                pos = t.id_pos.get(_scalar(eid))
+                if pos is None:
                     continue
                 row = store.row(store.base[table] + int(pos))
                 if bound.admits_row(row):
@@ -378,8 +501,8 @@ class ColumnarTraversal:
         ok = np.zeros(s.n_nodes, dtype=bool)
         t = s._table(task_spec.table_name)
         base = s.base[task_spec.table_name]
-        ok[base:base + t.n] = t.frame[
-            task_spec.target_column].notna().to_numpy()
+        if task_spec.target_column in t.cols:
+            ok[base:base + t.n] = _notna_mask(t.cols[task_spec.target_column])
         self._label_ok[task_spec.table_name] = ok
         return ok
 
@@ -392,7 +515,7 @@ class ColumnarTraversal:
         entity_col = next(iter(t.fk_cols))
         base = s.base[task_spec.table_name]
         lookup = {}
-        ents = t.frame[entity_col].to_numpy()
+        ents = t.cols[entity_col]
         for pos in range(t.n):
             lookup[(ents[pos].item() if isinstance(ents[pos], np.generic)
                     else ents[pos], float(t.ts[pos]))] = base + pos
