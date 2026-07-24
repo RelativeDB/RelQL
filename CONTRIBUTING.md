@@ -100,6 +100,33 @@ integration tier. When a test needs a prerequisite, route the decision through
 `require_text_embedder` in `python/tests/conftest.py` — never call
 `pytest.skip` for these conditions directly, or strict mode stops working.
 
+### The sampling regression harness
+
+Context assembly is a seeded walk, so a refactor can change which rows land in
+a context — and therefore every prediction — while every behavioural test still
+passes. `python/tests/test_sampling_regression.py` freezes the *ordered* row
+sequence each entity is given, plus the order `execute()` hands contexts to the
+backend, across ten engine configurations. It needs no model and runs in the
+unit tier.
+
+`python/tests/data/sampling_fingerprints.json` is a tripwire, not a
+convenience. If it fails, sampling changed: the failure names the case, the
+entity and the index of the first divergent row. Work out why before touching
+the fixture — a diff there is a real behavioural change, and the last time this
+class of divergence went unnoticed it cost a whole module. Regenerate only once
+the change is understood and intended:
+
+```sh
+RELATIVEDB_UPDATE_SAMPLING_GOLDEN=1 pytest python/tests/test_sampling_regression.py
+```
+
+Two of the ten fingerprints are deliberately identical, and a test asserts
+exactly which: `bfs-retriever` must equal `bfs-csc` (the sampler mode is a way
+of reaching the graph, not a change to it) and `reference-pipelined` must equal
+`reference-default` (pipelined assembly is an optimization and must be
+invisible in the output). Any *other* pair of identical fingerprints fails the
+suite, because a case that duplicates another adds no detection power.
+
 ## Coverage
 
 Python — the exact invocation CI uses:
