@@ -45,13 +45,15 @@ int relql_parse(const char* query, char* out, size_t outlen, char* err,
   }
 }
 
-int relql_analyze(const char* query, const char* schema_json, char* out,
-                  size_t outlen, char* err, size_t errlen) {
+int relql_analyze(const char* query, const char* schema_json,
+                  const char* params_json, char* out, size_t outlen,
+                  char* err, size_t errlen) {
   try {
     if (query == nullptr) throw relql::RelqlError("null query");
     if (schema_json == nullptr) throw relql::SchemaError("null schema");
-    std::string json =
-        relql::analyze_to_json(std::string(query), std::string(schema_json));
+    std::string json = relql::analyze_to_json(
+        std::string(query), std::string(schema_json),
+        params_json ? std::string(params_json) : std::string());
     if (out == nullptr || outlen == 0) {
       set_str(err, errlen, "output buffer too small");
       return 2;

@@ -9,6 +9,9 @@
 
 #include <set>
 
+#include "json.hpp"
+#include "plan.hpp"
+
 namespace relql {
 
 namespace {
@@ -275,15 +278,152 @@ ParsedQuery validate(const ParsedQuery& q, const Schema& schema) {
   return bound;
 }
 
+
+namespace {
+
+// One JSON value -> a RelQL literal. Strings stay strings (a date literal is
+// carried as its text), numbers split int/float, arrays become IN-lists.
+Lit lit_from_json(const JsonValue& v, const std::string& name) {
+  Lit l;
+  // A binding sends a date/datetime as {"__date__": "<text>"} so it comes back
+  // as a DATE literal rather than a plain string -- a bound `col = :when` must
+  // stay a date on the far side of the round-trip.
+  if (v.kind == JsonValue::Kind::Obj) {
+    const JsonValue* d = v.find("__date__");
+    if (d && d->kind == JsonValue::Kind::Str) {
+      l.kind = LitKind::Date;
+      l.sval = d->str;
+      return l;
+    }
+  }
+  switch (v.kind) {
+    case JsonValue::Kind::Str:
+      l.kind = LitKind::Str;
+      l.sval = v.str;
+      return l;
+    case JsonValue::Kind::Bool:
+      l.kind = LitKind::Bool;
+      l.bval = v.b;
+      return l;
+    case JsonValue::Kind::Num:
+      if (v.num == (double)(long long)v.num) {
+        l.kind = LitKind::Int;
+        l.ival = (long long)v.num;
+      } else {
+        l.kind = LitKind::Float;
+        l.dval = v.num;
+      }
+      return l;
+    case JsonValue::Kind::Null:
+      l.kind = LitKind::Null;
+      return l;
+    case JsonValue::Kind::Arr:
+      l.kind = LitKind::List;
+      for (const JsonValue& item : v.arr)
+        l.items.push_back(lit_from_json(item, name));
+      return l;
+    default:
+      throw ValidationError("bind parameter :" + name +
+                            " cannot be an object");
+  }
+}
+
+std::string supplied_list(const JsonValue& params) {
+  std::string have;
+  for (const auto& [k, _] : params.obj) {
+    if (!have.empty()) have += ", ";
+    have += k;
+  }
+  return "(params given: " + (have.empty() ? "none" : have) + ")";
+}
+
+ExprPtr bind_expr(const ExprPtr& e, const JsonValue& params) {
+  if (!e) return nullptr;
+  Expr copy = *e;
+  if (e->kind == ExprKind::Param) {
+    const JsonValue* v = params.find(e->param_name);
+    if (!v)
+      throw ValidationError("query references bind parameter :" +
+                            e->param_name + ", which was not supplied " +
+                            supplied_list(params));
+    copy.kind = ExprKind::Lit;
+    copy.lit = lit_from_json(*v, e->param_name);
+    return std::make_shared<Expr>(copy);
+  }
+  // A parameter in comparison-RHS position collapses onto the literal slot,
+  // matching how an inline IN list parses.
+  if (e->kind == ExprKind::Cond && e->right_expr &&
+      e->right_expr->kind == ExprKind::Param) {
+    const std::string& name = e->right_expr->param_name;
+    const JsonValue* v = params.find(name);
+    if (!v)
+      throw ValidationError("query references bind parameter :" + name +
+                            ", which was not supplied " +
+                            supplied_list(params));
+    copy.right = lit_from_json(*v, name);
+    copy.has_right = true;
+    copy.right_expr = nullptr;
+    copy.left = bind_expr(e->left, params);
+    return std::make_shared<Expr>(copy);
+  }
+  copy.filter = bind_expr(e->filter, params);
+  copy.left = bind_expr(e->left, params);
+  copy.right_expr = bind_expr(e->right_expr, params);
+  copy.rleft = bind_expr(e->rleft, params);
+  copy.rright = bind_expr(e->rright, params);
+  copy.inner = bind_expr(e->inner, params);
+  copy.a_left = bind_expr(e->a_left, params);
+  copy.a_right = bind_expr(e->a_right, params);
+  for (size_t i = 0; i < copy.args.size(); ++i)
+    copy.args[i] = bind_expr(e->args[i], params);
+  for (size_t i = 0; i < copy.when_conds.size(); ++i)
+    copy.when_conds[i] = bind_expr(e->when_conds[i], params);
+  for (size_t i = 0; i < copy.when_thens.size(); ++i)
+    copy.when_thens[i] = bind_expr(e->when_thens[i], params);
+  copy.case_else = bind_expr(e->case_else, params);
+  return std::make_shared<Expr>(copy);
+}
+
+}  // namespace
+
+ParsedQuery bind_params(const ParsedQuery& q, const std::string& params_json) {
+  // No early return on an empty map: a query carrying :name with nothing
+  // supplied must be reported here, not left as an unbound Param for the
+  // evaluator to trip over further downstream.
+  JsonValue params;
+  if (params_json.empty()) {
+    params.kind = JsonValue::Kind::Obj;
+  } else {
+    try {
+      params = json_parse(params_json);
+    } catch (const JsonError& e) {
+      throw ValidationError(std::string("bind parameters: ") + e.what());
+    }
+  }
+  if (params.kind != JsonValue::Kind::Obj)
+    throw ValidationError("bind parameters must be a JSON object");
+  ParsedQuery out = q;
+  out.target = bind_expr(q.target, params);
+  out.where = bind_expr(q.where, params);
+  out.assuming = bind_expr(q.assuming, params);
+  return out;
+}
+
 std::string analyze_to_json(const std::string& query,
-                            const std::string& schema_json) {
+                            const std::string& schema_json,
+                            const std::string& params_json) {
   Schema schema = schema_from_json(schema_json);
-  ParsedQuery bound = validate(parse(query), schema);
+  ParsedQuery bound = bind_params(validate(parse(query), schema),
+                                  params_json);
   std::string out = "{\"query\":";
   out += to_json(bound);
   out += ",\"task_type\":\"";
   out += task_name(task_type(bound, schema));
-  out += "\"}";
+  // The logical plan travels with the analysis: a frontend needs both, and
+  // computing them together means one parse rather than two.
+  out += "\",\"plan\":";
+  out += plan_to_json(build_logical_plan(bound, schema));
+  out += "}";
   return out;
 }
 

@@ -33,11 +33,21 @@ TaskType task_type(const ParsedQuery& q, const Schema& schema);
 // Returns the bound query; callers must use it rather than their input.
 ParsedQuery validate(const ParsedQuery& q, const Schema& schema);
 
-// parse + validate + infer, serialized as the JSON the bindings consume:
-//   {"query": <AST>, "task_type": "..."}
+// Substitute every `:name` bind parameter with its value from `params_json`
+// (a JSON object). A parameter in comparison-RHS position collapses onto the
+// literal slot, so downstream code never has to know parameters existed.
+// Throws ValidationError naming any parameter the map does not supply.
+ParsedQuery bind_params(const ParsedQuery& q, const std::string& params_json);
+
+// parse + validate + bind + plan, serialized as the JSON bindings consume:
+//   {"query": <bound AST>, "task_type": "...", "plan": {...}}
+// `params_json` may be empty or "{}" when the query has no parameters. The
+// plan is built from the BOUND query: a cohort pinned through `IN :ids` is
+// only visible once the parameter is substituted.
 // Throws RelqlError (syntax) or ValidationError (semantics).
 std::string analyze_to_json(const std::string& query,
-                            const std::string& schema_json);
+                            const std::string& schema_json,
+                            const std::string& params_json = "");
 
 }  // namespace relql
 

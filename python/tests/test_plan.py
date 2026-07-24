@@ -34,9 +34,11 @@ def engine(churn_schema, stub_backend):
 
 
 def _plan_for(engine, query, **kw):
+    """Mirrors what Engine.execute does: one trip through the C++ front end
+    that validates, binds :params and returns the logical plan."""
     input = ExecutionInput(query=query, anchor_time=ANCHOR, **kw)
-    pq = validate(parse(query), engine.schema).query.bind_params(input.params)
-    return engine._plan(pq, input, ANCHOR)
+    vq = validate(query, engine.schema, input.params)
+    return engine._plan(vq.query, input, ANCHOR, logical=vq.plan)
 
 
 # --------------------------------------------------------------------------
@@ -121,15 +123,15 @@ def test_plan_names_the_sampler_and_traversal(engine, churn_schema,
 def test_pipelining_needs_a_cohort_larger_than_the_scoring_batch(engine):
     """pipelined mirrors execute()'s guard exactly: a batch size, a cohort
     that exceeds it, and a task whose scoring is a plain batched forward."""
-    pq = validate(parse(CHURN), engine.schema).query.bind_params(
-        {"ids": ["C1", "C7", "C9"]})
-    input = ExecutionInput(query=CHURN, anchor_time=ANCHOR,
-                           params={"ids": ["C1", "C7", "C9"]})
+    params = {"ids": ["C1", "C7", "C9"]}
+    vq = validate(CHURN, engine.schema, params)
+    input = ExecutionInput(query=CHURN, anchor_time=ANCHOR, params=params)
 
     def plan_with(batch, cohort):
-        return build_plan(engine.schema, pq, input, effective=ANCHOR,
+        return build_plan(engine.schema, vq.query, input, effective=ANCHOR,
                           traversal=engine.traversal, sampler="retriever",
-                          cohort_size=cohort, scoring_batch_size=batch)
+                          cohort_size=cohort, scoring_batch_size=batch,
+                          logical=vq.plan)
 
     assert plan_with(2, 5).pipelined is True
     assert plan_with(8, 5).pipelined is False    # cohort fits in one batch

@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .ast import (Ablation, AggFunc, Aggregation, Arith, AsOf, BoolOp, Case,
-                  ColumnRef, Condition, Explain, Func, Lit, LogicalOp, Not,
-                  Operator, Param, ParsedQuery, RankKind, ReturnSpec,
-                  TargetExpr, TimeUnit, Window)
+                  ColumnRef, Condition, Explain, Func, Lit, LogicalOp,
+                  MissingParameterError, Not, Operator, Param, ParsedQuery,
+                  RankKind, ReturnSpec, TargetExpr, TimeUnit, Window)
 from .parser import RelqlSyntaxError
 
 __all__ = ["parse_native", "native_available", "NativeParserUnavailable"]
@@ -67,8 +67,9 @@ def _load() -> Optional[ctypes.CDLL]:
                                           ctypes.c_size_t]
                 lib.relql_analyze.restype = ctypes.c_int
                 lib.relql_analyze.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
-                                              ctypes.c_char_p, ctypes.c_size_t,
-                                              ctypes.c_char_p, ctypes.c_size_t]
+                                              ctypes.c_char_p, ctypes.c_char_p,
+                                              ctypes.c_size_t, ctypes.c_char_p,
+                                              ctypes.c_size_t]
                 _lib = lib
                 return _lib
             except (OSError, AttributeError) as e:
@@ -99,13 +100,31 @@ def parse_native(query: str) -> ParsedQuery:
     return _query_from_json(obj, query)
 
 
-def analyze_native(query: str, schema_json: str):
-    """Parse, validate against the schema, and infer the task type — all in
-    the C++ layer (``relql_analyze``).
+def params_to_json(params: Optional[dict]) -> str:
+    """Serialize bind parameters for the C++ pass.
 
-    Returns ``(bound_query, task_type_name)``. The query is *bound*: the
-    population's primary key is resolved, so callers must use it rather than
-    their own parse.
+    Dates travel as ``{"__date__": "<iso>"}`` so they come back as DATE
+    literals; sent as plain strings they would bind as text and a
+    ``col = :when`` comparison would silently change meaning.
+    """
+    def encode(v):
+        if isinstance(v, datetime):
+            return {"__date__": v.strftime("%Y-%m-%d %H:%M:%S")}
+        if isinstance(v, (list, tuple)):
+            return [encode(x) for x in v]
+        return v
+
+    return json.dumps({k: encode(v) for k, v in (params or {}).items()})
+
+
+def analyze_native(query: str, schema_json: str, params_json: str = "{}",
+                   params: Optional[dict] = None):
+    """Parse, validate, bind parameters, infer the task and build the logical
+    plan — all in the C++ layer (``relql_analyze``).
+
+    Returns ``(bound_query, task_type_name, logical_plan)``. The query is
+    *bound*: the population's primary key is resolved and every ``:name`` is
+    substituted, so callers must use it rather than their own parse.
 
     The C ABI prefixes its message so this layer can raise the exception type
     Python users expect without the C layer knowing about Python.
@@ -118,19 +137,28 @@ def analyze_native(query: str, schema_json: str):
     out = ctypes.create_string_buffer(_OUT)
     err = ctypes.create_string_buffer(_ERR)
     rc = lib.relql_analyze(query.encode("utf-8"),
-                           schema_json.encode("utf-8"), out, _OUT, err, _ERR)
+                           schema_json.encode("utf-8"),
+                           (params_json or "{}").encode("utf-8"),
+                           out, _OUT, err, _ERR)
     if rc != 0:
         from .parser import RelqlValidationError
         msg = err.value.decode("utf-8", "replace") or "analyze failed"
         if msg.startswith("invalid: "):
-            raise RelqlValidationError(msg[len("invalid: "):])
+            detail = msg[len("invalid: "):]
+            # An unsupplied :name is its own error type in Python, and callers
+            # catch it specifically.
+            if "bind parameter :" in detail and "was not supplied" in detail:
+                name = detail.split("bind parameter :", 1)[1].split(",", 1)[0]
+                raise MissingParameterError(name, (params or {}))
+            raise RelqlValidationError(detail)
         if msg.startswith("syntax: "):
             raise RelqlSyntaxError(msg[len("syntax: "):])
         if msg.startswith("schema: "):
             raise ValueError(msg[len("schema: "):])
         raise RelqlSyntaxError(msg)
     obj = json.loads(out.value.decode("utf-8"))
-    return _query_from_json(obj["query"], query), obj["task_type"]
+    return (_query_from_json(obj["query"], query), obj["task_type"],
+            obj["plan"])
 
 
 # ---------------------------------------------------------------------------

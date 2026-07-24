@@ -302,22 +302,18 @@ def _strategy_for(input) -> str:
     return "per-entity"
 
 
-def build_plan(schema: Schema, pq: ParsedQuery, input, *,
-               effective: Optional[datetime],
-               traversal: Any,
-               sampler: str,
-               model_uri: Optional[str] = None,
-               cohort_size: Optional[int] = None,
-               scoring_batch_size: Optional[int] = None) -> QueryPlan:
-    """Derive the plan for one query. Never touches data."""
-    task_type = pq.task_type(schema)
 
+def _logical_from_ast(schema: Schema, pq: ParsedQuery) -> dict:
+    """The logical plan derived from the AST, in the shape cpp/src/plan.cpp
+    emits.
+
+    Used only for a query built by AST surgery rather than written -- the
+    engine's hurdle composition derives one, and it has no source text for the
+    C++ pass to analyze. Everything written by a user goes through relql_analyze
+    instead, so this is a fallback, not a second implementation in waiting.
+    """
+    task = pq.task_type(schema)
     pinned = pinned_ids(pq.where, pq.entity_key)
-    selector = pinned if pinned is not None else "ALL"
-
-    output = (pq.ret.kind.lower() if pq.ret is not None
-              else TASK_DEFAULT_OUTPUT[task_type])
-
     windows: list[dict] = []
     collect_windows(schema, pq.target_aggregations, "target", windows)
     if pq.where is not None:
@@ -327,7 +323,12 @@ def build_plan(schema: Schema, pq: ParsedQuery, input, *,
         from .relql.ast import _find_aggregations
         collect_windows(schema, _find_aggregations(pq.assuming), "assuming",
                         windows)
-
+    warnings_: list[str] = []
+    if pq.assuming is not None:
+        try:
+            assumptions(pq.assuming)
+        except ExecutionError as e:
+            warnings_.append(str(e))
     ao = pq.as_of
     if ao is None or ao.kind == "now":
         source = "execution-anchor"
@@ -335,25 +336,57 @@ def build_plan(schema: Schema, pq: ParsedQuery, input, *,
         source = "query-date"
     else:
         source = "query-param"
-    as_of = {
-        "source": source,
-        "value": effective.isoformat() if effective is not None else None,
+    return {
+        "target": _expr_str(pq.target),
+        "task_type": task.value,
+        "entity_table": pq.entity_key.table,
+        "entity_pk": pq.entity_key.column,
+        "selector_all": pinned is None,
+        "selector": pinned or [],
+        "output": (pq.ret.kind.lower() if pq.ret is not None
+                   else TASK_DEFAULT_OUTPUT[task]),
+        "windows": windows,
+        "where_present": pq.where is not None,
+        "assuming_present": pq.assuming is not None,
+        "assuming": assuming_plan(pq.assuming),
+        "as_of_source": source,
+        "as_of_param": (ao.value if ao is not None and ao.kind == "param"
+                        else None),
+        "ablations": [a.name for a in pq.ablations],
+        "warnings": warnings_,
     }
-    if ao is not None and ao.kind == "param":
-        as_of["param"] = ao.value
 
-    warnings_: list[str] = []
-    if pq.assuming is not None:
-        # EXPLAIN must describe any query that parses; execute() raises the
-        # same condition rather than reporting it.
-        try:
-            assumptions(pq.assuming)
-        except ExecutionError as e:
-            warnings_.append(str(e))
+
+def build_plan(schema: Schema, pq: ParsedQuery, input, *,
+               effective: Optional[datetime] = None,
+               traversal: Any = None,
+               sampler: str = "retriever",
+               model_uri: Optional[str] = None,
+               cohort_size: Optional[int] = None,
+               scoring_batch_size: Optional[int] = None,
+               logical: Optional[dict] = None) -> QueryPlan:
+    """Assemble the plan for one query. Never touches data.
+
+    The logical half comes from the C++ pass (cpp/src/plan.cpp) so every
+    frontend derives it identically; `logical` is that payload, as returned by
+    relql_analyze. When it is absent -- a query built by AST surgery, which has
+    no source text to re-analyze -- the fields it would have supplied are
+    derived here from the AST instead.
+    """
+    if logical is None:
+        logical = _logical_from_ast(schema, pq)
+
+    task_type = TaskType(logical["task_type"])
+    selector = "ALL" if logical["selector_all"] else list(logical["selector"])
+
+    as_of = {"source": logical["as_of_source"],
+             "value": effective.isoformat() if effective is not None else None}
+    if logical.get("as_of_param"):
+        as_of["param"] = logical["as_of_param"]
 
     # A pinned cohort is known without touching data; "ALL" is not.
-    if cohort_size is None and pinned is not None:
-        cohort_size = len(pinned)
+    if cohort_size is None and selector != "ALL":
+        cohort_size = len(selector)
 
     pipelined: Optional[bool] = None
     if scoring_batch_size is not None and cohort_size is not None:
@@ -362,20 +395,20 @@ def build_plan(schema: Schema, pq: ParsedQuery, input, *,
                      and task_type in PIPELINEABLE_TASKS)
 
     return QueryPlan(
-        target=_expr_str(pq.target),
+        target=logical["target"],
         task_type=task_type,
-        entity_table=pq.entity_key.table,
-        entity_pk=pq.entity_key.column,
+        entity_table=logical["entity_table"],
+        entity_pk=logical["entity_pk"],
         entity_selector=selector,
-        output=output,
-        windows=tuple(windows),
-        where_present=pq.where is not None,
-        assuming_present=pq.assuming is not None,
-        assuming=assuming_plan(pq.assuming),
+        output=logical["output"],
+        windows=tuple(logical["windows"]),
+        where_present=logical["where_present"],
+        assuming_present=logical["assuming_present"],
+        assuming=logical["assuming"],
         as_of=as_of,
-        ablations=tuple({"table": a.name, "note": "declared, not applied"}
-                        for a in pq.ablations),
-        warnings=tuple(warnings_),
+        ablations=tuple({"table": name, "note": "declared, not applied"}
+                        for name in logical["ablations"]),
+        warnings=tuple(logical["warnings"]),
         strategy=_strategy_for(input),
         sampler=sampler,
         traversal=type(traversal).__name__,

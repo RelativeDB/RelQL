@@ -8,6 +8,7 @@
 #include <string>
 
 #include "analyze.hpp"
+#include "plan.hpp"
 #include "relql.hpp"
 #include "schema.hpp"
 
@@ -200,6 +201,66 @@ void test_analyze_json() {
   ok(contains(json, "customer_id"), "bound AST includes the resolved key");
 }
 
+
+void test_logical_plan() {
+  relql::Schema s = schema();
+  auto plan_of = [&](const std::string& q) {
+    return relql::build_logical_plan(relql::validate(relql::parse(q), s), s);
+  };
+
+  relql::LogicalPlan p = plan_of(
+      "PREDICT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
+      "WHERE customers.customer_id IN ('C1','C7')");
+  ok(p.entity_table == "customers", "plan carries the entity table");
+  ok(p.entity_pk == "customer_id", "plan carries the bound primary key");
+  ok(p.output == "probability", "binary task defaults to probability output");
+  ok(!p.selector_all && p.selector.size() == 2, "IN pins a two-id cohort");
+  ok(p.selector[0] == "C1", "pinned ids are values, not rendered literals");
+  ok(p.where_present, "where_present set");
+  ok(p.windows.size() == 1 && p.windows[0].role == "target",
+     "target window collected with its role");
+  ok(p.windows[0].time_column == "order_date",
+     "window carries the table's time column");
+  ok(p.as_of_source == "execution-anchor", "absent AS OF defers to the anchor");
+
+  // An OR does not pin a cohort: the clause no longer restricts it alone.
+  relql::LogicalPlan orp = plan_of(
+      "PREDICT customers.age FROM customers "
+      "WHERE customers.customer_id = 'C1' OR customers.age > 30");
+  ok(orp.selector_all, "OR leaves the population unpinned");
+
+  // ANDed pins intersect.
+  relql::LogicalPlan andp = plan_of(
+      "PREDICT customers.age FROM customers "
+      "WHERE customers.customer_id IN ('C1','C7') "
+      "AND customers.customer_id IN ('C7','C9')");
+  ok(!andp.selector_all && andp.selector.size() == 1 &&
+         andp.selector[0] == "C7", "ANDed pins intersect");
+
+  ok(plan_of("PREDICT customers.age FROM customers AS OF 2026-05-01")
+         .as_of_source == "query-date", "AS OF date");
+  relql::LogicalPlan pp = plan_of(
+      "PREDICT customers.age FROM customers AS OF :t");
+  ok(pp.as_of_source == "query-param" && pp.as_of_param == "t",
+     "AS OF param names its parameter");
+
+  // ASSUMING: applicable clauses render, inapplicable ones warn rather than
+  // raise, because EXPLAIN must describe any query that parses.
+  relql::LogicalPlan a = plan_of(
+      "PREDICT customers.age FROM customers ASSUMING customers.tier = 'gold'");
+  ok(a.has_assuming_plan && a.assuming == "customers.tier := 'gold'",
+     "ASSUMING renders its assignment");
+  relql::LogicalPlan bad = plan_of(
+      "PREDICT customers.age FROM customers ASSUMING customers.age > 30");
+  ok(!bad.has_assuming_plan && bad.warnings.size() == 1,
+     "inapplicable ASSUMING warns instead of raising");
+
+  ok(plan_of("PREDICT customers.age FROM customers").output == "value",
+     "regression defaults to value output");
+  ok(relql::pure_pin(nullptr, "customers", "customer_id") == false,
+     "no WHERE is not a pure pin");
+}
+
 }  // namespace
 
 int main() {
@@ -210,6 +271,7 @@ int main() {
   test_window_rules();
   test_return_compatibility();
   test_analyze_json();
+  test_logical_plan();
   std::printf("PASS: %d/%d\n", checks - fails, checks);
   return fails == 0 ? 0 : 1;
 }

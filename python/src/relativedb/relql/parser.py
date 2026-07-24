@@ -51,19 +51,25 @@ def parse(query: str) -> ParsedQuery:
 class ValidatedQuery:
     query: ParsedQuery
     task_type: Any  # TaskType
+    # The logical plan the C++ pass built from the bound query (cpp/src/plan.cpp).
+    # None only for a query taken as already-bound, which has no source text to
+    # analyze; relativedb.plan derives that case from the AST instead.
+    plan: Any = None
 
 
-def validate(query, schema) -> ValidatedQuery:
+def validate(query, schema, params=None) -> ValidatedQuery:
     """Parse + bind against a schema: tables/columns exist, the population's
     primary key is resolved, target windows are future-facing (start >= 0).
 
     The rules live in the C++ layer (``relql_analyze``, cpp/src/analyze.cpp) so
     every binding enforces the same ones; this is the Python surface over them.
+    Passing ``params`` binds them there too, which matters for planning: a
+    cohort pinned through ``IN :ids`` is only visible once bound.
 
     ``ValidatedQuery.query`` is the *bound* query — same AST, with the
     population's primary key filled in — so callers should use it rather than
     the query they passed in."""
-    from .native import analyze_native
+    from .native import analyze_native, params_to_json
 
     text = query if isinstance(query, str) else query.text
     if not text:
@@ -77,11 +83,13 @@ def validate(query, schema) -> ValidatedQuery:
             raise RelqlValidationError(
                 "validate() needs the query text; pass the query string or a "
                 "ParsedQuery produced by parse()")
-        return ValidatedQuery(query, query.task_type(schema))
-    bound, task_name = analyze_native(text, json.dumps(schema.to_json_dict()))
+        return ValidatedQuery(query, query.task_type(schema), None)
+    bound, task_name, logical = analyze_native(
+        text, json.dumps(schema.to_json_dict()), params_to_json(params),
+        params)
     task = TaskType(task_name)
     # The C++ pass already inferred the task with the schema in hand; cache it
     # so ParsedQuery.task_type() answers from that rather than re-deriving the
     # same rules in Python.
     object.__setattr__(bound, "_task_type", task)
-    return ValidatedQuery(bound, task)
+    return ValidatedQuery(bound, task, logical)

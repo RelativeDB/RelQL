@@ -239,10 +239,10 @@ def test_history_window_labels_are_scoped_to_the_owning_entity(churn_schema):
     engine = Engine(churn_schema, wiring,
                     context_policy=ContextPolicy(num_history_windows=3),
                     traversal=ReferenceTraversal())
-    pq = validate(parse(
+    pq = validate(
         "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
-        "FROM customers WHERE customers.customer_id IN :ids"),
-        churn_schema).query.bind_params({"ids": ["C7"]})
+        "FROM customers WHERE customers.customer_id IN :ids",
+        churn_schema, {"ids": ["C7"]}).query
     ctx = engine.assemble_context("customers", "C7", dt("2026-07-01"),
                                   query=pq)
 

@@ -528,8 +528,11 @@ class Engine:
         if pq.explain is not None:
             # An EXPLAIN-prefixed query must never silently score; route it.
             return self.explain(replace(input, query=pq))
-        pq = validate(pq, self.schema).query   # binds the population's pk
-        pq = pq.bind_params(input.params)      # substitutes :name -> values
+        # One trip into the C++ front end: validate, bind :params, infer the
+        # task and build the logical plan. Binding there is what lets the plan
+        # see a cohort pinned through `IN :ids`.
+        _vq = validate(pq, self.schema, input.params)
+        pq, _logical = _vq.query, _vq.plan
         # Bind the effective anchor (AS OF) before any assembly/scoring so it
         # threads through the temporal bound and pseudo-anchors unchanged.
         input = replace(input, anchor_time=self._effective_anchor(pq, input))
@@ -539,7 +542,8 @@ class Engine:
         backend = self._require_backend()
         # One plan, built here and acted on below. EXPLAIN builds the same one
         # from the same inputs, so what it prints is what runs.
-        plan = self._plan(pq, input, input.anchor_time, cohort_size=len(ids))
+        plan = self._plan(pq, input, input.anchor_time, cohort_size=len(ids),
+                          logical=_logical)
 
         # Which strategy runs, and how it batches, is the plan's decision --
         # see relativedb.strategies for the registry it selects from.
@@ -986,7 +990,8 @@ class Engine:
 
     def _plan(self, pq: ParsedQuery, input: ExecutionInput,
               effective: Optional[datetime], *,
-              cohort_size: Optional[int] = None) -> QueryPlan:
+              cohort_size: Optional[int] = None,
+              logical: Optional[dict] = None) -> QueryPlan:
         """Build the plan for one query. Both execute() and explain() go
         through here, which is what keeps EXPLAIN honest.
 
@@ -1006,6 +1011,7 @@ class Engine:
             model_uri=self.model_config.model_uri_for(task_type),
             cohort_size=cohort_size,
             scoring_batch_size=batch,
+            logical=logical,
         )
 
     def explain(self, input: Union[ExecutionInput, str], **kwargs) -> ExplainResult:
@@ -1015,8 +1021,11 @@ class Engine:
             input = ExecutionInput(query=input, **kwargs)
         pq = (parse(input.query) if isinstance(input.query, str)
               else input.query)
-        pq = validate(pq, self.schema).query   # binds the population's pk
-        pq = pq.bind_params(input.params)      # substitutes :name -> values
+        # One trip into the C++ front end: validate, bind :params, infer the
+        # task and build the logical plan. Binding there is what lets the plan
+        # see a cohort pinned through `IN :ids`.
+        _vq = validate(pq, self.schema, input.params)
+        pq, _logical = _vq.query, _vq.plan
         ex = pq.explain or Explain()
         mode = (ex.mode or "PLAN").upper()
         fmt = (ex.format or "TEXT").upper()
@@ -1024,7 +1033,7 @@ class Engine:
 
         # The same planner execute() uses, so EXPLAIN describes the run that
         # would actually happen rather than a separately-derived description.
-        plan = self._plan(pq, input, effective).to_dict()
+        plan = self._plan(pq, input, effective, logical=_logical).to_dict()
         context: Optional[dict] = None
         predictions: Optional[tuple[EntityPrediction, ...]] = None
 

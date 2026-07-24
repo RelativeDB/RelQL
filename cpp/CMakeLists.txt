@@ -104,7 +104,8 @@ endif()
 # Shared RelQL front end: lexer + recursive-descent parser, plus the
 # schema-aware semantic pass (validation, task-type inference) that each
 # binding used to reimplement in its own language.
-add_library(relql STATIC src/relql.cpp src/schema.cpp src/analyze.cpp)
+add_library(relql STATIC src/relql.cpp src/schema.cpp src/analyze.cpp
+                        src/plan.cpp src/json.cpp)
 target_include_directories(relql PUBLIC src)
 target_link_libraries(relql PUBLIC rt_flags)
 
@@ -114,7 +115,7 @@ target_include_directories(csc PUBLIC src)
 target_link_libraries(csc PUBLIC rt_flags)
 
 add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
-                        src/schema.cpp src/analyze.cpp
+                        src/schema.cpp src/analyze.cpp src/plan.cpp src/json.cpp
                         src/csc_c.cpp src/csc.cpp)
 target_link_libraries(rt_c PRIVATE rt)
 target_include_directories(rt_c PUBLIC src)
