@@ -209,22 +209,73 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
     }
   };
 
-  extend(target, true);
-  if (!full && eligible) {
-    relrng::StdRng091 fallback_rng(
-        (step_seed + (std::uint64_t)target + 0xA5A5A5A5A5A5A5A5ULL) & kU64);
-    std::vector<std::int64_t> pool;
-    for (std::int64_t n = 0; n < n_nodes_; ++n)
-      if (eligible[n] && n != target &&
-          (std::isnan(ts_[n]) || ts_[n] <= cutoff_ts))
-        pool.push_back(n);
-    const std::int32_t amount =
-        (std::int32_t)std::min<std::size_t>(pool.size(), 4096);
-    auto sel = rand_sample(fallback_rng, (std::int32_t)pool.size(), amount);
-    for (std::int32_t i : sel) {
-      if (full) break;
-      extend(pool[i], false);
+  // ---- tier 1: rank peers by a random walk from the target ---------------
+  // The walk is over the bidirectional neighbourhood with children cut at the
+  // anchor; parents are always admitted. Ranking is by visit count, then
+  // recency when prefer_latest, with a per-node RNG draw breaking ties -- the
+  // same three keys, in the same order, as the traversal this replaces.
+  std::vector<std::int64_t> tier1;
+  if (eligible) {
+    std::vector<std::int32_t> off(n_nodes_ + 1, 0);
+    std::vector<std::int32_t> flat;
+    flat.reserve(f2p_.size() + p2f_.size());
+    for (std::int64_t n = 0; n < n_nodes_; ++n) {
+      off[n] = (std::int32_t)flat.size();
+      for (std::int64_t i = f2p_off_[n]; i < f2p_off_[n + 1]; ++i)
+        flat.push_back((std::int32_t)f2p_[i]);           // parents: no bound
+      for (std::int64_t i = p2f_off_[n]; i < p2f_off_[n + 1]; ++i) {
+        const std::int64_t c = p2f_[i];
+        if (std::isnan(ts_[c]) || ts_[c] <= cutoff_ts)
+          flat.push_back((std::int32_t)c);
+      }
     }
+    off[n_nodes_] = (std::int32_t)flat.size();
+
+    std::vector<std::uint8_t> walk_eligible(eligible, eligible + n_nodes_);
+    walk_eligible[target] = 0;
+    std::vector<std::uint32_t> counts(n_nodes_, 0);
+    relrng::StdRng091 walk_rng(
+        (step_seed + (std::uint64_t)target + 0xD0D0D0D0D0D0D0D0ULL) & kU64);
+    for (std::int32_t w = 0; w < policy.num_walks; ++w) {
+      std::int64_t current = target;
+      for (std::int32_t step = 0; step < policy.walk_length; ++step) {
+        if (walk_eligible[current]) ++counts[current];
+        const std::int32_t begin = off[current], end = off[current + 1];
+        if (begin == end) break;
+        current = flat[begin + walk_rng.range((std::uint32_t)(end - begin))];
+      }
+    }
+    for (std::int64_t n = 0; n < n_nodes_; ++n)
+      if (counts[n]) tier1.push_back(n);
+    std::vector<std::uint64_t> tie(tier1.size());
+    for (std::size_t i = 0; i < tier1.size(); ++i)
+      tie[i] = relrng::StdRng091(
+          (step_seed + (std::uint64_t)tier1[i]) & kU64).u64();
+    std::vector<std::size_t> idx(tier1.size());
+    for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+    const bool latest = policy.prefer_latest;
+    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) {
+      if (counts[tier1[a]] != counts[tier1[b]])
+        return counts[tier1[a]] > counts[tier1[b]];
+      if (latest) {
+        const double ta = std::isnan(ts_[tier1[a]])
+            ? -std::numeric_limits<double>::infinity() : ts_[tier1[a]];
+        const double tb = std::isnan(ts_[tier1[b]])
+            ? -std::numeric_limits<double>::infinity() : ts_[tier1[b]];
+        if (ta != tb) return ta > tb;
+      }
+      return tie[a] < tie[b];
+    });
+    std::vector<std::int64_t> ranked;
+    ranked.reserve(idx.size());
+    for (std::size_t i : idx) ranked.push_back(tier1[i]);
+    tier1.swap(ranked);
+  }
+
+  extend(target, true);
+  for (std::int64_t node : tier1) {
+    if (full) break;
+    extend(node, false);
   }
 
   const std::int32_t n =

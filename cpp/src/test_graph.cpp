@@ -196,6 +196,64 @@ void test_output_is_capped_not_overrun() {
   ok(n >= 0 && n <= 5, "the emitted count respects the caller's buffer");
 }
 
+void test_walk_tiering_engages() {
+  // Passing `eligible` turns on the walk that ranks a first tier of peers
+  // before the BFS. Without it only the target's own neighbourhood is walked,
+  // so the two must differ -- an assemble that ignored the walk entirely would
+  // return the same context either way, which is exactly the bug this catches.
+  Fixture f;
+  auto g = f.build();
+  auto p = policy();
+  p.max_context_cells = 4096;
+  p.local_context_cells = 4096;
+  p.num_walks = 200;
+  p.walk_length = 8;
+
+  const auto without = assemble(g, 0, 1e18, p);
+
+  std::vector<std::uint8_t> eligible(f.n_nodes, 1);
+  std::vector<std::int64_t> nodes(4096);
+  std::vector<std::uint8_t> focal(4096);
+  const std::int32_t n = g.assemble(0, 1e18, eligible.data(), p, nodes.data(),
+                                    focal.data(), 4096);
+  std::vector<std::int64_t> with(nodes.begin(), nodes.begin() + n);
+
+  ok(n > 0, "the tiered walk produces a context");
+  ok(with != without, "the walk tier changes what is emitted");
+  ok(with.size() >= without.size(),
+     "the tier adds peers rather than removing them");
+  // Only the target's own extend marks focal, whatever the walk contributes.
+  std::int32_t focal_count = 0;
+  for (std::int32_t i = 0; i < n; ++i) focal_count += focal[i];
+  ok(focal_count > 0 && focal_count < n,
+     "walk-tier peers are emitted but not marked focal");
+}
+
+void test_prefer_latest_changes_tier_order() {
+  Fixture f;
+  auto g = f.build();
+  auto p = policy();
+  p.max_context_cells = 4096;
+  p.local_context_cells = 4096;
+  // prefer_latest only breaks TIES in visit count. With many walks every node
+  // lands on a distinct count and the flag is inert, so keep the walk short
+  // enough that nodes genuinely tie.
+  p.num_walks = 12;
+  p.walk_length = 4;
+  std::vector<std::uint8_t> eligible(f.n_nodes, 1);
+  std::vector<std::int64_t> a(4096), b(4096);
+  std::vector<std::uint8_t> fa(4096), fb(4096);
+  const std::int32_t na =
+      g.assemble(0, 1e18, eligible.data(), p, a.data(), fa.data(), 4096);
+  p.prefer_latest = false;
+  const std::int32_t nb =
+      g.assemble(0, 1e18, eligible.data(), p, b.data(), fb.data(), 4096);
+  ok(na > 0 && nb > 0, "both orderings produce a context");
+  ok(std::vector<std::int64_t>(a.begin(), a.begin() + na) !=
+         std::vector<std::int64_t>(b.begin(), b.begin() + nb),
+     "prefer_latest actually reorders the tier");
+}
+
 }  // namespace
 
 int main() {
@@ -207,6 +265,8 @@ int main() {
   test_fanout_cap_is_applied();
   test_out_of_range_target();
   test_output_is_capped_not_overrun();
+  test_walk_tiering_engages();
+  test_prefer_latest_changes_tier_order();
   std::printf("PASS: %d/%d\n", checks - fails, checks);
   return fails == 0 ? 0 : 1;
 }
