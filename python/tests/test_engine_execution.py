@@ -177,3 +177,80 @@ def test_explain_plan_needs_no_backend(churn_schema):
                                      params={"ids": IDS}))
     assert out.plan["execution"]["strategy"] == "per-entity"
     assert out.predictions is None
+
+
+# --------------------------------------------------------------------------
+# strategy dispatch
+#
+# execute() no longer branches on ExecutionInput flags; it hands the plan to
+# relativedb.strategies, which selects from a registry. These pin that the
+# selection really is plan-driven.
+# --------------------------------------------------------------------------
+
+def test_dispatch_selects_the_strategy_the_plan_names(churn_schema,
+                                                      monkeypatch):
+    from relativedb import strategies
+
+    called: list[str] = []
+
+    def spy(name, real):
+        def wrapper(engine, req):
+            called.append(name)
+            return real(engine, req)
+        return wrapper
+
+    monkeypatch.setitem(strategies._REGISTRY, "per-entity",
+                        spy("per-entity", strategies.run_per_entity))
+    eng = _engine(churn_schema, BatchedStub(batch_size=99))
+    eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                               params={"ids": IDS}))
+    assert called == ["per-entity"]
+
+
+def test_shared_context_declining_falls_back_to_per_entity(churn_schema,
+                                                           monkeypatch):
+    """A strategy that returns None means "not applicable", and the dispatcher
+    must fall through rather than returning nothing."""
+    from relativedb import strategies
+
+    monkeypatch.setitem(strategies._REGISTRY, "shared-context",
+                        lambda engine, req: None)
+    eng = _engine(churn_schema, BatchedStub(batch_size=99))
+    res = eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                                     params={"ids": IDS},
+                                     shared_context=True))
+    assert [p.id for p in res.predictions] == IDS
+
+
+def test_a_strategy_that_must_not_decline_is_an_error(churn_schema,
+                                                      monkeypatch):
+    """per-entity always produces a result. If it ever returns None that is a
+    bug in the strategy, not a signal to fall back -- silently retrying would
+    loop or mask it."""
+    from relativedb import strategies
+
+    monkeypatch.setitem(strategies._REGISTRY, "per-entity",
+                        lambda engine, req: None)
+    eng = _engine(churn_schema, BatchedStub(batch_size=99))
+    with pytest.raises(RuntimeError, match="returned no result"):
+        eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                                   params={"ids": IDS}))
+
+
+def test_every_plan_strategy_has_a_registered_handler():
+    """The planner and the registry must not drift apart: a plan naming a
+    strategy nothing implements would fail only at execution time."""
+    from relativedb import strategies
+    from relativedb.plan import _strategy_for
+
+    class _Input:
+        def __init__(self, hurdle_gate=None, shared_context=False):
+            self.hurdle_gate = hurdle_gate
+            self.shared_context = shared_context
+
+    reachable = {
+        _strategy_for(_Input()),
+        _strategy_for(_Input(shared_context=True)),
+        _strategy_for(_Input(hurdle_gate=0.5)),
+    }
+    assert reachable <= set(strategies._REGISTRY)
