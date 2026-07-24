@@ -173,6 +173,21 @@ CHURN = ("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
 COUNT = ("PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) "
          "FROM customers WHERE customers.customer_id IN :ids")
 
+# A direct target (a column of the entity table) skips the derived-task graph
+# and takes ReferenceTraversal's non-shared path, where the walk seeds from
+# `physical_node_ids` -- i.e. from the ORDER rows are enumerated in, not just
+# their count. Without a case here the harness cannot see a node-renumbering
+# change at all, which a mutation test showed the hard way.
+DIRECT = ("PREDICT customers.age FROM customers "
+          "WHERE customers.customer_id IN :ids")
+
+# `customers` is declared first AND sorts first, so its node indices are the
+# same under either ordering -- a renumbering bug is invisible from a customer
+# target. `products` is declared second but sorts last, so its indices do move.
+# This is the case that can actually see a renumbering change.
+DIRECT_PRODUCTS = "PREDICT products.price FROM products"
+PRODUCT_COHORT = [f"P{i}" for i in range(N_PRODUCTS)]
+
 COHORT = [f"C{i:02d}" for i in range(6)]
 ANCHOR = EPOCH + timedelta(days=120)
 
@@ -211,6 +226,17 @@ def cases() -> dict[str, dict]:
         # serial path; a batch size smaller than the cohort turns it on.
         "reference-pipelined": dict(
             policy=_policy(), traversal="reference", batch_size=2),
+        # Direct target -> the non-shared traversal path, whose walk seed
+        # depends on physical node ORDER. This is the only case that can see a
+        # renumbering change.
+        # (No BFS equivalent: BreadthFirstTraversal is target-agnostic, so a
+        # direct target fingerprints identically to the cases above and would
+        # add no detection power.)
+        "reference-direct-target": dict(
+            policy=_policy(), traversal="reference", query=DIRECT),
+        "reference-direct-target-products": dict(
+            policy=_policy(), traversal="reference", query=DIRECT_PRODUCTS,
+            entity_table="products", cohort=PRODUCT_COHORT),
     }
 
 
@@ -233,7 +259,8 @@ def _row_key(row: Row) -> str:
     return f"{row.table}:{row.id}"
 
 
-def context_fingerprint(engine: Engine, query: str, ids, anchor) -> dict:
+def context_fingerprint(engine: Engine, query, ids, anchor,
+                        entity_table: str = "customers") -> dict:
     """The ordered context each entity is given.
 
     ``rows`` is the sampled sequence in order -- the exact thing the model
@@ -241,7 +268,7 @@ def context_fingerprint(engine: Engine, query: str, ids, anchor) -> dict:
     """
     out: dict[str, dict] = {}
     for eid in ids:
-        ctx = engine.assemble_context("customers", eid, anchor, query=query)
+        ctx = engine.assemble_context(entity_table, eid, anchor, query=query)
         out[str(eid)] = {
             "rows": [_row_key(r) for r in ctx.rows],
             "focal": sorted(f"{t}:{i}" for t, i in ctx.focal_row_keys),
@@ -257,8 +284,9 @@ def execution_fingerprint(engine: Engine, backend: RecordingBackend,
     """The order execute() delivers contexts to the backend, and the order and
     values of the predictions that come back."""
     from relativedb import ExecutionInput
+    params = {"ids": list(ids)} if ":ids" in query else None
     result = engine.execute(ExecutionInput(query=query, anchor_time=anchor,
-                                           params={"ids": list(ids)}))
+                                           params=params))
     return {
         "scored_order": list(backend.seen),
         "prediction_order": [str(p.id) for p in result.predictions],
@@ -281,13 +309,16 @@ def compute_all() -> dict:
         bare = query.replace(" WHERE customers.customer_id IN :ids", "")
         pq = validate(parse(bare), schema).query
         anchor = spec.get("anchor", ANCHOR)
+        cohort = spec.get("cohort", COHORT)
+        entity_table = spec.get("entity_table", "customers")
         ctx_engine = make_engine(schema, wiring, spec)
         backend = RecordingBackend(batch_size=spec.get("batch_size", 0))
         exec_engine = make_engine(schema, wiring, spec, backend=backend)
         out[name] = {
-            "context": context_fingerprint(ctx_engine, pq, COHORT, anchor),
+            "context": context_fingerprint(ctx_engine, pq, cohort, anchor,
+                                           entity_table),
             "execution": execution_fingerprint(exec_engine, backend, query,
-                                               COHORT, anchor),
+                                               cohort, anchor),
         }
     return out
 

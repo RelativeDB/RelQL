@@ -1059,6 +1059,270 @@
       ]
     }
   },
+  "reference-direct-target": {
+    "context": {
+      "C00": {
+        "cells": 24,
+        "focal": [
+          "customers:C00"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "customers:C00",
+          "customers:C01",
+          "customers:C10",
+          "customers:C09",
+          "customers:C03",
+          "customers:C08",
+          "customers:C05",
+          "customers:C04",
+          "customers:C07",
+          "customers:C11",
+          "customers:C06",
+          "customers:C02"
+        ],
+        "truncated_children": false
+      },
+      "C01": {
+        "cells": 24,
+        "focal": [
+          "customers:C01"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "customers:C01",
+          "customers:C09",
+          "customers:C05",
+          "customers:C11",
+          "customers:C08",
+          "customers:C07",
+          "customers:C02",
+          "customers:C00",
+          "customers:C03",
+          "customers:C04",
+          "customers:C06",
+          "customers:C10"
+        ],
+        "truncated_children": false
+      },
+      "C02": {
+        "cells": 24,
+        "focal": [
+          "customers:C02"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "customers:C02",
+          "customers:C01",
+          "customers:C00",
+          "customers:C10",
+          "customers:C03",
+          "customers:C05",
+          "customers:C11",
+          "customers:C08",
+          "customers:C04",
+          "customers:C09",
+          "customers:C06",
+          "customers:C07"
+        ],
+        "truncated_children": false
+      },
+      "C03": {
+        "cells": 24,
+        "focal": [
+          "customers:C03"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "customers:C03",
+          "customers:C02",
+          "customers:C07",
+          "customers:C11",
+          "customers:C06",
+          "customers:C05",
+          "customers:C04",
+          "customers:C09",
+          "customers:C00",
+          "customers:C10",
+          "customers:C01",
+          "customers:C08"
+        ],
+        "truncated_children": false
+      },
+      "C04": {
+        "cells": 24,
+        "focal": [
+          "customers:C04"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "customers:C04",
+          "customers:C03",
+          "customers:C08",
+          "customers:C09",
+          "customers:C00",
+          "customers:C01",
+          "customers:C05",
+          "customers:C10",
+          "customers:C06",
+          "customers:C07",
+          "customers:C11",
+          "customers:C02"
+        ],
+        "truncated_children": false
+      },
+      "C05": {
+        "cells": 24,
+        "focal": [
+          "customers:C05"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "customers:C05",
+          "customers:C01",
+          "customers:C09",
+          "customers:C03",
+          "customers:C00",
+          "customers:C10",
+          "customers:C08",
+          "customers:C11",
+          "customers:C02",
+          "customers:C07",
+          "customers:C06",
+          "customers:C04"
+        ],
+        "truncated_children": false
+      }
+    },
+    "execution": {
+      "prediction_order": [
+        "C00",
+        "C01",
+        "C02",
+        "C03",
+        "C04",
+        "C05"
+      ],
+      "scored_order": [
+        "C00",
+        "C01",
+        "C02",
+        "C03",
+        "C04",
+        "C05"
+      ],
+      "values": [
+        0.901,
+        0.645,
+        0.883,
+        0.316,
+        0.39,
+        0.867
+      ]
+    }
+  },
+  "reference-direct-target-products": {
+    "context": {
+      "P0": {
+        "cells": 10,
+        "focal": [
+          "products:P0"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "products:P0",
+          "products:P1",
+          "products:P2",
+          "products:P3",
+          "products:P4"
+        ],
+        "truncated_children": false
+      },
+      "P1": {
+        "cells": 10,
+        "focal": [
+          "products:P1"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "products:P1",
+          "products:P0",
+          "products:P2",
+          "products:P3",
+          "products:P4"
+        ],
+        "truncated_children": false
+      },
+      "P2": {
+        "cells": 10,
+        "focal": [
+          "products:P2"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "products:P2",
+          "products:P1",
+          "products:P4",
+          "products:P3",
+          "products:P0"
+        ],
+        "truncated_children": false
+      },
+      "P3": {
+        "cells": 10,
+        "focal": [
+          "products:P3"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "products:P3",
+          "products:P1",
+          "products:P2",
+          "products:P4",
+          "products:P0"
+        ],
+        "truncated_children": false
+      },
+      "P4": {
+        "cells": 10,
+        "focal": [
+          "products:P4"
+        ],
+        "hit_cell_budget": false,
+        "rows": [
+          "products:P4",
+          "products:P2",
+          "products:P1",
+          "products:P3",
+          "products:P0"
+        ],
+        "truncated_children": false
+      }
+    },
+    "execution": {
+      "prediction_order": [
+        "P0",
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "scored_order": [
+        "P0",
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "values": [
+        0.005,
+        0.969,
+        0.298,
+        0.243,
+        0.785
+      ]
+    }
+  },
   "reference-early-anchor": {
     "context": {
       "C00": {

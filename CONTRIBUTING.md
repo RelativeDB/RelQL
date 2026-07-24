@@ -120,12 +120,19 @@ the change is understood and intended:
 RELATIVEDB_UPDATE_SAMPLING_GOLDEN=1 pytest python/tests/test_sampling_regression.py
 ```
 
-Two of the ten fingerprints are deliberately identical, and a test asserts
+Two of the twelve fingerprints are deliberately identical, and a test asserts
 exactly which: `bfs-retriever` must equal `bfs-csc` (the sampler mode is a way
 of reaching the graph, not a change to it) and `reference-pipelined` must equal
 `reference-default` (pipelined assembly is an optimization and must be
 invisible in the output). Any *other* pair of identical fingerprints fails the
 suite, because a case that duplicates another adds no detection power.
+
+`reference-direct-target-products` looks redundant and is not. A direct target
+takes the traversal's non-shared path, where the walk seeds from the *order*
+rows are enumerated in rather than their count — and `products` is the only
+entity table here whose node indices actually move when that order changes,
+since `customers` is both declared first and sorted first. Without it, renaming
+or reordering schema tables silently changes sampling and nothing goes red.
 
 ## Coverage
 
