@@ -3,7 +3,14 @@ brute-force reference of python/.../csc.py's children() semantics, node for
 node, across randomized graphs. This is the guardrail that lets the CSC hot
 path live in one place (C++) without the language bindings diverging.
 
-Skips cleanly if ``librt_c`` hasn't been built.
+Integration tier, ``native`` sub-tier: needs ``librt_c`` but no checkpoint, so
+CI can run it without the multi-hundred-MB model download.
+
+Skips cleanly if ``librt_c`` hasn't been built — unless
+``RELATIVEDB_REQUIRE_NATIVE=1``, in which case it fails. The gate is an
+autouse fixture rather than a module-level ``skipif`` on purpose: ``skipif``
+conditions are evaluated at import time and can only ever produce a skip,
+which is exactly the silent green strict mode exists to prevent.
 """
 from __future__ import annotations
 
@@ -12,11 +19,15 @@ import random
 
 import pytest
 
-from relativedb.csc_native import NativeCsc, native_available
+from conftest import require_native_csc
+from relativedb.csc_native import NativeCsc
 
-pytestmark = pytest.mark.skipif(
-    not native_available(),
-    reason="librt_c not built (run cmake in cpp/); native CSC unavailable")
+pytestmark = [pytest.mark.integration, pytest.mark.native]
+
+
+@pytest.fixture(autouse=True)
+def _needs_librt_c():
+    require_native_csc()
 
 _NEG_INF = -math.inf
 

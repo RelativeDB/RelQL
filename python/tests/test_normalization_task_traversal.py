@@ -10,7 +10,7 @@ from relativedb.relql.parser import parse, validate
 from relativedb.rt_native import ColumnStats, RtNativeBackend
 from relativedb.traversal import TraversalResult, _StdRng, _rand_sample
 
-from conftest import dt, in_memory_wiring, churn_rows
+from conftest import dt, in_memory_wiring, churn_rows, require_native
 
 
 QUERY = ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
@@ -123,9 +123,9 @@ def test_reference_rng_matches_rand_0_9_1_stdrng(seed, expected):
     assert (rng.u32(), rng.u32(), rng.u64(), rng.range(17)) == expected
 
 
+@pytest.mark.integration
+@pytest.mark.native
 def test_native_reference_walk_is_exact_not_a_fallback():
-    from relativedb.rt_native import load_lib
-
     # 0 -> [1,2], 1 -> [0,2], 2 -> [2]. Count visits to non-target nodes.
     offsets = np.asarray([0, 2, 4, 5], np.int32)
     neighbors = np.asarray([1, 2, 0, 2, 2], np.int32)
@@ -143,7 +143,7 @@ def test_native_reference_walk_is_exact_not_a_fallback():
             current = neighbors[begin + rng.range(int(end - begin))]
 
     actual = np.zeros(3, np.uint32)
-    lib = load_lib()._lib
+    lib = require_native()._lib
     assert lib.rt_reference_walk_counts(
         3, offsets, neighbors, 0, eligible, 123456789, 37, 11, actual) == 0
     assert actual.tolist() == expected.tolist()

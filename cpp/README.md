@@ -208,13 +208,96 @@ order) accumulating over 12 layers; ranking and scores agree to ~3–4 decimals.
 ## Build & run
 
 ```bash
-cmake -B build -S . && cmake --build build -j        # add -DRT_CUDA=ON for CUDA
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
 
-# regenerate golden data (needs the rt repo's venv + HF cache):
-/Users/henneberger/rt/.venv/bin/python tools/dump_golden.py
+Supported targets: macOS arm64 (Accelerate + Metal), Linux x86_64, Linux
+aarch64. Requires CMake ≥ 3.20 and a C++20 compiler (GCC ≥ 11, Clang ≥ 14,
+AppleClang 14+).
 
-./build/rt_test testdata <path-to>/classification/model.safetensors \
-    [--device cpu|mps|cuda]
+CMake options:
+
+| option | default | meaning |
+| --- | --- | --- |
+| `RT_METAL` | `ON` | Metal/MPS backend. Apple only; ignored elsewhere. |
+| `RT_CUDA` | `OFF` | cuBLAS/CUDA backend; needs the CUDA toolkit. |
+| `RT_WARNINGS` | `ON` | `-Wall -Wextra`. Never `-Werror`. |
+| `RT_COVERAGE` | `OFF` | Coverage instrumentation (see below). |
+| `RT_ASSERTS` | `ON` | Keep `assert()` live in Release (`-UNDEBUG`), so a malformed safetensors header aborts instead of running into UB. |
+| `RT_TEST_CHECKPOINT` | *(empty)* | Checkpoint path that enables the `rt_golden` integration test. |
+
+On non-Apple platforms the CPU math falls back to the portable register-blocked
+kernels in `rt_math.hpp` (no BLAS dependency). `-DRT_PORTABLE` forces that path
+on Apple too, which is the cheapest way to smoke-test the Linux code path from a
+Mac.
+
+## Tests
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+The default suite is hermetic (no network, no checkpoint) and finishes in about
+a second:
+
+| test | what it covers |
+| --- | --- |
+| `csc` | randomized CSC adjacency batteries, fixed seeds (~22.5k assertions) |
+| `relql` | parses the 67-query corpus in `python/tests/data/examples.relql` and rejects 22 malformed queries |
+| `train` | head fine-tuning: zero-shot reparameterization everywhere, plus multiclass/ranking/checkpoint round-trip on Metal. Self-skips the Metal sections with exit 0 when no MPS device is present. |
+
+`rt_golden` (the PyTorch-parity forward-pass test) is registered but **DISABLED
+by default**: it needs a real `.safetensors` checkpoint *and* the dumped demo
+batch `testdata/*.bin`, which is gitignored, not in the repo, and only
+regenerable with a Python env + HF cache. Enable it explicitly:
+
+```bash
+# regenerate golden data (needs a venv with torch + the HF cache):
+python tools/dump_golden.py
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DRT_TEST_CHECKPOINT=<path-to>/classification/model.safetensors
+cmake --build build -j
+ctest --test-dir build -L integration --output-on-failure
+```
+
+Or run it directly: `./build/rt_test testdata <ckpt>.safetensors [--device cpu|mps|cuda]`.
+
+## Coverage
+
+Clang / AppleClang (llvm-cov):
+
+```bash
+cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug -DRT_COVERAGE=ON
+cmake --build build-coverage -j
+cd build-coverage
+LLVM_PROFILE_FILE="$PWD/coverage/%p.profraw" ctest --output-on-failure
+xcrun llvm-profdata merge -sparse coverage/*.profraw -o coverage/merged.profdata
+xcrun llvm-cov report ./csc_test -object ./relql_test -object ./rt_train_test \
+    -instr-profile=coverage/merged.profdata \
+    -ignore-filename-regex='(test_|bench\.cpp|quantize\.cpp)'
+xcrun llvm-cov export -format=lcov ./csc_test -object ./relql_test -object ./rt_train_test \
+    -instr-profile=coverage/merged.profdata \
+    -ignore-filename-regex='(test_|bench\.cpp|quantize\.cpp)' > coverage/coverage.lcov
+```
+
+(Drop `xcrun ` on Linux and use the `llvm-profdata`/`llvm-cov` that matches your
+clang major version.) The default suite measures ~41% line coverage overall —
+`csc.cpp` 100%, `relql.cpp` 86%, `rt_train.cpp` 67%, but `rt.cpp` only ~7%
+because the forward pass is exercised solely by the disabled `rt_golden` test.
+Configure with `-DRT_TEST_CHECKPOINT=...` to cover `rt.cpp` too.
+
+GCC (gcov/lcov):
+
+```bash
+cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug -DRT_COVERAGE=ON
+cmake --build build-coverage -j
+ctest --test-dir build-coverage --output-on-failure
+lcov --capture --directory build-coverage --output-file build-coverage/coverage.lcov \
+     --ignore-errors mismatch
 ```
 
 

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: RelQL documentation
+    url: https://relql.com/docs/
+    about: The grammar reference and the engine guide.

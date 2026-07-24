@@ -181,6 +181,15 @@ FullFineTuneStep fit_model_metal_step(Model&, const Batch&,
   throw std::runtime_error("full-model Metal fine-tuning backend was not compiled");
 }
 void reset_model_metal_optimizer(Model& model) { model.training_ctx.reset(); }
+void save_model_metal_optimizer(Model&, const std::string&) {
+  throw std::runtime_error("full-model Metal fine-tuning backend was not compiled");
+}
+void load_model_metal_optimizer(Model&, const std::string&) {
+  throw std::runtime_error("full-model Metal fine-tuning backend was not compiled");
+}
+FullGradientCheck check_model_metal_gradients(Model&, const Batch&, float) {
+  throw std::runtime_error("full-model Metal fine-tuning backend was not compiled");
+}
 #endif
 
 }  // namespace rt

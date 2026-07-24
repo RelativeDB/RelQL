@@ -331,7 +331,7 @@ void kernel(FullCtx& c,const char* name,size_t threads,Bind bind,bool simd=false
 
 void zero(FullCtx& c,id<MTLBuffer> x,size_t n){uint32_t nn=(uint32_t)n;kernel(c,"fill_zero",n,[&](id<MTLComputeCommandEncoder>e){[e setBuffer:x offset:0 atIndex:0];[e setBytes:&nn length:4 atIndex:1];});}
 void copy(FullCtx& c,id<MTLBuffer>a,id<MTLBuffer>b,size_t n){uint32_t nn=n;kernel(c,"copy_f32",n,[&](id<MTLComputeCommandEncoder>e){[e setBuffer:a offset:0 atIndex:0];[e setBuffer:b offset:0 atIndex:1];[e setBytes:&nn length:4 atIndex:2];});}
-void add(FullCtx& c,id<MTLBuffer>a,id<MTLBuffer>b,size_t n){uint32_t nn=n;kernel(c,"add_f32",n,[&](id<MTLComputeCommandEncoder>e){[e setBuffer:a offset:0 atIndex:0];[e setBuffer:b offset:0 atIndex:1];[e setBytes:&nn length:4 atIndex:2];});}
+[[maybe_unused]] void add(FullCtx& c,id<MTLBuffer>a,id<MTLBuffer>b,size_t n){uint32_t nn=n;kernel(c,"add_f32",n,[&](id<MTLComputeCommandEncoder>e){[e setBuffer:a offset:0 atIndex:0];[e setBuffer:b offset:0 atIndex:1];[e setBytes:&nn length:4 atIndex:2];});}
 
 void gemm(FullCtx& c,id<MTLBuffer>a,id<MTLBuffer>b,id<MTLBuffer>o,
           int M,int N,int K,bool ta,bool tb,float beta=0){
@@ -469,7 +469,7 @@ void encoder_backward(FullCtx&c,const char* name,id<MTLBuffer>input,int in,
   uint32_t bshape[2]={(uint32_t)rows,D};kernel(c,"bias_grad",D,[&](id<MTLComputeCommandEncoder>e){[e setBuffer:draw offset:0 atIndex:0];[e setBuffer:b.g offset:0 atIndex:1];[e setBytes:bshape length:8 atIndex:2];});
 }
 
-void embedding_backward(FullCtx&c,const Model&model,const Batch&batch,const Output&meta,
+void embedding_backward(FullCtx&c,[[maybe_unused]] const Model&model,const Batch&batch,const Output&meta,
                         id<MTLBuffer>dx,size_t rows){
   const size_t BS=rows;std::vector<float>col(BS*kDText),text(BS*kDText);
   std::vector<float>number(BS),datetime(BS),booleanv(BS);std::vector<uint8_t>colmask(BS),masks[4],targets[4];

@@ -16,7 +16,8 @@ import pytest
 from relativedb.rt_native import (ContextConnectivityWarning,
                                   RtNativeBackend, RtNativeUnavailableError,
                                 load_lib, resolve_model_path)
-from conftest import churn_rows, dt, in_memory_wiring
+from conftest import (churn_rows, dt, in_memory_wiring, require_checkpoint,
+                      require_native, require_text_embedder, _unavailable)
 
 TESTDATA = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "..", "cpp", "testdata"))
@@ -26,25 +27,36 @@ GOLDEN_SCORES = {
     "regression": [-0.27052, -0.41538, +0.39998, -0.30649, +0.26804],
 }
 
-
-def _lib_or_skip():
-    try:
-        return load_lib()
-    except RtNativeUnavailableError as e:
-        pytest.skip(f"librt_c not available: {e}")
-
-
-def _checkpoint_or_skip(variant: str) -> str:
-    try:
-        return resolve_model_path(f"hf://stanford-star/rt-j/{variant}")
-    except Exception as e:
-        pytest.skip(f"rt-j {variant} checkpoint not available: {e}")
+# Backwards-compatible aliases; both route through conftest so that
+# RELATIVEDB_REQUIRE_NATIVE=1 turns a missing prerequisite into a failure.
+_lib_or_skip = require_native
+_checkpoint_or_skip = require_checkpoint
 
 
 def _load_golden_batch():
     if not os.path.isfile(os.path.join(TESTDATA, "manifest.json")):
-        pytest.skip(f"golden testdata not found at {TESTDATA}")
+        # Checked into the repo alongside cpp/; absence means a broken checkout.
+        _unavailable("golden testdata (cpp/testdata)", f"not found at {TESTDATA}")
     man = json.load(open(os.path.join(TESTDATA, "manifest.json")))
+
+    # The manifest alone is not enough: cpp/.gitignore used to exclude
+    # testdata/*.bin, so a clone got the manifest and none of the arrays. That
+    # slipped past a manifest-only check and died in np.fromfile with a bare
+    # FileNotFoundError -- an unreadable failure for the binding's acceptance
+    # gate. Check the arrays up front and route through _unavailable, so a
+    # partial checkout skips (or, under strict mode, fails) legibly.
+    # Underscore-prefixed manifest keys (_checkpoint, _note) are provenance
+    # strings, not arrays; only the dict-valued entries describe a .bin.
+    arrays = [n for n, m in man.items()
+              if not n.startswith("_") and isinstance(m, dict)]
+    missing = [n for n in arrays
+               if not os.path.isfile(os.path.join(TESTDATA, f"{n}.bin"))]
+    if missing:
+        _unavailable(
+            "golden testdata arrays (cpp/testdata/*.bin)",
+            f"{len(missing)} of {len(arrays)} missing under {TESTDATA} "
+            f"(e.g. {', '.join(sorted(missing)[:3])}); regenerate with "
+            f"cpp/tools/dump_golden.py")
 
     def arr(name):
         m = man[name]
@@ -60,6 +72,9 @@ def _load_golden_batch():
         text_v=arr("text_values"), col_name_v=arr("col_name_values"))
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 @pytest.mark.parametrize("variant", ["classification", "regression"])
 def test_golden_scores_through_ctypes(variant):
     """Raw golden arrays -> rt_forward -> scores match PyTorch within 2e-3."""
@@ -74,6 +89,9 @@ def test_golden_scores_through_ctypes(variant):
         assert abs(float(got) - want) < 2e-3, (variant, scores)
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_native_mps_full_model_step_and_checkpoint(tmp_path):
     """The full path decreases loss and emits a regular model checkpoint."""
     lib = _lib_or_skip()
@@ -92,6 +110,9 @@ def test_native_mps_full_model_step_and_checkpoint(tmp_path):
     assert loaded.num_params == model.num_params
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_native_mps_accumulation_resume_and_gradients(tmp_path):
     lib = _lib_or_skip()
     from relativedb.rt_native import RT_DEVICE_MPS
@@ -169,6 +190,9 @@ def test_resolve_model_path_prefers_quantized_only_when_opted_in(
 QUANT_TOL = {"q8": 5e-2, "q4": 1e-1, "f16": 5e-3}
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 @pytest.mark.parametrize("variant", ["classification", "regression"])
 @pytest.mark.parametrize("qv", ["q8", "q4", "f16"])
 def test_quantized_checkpoint_scores_track_fp32(variant, qv):
@@ -190,8 +214,11 @@ def test_quantized_checkpoint_scores_track_fp32(variant, qv):
 # End-to-end: the README churn scenario, scored by the native RT engine.
 # --------------------------------------------------------------------------
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_churn_end_to_end_with_native_backend(churn_schema):
-    pytest.importorskip("sentence_transformers")
+    require_text_embedder()
     _lib_or_skip()
     _checkpoint_or_skip("classification")
     from relativedb import ContextPolicy, Engine, ExecutionInput
@@ -224,7 +251,7 @@ def test_churn_end_to_end_with_native_backend(churn_schema):
 # --------------------------------------------------------------------------
 
 def _native_engine(schema):
-    pytest.importorskip("sentence_transformers")
+    require_text_embedder()
     _lib_or_skip()
     _checkpoint_or_skip("classification")
     from relativedb import Engine
@@ -232,6 +259,9 @@ def _native_engine(schema):
                   model_backend=RtNativeBackend(schema=schema))
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_return_class_emits_hard_label(churn_schema):
     from relativedb import ExecutionInput
     eng = _native_engine(churn_schema)
@@ -245,6 +275,9 @@ def test_return_class_emits_hard_label(churn_schema):
     assert not pred.class_probs
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_return_distribution_two_key_dist(churn_schema):
     from relativedb import ExecutionInput
     eng = _native_engine(churn_schema)
@@ -263,7 +296,7 @@ def test_return_distribution_two_key_dist(churn_schema):
 # --------------------------------------------------------------------------
 
 def _native_engine_with_wiring(schema):
-    pytest.importorskip("sentence_transformers")
+    require_text_embedder()
     _lib_or_skip()
     _checkpoint_or_skip("classification")
     from relativedb import Engine
@@ -272,6 +305,9 @@ def _native_engine_with_wiring(schema):
                   model_backend=RtNativeBackend(schema=schema, wiring=wiring))
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_multiclass_classification_end_to_end(churn_schema):
     """FIRST(products.name) -> masked TEXT target -> rt_forward_ex text head ->
     cosine vs the L2-normed MiniLM label embeddings. class_probs is a full,
@@ -295,6 +331,9 @@ def test_multiclass_classification_end_to_end(churn_schema):
         assert p.predicted_class == top
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_multiclass_return_class_and_distribution(churn_schema):
     from relativedb import ExecutionInput
     eng = _native_engine_with_wiring(churn_schema)
@@ -309,6 +348,9 @@ def test_multiclass_return_class_and_distribution(churn_schema):
         assert abs(sum(pred.class_probs.values()) - 1.0) < 1e-6
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_ranking_end_to_end_top_k(churn_schema):
     """LIST_DISTINCT(orders.product_id) RANK TOP 2 -> per-candidate existence
     contexts over the products (parent) ids -> sigmoid -> top-k ids."""
@@ -327,6 +369,9 @@ def test_ranking_end_to_end_top_k(churn_schema):
         assert set(p.ranked) <= all_products                # real parent ids
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_ranking_top_k_clamped_to_candidate_count(churn_schema):
     """k larger than the candidate pool yields at most #candidates ids (3)."""
     from relativedb import ExecutionInput
@@ -400,9 +445,12 @@ def _seqs_for(schema, warn_record, pk_as_column: bool):
     return seqs
 
 
+@pytest.mark.integration
+@pytest.mark.checkpoint
 def test_tokenless_parent_row_warns():
     """A `customers` row with no feature cells emits no tokens, so the orders
     hanging off it can never reach the prediction. That must not be silent."""
+    require_text_embedder()
     got = []
     _seqs_for(_keyless_entity_schema(pk_as_column=False), got,
               pk_as_column=False)
@@ -428,9 +476,14 @@ def test_schema_rejects_a_primary_key_that_is_also_a_column():
 # ---------------------------------------------------------------------------
 
 def _metal_or_skip():
-    """Head fitting runs on Metal; scoring a trained head does not."""
-    from relativedb.rt_native import RT_DEVICE_MPS, load_lib
-    if not load_lib().device_available(RT_DEVICE_MPS):
+    """Head fitting runs on Metal; scoring a trained head does not.
+
+    A genuinely absent GPU is a legitimate skip (it is a property of the
+    runner, not of the build), so this one stays a skip even under strict
+    mode — unlike the librt_c/checkpoint gates.
+    """
+    from relativedb.rt_native import RT_DEVICE_MPS
+    if not require_native().device_available(RT_DEVICE_MPS):
         pytest.skip("fine-tuning needs a Metal device")
 
 
@@ -454,6 +507,9 @@ def test_fit_head_rejects_scalar_substitute_for_full_tuning(churn_schema):
             [dt("2026-04-01")])
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_fitted_head_changes_ranking(churn_schema):
     """The head must actually be used at scoring time, not merely loadable."""
     _lib_or_skip()
@@ -520,6 +576,9 @@ def test_fk_columns_are_readable_by_aggregations():
     assert set(got) == {"P1", "P2", "P3"}
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
 def test_fit_head_accepts_naive_anchors(churn_schema):
     """Row timestamps are UTC-aware; a naive training anchor must be coerced,
     not blow up comparing offset-naive to offset-aware datetimes."""
@@ -555,3 +614,75 @@ def test_physical_forward_batch_is_bounded_without_reordering():
     got = backend._forward_batched(object(), [0, 1, 2, 3, 4])
     assert [len(chunk) for chunk in calls] == [2, 2, 1]
     assert got.tolist() == [0, 1, 2, 3, 4]
+
+
+# ---------------------------------------------------------------------------
+# README quickstart parity. release_smoke.py runs the same shape against an
+# INSTALLED WHEEL; these run it in-tree so a regression is caught before a
+# wheel is ever built. Assertions are shape/finiteness only — zero-shot values
+# on a four-row toy graph are model opinion, not artifact correctness.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
+def test_readme_quickstart_not_exists_with_params(churn_schema):
+    """The literal quickstart: NOT EXISTS(...) OVER (90 DAYS FOLLOWING) with a
+    bound :ids cohort, driven through the documented top-level import surface
+    (`from relativedb import RtNativeBackend`, not relativedb.rt_native).
+
+    The rest of the suite only exercises the equivalent
+    `COUNT(orders.*) ... = 0` spelling; NOT EXISTS is what users copy.
+    """
+    require_text_embedder()
+    require_native()
+    require_checkpoint("classification")
+    import relativedb
+    from relativedb import Engine, ExecutionInput
+
+    engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                    model_backend=relativedb.RtNativeBackend(schema=churn_schema))
+    res = engine.execute(ExecutionInput(
+        query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
+              "FROM customers WHERE customers.customer_id IN :ids",
+        params={"ids": ["C1", "C7"]},
+        anchor_time=dt("2026-07-01")))
+
+    assert res.task_type.name == "BINARY_CLASSIFICATION"
+    assert res.model_uri == "hf://stanford-star/rt-j/classification"
+    probs = {p.id: p.probability for p in res.predictions}
+    assert set(probs) == {"C1", "C7"}            # :ids narrows the cohort
+    for p in probs.values():
+        assert p is not None and 0.0 < p < 1.0 and math.isfinite(p)
+
+
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
+def test_regression_checkpoint_end_to_end(churn_schema):
+    """The rt-j *regression* weights, end to end through the engine.
+
+    Everywhere else the regression checkpoint is only fed raw golden arrays
+    through ctypes, or routed to by a stub backend — the two halves are never
+    joined. A README example (`PREDICT SUM(transactions.price) OVER (90 DAYS
+    FOLLOWING)`) depends on exactly this path.
+    """
+    require_text_embedder()
+    require_native()
+    require_checkpoint("regression")
+    from relativedb import ContextPolicy, Engine, ExecutionInput
+
+    engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                    context_policy=ContextPolicy(cohort_size=0),
+                    model_backend=RtNativeBackend(schema=churn_schema))
+    res = engine.execute(ExecutionInput(
+        query="PREDICT SUM(orders.qty) OVER (90 DAYS FOLLOWING) FROM customers",
+        anchor_time=dt("2026-07-01")))
+
+    assert res.task_type.name == "REGRESSION"
+    assert res.model_uri == "hf://stanford-star/rt-j/regression"
+    values = {p.id: p.value for p in res.predictions}
+    assert set(values) == {"C1", "C7", "C9"}
+    for v in values.values():
+        assert v is not None and math.isfinite(v)
+    assert values["C1"] is not None and len(set(values.values())) > 1

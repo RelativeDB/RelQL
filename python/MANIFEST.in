@@ -1,0 +1,21 @@
+# Keep the native engine out of the SOURCE distribution.
+#
+# [tool.setuptools.package-data] lists librt_c.* so the library gets picked up
+# into the wheel, but setuptools applies package-data to the sdist too. A
+# maintainer who runs a bare `python -m build` with a previously-built library
+# still sitting in src/relativedb/ therefore ships a platform binary inside a
+# supposedly pure sdist -- and a wheel built from that sdist on another
+# platform then crashes in setup.py's macOS branch, where `lipo -archs` is
+# handed a .so (or a .dylib that isn't there):
+#
+#   subprocess.CalledProcessError: Command '['lipo', '-archs', ...]'
+#   returned non-zero exit status 1
+#
+# build_wheel.sh deletes the library before its sdist step, so CI was never
+# exposed; this makes the guarantee hold for any build command, not just that
+# one script.
+global-exclude librt_c.dylib librt_c.so librt_c.dll rt_c.dll
+
+# The sdist deliberately cannot build the engine: it carries no cpp/ tree, and
+# an install from it falls back to RELATIVEDB_RT_LIB or a monorepo cpp/build
+# checkout at runtime. wheels.yml asserts exactly that.

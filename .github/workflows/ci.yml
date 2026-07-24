@@ -1,0 +1,305 @@
+name: CI
+
+# The test workflow. Runs on every push to main and every pull request.
+#
+# Lanes
+#   unit         cpp build + ctest + the fast Python tier, on all three
+#                supported architectures. This is the PR gate.
+#   integration  the tiers that need librt_c AND the rt-j checkpoint, with
+#                RELATIVEDB_REQUIRE_NATIVE=1 so a missing engine or missing
+#                checkpoint is a FAILURE rather than a silent skip. Also the
+#                source of the Python coverage report (it runs the whole
+#                suite, unit + integration, so the number is not misleading).
+#   cpp-coverage gcov/gcovr over the C++ engine, uploaded under the cpp flag.
+#
+# Platform support is Linux x86_64, Linux aarch64 and macOS arm64. Windows is
+# deliberately out of scope.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Superseded PR pushes are cancelled; main is not, so every commit on main
+# keeps a complete result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Metal is the shipped macOS default (cpp/CMakeLists.txt: RT_METAL ON), so
+  # CI builds what users get. GitHub's macOS arm64 runners are Apple silicon
+  # VMs that expose a Metal device, and the .mm sources need only the SDK to
+  # compile. If a runner image ever lands without a usable device, flip this
+  # to -DRT_METAL=OFF here and CI falls back to the Accelerate CPU path.
+  MACOS_CMAKE_ARGS: -DRT_METAL=ON
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Fast lane. The ubuntu-latest leg is the one PR authors wait on; it does
+  # no model download and no network beyond pip. The other two legs prove the
+  # engine compiles and its golden tests pass on Linux aarch64 and macOS
+  # arm64. Running the full matrix here is cheap; running the ~1 GB
+  # integration tier three times would not be, hence the split.
+  # ---------------------------------------------------------------------
+  unit:
+    name: Unit (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: linux-x86_64
+            lib: cpp/build/librt_c.so
+          # ubuntu-24.04-arm is a GitHub-hosted Arm64 label, generally
+          # available and free for public repositories.
+          - os: ubuntu-24.04-arm
+            arch: linux-aarch64
+            lib: cpp/build/librt_c.so
+          - os: macos-latest
+            arch: macos-arm64
+            lib: cpp/build/librt_c.dylib
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+
+      - name: Configure cpp
+        run: >-
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          ${{ runner.os == 'macOS' && env.MACOS_CMAKE_ARGS || '' }}
+
+      - name: Build cpp
+        run: cmake --build cpp/build -j
+
+      # --no-tests=error: plain ctest exits 0 when a build registers no tests
+      # at all, which would make this step a no-op that always passes.
+      - name: ctest
+        run: ctest --test-dir cpp/build --output-on-failure --no-tests=error
+
+      - name: Install the Python package
+        run: python -m pip install --upgrade "./python[dev]"
+
+      # Run from the repository root: python/tests/test_evaluation.py imports
+      # the root-level `evaluation` package. python/pyproject.toml sets
+      # pythonpath = ["..", "src"] which already covers this; PYTHONPATH is
+      # belt and braces so the run does not depend on that staying put.
+      - name: Python unit tier
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RELATIVEDB_RT_LIB: ${{ github.workspace }}/${{ matrix.lib }}
+        run: python -m pytest python/tests -m "not integration" -q
+
+  # ---------------------------------------------------------------------
+  # Integration lane. Two legs, not three: x86_64 Linux is the deployment
+  # target that gets the coverage upload, macOS arm64 is the second numeric
+  # backend (Accelerate/Metal) and the one most likely to diverge. Linux
+  # aarch64 shares its kernels with macOS arm64 and is already covered by
+  # ctest plus the unit tier above, so paying the ~1 GB checkpoint download a
+  # third time buys very little.
+  # ---------------------------------------------------------------------
+  integration:
+    name: Integration (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: linux-x86_64
+            lib: cpp/build/librt_c.so
+            coverage: true
+          - os: macos-latest
+            arch: macos-arm64
+            lib: cpp/build/librt_c.dylib
+            coverage: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+
+      # The checkpoint set changes only when the pinned model revisions
+      # change, so the key is a hand-bumped constant rather than a file hash:
+      # hashing a lockfile would evict a ~570 MB cache on every unrelated
+      # dependency bump. Bump the -v1 suffix to force a refetch.
+      # The restore-keys prefix is shared with wheels.yml deliberately, so
+      # either workflow can warm the other's cache.
+      - name: Restore the Hugging Face cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ runner.arch }}-rtj-v1
+          restore-keys: |
+            hf-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install the Python package
+        run: python -m pip install --upgrade "./python[dev]" pytest-cov
+
+      # Fetch explicitly rather than letting the first test that needs a
+      # checkpoint pull it: a failure here reads as "download broke", not as
+      # an inscrutable test error. Warm cache makes this a no-op.
+      #
+      # The sentence-transformers repos carry ONNX, OpenVINO, Rust and torch
+      # copies of the same weights; taking a full snapshot of both would be
+      # ~2.3 GB for ~225 MB of safetensors we actually load. Excluding them
+      # takes the cold fetch from ~2.6 GB to ~570 MB.
+      - name: Prefetch checkpoints
+        run: |
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+
+          # ~342 MB: the two rt-j heads.
+          snapshot_download("stanford-star/rt-j",
+                            allow_patterns=["*.json", "classification/*",
+                                            "regression/*"])
+
+          # ~128 MB. all-MiniLM-L12-v2 only: it is DEFAULT_EMBEDDING_MODEL
+          # (model.py) and the encoder rt_native.py pins, so it is the one the
+          # tests actually load. L6-v2 is merely an accepted alternative in
+          # _EMBEDDING_DIMS and no test selects it -- fetching it too would
+          # cost ~90 MB per cold run for nothing.
+          snapshot_download("sentence-transformers/all-MiniLM-L12-v2",
+                            ignore_patterns=[
+                                "onnx/*", "openvino/*", "*.ot", "*.h5",
+                                "*.msgpack", "pytorch_model.bin",
+                                "tf_model.h5"])
+          PY
+
+      - name: Configure cpp
+        run: >-
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          ${{ runner.os == 'macOS' && env.MACOS_CMAKE_ARGS || '' }}
+
+      - name: Build cpp
+        run: cmake --build cpp/build -j
+
+      # RELATIVEDB_REQUIRE_NATIVE=1 turns "skipped, no librt_c / no
+      # checkpoint" into a hard failure. Without it a fresh runner goes green
+      # having tested nothing, which is the whole reason this lane exists.
+      - name: Python integration tier
+        if: ${{ !matrix.coverage }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RELATIVEDB_RT_LIB: ${{ github.workspace }}/${{ matrix.lib }}
+          RELATIVEDB_REQUIRE_NATIVE: "1"
+        run: python -m pytest python/tests -m integration -q
+
+      # The coverage leg runs both tiers in one process. Measuring only the
+      # integration tier (or only the unit tier) would report a number that
+      # is wrong in an obvious direction.
+      - name: Python suite with coverage
+        if: ${{ matrix.coverage }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RELATIVEDB_RT_LIB: ${{ github.workspace }}/${{ matrix.lib }}
+          RELATIVEDB_REQUIRE_NATIVE: "1"
+        run: >-
+          python -m pytest python/tests
+          --cov=relativedb
+          --cov-report=xml:coverage-python.xml
+          --cov-report=term
+
+      - name: Upload Python coverage to Codecov
+        if: ${{ matrix.coverage }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage-python.xml
+          flags: python
+          # Tokenless OIDC: public repositories do not need a stored upload
+          # token. If this repository is private, or Codecov starts rejecting
+          # tokenless uploads, add token: ${{ secrets.CODECOV_TOKEN }} here
+          # and configure that secret in the repository settings.
+          use_oidc: true
+          fail_ci_if_error: false
+
+  # ---------------------------------------------------------------------
+  # C++ coverage. Separate job because an instrumented build is slower and
+  # its binaries are not the ones we want the rest of CI judging.
+  # ---------------------------------------------------------------------
+  cpp-coverage:
+    name: C++ coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # Explicit interpreter: the runner image is not guaranteed to expose a
+      # bare `python` (only `python3`), and this job's first action is a
+      # `python -m pip` call.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install gcovr
+        run: python -m pip install --upgrade gcovr
+
+      # RT_COVERAGE is the cpp side's coverage switch; on GCC it wires up
+      # --coverage, which is what gcovr reads below.
+      - name: Configure and build with coverage
+        run: |
+          cmake -S cpp -B cpp/build-coverage \
+            -DCMAKE_BUILD_TYPE=Debug -DRT_COVERAGE=ON
+          cmake --build cpp/build-coverage -j
+
+      - name: ctest
+        run: >-
+          ctest --test-dir cpp/build-coverage --output-on-failure
+          --no-tests=error
+
+      # cmake ignores an unknown -D with only a warning, so without this check
+      # a build that never enabled instrumentation would quietly upload 0%.
+      - name: Check instrumentation actually ran
+        run: |
+          if [ -z "$(find cpp/build-coverage -name '*.gcda' -print -quit)" ]; then
+            echo "no .gcda files: the build was not instrumented." >&2
+            echo "RT_COVERAGE=ON may not be wired up in cpp/CMakeLists.txt." >&2
+            exit 1
+          fi
+
+      - name: Generate the Cobertura report
+        run: >-
+          gcovr --root cpp --filter cpp/src
+          --exclude '.*test_.*' --exclude '.*bench.*'
+          --xml --output coverage-cpp.xml --print-summary
+
+      - name: Upload C++ coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage-cpp.xml
+          flags: cpp
+          use_oidc: true
+          fail_ci_if_error: false
+
+  # Single required check for branch protection: the matrix legs change name
+  # whenever the matrix does, this job's name does not.
+  ci-ok:
+    name: CI
+    if: always()
+    needs: [unit, integration, cpp-coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any lane failed
+        run: |
+          echo "unit=${{ needs.unit.result }}"
+          echo "integration=${{ needs.integration.result }}"
+          echo "cpp-coverage=${{ needs.cpp-coverage.result }}"
+          [ "${{ needs.unit.result }}" = success ] || exit 1
+          [ "${{ needs.integration.result }}" = success ] || exit 1
+          [ "${{ needs.cpp-coverage.result }}" = success ] || exit 1

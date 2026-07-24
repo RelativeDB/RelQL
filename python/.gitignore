@@ -3,3 +3,9 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# coverage artifacts (CI writes coverage-python.xml; pytest-cov writes .coverage)
+.coverage
+.coverage.*
+coverage-python.xml
+htmlcov/

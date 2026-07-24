@@ -1,10 +1,58 @@
 name: Release libraries
 
+# Publishes the relativedb Python distribution to PyPI.
+#
+# This workflow does NOT build wheels. The multi-architecture wheels and the
+# sdist are built by .github/workflows/wheels.yml, which uploads them as run
+# artifacts; this workflow downloads those artifacts, re-verifies them, and
+# publishes. Building here as well would risk shipping a different binary
+# from the one that was tested.
+#
+# Publishing is manual and gated, never automatic on a tag push:
+#   1. run wheels.yml (or let it run on main) and note its run id
+#   2. run this workflow with wheels_run_id set and publish unchecked
+#      -> downloads, twine check, dry run. Nothing is uploaded.
+#   3. re-run with publish checked -> the pypi environment requires whatever
+#      reviewers are configured on it before the upload step starts.
+#
+# Credentials: none. Upload uses PyPI trusted publishing (OIDC), so there is
+# no API token stored in this repository. The PyPI project `relativedb` must
+# have a trusted publisher configured for this repo, this workflow filename,
+# and the `pypi` environment. Same for TestPyPI if the dry run is used.
+#
+# Rust, Java and crates.io/Maven Central jobs used to live here. They pointed
+# at rust/ and java/ directories that do not exist in this repository and have
+# been removed.
+
 on:
   workflow_dispatch:
     inputs:
+      wheels_run_id:
+        description: >-
+          Run id of the wheels.yml run whose artifacts are to be published
+          (the numeric id in that run's URL). Required: this workflow never
+          builds wheels itself, so there is nothing sensible to default to.
+        required: true
+        type: string
+      artifact_pattern:
+        # Must match the artifact names wheels.yml uploads. As of writing it
+        # produces exactly these four, all flat sets of files for dist/:
+        #   relativedb-sdist
+        #   relativedb-wheel-manylinux-x86_64
+        #   relativedb-wheel-manylinux-aarch64
+        #   relativedb-wheel-macos-universal2
+        # If wheels.yml renames its artifacts, update this default to match.
+        description: Artifact name pattern to download from that run
+        required: false
+        type: string
+        default: "relativedb-*"
+      test_pypi:
+        description: Also upload to TestPyPI first (rehearsal)
+        required: false
+        type: boolean
+        default: false
       publish:
-        description: Publish the verified artifacts to their registries
+        description: Publish the verified artifacts to PyPI
         required: true
         type: boolean
         default: false
@@ -17,124 +65,92 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  python:
-    name: Build Python distribution
+  verify:
+    name: Collect and verify distributions
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read          # read artifacts from the wheels.yml run
     steps:
-      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: python/pyproject.toml
-      - name: Install build and test dependencies
-        run: python -m pip install --upgrade build twine "./python[dev]"
-      - name: Test
-        run: python -m pytest python/tests
-      - name: Build and inspect distributions
+
+      - name: Download the wheels.yml artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.artifact_pattern }}
+          merge-multiple: true
+          path: dist
+          run-id: ${{ inputs.wheels_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Check what arrived
         run: |
-          python -m build python
-          python -m twine check python/dist/*
+          set -euo pipefail
+          find dist -type f | sort
+          wheels=$(find dist -name '*.whl' | wc -l | tr -d ' ')
+          sdists=$(find dist -name '*.tar.gz' | wc -l | tr -d ' ')
+          echo "wheels=$wheels sdists=$sdists"
+          # A release with no platform wheel would ship a package with no
+          # engine in it, which is the exact failure mode of the old workflow.
+          [ "$wheels" -ge 1 ] || { echo "no wheels found" >&2; exit 1; }
+          [ "$sdists" -eq 1 ] || { echo "expected exactly one sdist" >&2; exit 1; }
+          # Guard against the relationdb/relativedb naming slip: the PyPI
+          # project is relativedb.
+          if find dist -name 'relationdb*' | grep -q .; then
+            echo "found relationdb-named artifacts; the project is relativedb" >&2
+            exit 1
+          fi
+
+      - name: twine check
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check --strict dist/*
+
       - uses: actions/upload-artifact@v7
         with:
-          name: python-distributions
-          path: python/dist/
+          name: verified-distributions
+          path: dist/
           if-no-files-found: error
 
-  rust:
-    name: Build Rust crate
+  test-pypi:
+    name: Rehearse on TestPyPI
+    if: ${{ inputs.test_pypi }}
+    needs: [verify]
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: Test
-        run: cargo test --manifest-path rust/Cargo.toml
-      - name: Package and verify crate
-        run: cargo package --manifest-path rust/relativedb/Cargo.toml
-      - uses: actions/upload-artifact@v7
-        with:
-          name: rust-crate
-          path: rust/target/package/relationdb-*.crate
-          if-no-files-found: error
-
-  java:
-    name: Build Java publications
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-      - name: Test and stage Maven publications locally
-        working-directory: java
-        run: ./gradlew --no-daemon test publishToMavenLocal
-      - uses: actions/upload-artifact@v7
-        with:
-          name: java-publications
-          path: |
-            ~/.m2/repository/com/relativedb/relationdb/
-            ~/.m2/repository/com/relativedb/relationdb-rt/
-          if-no-files-found: error
-
-  publish-python:
-    name: Publish Python to PyPI
-    if: ${{ inputs.publish }}
-    needs: [python, rust, java]
-    runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment:
-      name: pypi
-      url: https://pypi.org/p/relationdb
+      name: testpypi
+      url: https://test.pypi.org/p/relativedb
     permissions:
       id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: python-distributions
+          name: verified-distributions
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
-
-  publish-rust:
-    name: Publish Rust to crates.io
-    if: ${{ inputs.publish }}
-    needs: [python, rust, java]
-    runs-on: ubuntu-latest
-    environment: crates-io
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Publish crate
-        run: cargo publish --manifest-path rust/relativedb/Cargo.toml
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  publish-java:
-    name: Publish Java to Maven Central
-    if: ${{ inputs.publish }}
-    needs: [python, rust, java]
-    runs-on: ubuntu-latest
-    environment: maven-central
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
         with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-      - name: Publish and release Maven Central deployment
-        working-directory: java
-        run: >-
-          ./gradlew --no-daemon
-          -PmavenCentralPublishing=true
-          -PmavenCentralAutomaticPublishing=true
-          -PsignAllPublications=true
-          publishAndReleaseToMavenCentral
-        env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_SIGNING_KEY }}
-          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
+          repository-url: https://test.pypi.org/legacy/
+          # A version already rehearsed on TestPyPI should not block a retry.
+          skip-existing: true
+
+  publish-python:
+    name: Publish to PyPI
+    if: ${{ inputs.publish }}
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: https://pypi.org/p/relativedb
+    permissions:
+      id-token: write        # trusted publishing; no stored API token
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: verified-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

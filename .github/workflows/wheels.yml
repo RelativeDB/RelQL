@@ -1,0 +1,312 @@
+name: Wheels
+
+# Builds the release distributions for the `relativedb` PyPI package:
+# a pure sdist plus one platform wheel per target. librt_c is loaded with
+# ctypes, so a wheel is CPython-version-independent -- exactly ONE wheel per
+# platform (py3-none-<platform>), never one per interpreter.
+#
+# Targets: manylinux x86_64, manylinux aarch64, macOS universal2 (13.0).
+# Windows is out of scope.
+#
+# This workflow only PRODUCES and VERIFIES artifacts. Publishing to PyPI is
+# release-libraries.yml's job; it consumes the artifacts named below:
+#
+#   relativedb-sdist
+#   relativedb-wheel-manylinux-x86_64
+#   relativedb-wheel-manylinux-aarch64
+#   relativedb-wheel-macos-universal2
+#
+# All four match the glob `relativedb-*` and each holds a flat set of files
+# for dist/, so downstream can download-artifact with
+# `pattern: relativedb-*` + `merge-multiple: true`.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    # Cheap by default: a full three-platform build only runs when a
+    # maintainer adds the `build-wheels` label (see the `if:` on each job).
+    types: [labeled, synchronize, reopened]
+  schedule:
+    # Weekly drift check -- catches runner-image and toolchain changes
+    # between releases, when there is time to fix them.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The manylinux build image. 2_28 (AlmaLinux 8, glibc 2.28) is the current
+  # PyPA default: it covers every distro still receiving security updates
+  # (RHEL/Alma/Rocky 8+, Ubuntu 20.04+, Debian 10+) and is what the
+  # gcc-toolset C++20 support the engine needs actually lives in. 2_17 is
+  # gcc 4.8-era and cannot build this codebase without a bootstrap toolchain.
+  MANYLINUX_TAG: manylinux_2_28
+  # One interpreter builds the wheel; the wheel then works on all of them.
+  BUILD_PYTHON: "3.12"
+
+jobs:
+  sdist:
+    name: sdist
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-wheels')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.BUILD_PYTHON }}
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist
+        working-directory: python
+        run: python -m build --sdist
+
+      - name: twine check
+        run: python -m twine check python/dist/*.tar.gz
+
+      # The sdist must build and install from source with NO bundled library:
+      # it stays a pure py3-none-any wheel and falls back to
+      # RELATIVEDB_RT_LIB / a monorepo cpp/build tree at runtime.
+      - name: Install sdist in a clean venv outside the repo
+        run: |
+          set -euxo pipefail
+          sdist=$(ls "$PWD"/python/dist/*.tar.gz)
+          work=$(mktemp -d)
+          cd "$work"
+          python -m venv venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install "$sdist"
+          # Pure install: importable, and load_lib fails loudly rather than
+          # silently resolving something from the build machine.
+          ./venv/bin/python - <<'PY'
+          import relativedb
+          from relativedb.rt_native import RtNativeUnavailableError, load_lib
+          print("relativedb", relativedb.__file__)
+          try:
+              lib = load_lib()
+          except RtNativeUnavailableError as e:
+              print("no bundled library, as expected:", e)
+          else:
+              raise SystemExit(f"sdist install unexpectedly found {lib.path}")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: relativedb-sdist
+          path: python/dist/*.tar.gz
+          if-no-files-found: error
+
+  linux:
+    name: manylinux ${{ matrix.arch }}
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-wheels')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 uses a NATIVE arm64 GitHub-hosted runner (free for public
+          # repos). QEMU emulation of this C++20 build is an order of
+          # magnitude slower; fall back to
+          #   docker/setup-qemu-action + --platform linux/arm64
+          # only if `ubuntu-24.04-arm` ever becomes unavailable.
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.BUILD_PYTHON }}
+
+      # The wheel is built inside the manylinux image (old glibc, gcc-toolset)
+      # but VERIFIED on the plain Ubuntu runner below -- that is the check
+      # that matters, because "imports on the build machine" is exactly the
+      # failure mode a manylinux wheel is supposed to rule out.
+      - name: Build wheel in ${{ env.MANYLINUX_TAG }}_${{ matrix.arch }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e PLAT=${{ env.MANYLINUX_TAG }}_${{ matrix.arch }} \
+            quay.io/pypa/${{ env.MANYLINUX_TAG }}_${{ matrix.arch }}:latest \
+            bash -euxo pipefail -c '
+              python3.12 -m venv /venv
+              /venv/bin/pip install --upgrade pip build auditwheel cmake ninja
+              export PATH=/venv/bin:$PATH
+              # build_wheel.sh is the same script a local developer runs; on
+              # Linux it adds -fPIC and links libstdc++/libgcc statically.
+              PYTHON=/venv/bin/python SKIP_SDIST=1 sh python/build_wheel.sh
+              echo "--- ldd librt_c.so ---"
+              ldd python/src/relativedb/librt_c.so
+              echo "--- auditwheel show (raw) ---"
+              auditwheel show python/dist/*.whl
+              # repair retags linux_<arch> -> manylinux_*; PyPI rejects
+              # linux_* outright. It also vendors any non-whitelisted .so
+              # (there should be none -- see the static-link flags).
+              auditwheel repair --plat "$PLAT" -w /io/wheelhouse python/dist/*.whl
+              echo "--- auditwheel show (repaired) ---"
+              auditwheel show /io/wheelhouse/*.whl
+              chown -R $(stat -c "%u:%g" /io) /io/wheelhouse
+            '
+          ls -l wheelhouse
+
+      - name: Assert the tag is manylinux and interpreter-independent
+        run: |
+          set -euo pipefail
+          whl=$(ls wheelhouse/*.whl)
+          base=$(basename "$whl")
+          echo "built: $base"
+          case "$base" in
+            *-py3-none-*manylinux*_${{ matrix.arch }}*.whl) ;;
+            *) echo "unexpected wheel tag: $base" >&2; exit 1 ;;
+          esac
+          # A bare linux_<arch> tag (what setuptools emits before repair) is
+          # rejected outright by PyPI. Anchor on "-none-linux_" so the
+          # legitimate ...manylinux_2_28_x86_64.whl suffix does not match.
+          case "$base" in
+            *-none-linux_*) echo "bare linux_* tag: $base" >&2; exit 1 ;;
+            *cp3[0-9]*|*abi3*) echo "interpreter-specific tag: $base" >&2; exit 1 ;;
+          esac
+          set -- wheelhouse/*.whl
+          test "$#" -eq 1
+
+      - name: Cache Hugging Face checkpoints
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('python/release_smoke.py') }}
+          restore-keys: hf-${{ runner.os }}-${{ runner.arch }}-
+
+      # Runs on the host runner (Ubuntu 24.04, glibc 2.39) -- NOT in the
+      # manylinux image -- from a scratch directory, so the monorepo
+      # cpp/build fallback in rt_native cannot mask a broken bundle.
+      - name: Verify wheel in a clean environment
+        run: |
+          set -euxo pipefail
+          whl=$(ls "$PWD"/wheelhouse/*.whl)
+          smoke="$PWD/python/release_smoke.py"
+          python -m pip install --upgrade pip twine
+          python -m twine check "$whl"
+          work=$(mktemp -d)
+          cp "$smoke" "$work/release_smoke.py"
+          cd "$work"
+          python -m venv venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install "$whl"
+          # release_smoke.py asserts the library resolves from site-packages
+          # and that a real RT-J prediction comes out finite. Any HF download
+          # failure raises here -- there is deliberately no skip path.
+          ./venv/bin/python release_smoke.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: relativedb-wheel-manylinux-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal2
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-wheels')
+    # arm64 runner; the x86_64 slice is cross-compiled by clang. Both slices
+    # link the same universal Accelerate/Metal/MPS frameworks from the SDK.
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.BUILD_PYTHON }}
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      # build_wheel.sh passes -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 and
+      # -DCMAKE_OSX_ARCHITECTURES=arm64;x86_64; setup.py then derives the
+      # platform tag from the dylib's own Mach-O headers (lipo/otool), so the
+      # tag can never drift from what was actually built.
+      - name: Build universal2 wheel
+        run: |
+          SKIP_SDIST=1 PYTHON="$(which python)" sh python/build_wheel.sh
+
+      - name: Assert universal2 / 13.0 / py3-none
+        run: |
+          set -euo pipefail
+          dylib=python/src/relativedb/librt_c.dylib
+          lipo -archs "$dylib"
+          lipo -archs "$dylib" | grep -q arm64
+          lipo -archs "$dylib" | grep -q x86_64
+          # every slice must record minos 13.0
+          test "$(otool -l "$dylib" | grep -c 'minos 13.0')" -eq 2
+          whl=$(ls python/dist/*.whl)
+          base=$(basename "$whl")
+          echo "built: $base"
+          case "$base" in
+            *-py3-none-macosx_13_0_universal2.whl) ;;
+            *) echo "unexpected wheel tag: $base" >&2; exit 1 ;;
+          esac
+          set -- python/dist/*.whl
+          test "$#" -eq 1
+
+      - name: Cache Hugging Face checkpoints
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('python/release_smoke.py') }}
+          restore-keys: hf-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify wheel in a clean environment
+        run: |
+          set -euxo pipefail
+          whl=$(ls "$PWD"/python/dist/*.whl)
+          smoke="$PWD/python/release_smoke.py"
+          python -m twine check "$whl"
+          work=$(mktemp -d)
+          cp "$smoke" "$work/release_smoke.py"
+          cd "$work"
+          python -m venv venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install "$whl"
+          # Exercises the arm64 slice only -- an arm64 runner cannot execute
+          # the x86_64 half. The x86_64 slice is verified structurally by the
+          # lipo/otool assertions above.
+          ./venv/bin/python release_smoke.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: relativedb-wheel-macos-universal2
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  # A single gate release-libraries.yml (or branch protection) can require,
+  # instead of enumerating every matrix leg.
+  wheels-ok:
+    name: All distributions verified
+    # always() so a failed leg is reported rather than silently skipped, but
+    # still gated on the label so unlabeled PRs do not fail on skipped needs.
+    if: >-
+      always() && (github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-wheels'))
+    needs: [sdist, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          echo "sdist=${{ needs.sdist.result }}"
+          echo "linux=${{ needs.linux.result }}"
+          echo "macos=${{ needs.macos.result }}"
+          test "${{ needs.sdist.result }}" = success
+          test "${{ needs.linux.result }}" = success
+          test "${{ needs.macos.result }}" = success

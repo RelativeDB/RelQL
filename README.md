@@ -2,6 +2,12 @@
   <img src="website/static/img/logo.svg" alt="relativedb logo" width="120" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/RelativeDB/RelQL/actions/workflows/ci.yml"><img src="https://github.com/RelativeDB/RelQL/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
+  <a href="https://pypi.org/project/relativedb/"><img src="https://img.shields.io/pypi/v/relativedb.svg" alt="PyPI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0" /></a>
+</p>
+
 # What is RelativeDB/RelQL?
 RelativeDB is an optimized implementation of Relational Transformers, exposed through RelQL, a query language for predicting what happens next:
 
@@ -166,5 +172,21 @@ for p in result.predictions:
 
 </details>
 
+Wheels bundle the native engine for macOS (universal2, 13.0+) and manylinux
+x86_64/aarch64. Elsewhere `pip` falls back to the source distribution, which
+carries no engine: build `cpp/` yourself and point `RELATIVEDB_RT_LIB` at the
+result. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 # Notes
 - The multi-label head requires tuning (e.g. RANK TOP 10)
+
+# Development
+
+[CONTRIBUTING.md](CONTRIBUTING.md) — building `cpp/`, wiring Python at the
+built library, and the unit vs integration test tiers.
+[RELEASING.md](RELEASING.md) — cutting a release.
+[CHANGELOG.md](CHANGELOG.md) — what changed.
+
+# License
+
+[Apache-2.0](LICENSE).

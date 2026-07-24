@@ -1,5 +1,11 @@
 [build-system]
-requires = ["setuptools>=68"]
+# >=77, not >=68: `license = "Apache-2.0"` below is the PEP 639 SPDX
+# expression form, and setuptools only accepts it from 77.0.0. Against 68-76
+# the build dies with "project.license must be valid exactly by one
+# definition (2 matches found)" -- which only bites a pinned or offline build
+# environment, never a fresh resolve, so it would have surfaced first as a
+# bug report from someone building from the sdist.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,6 +16,33 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "relativedb contributors" }]
+keywords = [
+    "relational-transformer", "predictive-query", "relql",
+    "foundation-model", "tabular", "relational-deep-learning",
+    "zero-shot", "inference-engine",
+]
+# No "License :: OSI Approved :: ..." trove classifier here: setuptools >= 77
+# rejects a build that sets both it and the SPDX `license` expression above.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+# sentence-transformers is a genuine hard dependency, not a text-column
+# extra: rt_native._collate embeds the schema phrases ("<col> of <table>")
+# through MiniLM on every forward pass, even for a schema with no TEXT
+# column at all. Demoting it to an optional extra breaks every prediction.
 dependencies = [
     "numpy>=1.24",
     "sentence-transformers>=3.0",
@@ -22,7 +55,7 @@ Repository = "https://github.com/RelativeDB/RelQL"
 Issues = "https://github.com/RelativeDB/RelQL/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-cov>=5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -36,3 +69,50 @@ relativedb = ["librt_c.dylib", "librt_c.so", "librt_c.dll", "rt_c.dll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# rootdir is python/ for both `pytest tests` (from python/) and
+# `pytest python/tests` (from the repo root), so ".." is the repo root either
+# way. That puts the root-level `evaluation` package on sys.path explicitly
+# instead of relying on `python -m pytest` happening to prepend the cwd.
+pythonpath = ["..", "src"]
+# Unknown markers are errors: a typo'd -m expression must not silently select
+# nothing. Paired with the empty-selection guard in tests/conftest.py.
+addopts = "--strict-markers --strict-config"
+markers = [
+    "integration: needs librt_c and/or a real model checkpoint; excluded from the unit tier",
+    "native: needs librt_c (no checkpoint download)",
+    "checkpoint: needs an HF model checkpoint (rt-j and/or MiniLM)",
+]
+
+# Coverage for the `relativedb` package. CI calls exactly:
+#   pytest --cov=relativedb --cov-report=xml:coverage-python.xml --cov-report=term
+[tool.coverage.run]
+branch = true
+# Source scope comes from the CLI (`--cov=relativedb`), by package name rather
+# than path so it is correct from python/ or from the repo root, and for both
+# src/ and an installed wheel's site-packages. Repeating it here as
+# source/source_pkgs only duplicates the CLI value and makes coverage emit a
+# spurious "module-not-measured" warning; the totals are identical either way.
+omit = [
+    "*/__pycache__/*",
+    "*/tests/*",
+    "*/.venv/*",
+]
+
+[tool.coverage.paths]
+# Map an installed copy back onto the source tree so wheel-installed runs and
+# in-tree runs produce one combined report rather than two half-covered ones.
+source = ["src/relativedb", "*/site-packages/relativedb"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 2
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.xml]
+output = "coverage-python.xml"

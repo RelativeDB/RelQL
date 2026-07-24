@@ -45,13 +45,18 @@ FROM customers
 pip install relativedb
 ```
 
-Wheels bundle the native inference engine for **macOS arm64** (Apple
-Silicon; CPU and Metal). On other platforms the package installs from
-source; build the engine from
-[the repository](https://github.com/RelativeDB/RelQL) (`cpp/` with CMake)
-and point `RELATIVEDB_RT_LIB` at the built `librt_c`.
+Python 3.10 or newer. Wheels bundle the native inference engine for macOS
+(universal2, 13.0+; Accelerate and Metal) and manylinux x86_64 / aarch64.
+Windows is not supported. On any other platform `pip` falls back to the
+source distribution, which contains no engine: build it from
+[the repository](https://github.com/RelativeDB/RelQL) (`cpp/` with CMake) and
+point `RELATIVEDB_RT_LIB` at the built `librt_c`.
 
 ## Quickstart: 90-day churn from your own DataFrames
+
+A sketch — `customer_dao`, `order_dao` and `t0` stand in for your storage and
+your anchor time. A copy-paste runnable version with an in-memory database is
+in the [repository README](https://github.com/RelativeDB/RelQL#the-python-library).
 
 ```python
 from relativedb import (Schema, TableDef, LinkDef, ValueType,
@@ -103,6 +108,34 @@ RelativeDB is based on:
 
 - [stanford-star/relational-transformer](https://github.com/stanford-star/relational-transformer) — RT-J: Large-Scale Pretraining of Relational Transformers for Context-Efficient Predictions
 - [Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data](https://arxiv.org/abs/2510.06377) (arXiv:2510.06377)
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+pytest -m "not integration"   # unit tier: no checkpoint, no network (<1s)
+pytest -m integration         # native kernels + the real rt-j checkpoint
+pytest                        # everything
+```
+
+Both tiers run from this directory or from the repository root. The unit tier
+still needs `librt_c` — the RelQL grammar lives once in C++ and is shared by
+the Python, Java, and Rust bindings — but it never downloads a checkpoint or
+opens a socket. The integration tier resolves `hf://stanford-star/rt-j/…`
+through the Hugging Face cache (~326 MB fp32, plus ~128 MB for the pinned
+MiniLM text encoder).
+
+Set `RELATIVEDB_REQUIRE_NATIVE=1` to make a missing library or an
+unresolvable checkpoint a hard failure instead of a skip. CI sets it on the
+integration job, so a cold or broken model cache turns the build red rather
+than reporting "0 tests ran, all green".
+
+Coverage:
+
+```bash
+pytest --cov=relativedb --cov-report=xml:coverage-python.xml --cov-report=term
+```
 
 ## Docs
 

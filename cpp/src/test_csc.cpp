@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "csc.hpp"
+#include "csc_c.h"
 
 namespace {
 
@@ -125,10 +126,70 @@ bool run_case(std::uint64_t seed, std::int64_t n_parents, std::int64_t n_edges,
   return fails == 0;
 }
 
+// --------------------------------------------------------------------------
+// C ABI conformance (csc_c.h). The language bindings never touch
+// csc::CscAdjacency directly -- they go through this handle-based C surface,
+// so its contract (opaque handle, out-count, error buffer, null tolerance) is
+// tested here rather than from Python: a break should fail the C++ build's own
+// test run, not surface later as a confusing ctypes error.
+// --------------------------------------------------------------------------
+
+void check_c_abi(std::int64_t& checks, std::int64_t& fails) {
+  auto fail = [&](const char* what) {
+    ++fails;
+    std::printf("MISMATCH c-abi: %s\n", what);
+  };
+
+  std::vector<std::int64_t> ep{0, 0, 0, 1}, ec{10, 11, 12, 20};
+  std::vector<double> et{1.0, 2.0, 3.0, 5.0};
+  char err[256] = {0};
+
+  csc_index* ix = csc_build(2, 4, ep.data(), ec.data(), et.data(), err,
+                            sizeof(err));
+  ++checks;
+  if (!ix) return fail("csc_build returned null on a valid graph");
+
+  std::int64_t out[8];
+  std::int32_t n = -1;
+
+  // Bounded query: ts <= 2 admits {10, 11}, newest-first.
+  ++checks;
+  if (csc_children(ix, 0, 2.0, 8, out, &n, err, sizeof(err)) != 0 || n != 2 ||
+      out[0] != 11 || out[1] != 10)
+    fail("bounded children != [11, 10]");
+
+  // limit truncates from the newest end.
+  ++checks;
+  if (csc_children(ix, 0, 100.0, 2, out, &n, err, sizeof(err)) != 0 || n != 2 ||
+      out[0] != 12 || out[1] != 11)
+    fail("limited children != [12, 11]");
+
+  // An anchor before every edge admits nothing.
+  ++checks;
+  if (csc_children(ix, 0, 0.0, 8, out, &n, err, sizeof(err)) != 0 || n != 0)
+    fail("anchor before all edges returned rows");
+
+  // Out-of-range parent yields an empty result, not an error.
+  ++checks;
+  if (csc_children(ix, 99, 100.0, 8, out, &n, err, sizeof(err)) != 0 || n != 0)
+    fail("out-of-range parent did not yield 0");
+
+  // A null handle must be reported, not dereferenced.
+  ++checks;
+  if (csc_children(nullptr, 0, 1.0, 8, out, &n, err, sizeof(err)) == 0)
+    fail("null handle was accepted");
+
+  csc_free(ix);
+  ++checks;
+  csc_free(nullptr);  // must be a no-op, not a crash
+}
+
 }  // namespace
 
 int main() {
   std::int64_t checks = 0, fails = 0;
+
+  check_c_abi(checks, fails);
 
   // Edge cases: parent with no edges is covered by out-of-range/empty buckets;
   // an empty graph exercises the n_edges==0 path.

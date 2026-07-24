@@ -1,12 +1,142 @@
-"""Shared fixtures: the worked churn example from kb/example.md as a toy graph."""
+"""Shared fixtures: the worked churn example from kb/example.md as a toy graph.
+
+Also the single place where the unit/integration tier split is implemented:
+
+* ``pytest -m "not integration"`` — the unit tier. No model checkpoint, no
+  network, no GPU. Sub-second.
+* ``pytest -m integration`` — the real thing: the native compute kernels and
+  the rt-j checkpoint end to end.
+
+Sub-markers refine the integration tier for CI scheduling:
+
+* ``native``     — needs ``librt_c`` compute kernels (no HF download)
+* ``checkpoint`` — needs an HF checkpoint (rt-j weights and/or MiniLM)
+
+So ``-m "integration and native and not checkpoint"`` is a cheap CI job that
+needs only a built ``cpp/``, and ``-m "integration and checkpoint"`` is the
+one that needs the warmed model cache.
+
+WHAT THE UNIT TIER DOES *NOT* GUARANTEE
+---------------------------------------
+It does not run without ``librt_c``. That is by design, not an oversight:
+``relativedb.relql.parser.parse`` delegates to ``relql_parse`` in the shared
+C++ library (see ``relql/native.py`` — "librt_c is a hard dependency"), so any
+test that parses a RelQL string needs the library. Measured: with ``librt_c``
+made unloadable, 186 of the 214 unit tests fail with
+``NativeParserUnavailable``. Making the unit tier library-free would mean
+re-introducing a second, pure-Python RelQL grammar — exactly the duplication
+the C++ single-sourcing exists to prevent.
+
+``librt_c`` is a build artifact, not a download: CI builds it for the wheel
+regardless, and a missing one is already a red build. The property this tier
+*does* guarantee, and which is verified, is the expensive/flaky one: no model
+checkpoint, no network, no GPU.
+
+Strict mode: with ``RELATIVEDB_REQUIRE_NATIVE=1`` every skip that would fire
+for a missing library or an unresolvable checkpoint becomes a hard FAILURE, so
+a broken CI cache or a failed download turns the build red instead of quietly
+reporting "0 tests ran, all green". Route every such decision through
+:func:`require_native` / :func:`require_checkpoint`; do not call
+``pytest.skip`` for these conditions directly.
+"""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import pytest
 
 from relativedb import (ColumnDef, EntityPrediction, LinkDef, RetrieverWiring,
                       Row, Schema, TableDef, TaskType, TemporalBound, ValueType)
+
+# ---------------------------------------------------------------------------
+# tier machinery: markers, strict mode, empty-selection guard
+# ---------------------------------------------------------------------------
+
+STRICT_ENV = "RELATIVEDB_REQUIRE_NATIVE"
+
+
+def strict_native() -> bool:
+    """True when missing native/checkpoint prerequisites must FAIL, not skip."""
+    return os.environ.get(STRICT_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _unavailable(what: str, detail: str):
+    """Skip, or under strict mode fail loudly. Never returns."""
+    if strict_native():
+        pytest.fail(
+            f"{STRICT_ENV}=1 but {what} is unavailable: {detail}\n"
+            "This is the integration tier; a missing prerequisite here means a "
+            "broken build/cache, not a test that may be skipped.",
+            pytrace=False)
+    pytest.skip(f"{what} unavailable: {detail}")
+
+
+def require_native():
+    """Return the loaded ``librt_c`` wrapper, or skip/fail per strict mode."""
+    from relativedb.rt_native import RtNativeUnavailableError, load_lib
+    try:
+        return load_lib()
+    except RtNativeUnavailableError as e:
+        _unavailable("librt_c (build cpp/ with cmake, or set "
+                     "RELATIVEDB_RT_LIB)", str(e))
+
+
+def require_native_csc():
+    """``librt_c`` as reached by the CSC binding, or skip/fail per strict mode."""
+    from relativedb.csc_native import native_available
+    if not native_available():
+        _unavailable("librt_c for the native CSC binding",
+                     "csc_native.native_available() is False (run cmake in cpp/)")
+    return True
+
+
+def require_checkpoint(variant: str) -> str:
+    """Resolve ``hf://stanford-star/rt-j/<variant>``, or skip/fail per strict
+    mode. Cache-first; on CI the HF cache is pre-warmed, so a miss here means
+    the cache key is wrong or the download failed."""
+    from relativedb.rt_native import resolve_model_path
+    uri = f"hf://stanford-star/rt-j/{variant}"
+    try:
+        return resolve_model_path(uri)
+    except Exception as e:                       # noqa: BLE001 - report anything
+        _unavailable(f"rt-j {variant} checkpoint ({uri})", f"{type(e).__name__}: {e}")
+
+
+def require_text_embedder():
+    """The pinned MiniLM encoder (sentence-transformers/all-MiniLM-L12-v2)
+    used for text and schema cells. Skips/fails like the other prerequisites —
+    it is a network-backed model, so it never belongs in the unit tier."""
+    try:
+        import sentence_transformers                      # noqa: F401
+    except ImportError as e:
+        _unavailable("sentence-transformers (MiniLM text encoder)", str(e))
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "integration: needs librt_c and/or a real model checkpoint; excluded "
+        "from the unit tier")
+    config.addinivalue_line(
+        "markers", "native: needs librt_c (no checkpoint download)")
+    config.addinivalue_line(
+        "markers", "checkpoint: needs an HF model checkpoint (rt-j / MiniLM)")
+
+
+@pytest.hookimpl(trylast=True)     # after pytest's own marker deselection
+def pytest_collection_modifyitems(config, items):
+    """A marker expression that selects nothing is an error, not a pass.
+
+    Without this, a typo'd ``-m integration`` or a suite that lost its markers
+    exits 0 with "no tests ran" and CI goes green having verified nothing.
+    """
+    markexpr = getattr(config.option, "markexpr", "")
+    if markexpr and not items:
+        raise pytest.UsageError(
+            f"marker expression {markexpr!r} selected 0 tests. Refusing to "
+            "report success for an empty run.")
 
 
 def dt(s: str) -> datetime:

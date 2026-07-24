@@ -1,0 +1,51 @@
+name: Bug report
+description: Something behaves differently from what the docs or the code say it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        What you ran, what came out, and what you expected instead. A RelQL
+        query and a schema sketch are usually enough; a full dataset is not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest thing that shows it. If it needs the native engine, say
+        which backend (CPU / Metal / CUDA) and which checkpoint variant
+        (fp32 / f16 / q8 / q4, i.e. RELATIVEDB_RT_QUANTIZED).
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of the command below, plus your OS and CPU.
+      value: |
+        <details>
+
+        ```
+        $ python -c "import relativedb, sys, platform; \
+            print(relativedb.__version__, sys.version, platform.platform())"
+        $ python -c "from relativedb.rt_native import load_lib; print(load_lib().path)"
+        ```
+
+        </details>
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: native
+    attributes:
+      label: Engine
+      options:
+        - label: The library loaded (the second command above printed a path)
+        - label: I built `cpp/` myself rather than using a released wheel

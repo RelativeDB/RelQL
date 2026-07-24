@@ -1,0 +1,63 @@
+# Codecov configuration. Reports are uploaded by .github/workflows/ci.yml:
+# the python flag from the integration lane (which runs the whole suite, unit
+# + integration, so the number is not artificially low), the cpp flag from the
+# dedicated instrumented build.
+
+coverage:
+  precision: 2
+  round: down
+  range: "50...90"
+
+  status:
+    # Both gates start informational: they annotate the PR with the delta but
+    # never block a merge. This repository has no coverage history yet, so any
+    # real target picked today would be a guess, and a gate that fails every
+    # PR from day one gets switched off within a week. Let a few weeks of runs
+    # establish the actual baseline, then set `target: auto` with
+    # `threshold: 1%` and drop `informational` — a ratchet, not a wall.
+    project:
+      python:
+        flags: [python]
+        target: auto
+        threshold: 2%
+        informational: true
+      cpp:
+        flags: [cpp]
+        target: auto
+        threshold: 2%
+        informational: true
+    # Patch coverage (new/changed lines only) is the more useful of the two
+    # and the one to un-inform first: it does not punish anyone for legacy
+    # gaps they did not create.
+    patch:
+      default:
+        target: 70%
+        threshold: 5%
+        informational: true
+
+flag_management:
+  individual_flags:
+    - name: python
+      paths:
+        - python/src/
+    - name: cpp
+      paths:
+        - cpp/src/
+
+ignore:
+  - "website/**"          # Docusaurus site, no unit tests
+  - "evaluation/**"       # research/benchmark scripts, not shipped
+  - "cpp/build*/**"       # build trees, including build-coverage
+  - "cpp/testdata/**"
+  - "cpp/tools/**"
+  - "cpp/src/test_*.cpp"
+  - "cpp/src/bench.cpp"
+  - "python/tests/**"
+  - "python/build/**"
+  - "python/dist/**"
+  - "**/conftest.py"
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false

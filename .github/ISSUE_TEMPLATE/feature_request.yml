@@ -1,0 +1,28 @@
+name: Feature or RelQL grammar request
+description: Something the engine or the query language cannot express yet
+labels: [enhancement]
+body:
+  - type: textarea
+    id: prediction
+    attributes:
+      label: The prediction you want to make
+      description: >-
+        In plain words first. "For every store, units sold in each of the next
+        four weeks" — not the API call you think it needs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: query
+    attributes:
+      label: How you would want to write it
+      description: RelQL if you can guess at it, Python if the gap is in the API.
+      render: sql
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do instead today
+      description: >-
+        Including "nothing, I gave up". Knowing the workaround tells us how
+        much the gap actually costs.

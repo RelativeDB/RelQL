@@ -23,3 +23,15 @@ python/src/relativedb/librt_c.*
 python/src/relativedb/rt_c.dll
 .env
 cpp/build-wheel/
+
+# auditwheel output from the manylinux builds (wheels.yml, and the same
+# containers run locally)
+wheelhouse/
+wheelhouse-*/
+
+# pytest-cov writes .coverage next to the cwd, which is the repo root when
+# the suite is run as `pytest python/tests` from here
+.coverage
+.coverage.*
+coverage-python.xml
+coverage-cpp.xml

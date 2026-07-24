@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Action majors move fast enough that a pin goes stale quietly; this keeps
+  # the bumps visible as PRs that CI has to pass.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]

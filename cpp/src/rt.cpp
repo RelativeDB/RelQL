@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
@@ -189,7 +190,7 @@ namespace {
 // SMMLA kernel is compiled with a per-function target attribute, so the
 // library still loads on chips without i8mm (e.g. M1) — it just takes the
 // SDOT path there. Detected once.
-bool cpu_has_i8mm() {
+[[maybe_unused]] bool cpu_has_i8mm() {
 #if defined(RT_SDOT)
   static const bool v = [] {
     if (const char* e = std::getenv("RT_NO_I8MM"))   // force the SDOT path
@@ -216,7 +217,7 @@ bool cpu_has_i8mm() {
 //   packed[(p*(in/8) + kb)*16 + 0..7]  = row(2p)[kb*8 : kb*8+8]
 //   packed[(p*(in/8) + kb)*16 + 8..15] = row(2p+1)[kb*8 : kb*8+8]
 // so one vld1q_s8 feeds a full 2x8 SMMLA operand. Requires out even, in%8==0.
-void pack_q8_smmla(const int8_t* src, int8_t* dst, int out, int in) {
+[[maybe_unused]] void pack_q8_smmla(const int8_t* src, int8_t* dst, int out, int in) {
   const int KB = in / 8;
   for (int p = 0; p < out / 2; p++)
     for (int kb = 0; kb < KB; kb++) {
