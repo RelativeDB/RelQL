@@ -65,6 +65,10 @@ def _load() -> Optional[ctypes.CDLL]:
                 lib.relql_parse.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
                                           ctypes.c_size_t, ctypes.c_char_p,
                                           ctypes.c_size_t]
+                lib.relql_analyze.restype = ctypes.c_int
+                lib.relql_analyze.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                                              ctypes.c_char_p, ctypes.c_size_t,
+                                              ctypes.c_char_p, ctypes.c_size_t]
                 _lib = lib
                 return _lib
             except (OSError, AttributeError) as e:
@@ -93,6 +97,40 @@ def parse_native(query: str) -> ParsedQuery:
         raise RelqlSyntaxError(err.value.decode("utf-8", "replace") or "parse failed")
     obj = json.loads(out.value.decode("utf-8"))
     return _query_from_json(obj, query)
+
+
+def analyze_native(query: str, schema_json: str):
+    """Parse, validate against the schema, and infer the task type — all in
+    the C++ layer (``relql_analyze``).
+
+    Returns ``(bound_query, task_type_name)``. The query is *bound*: the
+    population's primary key is resolved, so callers must use it rather than
+    their own parse.
+
+    The C ABI prefixes its message so this layer can raise the exception type
+    Python users expect without the C layer knowing about Python.
+    """
+    lib = _load()
+    if lib is None:
+        raise NativeParserUnavailable(_load_failed or "librt_c unavailable")
+    if not isinstance(query, str) or not query.strip():
+        raise RelqlSyntaxError("empty query")
+    out = ctypes.create_string_buffer(_OUT)
+    err = ctypes.create_string_buffer(_ERR)
+    rc = lib.relql_analyze(query.encode("utf-8"),
+                           schema_json.encode("utf-8"), out, _OUT, err, _ERR)
+    if rc != 0:
+        from .parser import RelqlValidationError
+        msg = err.value.decode("utf-8", "replace") or "analyze failed"
+        if msg.startswith("invalid: "):
+            raise RelqlValidationError(msg[len("invalid: "):])
+        if msg.startswith("syntax: "):
+            raise RelqlSyntaxError(msg[len("syntax: "):])
+        if msg.startswith("schema: "):
+            raise ValueError(msg[len("schema: "):])
+        raise RelqlSyntaxError(msg)
+    obj = json.loads(out.value.decode("utf-8"))
+    return _query_from_json(obj["query"], query), obj["task_type"]
 
 
 # ---------------------------------------------------------------------------

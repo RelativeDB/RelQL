@@ -21,6 +21,20 @@ extern "C" {
 int relql_parse(const char* query, char* out, size_t outlen, char* err,
               size_t errlen);
 
+/* Parse AND validate against a schema, then infer the task type — the semantic
+ * pass each binding used to reimplement. `schema_json` is the document
+ * relativedb.schema.Schema.to_json_dict emits. On success writes
+ *   {"query": <bound AST>, "task_type": "..."}
+ * into out and returns 0. The AST is *bound*: the population's primary key is
+ * resolved, so callers must use it rather than their own parse.
+ *
+ * Returns 1 with a message in err for a syntax error, an invalid query, or a
+ * malformed schema; 2 when out is too small. Distinguishing the three is the
+ * binding's job — it knows which exception type its users expect — so the
+ * message is prefixed "syntax: ", "invalid: " or "schema: ". */
+int relql_analyze(const char* query, const char* schema_json, char* out,
+                  size_t outlen, char* err, size_t errlen);
+
 #ifdef __cplusplus
 }
 #endif

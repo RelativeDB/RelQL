@@ -390,6 +390,10 @@ class ParsedQuery:
     ret: Optional[ReturnSpec] = None            # RETURN output spec
     windows: dict = field(default_factory=dict, compare=False)  # named WINDOW templates
     text: str = field(default="", compare=False)
+    # Task type as inferred by the C++ semantic pass during validate(). Cached
+    # so task_type() answers from the shared implementation rather than
+    # re-deriving the same rules here; None on an unvalidated query.
+    _task_type: object = field(default=None, compare=False, repr=False)
 
     @property
     def target_aggregations(self) -> list[Aggregation]:
@@ -428,7 +432,14 @@ class ParsedQuery:
                                        table.primary_key))
 
     def task_type(self, schema=None) -> TaskType:
-        """Infer the task type (design §4: execution semantics, step 1)."""
+        """The task type (design §4: execution semantics, step 1).
+
+        A validated query carries the answer the C++ semantic pass computed
+        with the schema in hand (cpp/src/analyze.cpp), so return that. The
+        rules below are the schema-less fallback for a query that has not been
+        validated -- programmatic construction and parser tests."""
+        if self._task_type is not None:
+            return self._task_type
         if self.num_forecasts is not None:
             return TaskType.FORECASTING
         if self.rank is RankKind.RANK:

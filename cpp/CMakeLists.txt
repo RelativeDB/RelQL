@@ -101,8 +101,10 @@ if(RT_CUDA)
   set_target_properties(rt PROPERTIES CUDA_STANDARD 17)
 endif()
 
-# Shared RelQL parser (C++20 lexer + recursive-descent parser).
-add_library(relql STATIC src/relql.cpp)
+# Shared RelQL front end: lexer + recursive-descent parser, plus the
+# schema-aware semantic pass (validation, task-type inference) that each
+# binding used to reimplement in its own language.
+add_library(relql STATIC src/relql.cpp src/schema.cpp src/analyze.cpp)
 target_include_directories(relql PUBLIC src)
 target_link_libraries(relql PUBLIC rt_flags)
 
@@ -112,6 +114,7 @@ target_include_directories(csc PUBLIC src)
 target_link_libraries(csc PUBLIC rt_flags)
 
 add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
+                        src/schema.cpp src/analyze.cpp
                         src/csc_c.cpp src/csc.cpp)
 target_link_libraries(rt_c PRIVATE rt)
 target_include_directories(rt_c PUBLIC src)
@@ -134,6 +137,11 @@ target_link_libraries(rt_quantize rt)
 add_executable(relql_test src/test_relql.cpp)
 target_link_libraries(relql_test relql)
 
+# The semantic pass: validation + schema-aware task typing, shared by every
+# binding, so its behaviour is pinned here rather than per language.
+add_executable(analyze_test src/test_analyze.cpp)
+target_link_libraries(analyze_test relql)
+
 # csc_c.cpp is compiled in directly (rather than linking rt_c) so the test
 # exercises the C ABI without dragging in the whole engine shared library.
 add_executable(csc_test src/test_csc.cpp src/csc_c.cpp)
@@ -147,6 +155,7 @@ include(CTest)
 if(BUILD_TESTING)
   # Self-contained: randomized CSC adjacency batteries with fixed seeds.
   add_test(NAME csc COMMAND csc_test)
+  add_test(NAME analyze COMMAND analyze_test)
 
   # Needs the RelQL corpus, which lives in the python package. Pass it as an
   # absolute path so the test is independent of the working directory.

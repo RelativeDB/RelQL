@@ -564,10 +564,17 @@ class Engine:
             raise ExecutionError(
                 "hurdle_gate applies to regression targets only")
         reg = self.execute(replace(input, query=pq, hurdle_gate=None))
+        # A derived query: built by AST surgery, not written by a user. Its
+        # source text belongs to the regression query above, so it is cleared
+        # -- re-analyzing that text would validate the wrong query and hand
+        # back a regression task. `_task_type` is cleared for the same reason:
+        # inherited from pq it would say regression, and this asks a binary
+        # question. See validate()'s already-bound path.
         clf_pq = replace(
             pq,
             target=Condition(left=pq.target, op=Operator.GT, right=0),
-            ret=ReturnSpec("PROBABILITY"))
+            ret=ReturnSpec("PROBABILITY"),
+            text="", _task_type=None)
         clf = self.execute(replace(input, query=clf_pq, hurdle_gate=None))
         prob = {p.id: p.probability for p in clf.predictions}
         gated = tuple(
