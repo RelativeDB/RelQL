@@ -117,7 +117,7 @@ def params_to_json(params: Optional[dict]) -> str:
     return json.dumps({k: encode(v) for k, v in (params or {}).items()})
 
 
-def analyze_native(query: str, schema_json: str, params_json: str = "{}",
+def analyze_native(query: str, schema_json: str, params_json: str = "",
                    params: Optional[dict] = None):
     """Parse, validate, bind parameters, infer the task and build the logical
     plan — all in the C++ layer (``relql_analyze``).
@@ -138,7 +138,9 @@ def analyze_native(query: str, schema_json: str, params_json: str = "{}",
     err = ctypes.create_string_buffer(_ERR)
     rc = lib.relql_analyze(query.encode("utf-8"),
                            schema_json.encode("utf-8"),
-                           (params_json or "{}").encode("utf-8"),
+                           # "" and "{}" mean different things (do not bind
+                           # vs bind with nothing supplied), so no `or`.
+                           params_json.encode("utf-8"),
                            out, _OUT, err, _ERR)
     if rc != 0:
         from .parser import RelqlValidationError

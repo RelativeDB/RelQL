@@ -63,8 +63,13 @@ def validate(query, schema, params=None) -> ValidatedQuery:
 
     The rules live in the C++ layer (``relql_analyze``, cpp/src/analyze.cpp) so
     every binding enforces the same ones; this is the Python surface over them.
-    Passing ``params`` binds them there too, which matters for planning: a
-    cohort pinned through ``IN :ids`` is only visible once bound.
+    ``params`` distinguishes two things. ``None`` (the default) validates
+    WITHOUT binding: a parameterized query is legitimate to validate before
+    its values exist, and callers do that to get the bound primary key and the
+    task type. A dict -- including an empty one -- binds now, so an unsupplied
+    ``:name`` is reported here rather than surfacing much later. Binding also
+    matters for planning: a cohort pinned through ``IN :ids`` is only visible
+    once bound.
 
     ``ValidatedQuery.query`` is the *bound* query — same AST, with the
     population's primary key filled in — so callers should use it rather than
@@ -85,8 +90,8 @@ def validate(query, schema, params=None) -> ValidatedQuery:
                 "ParsedQuery produced by parse()")
         return ValidatedQuery(query, query.task_type(schema), None)
     bound, task_name, logical = analyze_native(
-        text, json.dumps(schema.to_json_dict()), params_to_json(params),
-        params)
+        text, json.dumps(schema.to_json_dict()),
+        "" if params is None else params_to_json(params), params)
     task = TaskType(task_name)
     # The C++ pass already inferred the task with the schema in hand; cache it
     # so ParsedQuery.task_type() answers from that rather than re-deriving the

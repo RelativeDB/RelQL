@@ -531,7 +531,7 @@ class Engine:
         # One trip into the C++ front end: validate, bind :params, infer the
         # task and build the logical plan. Binding there is what lets the plan
         # see a cohort pinned through `IN :ids`.
-        _vq = validate(pq, self.schema, input.params)
+        _vq = validate(pq, self.schema, input.params or {})
         pq, _logical = _vq.query, _vq.plan
         # Bind the effective anchor (AS OF) before any assembly/scoring so it
         # threads through the temporal bound and pseudo-anchors unchanged.
@@ -1024,7 +1024,7 @@ class Engine:
         # One trip into the C++ front end: validate, bind :params, infer the
         # task and build the logical plan. Binding there is what lets the plan
         # see a cohort pinned through `IN :ids`.
-        _vq = validate(pq, self.schema, input.params)
+        _vq = validate(pq, self.schema, input.params or {})
         pq, _logical = _vq.query, _vq.plan
         ex = pq.explain or Explain()
         mode = (ex.mode or "PLAN").upper()

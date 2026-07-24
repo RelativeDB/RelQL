@@ -387,13 +387,15 @@ ExprPtr bind_expr(const ExprPtr& e, const JsonValue& params) {
 }  // namespace
 
 ParsedQuery bind_params(const ParsedQuery& q, const std::string& params_json) {
-  // No early return on an empty map: a query carrying :name with nothing
-  // supplied must be reported here, not left as an unbound Param for the
-  // evaluator to trip over further downstream.
+  // An EMPTY string means "do not bind": validating a parameterized query
+  // without supplying values is legitimate -- a caller may only want the
+  // bound primary key and the task type. "{}" is different: it means "bind
+  // now, with nothing supplied", so a query carrying :name is reported here
+  // rather than leaving an unbound Param for the evaluator to trip over much
+  // further downstream.
+  if (params_json.empty()) return q;
   JsonValue params;
-  if (params_json.empty()) {
-    params.kind = JsonValue::Kind::Obj;
-  } else {
+  {
     try {
       params = json_parse(params_json);
     } catch (const JsonError& e) {
