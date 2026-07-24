@@ -456,42 +456,8 @@ class ColumnarTraversal:
                  task_spec_factory: Optional[Callable] = None):
         self.store = store
         self.task_spec_factory = task_spec_factory or TaskSpec.from_query
-        self._walk_core: Optional[dict] = None
-        self._overlay: Optional[dict] = None
         self._focal_lookup: dict[str, dict] = {}
         self._label_ok: dict[str, np.ndarray] = {}
-
-    # ---- store-level cores (built once) --------------------------------
-    def _core(self) -> dict:
-        if self._walk_core is not None:
-            return self._walk_core
-        s = self.store
-        n = s.n_nodes
-        fcounts = np.diff(s.f2p_offsets)
-        pcounts = np.diff(s.p2f_offsets)
-        counts = fcounts + pcounts
-        offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
-        total = int(offsets[-1])
-        flat = np.empty(total, dtype=np.int32)
-        edge_ts = np.empty(total, dtype=np.float64)
-        # f2p block per node (parents always admitted)
-        child_of_edge = np.repeat(np.arange(n), fcounts)
-        within = np.arange(len(s.f2p_parent)) - np.repeat(
-            s.f2p_offsets[:-1], fcounts)
-        dest = offsets[child_of_edge] + within
-        flat[dest] = s.f2p_parent
-        edge_ts[dest] = -np.inf
-        # p2f block per node (children admitted by timestamp)
-        parent_of_edge = np.repeat(np.arange(n), pcounts)
-        within = np.arange(len(s.p2f_child)) - np.repeat(
-            s.p2f_offsets[:-1], pcounts)
-        dest = offsets[parent_of_edge] + fcounts[parent_of_edge] + within
-        flat[dest] = s.p2f_child
-        child_ts = s.node_ts[s.p2f_child]
-        edge_ts[dest] = np.where(np.isnan(child_ts), -np.inf, child_ts)
-        self._walk_core = {"offsets": offsets, "flat": flat,
-                          "edge_ts": edge_ts, "n_parents": fcounts}
-        return self._walk_core
 
     def _labels_ok(self, task_spec: TaskSpec) -> np.ndarray:
         got = self._label_ok.get(task_spec.table_name)
@@ -521,28 +487,6 @@ class ColumnarTraversal:
                     else ents[pos], float(t.ts[pos]))] = base + pos
         self._focal_lookup[task_spec.table_name] = lookup
         return lookup
-
-    def _overlay_for(self, task_spec: TaskSpec, cutoff_f: float) -> dict:
-        cached = self._overlay
-        if (cached is not None and cached["cutoff"] == cutoff_f
-                and cached["table"] == task_spec.table_name):
-            return cached
-        core = self._core()
-        mask = core["edge_ts"] <= cutoff_f
-        kept = np.concatenate(([0], np.cumsum(mask, dtype=np.int64)))
-        offsets = kept[core["offsets"]].astype(np.int32)
-        neighbors = np.ascontiguousarray(core["flat"][mask])
-        s = self.store
-        eligible = (self._labels_ok(task_spec)
-                    & (np.isnan(s.node_ts) | (s.node_ts <= cutoff_f)))
-        self._overlay = {
-            "cutoff": cutoff_f, "table": task_spec.table_name,
-            "offsets": offsets, "neighbors": neighbors,
-            "eligible": eligible.astype(np.uint8),
-        }
-        return self._overlay
-
-    # ---- engine contract ------------------------------------------------
     def cohort_targets(self, entity_table, entity_ids, anchor, task_spec,
                        *, history: int):
         s = self.store
