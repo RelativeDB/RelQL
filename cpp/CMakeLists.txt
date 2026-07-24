@@ -111,12 +111,17 @@ target_link_libraries(relql PUBLIC rt_flags)
 
 # Shared CSC adjacency (time-bounded "latest <= anchor" children query).
 add_library(csc STATIC src/csc.cpp)
+
+# Array-backed context assembly: returns the ordered node ids a
+# context emits, so a binding materializes only those rows.
+add_library(relgraph STATIC src/graph.cpp)
+target_include_directories(relgraph PUBLIC src)
 target_include_directories(csc PUBLIC src)
 target_link_libraries(csc PUBLIC rt_flags)
 
 add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
                         src/schema.cpp src/analyze.cpp src/plan.cpp src/json.cpp
-                        src/csc_c.cpp src/csc.cpp)
+                        src/csc_c.cpp src/csc.cpp src/graph.cpp)
 target_link_libraries(rt_c PRIVATE rt)
 target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)
@@ -145,6 +150,9 @@ target_link_libraries(analyze_test relql)
 
 # csc_c.cpp is compiled in directly (rather than linking rt_c) so the test
 # exercises the C ABI without dragging in the whole engine shared library.
+add_executable(graph_test src/test_graph.cpp)
+target_link_libraries(graph_test relgraph)
+
 add_executable(csc_test src/test_csc.cpp src/csc_c.cpp)
 target_link_libraries(csc_test csc)
 
@@ -157,6 +165,7 @@ if(BUILD_TESTING)
   # Self-contained: randomized CSC adjacency batteries with fixed seeds.
   add_test(NAME csc COMMAND csc_test)
   add_test(NAME analyze COMMAND analyze_test)
+  add_test(NAME graph COMMAND graph_test)
 
   # Needs the RelQL corpus, which lives in the python package. Pass it as an
   # absolute path so the test is independent of the working directory.
