@@ -173,10 +173,21 @@ class _Table:
         # the time column is also a declared feature (mirrors the default
         # row cell accounting).
         counts = np.zeros(self.n, dtype=np.int32)
+        # The per-column non-null masks are KEPT, not just summed away.
+        # Materializing a row asked `_is_missing` about every cell, one Python
+        # call per column per row, when the same answer is already computed
+        # here once per column for the whole table. `cells_of` is the pulled
+        # apart form row() iterates: (name, values, present) with the columns
+        # the frame does not carry already dropped.
+        self.cells_of: list = []
         for col in feature_cols:
             if col in self.cols:
-                counts += _notna_mask(self.cols[col]).astype(np.int32)
+                mask = _notna_mask(self.cols[col])
+                counts += mask.astype(np.int32)
+                self.cells_of.append((col, self.cols[col], mask))
         self.cell_counts = counts
+        self.fk_items: list = [(fk, parent) for fk, parent in fk_cols.items()
+                               if fk in self.cols]
 
     @property
     def id_pos(self) -> dict:
@@ -382,24 +393,22 @@ class ColumnarStore:
         # pandas Series for every materialized row -- on the one path this
         # module exists to make cheap.
         cells = {}
-        for col in table.feature_cols:
-            if col not in table.cols:
-                continue
-            v = table.cols[col][pos]
-            if _is_missing(v):
-                continue
-            cells[col] = _scalar(v)
+        for col, values, present in table.cells_of:
+            # `present` is the column's non-null mask, computed once for the
+            # table; asking `_is_missing` per cell here was the same question
+            # answered a few hundred thousand times over.
+            if present[pos]:
+                cells[col] = _scalar(values[pos])
         ts = None
-        if not math.isnan(self.node_ts[node]):
-            ts = datetime.fromtimestamp(float(self.node_ts[node]),
-                                        timezone.utc)
+        stamp = self.node_ts[node]
+        if not math.isnan(stamp):
+            ts = datetime.fromtimestamp(float(stamp), timezone.utc)
         parents = {}
-        for fk, parent_name in table.fk_cols.items():
-            if fk not in table.cols:
-                continue
+        entity = name not in self.tables
+        for fk, parent_name in table.fk_items:
             v = table.cols[fk][pos]
             if not _is_missing(v):
-                parents[fk if name in self.tables else "__entity__"] = _scalar(v)
+                parents["__entity__" if entity else fk] = _scalar(v)
         rid = _scalar(table.ids[pos])
         row = Row(name, rid, cells, ts, parents)
         self._row_cache[node] = row
@@ -469,6 +478,8 @@ class ColumnarTraversal:
         self.task_spec_factory = task_spec_factory or TaskSpec.from_query
         self._focal_lookup: dict[str, dict] = {}
         self._label_ok: dict[str, np.ndarray] = {}
+        self._eligible_key: Optional[tuple] = None
+        self._eligible: Optional[np.ndarray] = None
 
     def _labels_ok(self, task_spec: TaskSpec) -> np.ndarray:
         got = self._label_ok.get(task_spec.table_name)
@@ -505,6 +516,7 @@ class ColumnarTraversal:
         anchor_f = (anchor.timestamp() if anchor is not None else math.nan)
         targets, inject, extra = [], [], {}
         labels_ok = self._labels_ok(task_spec)
+        task_idx = s.order.index(task_spec.table_name)
         for eid in entity_ids:
             node = lookup.get((eid, anchor_f))
             if node is None:
@@ -518,11 +530,16 @@ class ColumnarTraversal:
                 erow = s.row(enode)
                 inject.append(erow)
                 extra[erow.key] = int(enode)
-                hist_nodes = [int(c) for c in s.children(enode)
-                              if s.table_of(int(c)) == task_spec.table_name
-                              and labels_ok[int(c)]
-                              and s.node_ts[int(c)] < anchor_f]
-                hist_nodes.sort(key=lambda c: -s.node_ts[c])
+                # Same three filters and the same recency order as the row
+                # loop this replaces, done over the arrays: an entity with
+                # many task rows was paying a numpy scalar box per child, per
+                # cohort member, and a cohort here runs to tens of thousands.
+                kids = s.children(enode)
+                keep = ((s.node_table_idx[kids] == task_idx)
+                        & labels_ok[kids] & (s.node_ts[kids] < anchor_f))
+                kids = kids[keep]
+                order = np.argsort(-s.node_ts[kids], kind="stable")
+                hist_nodes = kids[order].tolist()
                 for c in hist_nodes[:history]:
                     hrow = s.row(c)
                     inject.append(hrow)
@@ -548,29 +565,56 @@ class ColumnarTraversal:
         anchor_f = anchor.timestamp() if anchor is not None else math.nan
         target = self._focal(task_spec).get((entity_id, anchor_f))
         if target is None:
+            # An empty context is not a neutral answer: the entity gets scored
+            # as though it had no history. That is a wiring or anchor mismatch,
+            # so make it visible rather than quietly returning nothing.
+            from .engine import _fallback
+            _fallback(f"no task row for entity {entity_id!r} at anchor "
+                      f"{anchor_f}; returning an EMPTY context, which scores "
+                      f"the entity as having no history")
             return TraversalResult()
         cutoff_f = float(s.node_ts[target])
         if math.isnan(cutoff_f):
             cutoff_f = math.inf
 
-        eligible = (self._labels_ok(task_spec)
-                    & (np.isnan(s.node_ts) | (s.node_ts <= cutoff_f)))
-        eligible = eligible.astype(np.uint8)
+        # The walk mask depends only on the task table and the cut-off, and a
+        # cohort scored at one anchor shares both -- rebuilding it per target
+        # was five passes over every node in the database for each context.
+        # Only the target's own bit differs, so it is punched out and put
+        # back around the call.
+        key = (task_spec.table_name, cutoff_f)
+        if self._eligible_key != key:
+            self._eligible = (self._labels_ok(task_spec)
+                              & (np.isnan(s.node_ts) | (s.node_ts <= cutoff_f))
+                              ).astype(np.uint8)
+            self._eligible_key = key
+        eligible = self._eligible
+        was = eligible[target]
         eligible[target] = 0
 
         # The fallback stage pads a short context from the task table, so the
         # native side needs that table's contiguous node range.
         t = s._table(task_spec.table_name)
-        nodes, focal_flags = s.native_graph().assemble(
-            int(target), cutoff_f, eligible, policy,
-            fallback_base=s.base[task_spec.table_name], fallback_n=t.n,
-            max_nodes=max(policy.max_context_cells, 1024))
+        try:
+            nodes, focal_flags = s.native_graph().assemble(
+                int(target), cutoff_f, eligible, policy,
+                fallback_base=s.base[task_spec.table_name], fallback_n=t.n,
+                # NOT max_context_cells: emitted ROWS are not bounded by the
+                # CELL budget -- a row whose columns are all null costs zero
+                # cells and still takes a slot -- so sizing the buffer from
+                # the budget silently dropped the tail of every context that
+                # ran long (measured: 8.6k-21.4k rows at an 8192 budget).
+                # Real slack, and the native side now errors rather than
+                # truncating if it ever binds.
+                max_nodes=int(min(s.n_nodes, 1 << 21)))
+        finally:
+            eligible[target] = was
 
         rows: list[Row] = []
         node_ids: list[tuple[tuple[str, Any], int]] = []
         focal_keys = set()
-        for node, is_focal in zip(nodes, focal_flags):
-            node = int(node)
+        # tolist() once beats a numpy scalar box per emitted node.
+        for node, is_focal in zip(nodes.tolist(), focal_flags.tolist()):
             row = s.row(node)
             if node == target:
                 cells_masked = dict(row.cells)
@@ -582,7 +626,7 @@ class ColumnarTraversal:
             if is_focal:
                 focal_keys.add(row.key)
         focal_keys = frozenset(focal_keys)
-        full = len(rows) > 0 and sum(
-            int(s.node_cells[int(n)]) for n in nodes) >= policy.max_context_cells
+        full = len(rows) > 0 and int(
+            s.node_cells[nodes].sum()) >= policy.max_context_cells
         return TraversalResult(tuple(rows), focal_keys, 0, full,
                                tuple(node_ids))

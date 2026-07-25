@@ -297,6 +297,38 @@ def _lib_filename() -> str:
     return "librt_c.so"
 
 
+def _warn_if_stale_bundled(chosen, candidates) -> None:
+    """A bundled library that shadows a fresher monorepo build is silent poison.
+
+    The in-package copy exists so a wheel carries its engine, and it is
+    searched first for that reason. In a monorepo checkout that ordering means
+    a stale artifact wins over cpp/build -- so a whole session of C++ work can
+    be rebuilt, tested and benchmarked while none of it is ever loaded. That
+    happened: every C++ change on 2026-07-24 was invisible to the benchmarks
+    because a dylib built at 12:10 shadowed one built at 17:21.
+    """
+    import warnings
+    from pathlib import Path as _P
+    try:
+        picked = _P(chosen)
+        if "cpp/build" in str(picked):
+            return                                # already the build tree
+        for cand in candidates:
+            cand = _P(cand)
+            if "cpp/build" not in str(cand) or not cand.exists():
+                continue
+            if cand.stat().st_mtime > picked.stat().st_mtime:
+                warnings.warn(
+                    f"loaded the bundled {picked.name} ({picked}) but {cand} "
+                    f"is NEWER: the bundled copy shadows it, so a fresh C++ "
+                    f"build is not what is running. Delete the bundled copy, "
+                    f"or set RELATIVEDB_RT_LIB to the build you mean.",
+                    RuntimeWarning, stacklevel=3)
+                return
+    except OSError:
+        return
+
+
 def _candidate_paths() -> list[str]:
     cands = []
     env = os.environ.get("RELATIVEDB_RT_LIB")
@@ -917,6 +949,7 @@ def load_lib(path: Optional[str] = None) -> RtLib:
                 f"found {cand} but could not bind the rt_c ABI: {e}") from e
         if path is None:
             _cached_lib = lib
+        _warn_if_stale_bundled(cand, candidates)
         return lib
     raise RtNativeUnavailableError(
         "librt_c was not found (build cpp/ with cmake, or set RELATIVEDB_RT_LIB "

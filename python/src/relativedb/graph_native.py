@@ -55,6 +55,37 @@ _lib: Optional[ctypes.CDLL] = None
 _load_failed: Optional[str] = None
 
 
+def _warn_if_stale_bundled(chosen, candidates) -> None:
+    """A bundled library that shadows a fresher monorepo build is silent poison.
+
+    The in-package copy exists so a wheel carries its engine, and it is
+    searched first for that reason. In a monorepo checkout that ordering means
+    a stale artifact wins over `cpp/build`, so a whole session of C++ work can
+    be rebuilt, tested and benchmarked while none of it is actually loaded --
+    which is exactly what happened on 2026-07-24. Say so rather than let a
+    build silently not take effect.
+    """
+    import warnings
+    try:
+        chosen = Path(chosen)
+        if "cpp/build" in str(chosen):
+            return                       # already using the build tree
+        for cand in candidates:
+            cand = Path(cand)
+            if "cpp/build" not in str(cand) or not cand.exists():
+                continue
+            if cand.stat().st_mtime > chosen.stat().st_mtime:
+                warnings.warn(
+                    f"loaded the bundled {chosen.name} ({chosen}) but "
+                    f"{cand} is NEWER -- the bundled copy shadows it, so a "
+                    f"fresh C++ build is not being used. Delete the bundled "
+                    f"copy or set RELATIVEDB_RT_LIB to the build you mean.",
+                    RuntimeWarning, stacklevel=3)
+                return
+    except OSError:
+        return
+
+
 def _load() -> Optional[ctypes.CDLL]:
     global _lib, _load_failed
     if _lib is not None or _load_failed is not None:
@@ -90,6 +121,7 @@ def _load() -> Optional[ctypes.CDLL]:
                     ctypes.c_int64, i64p, u8p, ctypes.c_int32,
                     ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p,
                     ctypes.c_size_t]
+                _warn_if_stale_bundled(p, _candidate_paths())
                 _lib = lib
                 return _lib
             except (OSError, AttributeError) as e:
