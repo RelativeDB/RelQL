@@ -48,7 +48,9 @@ int rel_graph_adjacency(const rel_graph*, int want_children,
  * target's neighbourhood alone. `cutoff_ts` bounds which rows are visible.
  * Writes emitted ids into out_nodes and a 1/0 focal flag into out_focal, both
  * caller-allocated with room for max_nodes, and sets *out_count. Returns 0 on
- * success. */
+ * success. A context larger than max_nodes is an ERROR, not a truncation: the
+ * emitted row count is not bounded by max_context_cells, since a row whose
+ * columns are all null costs no cells and still takes a slot. */
 int rel_graph_assemble(const rel_graph*, int64_t target, double cutoff_ts,
                        const uint8_t* eligible, int32_t max_context_cells,
                        int32_t local_context_cells, int32_t bfs_width,

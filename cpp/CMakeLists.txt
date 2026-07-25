@@ -200,4 +200,20 @@ if(BUILD_TESTING)
   if(NOT RT_TEST_CHECKPOINT OR NOT EXISTS "${RT_TESTDATA_DIR}/node_idxs.bin")
     set_tests_properties(rt_golden PROPERTIES DISABLED TRUE)
   endif()
+
+  # Same gate on the long-context golden (B=2, S=70). The batch above is B=5
+  # S=16, which is below the sequence length where crowded attention groups
+  # start to exist at all -- a grouping or masking defect that only bites past
+  # S~36 passes it green. --tol 6 because the stored reference is the PyTorch
+  # model in fp32, whose own drift at S=70 is ~4x its drift at S=16.
+  add_test(NAME rt_golden_large
+           COMMAND rt_test "${RT_TESTDATA_DIR}/large" "${RT_TEST_CHECKPOINT}"
+                   --seq 70 --tol 6)
+  set_tests_properties(rt_golden_large PROPERTIES
+                       LABELS "integration"
+                       TIMEOUT 900
+                       WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  if(NOT RT_TEST_CHECKPOINT OR NOT EXISTS "${RT_TESTDATA_DIR}/large/node_idxs.bin")
+    set_tests_properties(rt_golden_large PROPERTIES DISABLED TRUE)
+  endif()
 endif()

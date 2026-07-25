@@ -172,5 +172,5 @@ def test_context_truncation_is_an_error():
         prefer_latest = True
 
     # A buffer far smaller than the context must raise, not truncate.
-    with pytest.raises(ContextTruncated, match="filled the emitted-node buffer"):
+    with pytest.raises(ContextTruncated, match="max_nodes|emitted-node buffer"):
         g.assemble(0, float("inf"), None, _P(), max_nodes=4)

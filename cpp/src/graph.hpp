@@ -67,8 +67,10 @@ class Graph {
   // the walk may land on (length n_nodes, 1 = eligible); `cutoff_ts` bounds
   // which rows are visible. Writes emitted node ids in order into `out_nodes`
   // (caller-allocated, length >= max_nodes) and a 1/0 focal flag per emitted
-  // node into `out_focal`. Returns how many were written, or -1 if the target
-  // is out of range.
+  // node into `out_focal`. Returns how many were written, -1 if the target is
+  // out of range, or -2 if `max_nodes` is smaller than the context. The node
+  // count is NOT bounded by max_context_cells -- an all-null row costs zero
+  // cells and still occupies a slot -- so size this with real slack.
   // `fallback_base`/`fallback_n` name the task table's contiguous node range.
   // When the target and its walk tier leave the context short of the budget,
   // rows are sampled from that range to pad it -- the stage the reference
@@ -80,6 +82,10 @@ class Graph {
                         std::int32_t max_nodes) const;
 
  private:
+  // Identifies this graph to the per-thread walk caches in assemble(). A raw
+  // `this` would alias: free one graph, build another at the same address and
+  // a stale cache looks live.
+  std::uint64_t id_;
   std::int64_t n_nodes_;
   std::vector<double> ts_;
   std::vector<std::int32_t> cells_;

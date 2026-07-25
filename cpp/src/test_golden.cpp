@@ -56,11 +56,15 @@ int main(int argc, char** argv) {
   // artifacts + less bandwidth; thresholds scale accordingly. Measured
   // drift: f16/q8 ~10-20x fp32 (--quantized = 30x), q4 ~50x (use --tol 100).
   float tol = 1.0f;
+  // Sequence length of the dumped batch. cpp/testdata is S=16; cpp/testdata/large
+  // is S=70, long enough for crowded attention groups to exist at all.
+  int seq = 16;
   rt::ForwardOpts opts;
   for (int i = 3; i < argc; i++) {
     if (std::string(argv[i]) == "--quantized") tol = 30.0f;
     if (i + 1 >= argc) break;
     if (std::string(argv[i]) == "--tol") tol = (float)atof(argv[i + 1]);
+    if (std::string(argv[i]) == "--seq") seq = atoi(argv[i + 1]);
     if (std::string(argv[i]) == "--bench") bench = atoi(argv[i + 1]);
     if (std::string(argv[i]) == "--device") {
       std::string d = argv[i + 1];
@@ -76,10 +80,11 @@ int main(int argc, char** argv) {
   printf("device: %s\n", rt::device_name(opts.device));
   opts.want_target_features = opts.device != rt::Device::CUDA;
 
-  // Shapes for the demo batch are fixed by the dump (B=5, S=16).
+  // Shapes for the demo batch are fixed by the dump; B falls out of the file
+  // size once S is known (S=16 by default, --seq for the long-context dump).
   rt::Batch b;
   b.node_idxs = read_bin<int64_t>(dir + "/node_idxs.bin");
-  b.S = 16;
+  b.S = seq;
   b.B = static_cast<int>(b.node_idxs.size()) / b.S;
   size_t BS = b.node_idxs.size();
   b.f2p = read_bin<int64_t>(dir + "/f2p_nbr_idxs.bin", BS * rt::kMaxF2p);
@@ -125,6 +130,15 @@ int main(int argc, char** argv) {
   double feature_head_max = 0.0;
   if (opts.want_target_features) {
     for (int bb = 0; bb < b.B; bb++) {
+      // target_features holds ONE vector per batch row, so this identity only
+      // means anything on rows with exactly one masked target. The long-context
+      // golden carries several targets per row (shared-context multi-target
+      // scoring), where each target has its own features and no single vector
+      // can reproduce them all; skip those rows rather than assert a falsehood.
+      int n_targets = 0;
+      for (int s = 0; s < b.S; s++)
+        n_targets += out.sorted_is_target[(size_t)bb * b.S + s] ? 1 : 0;
+      if (n_targets != 1) continue;
       float score = model.dec_number.b[0];
       for (int d = 0; d < rt::kDModel; d++)
         score += out.target_features[(size_t)bb * rt::kDModel + d] *

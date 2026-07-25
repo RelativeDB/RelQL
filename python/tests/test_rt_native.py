@@ -27,17 +27,29 @@ GOLDEN_SCORES = {
     "regression": [-0.27052, -0.41538, +0.39998, -0.30649, +0.26804],
 }
 
+# Second golden, cpp/testdata/large (B=2, S=70). The B=5 S=16 batch above is
+# structurally blind to long-context defects: at S=16 every attention group is
+# a singleton or near it, and the node ids are 0..N. The large batch clears the
+# S=36 regime, carries 35 multi-token same-node (feat) groups and 8 multi-token
+# column groups, and uses node ids around 4.49e7 -- past 2**24, where distinct
+# integers stop being representable in float32. See cpp/tools/dump_golden.py.
+LARGE_GOLDEN_SCORES = {
+    "classification": [+0.46119, +1.27047],
+}
+
 # Backwards-compatible aliases; both route through conftest so that
 # RELATIVEDB_REQUIRE_NATIVE=1 turns a missing prerequisite into a failure.
 _lib_or_skip = require_native
 _checkpoint_or_skip = require_checkpoint
 
 
-def _load_golden_batch():
-    if not os.path.isfile(os.path.join(TESTDATA, "manifest.json")):
+def _load_golden_batch(subdir=""):
+    root = os.path.join(TESTDATA, subdir) if subdir else TESTDATA
+    if not os.path.isfile(os.path.join(root, "manifest.json")):
         # Checked into the repo alongside cpp/; absence means a broken checkout.
-        _unavailable("golden testdata (cpp/testdata)", f"not found at {TESTDATA}")
-    man = json.load(open(os.path.join(TESTDATA, "manifest.json")))
+        _unavailable(f"golden testdata (cpp/testdata/{subdir})",
+                     f"not found at {root}")
+    man = json.load(open(os.path.join(root, "manifest.json")))
 
     # The manifest alone is not enough: cpp/.gitignore used to exclude
     # testdata/*.bin, so a clone got the manifest and none of the arrays. That
@@ -50,17 +62,17 @@ def _load_golden_batch():
     arrays = [n for n, m in man.items()
               if not n.startswith("_") and isinstance(m, dict)]
     missing = [n for n in arrays
-               if not os.path.isfile(os.path.join(TESTDATA, f"{n}.bin"))]
+               if not os.path.isfile(os.path.join(root, f"{n}.bin"))]
     if missing:
         _unavailable(
-            "golden testdata arrays (cpp/testdata/*.bin)",
-            f"{len(missing)} of {len(arrays)} missing under {TESTDATA} "
+            f"golden testdata arrays (cpp/testdata/{subdir}/*.bin)",
+            f"{len(missing)} of {len(arrays)} missing under {root} "
             f"(e.g. {', '.join(sorted(missing)[:3])}); regenerate with "
             f"cpp/tools/dump_golden.py")
 
     def arr(name):
         m = man[name]
-        return np.fromfile(os.path.join(TESTDATA, f"{name}.bin"),
+        return np.fromfile(os.path.join(root, f"{name}.bin"),
                            dtype=m["dtype"]).reshape(m["shape"])
 
     return dict(
@@ -70,6 +82,19 @@ def _load_golden_batch():
         is_target=arr("is_targets"), number_v=arr("number_values"),
         datetime_v=arr("datetime_values"), boolean_v=arr("boolean_values"),
         text_v=arr("text_values"), col_name_v=arr("col_name_values"))
+
+
+def _load_golden_reference(subdir=""):
+    """PyTorch yhat_number (POST-sort) and the sort permutation that yields it."""
+    root = os.path.join(TESTDATA, subdir) if subdir else TESTDATA
+    man = json.load(open(os.path.join(root, "manifest.json")))
+
+    def arr(name):
+        m = man[name]
+        return np.fromfile(os.path.join(root, f"{name}.bin"),
+                           dtype=m["dtype"]).reshape(m["shape"])
+
+    return arr("yhat_number"), arr("sort_idxs")
 
 
 @pytest.mark.integration
@@ -87,6 +112,110 @@ def test_golden_scores_through_ctypes(variant):
     assert scores.shape == (5,)
     for got, want in zip(scores, GOLDEN_SCORES[variant]):
         assert abs(float(got) - want) < 2e-3, (variant, scores)
+
+
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
+@pytest.mark.parametrize("variant", sorted(LARGE_GOLDEN_SCORES))
+def test_large_golden_scores_through_ctypes(variant):
+    """Long-context golden (B=2, S=70) -> rt_forward -> scores match PyTorch.
+
+    The B=5 S=16 gate above sits underneath a whole class of defect: it has no
+    long sequences, no crowded attention groups and no node ids above 2**24.
+    This case covers that regime, so a grouping or masking regression that only
+    shows up past S~36 cannot pass the suite green.
+    """
+    lib = _lib_or_skip()
+    path = _checkpoint_or_skip(variant)
+    batch = _load_golden_batch("large")
+    assert batch["node_idxs"].shape[1] >= 64
+    model = lib.load_model(path)
+
+    # Per-token check first: it localizes a regression to a token instead of
+    # letting sign-cancellation hide inside a summed score.
+    #
+    # Tolerances are looser than the S=16 gate's 2e-3, and the reason is the
+    # golden, not the native code. The stored yhat_number is the PyTorch model
+    # in fp32; measured against an fp64 recomputation of this same batch, the
+    # native forward is accurate to 8e-6 per token while the stored fp32
+    # reference is off by 3.8e-3. 6e-3 covers the reference's own noise at
+    # S=70 and still leaves ~25x headroom over the grouping defect this batch
+    # exists to catch, which moved tokens by 1.5e-1 at block 0 alone.
+    tokens = model.forward_tokens(**batch)          # pre-sort order
+    reference, sort_idxs = _load_golden_reference("large")
+    got = np.take_along_axis(tokens, sort_idxs, axis=1)    # -> post-sort order
+    keep = np.take_along_axis(batch["is_padding"], sort_idxs, axis=1) == 0
+    assert np.abs(got - reference)[keep].max() < 6e-3, (
+        variant, np.abs(got - reference)[keep].max())
+
+    # Each row carries six masked targets, so the summed score accumulates six
+    # tokens' worth of that same reference drift.
+    scores = model.forward(**batch)
+    assert scores.shape == (2,)
+    for value, expected in zip(scores, LARGE_GOLDEN_SCORES[variant]):
+        assert abs(float(value) - expected) < 1e-2, (variant, scores)
+
+
+def test_large_golden_exercises_crowded_groups_and_wide_node_ids():
+    """The large golden is only a real gate if it has the structure to be one.
+
+    Guards the batch itself, not the model: a regenerated golden whose groups
+    are all singletons, or whose node ids fit in float32, would be exactly as
+    blind as the S=16 set and would still pass every score assertion.
+    """
+    batch = _load_golden_batch("large")
+    keep = batch["is_padding"][0] == 0
+    node = batch["node_idxs"][0][keep]
+    coltab = [(int(c) << 32) ^ int(t) for c, t in
+              zip(batch["col_idxs"][0][keep], batch["table_idxs"][0][keep])]
+
+    _, node_counts = np.unique(node, return_counts=True)
+    _, col_counts = np.unique(coltab, return_counts=True)
+    assert batch["node_idxs"].shape[1] >= 64, "must clear the S~36 onset"
+    assert (node_counts > 1).sum() >= 5, "no multi-token feat groups"
+    assert (col_counts > 1).sum() >= 5, "no multi-token column groups"
+
+    # Node ids are global row ids in production, routinely past 2**24. Anything
+    # that round-trips them through float32 on the way to the native layer
+    # merges distinct nodes and silently fuses their attention groups; the
+    # golden has to contain ids that make that mistake observable.
+    assert int(node.max()) > 2 ** 24
+    assert len(np.unique(node.astype(np.float32))) < len(np.unique(node))
+
+
+def test_reference_adapter_preserves_wide_integer_ids():
+    """The eval adapter must hand the native layer exact int64 ids.
+
+    Regression test for the defect this golden was added alongside: the adapter
+    converted every batch tensor with ``.float()`` before casting to int64, so
+    node ids and FK parent ids above 2**24 collapsed onto shared float32 values.
+    Distinct rows became one node, their feat/nbr attention groups were merged,
+    and native diverged from the reference by ~5e-1 in logit space -- with every
+    C++ and Python test still green.
+    """
+    torch = pytest.importorskip("torch")
+    import importlib.util
+    path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "evaluation",
+        "run_native_on_reference.py"))
+    if not os.path.isfile(path):
+        pytest.skip("evaluation/run_native_on_reference.py not present")
+    spec = importlib.util.spec_from_file_location("_run_native_on_ref", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # Float32 spacing at 4.49e7 is 4, so all three ids below round to the same
+    # float and the old conversion returned them as one value.
+    ids = torch.tensor([[44903103, 44903104, 44903105, -1]], dtype=torch.int64)
+    got = module.NativeReferenceAdapter._np(ids, np.int64)
+    assert got.dtype == np.int64
+    np.testing.assert_array_equal(got, ids.numpy())
+    assert len(np.unique(got)) == 4, "distinct ids must survive the conversion"
+
+    values = torch.tensor([[1.5, -2.25]], dtype=torch.float32)
+    np.testing.assert_allclose(module.NativeReferenceAdapter._np(values),
+                               values.numpy())
 
 
 @pytest.mark.integration

@@ -31,7 +31,14 @@ class NativeReferenceAdapter:
 
     @staticmethod
     def _np(tensor, dtype=None):
-        array = tensor.detach().float().cpu().numpy()
+        # NB: never route through float32. node_idxs / f2p_nbr_idxs carry global
+        # row ids in the tens of millions, well past 2**24, so an f32 round-trip
+        # collapses distinct ids onto one value and silently merges the feat/nbr
+        # attention groups built from them.
+        tensor = tensor.detach().cpu()
+        if dtype is not None and np.issubdtype(dtype, np.integer):
+            return tensor.to(torch.int64).numpy().astype(dtype, copy=False)
+        array = tensor.float().numpy()
         return array.astype(dtype, copy=False) if dtype is not None else array
 
     def predict(self, batch, ctx_sizes, device, task, bool_as_num):

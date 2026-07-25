@@ -183,17 +183,27 @@ void test_out_of_range_target() {
      "a target past the end is rejected");
 }
 
-void test_output_is_capped_not_overrun() {
+void test_short_buffer_is_reported_not_truncated() {
+  // A buffer smaller than the context is an error, not a silent cut. Callers
+  // sized max_nodes from max_context_cells, which does not bound the emitted
+  // ROW count -- an all-null row costs zero cells and still takes a slot --
+  // and every context that ran long lost its tail without saying so.
   Fixture f;
   auto g = f.build();
   auto loose = policy();
   loose.max_context_cells = 4096;
   loose.local_context_cells = 4096;
-  std::vector<std::int64_t> nodes(5, -1);
-  std::vector<std::uint8_t> focal(5, 0);
-  const std::int32_t n =
-      g.assemble(0, 1e18, nullptr, loose, 0, 0, nodes.data(), focal.data(), 5);
-  ok(n >= 0 && n <= 5, "the emitted count respects the caller's buffer");
+  std::vector<std::int64_t> nodes(64, -1);
+  std::vector<std::uint8_t> focal(64, 0);
+  const std::int32_t full =
+      g.assemble(0, 1e18, nullptr, loose, 0, 0, nodes.data(), focal.data(), 64);
+  ok(full > 1, "the fixture emits more than one row");
+  ok(g.assemble(0, 1e18, nullptr, loose, 0, 0, nodes.data(), focal.data(),
+                full - 1) == -2,
+     "a buffer shorter than the context is reported");
+  ok(g.assemble(0, 1e18, nullptr, loose, 0, 0, nodes.data(), focal.data(),
+                full) == full,
+     "a buffer exactly the size of the context is enough");
 }
 
 void test_walk_tiering_engages() {
@@ -264,7 +274,7 @@ int main() {
   test_cutoff_excludes_the_future();
   test_fanout_cap_is_applied();
   test_out_of_range_target();
-  test_output_is_capped_not_overrun();
+  test_short_buffer_is_reported_not_truncated();
   test_walk_tiering_engages();
   test_prefer_latest_changes_tier_order();
   std::printf("PASS: %d/%d\n", checks - fails, checks);

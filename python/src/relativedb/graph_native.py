@@ -215,15 +215,22 @@ class NativeGraph:
             ctypes.c_int64(int(fallback_base)), ctypes.c_int64(int(fallback_n)),
             out, focal, max_nodes, ctypes.byref(count), err, _ERR)
         if rc != 0:
-            raise RuntimeError(
-                err.value.decode("utf-8", "replace") or "assemble failed")
+            msg = err.value.decode("utf-8", "replace") or "assemble failed"
+            # The native side detects the bound now and refuses rather than
+            # truncating. Keep the typed exception so callers can tell "your
+            # buffer was too small" from any other assemble failure.
+            if "max_nodes" in msg:
+                raise ContextTruncated(msg)
+            raise RuntimeError(msg)
         n = count.value
+        # Belt and braces: the native side refuses above, but a buffer filled
+        # exactly to the brim is indistinguishable from one that fit, and this
+        # class of bug is why the tail of a context went missing for a session.
         if n >= max_nodes:
             raise ContextTruncated(
                 f"context for node {target} filled the emitted-node buffer "
-                f"({n} of {max_nodes}); the rest of the context was dropped. "
-                f"Size max_nodes from the graph, not from max_context_cells: "
-                f"a zero-cell row still occupies a node slot.")
+                f"({n} of {max_nodes}); emitted rows are not bounded by "
+                f"max_context_cells, since an all-null row costs no cells.")
         return out[:n], focal[:n]
 
     def __del__(self) -> None:

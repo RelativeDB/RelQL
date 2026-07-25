@@ -100,6 +100,10 @@ int rel_graph_assemble(const rel_graph* handle, int64_t target, double cutoff_ts
     const int32_t n = handle->g.assemble(target, cutoff_ts, eligible, p,
                                          fallback_base, fallback_n, out_nodes,
                                          out_focal, max_nodes);
+    if (n == -2)
+      throw std::runtime_error(
+          "max_nodes is smaller than the assembled context; emitted rows are "
+          "not bounded by max_context_cells (an all-null row costs no cells)");
     if (n < 0) throw std::runtime_error("target node out of range");
     *out_count = n;
     return 0;

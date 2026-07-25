@@ -9,6 +9,7 @@
 #include "graph.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -21,6 +22,11 @@ namespace relgraph {
 namespace {
 
 constexpr std::uint64_t kU64 = ~0ULL;
+
+std::uint64_t next_graph_id() {
+  static std::atomic<std::uint64_t> counter{0};
+  return ++counter;
+}
 
 // rand::seq::index::sample for the u32-sized cases contexts use. Only the
 // in-place (partial Fisher-Yates) and Floyd branches are reachable at these
@@ -74,7 +80,8 @@ Graph::Graph(std::int64_t n_nodes, const double* node_ts,
              const std::int32_t* node_cells, const std::int32_t* node_table,
              const std::uint8_t* node_is_task, std::int64_t n_edges,
              const std::int64_t* edge_parent, const std::int64_t* edge_child)
-    : n_nodes_(n_nodes),
+    : id_(next_graph_id()),
+      n_nodes_(n_nodes),
       ts_(node_ts, node_ts + n_nodes),
       cells_(node_cells, node_cells + n_nodes),
       table_(node_table, node_table + n_nodes),
@@ -229,39 +236,76 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
   // recency when prefer_latest, with a per-node RNG draw breaking ties -- the
   // same three keys, in the same order, as the traversal this replaces.
   std::vector<std::int64_t> tier1;
-  std::unordered_set<std::int64_t> visits;
+  // The nodes the walk landed on, ascending. Only the fallback stage reads
+  // them, and it reads them as a membership test -- a sorted vector answers
+  // that without the hash set the tier used to be copied into.
+  std::vector<std::int64_t> visits;
   if (eligible) {
-    std::vector<std::int32_t> off(n_nodes_ + 1, 0);
-    std::vector<std::int32_t> flat;
-    flat.reserve(f2p_.size() + p2f_.size());
-    for (std::int64_t n = 0; n < n_nodes_; ++n) {
-      off[n] = (std::int32_t)flat.size();
-      for (std::int64_t i = f2p_off_[n]; i < f2p_off_[n + 1]; ++i)
-        flat.push_back((std::int32_t)f2p_[i]);           // parents: no bound
-      for (std::int64_t i = p2f_off_[n]; i < p2f_off_[n + 1]; ++i) {
-        const std::int64_t c = p2f_[i];
-        if (std::isnan(ts_[c]) || ts_[c] <= cutoff_ts)
-          flat.push_back((std::int32_t)c);
+    // The overlay the walk steps over is "parents of n, then the children of
+    // n the cut-off admits". It used to be MATERIALIZED here -- an offsets
+    // array plus a flattened neighbour list, O(nodes + edges) rebuilt for
+    // every context -- which on a large database cost more than the walk it
+    // fed. It does not have to exist: children of one parent are stored
+    // timeless-first then by ascending timestamp, so the ones a cut-off
+    // admits are exactly a PREFIX of that node's child range, and the prefix
+    // length is a binary search. Same neighbours, same order, same draws.
+    // Held per thread across calls, because a cohort scored at one anchor
+    // shares one cut-off: the prefix lengths are then computed once for the
+    // whole cohort instead of being searched for on every walk step of every
+    // context.
+    struct WalkOverlay {
+      std::uint64_t graph_id = 0;
+      double cutoff = 0.0;
+      bool valid = false;
+      std::vector<std::int32_t> admitted;
+    };
+    thread_local WalkOverlay overlay;
+    const bool same_cut = overlay.cutoff == cutoff_ts ||
+        (std::isnan(overlay.cutoff) && std::isnan(cutoff_ts));
+    if (!(overlay.valid && overlay.graph_id == id_ && same_cut)) {
+      overlay.admitted.resize(n_nodes_);
+      for (std::int64_t n = 0; n < n_nodes_; ++n) {
+        const auto lo = p2f_.begin() + p2f_off_[n];
+        const auto hi = p2f_.begin() + p2f_off_[n + 1];
+        overlay.admitted[n] = (std::int32_t)(
+            std::partition_point(lo, hi, [&](std::int64_t c) {
+              return std::isnan(ts_[c]) || ts_[c] <= cutoff_ts;
+            }) - lo);
       }
+      overlay.graph_id = id_;
+      overlay.cutoff = cutoff_ts;
+      overlay.valid = true;
     }
-    off[n_nodes_] = (std::int32_t)flat.size();
+    const std::int32_t* admitted = overlay.admitted.data();
 
-    std::vector<std::uint8_t> walk_eligible(eligible, eligible + n_nodes_);
-    walk_eligible[target] = 0;
-    std::vector<std::uint32_t> counts(n_nodes_, 0);
+    // Visit counts live in a buffer reused across calls and cleared only
+    // where the walk touched it: zeroing n_nodes words per context was the
+    // other O(nodes) term. `touched` is what makes that possible, and
+    // sorting it reproduces the ascending scan the dense pass did.
+    thread_local std::vector<std::uint32_t> counts;
+    if ((std::int64_t)counts.size() < n_nodes_) counts.assign(n_nodes_, 0);
+    std::vector<std::int64_t> touched;
     relrng::StdRng091 walk_rng(
         (step_seed + (std::uint64_t)target + 0xD0D0D0D0D0D0D0D0ULL) & kU64);
     for (std::int32_t w = 0; w < policy.num_walks; ++w) {
       std::int64_t current = target;
       for (std::int32_t step = 0; step < policy.walk_length; ++step) {
-        if (walk_eligible[current]) ++counts[current];
-        const std::int32_t begin = off[current], end = off[current + 1];
-        if (begin == end) break;
-        current = flat[begin + walk_rng.range((std::uint32_t)(end - begin))];
+        if (eligible[current] && current != target) {
+          if (!counts[current]) touched.push_back(current);
+          ++counts[current];
+        }
+        const std::int64_t n_par = f2p_off_[current + 1] - f2p_off_[current];
+        const std::int64_t n_kid = admitted[current];
+        const std::int64_t degree = n_par + n_kid;
+        if (degree == 0) break;
+        const std::int64_t r = (std::int64_t)walk_rng.range(
+            (std::uint32_t)degree);
+        current = r < n_par ? f2p_[f2p_off_[current] + r]
+                            : p2f_[p2f_off_[current] + (r - n_par)];
       }
     }
-    for (std::int64_t n = 0; n < n_nodes_; ++n)
-      if (counts[n]) { tier1.push_back(n); visits.insert(n); }
+    std::sort(touched.begin(), touched.end());
+    tier1 = touched;
     std::vector<std::uint64_t> tie(tier1.size());
     for (std::size_t i = 0; i < tier1.size(); ++i)
       tie[i] = relrng::StdRng091(
@@ -288,6 +332,8 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
     ranked.reserve(idx.size());
     for (std::size_t i : idx) ranked.push_back(tier1[i]);
     tier1.swap(ranked);
+    for (std::int64_t n : touched) counts[n] = 0;   // leave the buffer clean
+    visits.swap(touched);
   }
 
   extend(target, true);
@@ -306,15 +352,21 @@ std::int32_t Graph::assemble(std::int64_t target, double cutoff_ts,
     for (std::int32_t pos : sel) {
       if (full) break;
       const std::int64_t node = fallback_base + pos;
-      if (node == target || visits.count(node)) continue;
+      if (node == target ||
+          std::binary_search(visits.begin(), visits.end(), node)) continue;
       if (!(std::isnan(ts_[node]) || ts_[node] <= cutoff_ts)) continue;
       if (eligible && !eligible[node]) continue;
       extend(node, false);
     }
   }
 
-  const std::int32_t n =
-      (std::int32_t)std::min<std::size_t>(ordered.size(), (std::size_t)max_nodes);
+  // A short buffer is REPORTED, never quietly honoured. Emitted nodes are
+  // not bounded by the cell budget -- a row whose columns are all null costs
+  // zero cells and still takes a slot -- so a caller sizing `max_nodes` from
+  // max_context_cells undercounts, and truncating here would drop the tail of
+  // a context with nothing to show for it.
+  if ((std::size_t)max_nodes < ordered.size()) return -2;
+  const std::int32_t n = (std::int32_t)ordered.size();
   for (std::int32_t i = 0; i < n; ++i) {
     out_nodes[i] = ordered[i];
     out_focal[i] = focal.count(ordered[i]) ? 1 : 0;
