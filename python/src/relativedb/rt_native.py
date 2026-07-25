@@ -1025,8 +1025,19 @@ class TextEmbedder:
                     "RtNativeBackend needs sentence-transformers for the "
                     f"pinned {self.model_name} text encoder: "
                     "pip install sentence-transformers") from e
+            # Device is configurable, as it is in the reference
+            # (rt/embed.py takes it as a parameter and the evaluator passes
+            # the run's device). CPU stays the default so nothing moves
+            # unless a caller asks: off CUDA the reference is fp32 too, so
+            # this is a kernel-ordering difference, not a dtype change -- but
+            # it is still a difference, and embeddings feed every prediction.
+            #
+            # It is worth asking for: text embedding is HALF the wall clock of
+            # a large task (measured: 361s of 719s on rel-trial/site-success),
+            # far more than context assembly or the model forward.
+            device = os.environ.get("RELATIVEDB_EMBED_DEVICE", "cpu")
             self._model = SentenceTransformer(
-                f"sentence-transformers/{self.model_name}", device="cpu")
+                f"sentence-transformers/{self.model_name}", device=device)
             # Left at the encoder's shipped 128 word-piece window ON PURPOSE.
             # RT-J is frozen and was trained on vectors this encoder produced
             # at that setting; raising it changes the embedding function out
