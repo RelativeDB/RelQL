@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <string>
 
 #include "graph.hpp"

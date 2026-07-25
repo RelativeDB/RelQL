@@ -274,6 +274,12 @@ FullCtx* make_full_ctx(Model& model) {
   c->queue = [c->dev newCommandQueue];
   NSError* err=nil; MTLCompileOptions* options=[MTLCompileOptions new];
   if (@available(macOS 15.0,*)) options.mathMode=MTLMathModeSafe;
+  // The backward kernels accumulate into device atomic_float, which the MSL
+  // spec only defines from 3.0. Left unset, languageVersion resolves to a
+  // default that tracks the SDK the caller was built against rather than the
+  // running OS, so a machine that fully supports float atomics can still
+  // compile this source as 2.x and reject the type outright. Pin it.
+  options.languageVersion=MTLLanguageVersion3_0;
   id<MTLLibrary> lib=[c->dev newLibraryWithSource:@(kFullTrainMsl) options:options error:&err];
   if(!lib) throw std::runtime_error(std::string("rt/full-train: shader compile: ")+
       (err?err.localizedDescription.UTF8String:"?"));
