@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rt_metal_opts.h"
 #include "rt_train.hpp"
 
 namespace rt {
@@ -169,7 +170,7 @@ TrainMetalCtx& train_ctx() {
     ctx.queue = [ctx.dev newCommandQueue];
     NSError* err = nil;
     MTLCompileOptions* opts = [MTLCompileOptions new];
-    if (@available(macOS 15.0, *)) opts.mathMode = MTLMathModeSafe;
+    detail::set_safe_math(opts);
     id<MTLLibrary> lib = [ctx.dev newLibraryWithSource:@(kTrainMsl)
                                                options:opts error:&err];
     if (!lib)

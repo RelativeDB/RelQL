@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rt_metal_opts.h"
 #include "rt_internal.hpp"
 #include "rt_train.hpp"
 
@@ -291,7 +292,7 @@ FullCtx* make_full_ctx(Model& model) {
   if (!c->dev) throw std::runtime_error("rt/full-train: no Metal device");
   c->queue = [c->dev newCommandQueue];
   NSError* err=nil; MTLCompileOptions* options=[MTLCompileOptions new];
-  if (@available(macOS 15.0,*)) options.mathMode=MTLMathModeSafe;
+  detail::set_safe_math(options);
   // The backward kernels accumulate into device atomic_float, which the MSL
   // spec only defines from 3.0. Left unset, languageVersion resolves to a
   // default that tracks the SDK the caller was built against rather than the

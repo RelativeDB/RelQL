@@ -27,8 +27,11 @@ API = "https://api.elections.kalshi.com/trade-api/v2"
 AGENT = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 
 
-def get(url: str, tries: int = 3):
+def get(url: str, tries: int = 5):
+    import time
     for attempt in range(tries):
+        if attempt:
+            time.sleep(0.6 * attempt)
         try:
             request = urllib.request.Request(url, headers=AGENT)
             with urllib.request.urlopen(request, timeout=25) as response:
@@ -58,21 +61,24 @@ def last_trade(ticker: str):
     return ticker, (None if yes is None else float(yes)), len(trades)
 
 
-def stooq(symbol: str):
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+def daily_closes(symbol: str, months: str = "6mo"):
+    """Daily settles from Yahoo's chart endpoint. Stooq now sits behind a
+    JavaScript proof-of-work wall, which a plain fetch cannot pass."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+           f"?range={months}&interval=1d")
+    payload = get(url)
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            text = response.read().decode()
-    except Exception as exc:
-        print(f"   ! {symbol}: {exc}")
+        result = payload["chart"]["result"][0]
+        stamps = result["timestamp"]
+        closes = result["indicators"]["quote"][0]["close"]
+    except (TypeError, KeyError, IndexError):
+        print(f"   ! {symbol}: no data")
         return {}
     out = {}
-    for row in csv.DictReader(io.StringIO(text)):
-        try:
-            out[dt.date.fromisoformat(row["Date"])] = float(row["Close"])
-        except (ValueError, KeyError, TypeError):
+    for stamp, close in zip(stamps, closes):
+        if close is None:
             continue
+        out[dt.datetime.fromtimestamp(stamp, dt.timezone.utc).date()] = close
     return out
 
 
@@ -80,7 +86,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=70)
     ap.add_argument("--today", default="2026-07-25")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=2)
     args = ap.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     today = dt.date.fromisoformat(args.today)
@@ -123,8 +129,8 @@ def main() -> None:
 
     print(">> wholesale (stooq)")
     wholesale = {}
-    for name, symbol in (("wti", "cl.f"), ("brent", "cb.f"), ("rbob", "rb.f")):
-        series = stooq(symbol)
+    for name, symbol in (("wti", "CL=F"), ("brent", "BZ=F"), ("rbob", "RB=F")):
+        series = daily_closes(symbol)
         print(f"   {name}: {len(series)} days"
               + (f", latest {max(series)} = {series[max(series)]}" if series else ""))
         for day, close in series.items():

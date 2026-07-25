@@ -38,6 +38,7 @@
 #include <tuple>
 #include <vector>
 
+#include "rt_metal_opts.h"
 #include "rt_internal.hpp"
 
 namespace rt {
@@ -619,14 +620,7 @@ MetalCtx* make_ctx(const Model& m) {
   NSError* err = nil;
   MTLCompileOptions* opts = [MTLCompileOptions new];
   // keep exp/rsqrt at fp32 precision
-  if (@available(macOS 15.0, *)) {
-    opts.mathMode = MTLMathModeSafe;
-  } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    opts.fastMathEnabled = NO;
-#pragma clang diagnostic pop
-  }
+  detail::set_safe_math(opts);
   id<MTLLibrary> lib =
       [ctx->dev newLibraryWithSource:@(kMsl) options:opts error:&err];
   if (!lib)
