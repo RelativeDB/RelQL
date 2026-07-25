@@ -501,9 +501,20 @@ class RtLib:
         lib.rt_model_finetune_reset_optimizer.argtypes = [ctypes.c_void_p]
         lib.rt_device_available.restype = ctypes.c_int
         lib.rt_device_available.argtypes = [ctypes.c_int32]
+        lib.rt_full_finetune_available.restype = ctypes.c_int
+        lib.rt_full_finetune_available.argtypes = []
 
     def device_available(self, device: int) -> bool:
         return bool(self._lib.rt_device_available(device))
+
+    def full_finetune_available(self) -> bool:
+        """Whether full-model fine-tuning can run on this machine's GPU.
+
+        Stricter than ``device_available(RT_DEVICE_MPS)``. Inference runs on a
+        paravirtualised GPU; the full-train kernels need the Metal 3 feature
+        set and would return NaN without it, so they refuse instead.
+        """
+        return bool(self._lib.rt_full_finetune_available())
 
     def load_model(self, safetensors_path: str) -> "RtModel":
         err = ctypes.create_string_buffer(512)

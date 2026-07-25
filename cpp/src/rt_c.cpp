@@ -68,6 +68,14 @@ int rt_device_available(int32_t device) {
   return rt::device_available(static_cast<rt::Device>(device)) ? 1 : 0;
 }
 
+int rt_full_finetune_available(void) {
+#ifdef RT_METAL
+  return rt::full_finetune_available() ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
 int rt_reference_walk_counts(int32_t node_count, const int32_t* offsets,
                              const int32_t* neighbors, int32_t target,
                              const uint8_t* eligible, uint64_t seed,

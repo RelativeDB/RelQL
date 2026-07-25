@@ -258,13 +258,31 @@ struct FullCtx {
   uint32_t accumulated_microbatches = 0;
 };
 
+// Metal returns nil when it cannot allocate. Binding nil to an encoder is not
+// an error, so an unchecked failure here does not crash -- it quietly leaves a
+// kernel reading and writing nothing, and the first symptom is a NaN loss many
+// calls later with no allocation anywhere in the traceback. A full-model
+// training context holds w+g+m+v for every parameter, so several live models
+// can exhaust a smaller device long before anything else complains.
+[[noreturn]] void alloc_failed(id<MTLDevice> d, size_t n) {
+  throw std::runtime_error(
+      "rt/full-train: Metal could not allocate "+std::to_string(n)+" bytes ("+
+      std::to_string(d.currentAllocatedSize)+" already allocated on "+
+      d.name.UTF8String+", recommended working set "+
+      std::to_string(d.recommendedMaxWorkingSetSize)+
+      " bytes). Fewer live models, or a smaller batch, will fit.");
+}
 id<MTLBuffer> buffer(id<MTLDevice> d, size_t n) {
-  return [d newBufferWithLength:std::max<size_t>(n, 4)
-                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> b=[d newBufferWithLength:std::max<size_t>(n, 4)
+                                 options:MTLResourceStorageModeShared];
+  if(!b)alloc_failed(d,n);
+  return b;
 }
 id<MTLBuffer> upload(id<MTLDevice> d, const void* p, size_t n) {
-  return [d newBufferWithBytes:p length:std::max<size_t>(n, 4)
-                        options:MTLResourceStorageModeShared];
+  id<MTLBuffer> b=[d newBufferWithBytes:p length:std::max<size_t>(n, 4)
+                                options:MTLResourceStorageModeShared];
+  if(!b)alloc_failed(d,n);
+  return b;
 }
 
 FullCtx* make_full_ctx(Model& model) {
@@ -503,7 +521,15 @@ float gradient_norm(FullCtx&c,float scale){
   id<MTLBuffer>sum=buffer(c.dev,4);zero(c,sum,1);
   for(auto&[_,p]:c.params)if(p.used){uint32_t n=p.n;kernel(c,"grad_square",p.n,[&](id<MTLComputeCommandEncoder>e){[e setBuffer:p.g offset:0 atIndex:0];[e setBuffer:sum offset:0 atIndex:1];[e setBytes:&n length:4 atIndex:2];});}
   flush(c);
-  return std::sqrt(std::max(0.f,*(float*)sum.contents))*scale;
+  // The clamp exists to absorb a tiny negative sum from float error. It must
+  // not absorb a NaN: std::max(0.f, NaN) returns 0.f -- (0 < NaN) is false --
+  // so a NaN gradient would report a norm of exactly zero, sail past the
+  // finite check, and get written into the weights by AdamW. The step that
+  // produced the NaN would look clean and the *next* one would fail, with
+  // nothing left pointing at the real culprit.
+  float total=*(float*)sum.contents;
+  if(!std::isfinite(total))return total;
+  return std::sqrt(std::max(0.f,total))*scale;
 }
 
 float update_parameters(FullCtx&c,const FullFineTuneOptions&o,uint32_t microbatches){
@@ -574,10 +600,59 @@ float model_loss_locked(FullCtx&c,Model&model,const Batch&batch){
   return *(float*)loss.contents;
 }
 
+// "non-finite loss or gradient" says a step failed without saying where, which
+// is the least useful thing to learn from a machine you cannot attach a
+// debugger to. Name the side that went bad, and if it is the gradients, the
+// parameters carrying the NaN -- the first few are enough to identify the
+// stage, since the backward pass runs in a known order.
+std::string describe_non_finite(FullCtx&c,float loss_value,float grad_norm){
+  std::string msg="non-finite ";
+  bool bad_loss=!std::isfinite(loss_value),bad_grad=!std::isfinite(grad_norm);
+  msg+=bad_loss&&bad_grad?"loss and gradient":bad_loss?"loss":"gradient";
+  msg+=" (loss="+std::to_string(loss_value)+", grad_norm="+std::to_string(grad_norm)+")";
+  if(!bad_grad)return msg;
+  std::vector<std::string>named;size_t n_bad=0,n_used=0;
+  for(auto&[key,p]:c.params){
+    if(!p.used)continue;
+    n_used++;
+    const float*g=(const float*)p.g.contents;bool ok=true;
+    for(uint64_t i=0;i<p.n;i++)if(!std::isfinite(g[i])){ok=false;break;}
+    if(ok)continue;
+    n_bad++;
+    if(named.size()<6)named.push_back(key);
+  }
+  msg+="; "+std::to_string(n_bad)+" of "+std::to_string(n_used)+
+       " used parameters have non-finite gradients";
+  if(!named.empty()){msg+=", including:";for(auto&k:named)msg+=" "+k;}
+  return msg;
+}
+
 } // namespace
+
+// A paravirtualised GPU -- what CI runners and VMs expose -- compiles these
+// kernels, allocates their buffers, reports every command buffer as completed,
+// and produces NaN. There is no error to catch anywhere in that sequence, so
+// the capability has to be asked about up front. Metal 3 is the honest
+// predicate: the backward pass accumulates into MSL 3.0 float atomics, and
+// every real GPU that can run this supports it while paravirtual does not.
+bool full_finetune_available(){
+  static bool ok=[]{
+    @autoreleasepool {
+      id<MTLDevice> d=MTLCreateSystemDefaultDevice();
+      return d!=nil&&[d supportsFamily:MTLGPUFamilyMetal3];
+    }
+  }();
+  return ok;
+}
 
 FullFineTuneStep fit_model_metal_step(Model& model,const Batch& batch,const FullFineTuneOptions& opts){
   @autoreleasepool {
+    if(!full_finetune_available())
+      throw std::runtime_error(
+        "rt/full-train: this Metal device does not support the Metal 3 feature "
+        "set that full-model fine-tuning requires. Inference and head fitting "
+        "still work; full fine-tuning does not, and would silently produce NaN "
+        "rather than fail. Paravirtualised GPUs (CI runners, VMs) land here.");
     if(batch.B<=0||batch.S<=0)throw std::runtime_error("full-model fine-tuning batch is empty");
     if(!(opts.learning_rate>0)||opts.weight_decay<0||opts.beta1<0||opts.beta1>=1||opts.beta2<0||opts.beta2>=1||!(opts.epsilon>0))
       throw std::runtime_error("invalid full-model fine-tuning options");
@@ -613,7 +688,7 @@ FullFineTuneStep fit_model_metal_step(Model& model,const Batch& batch,const Full
     uint32_t accumulated=c.accumulated_microbatches;
     if(updated){grad_norm=update_parameters(c,opts,c.accumulated_microbatches);sync_model(model,c);c.accumulated_microbatches=0;}
     float loss_value=*(float*)loss.contents;if(!std::isfinite(loss_value)||!std::isfinite(grad_norm))
-      throw std::runtime_error("rt/full-train: non-finite loss or gradient");
+      throw std::runtime_error("rt/full-train: "+describe_non_finite(c,loss_value,grad_norm));
     auto stop=std::chrono::steady_clock::now();return {loss_value,grad_norm,c.step,std::chrono::duration<double>(stop-start).count(),accumulated,updated};
   }
 }

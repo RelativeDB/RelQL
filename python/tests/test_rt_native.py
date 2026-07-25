@@ -227,6 +227,9 @@ def test_native_mps_full_model_step_and_checkpoint(tmp_path):
     from relativedb.rt_native import RT_DEVICE_MPS
     if not lib.device_available(RT_DEVICE_MPS):
         pytest.skip("full-model fine-tuning needs MPS")
+    if not lib.full_finetune_available():
+        pytest.skip("full-model fine-tuning needs a Metal 3 GPU; this device "
+                    "(paravirtualised GPUs on CI runners and VMs) is not one")
     model = lib.load_model(_checkpoint_or_skip("classification"))
     batch = _load_golden_batch()
     first = model.finetune_step(**batch, learning_rate=1e-6)
@@ -247,6 +250,9 @@ def test_native_mps_accumulation_resume_and_gradients(tmp_path):
     from relativedb.rt_native import RT_DEVICE_MPS
     if not lib.device_available(RT_DEVICE_MPS):
         pytest.skip("full-model fine-tuning needs MPS")
+    if not lib.full_finetune_available():
+        pytest.skip("full-model fine-tuning needs a Metal 3 GPU; this device "
+                    "(paravirtualised GPUs on CI runners and VMs) is not one")
     checkpoint = _checkpoint_or_skip("classification")
     batch = _load_golden_batch()
     one = {key: value[:1].copy() for key, value in batch.items()}

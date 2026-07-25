@@ -66,6 +66,13 @@ struct FullFineTuneStep {
   bool updated = false;
 };
 
+// Whether this machine's Metal device can actually run full-model fine-tuning,
+// which is a stricter question than "is there a Metal device". Inference runs
+// happily on a paravirtualised GPU; the full-train kernels need the Metal 3
+// feature set (they accumulate into MSL 3.0 float atomics) and return NaN
+// rather than an error on a device that lacks it.
+bool full_finetune_available();
+
 FullFineTuneStep fit_model_metal_step(Model& model, const Batch& batch,
                                       const FullFineTuneOptions& opts = {});
 void reset_model_metal_optimizer(Model& model);

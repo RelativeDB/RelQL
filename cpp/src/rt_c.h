@@ -56,6 +56,12 @@ int64_t rt_model_num_params(const rt_model*);
 /* 1 if the device can run rt_forward_device, else 0. */
 int rt_device_available(int32_t device);
 
+/* 1 if full-model fine-tuning (rt_finetune_step) can actually run here.
+ * Stricter than rt_device_available(RT_DEVICE_MPS): the full-train kernels
+ * need the Metal 3 feature set, which paravirtualised GPUs do not provide.
+ * Inference and head fitting are unaffected. */
+int rt_full_finetune_available(void);
+
 /* Reference graph-walk sampler primitive.  ``offsets``/``neighbors`` are a
  * CSR graph with deterministic neighbor order; ``eligible`` marks nodes whose
  * visits are counted. The RNG and integer range sampling match rand 0.9.1
