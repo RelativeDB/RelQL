@@ -9,27 +9,7 @@ the RelQL grammar may still change between minor versions.
 
 ## [Unreleased]
 
-### Added
-- Release engineering: a CI workflow that builds `cpp/` and runs `ctest` plus
-  both Python test tiers on Linux x86_64, Linux aarch64 and macOS arm64; a
-  wheels workflow producing manylinux_2_28 x86_64/aarch64 and macOS
-  universal2 distributions; a publish workflow gated behind a manual
-  `workflow_dispatch` and a reviewed GitHub environment.
-- Test tiers. `pytest -m "not integration"` runs offline with nothing built;
-  `pytest -m integration` needs `librt_c` and the RT-J checkpoint.
-  `RELATIVEDB_REQUIRE_NATIVE=1` turns a missing engine or an unresolvable
-  checkpoint into a failure instead of a skip, so a broken cache cannot make
-  CI green having tested nothing.
-- Coverage for both languages (`--cov=relativedb`, gcov/gcovr over `cpp/src`),
-  reported per flag.
-- `RELEASING.md`, `CONTRIBUTING.md`, this changelog, and issue/PR templates.
-
-### Removed
-- The DuckDB extension workflow. It built `crates/` and `duckdb-extension/`,
-  neither of which exists in this repository.
-- The Rust and Java jobs in the release workflow, for the same reason.
-
-## [0.2.0] — unreleased
+## [0.1.2] — 2026-07-25
 
 ### Added
 - **Shared-context scoring.** Cohort members that share an anchor time are
@@ -52,6 +32,16 @@ the RelQL grammar may still change between minor versions.
 - macOS wheels are `universal2` (arm64 + x86_64, deployment target 13.0), so
   one wheel serves both Mac architectures. The platform tag is derived from
   the built dylib's Mach-O headers and cannot drift from what was compiled.
+- Linux wheels: manylinux_2_28 x86_64 and aarch64, alongside a pure sdist that
+  resolves the engine at runtime.
+- Test tiers. `pytest -m "not integration"` runs offline with nothing built;
+  `pytest -m integration` needs `librt_c` and the RT-J checkpoint.
+  `RELATIVEDB_REQUIRE_NATIVE=1` turns a missing engine or an unresolvable
+  checkpoint into a failure instead of a skip, so a broken cache cannot make
+  CI green having tested nothing.
+- Coverage for both languages (`--cov=relativedb`, gcov/gcovr over `cpp/src`),
+  reported per flag.
+- `RELEASING.md`, `CONTRIBUTING.md`, this changelog, and issue/PR templates.
 
 ### Changed
 - Shared-context chunk size is derived from the measured cost of injecting a
@@ -69,6 +59,9 @@ the RelQL grammar may still change between minor versions.
 ### Removed
 - `HistoryBaselineBackend`. RT-J is the only scoring backend; a model-free
   baseline in the same interface invited accidental use in production.
+- The DuckDB extension workflow. It built `crates/` and `duckdb-extension/`,
+  neither of which exists in this repository.
+- The Rust and Java jobs in the release workflow, for the same reason.
 
 ## [0.1.1] — 2026-07-22
 
@@ -97,7 +90,7 @@ First release.
   regression targets.
 - Apache-2.0 license; macOS arm64 wheel with the engine bundled.
 
-[Unreleased]: https://github.com/RelativeDB/RelQL/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/RelativeDB/RelQL/compare/v0.1.1...v0.2.0
+[Unreleased]: https://github.com/RelativeDB/RelQL/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/RelativeDB/RelQL/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/RelativeDB/RelQL/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/RelativeDB/RelQL/releases/tag/v0.1.0

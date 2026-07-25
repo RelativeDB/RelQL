@@ -1,0 +1,12 @@
+# The example lives inside the RelativeDB repo, so it uses the checkout it
+# ships with rather than the (older) release on PyPI. Outside the repo,
+# `pip install relativedb` gives you the same API.
+-e ../../python
+
+# Unified prediction-market client: Polymarket, Kalshi, Limitless and friends
+# behind one interface. Self-hosted mode needs no API key; the SDK spawns and
+# manages a local pmxt-core for you.
+pmxt>=2.54
+
+# News comes from the GDELT 2.0 doc API over plain urllib — no dependency, no
+# key, no account.

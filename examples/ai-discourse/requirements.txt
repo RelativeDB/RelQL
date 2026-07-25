@@ -1,0 +1,7 @@
+# The example lives inside the RelativeDB repo, so it uses the checkout it
+# ships with rather than the (older) release on PyPI. Outside the repo,
+# `pip install relativedb` gives you the same API.
+-e ../../python
+
+# There is no third dependency. Bluesky's public appview is plain HTTP over
+# urllib: no client library, no API key, no account, no scraping.
