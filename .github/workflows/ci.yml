@@ -113,6 +113,13 @@ jobs:
     name: Integration (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # codecov-action's use_oidc mints a token through ACTIONS_ID_TOKEN_-
+    # REQUEST_URL, which the runner only exports when the job asks for
+    # id-token: write. Without it the action throws before fail_ci_if_error
+    # can swallow anything, so a green test run still reports a failed job.
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -236,6 +243,10 @@ jobs:
     name: C++ coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Same OIDC upload as the integration job; see the note there.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
