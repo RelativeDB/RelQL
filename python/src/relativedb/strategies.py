@@ -195,5 +195,12 @@ def run(engine: "Engine", req: ExecutionRequest) -> "PredictionResult":
         if strategy not in _MAY_DECLINE:
             raise RuntimeError(
                 f"execution strategy {strategy!r} returned no result")
+        # Declining is legitimate, but it is a PROTOCOL CHANGE, not a detail:
+        # a cohort scored per-entity is not the cohort scored in one shared
+        # context, and the two give different predictions. Say so.
+        from .engine import _fallback
+        _fallback(f"{strategy} declined this query; scoring per-entity "
+                  f"instead, which produces different predictions than the "
+                  f"shared context that was requested")
         result = run_per_entity(engine, req)
     return result

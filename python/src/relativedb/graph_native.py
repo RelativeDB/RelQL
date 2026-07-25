@@ -19,13 +19,25 @@ from typing import Optional
 
 import numpy as np
 
-__all__ = ["NativeGraph", "NativeGraphUnavailable", "native_available"]
+__all__ = ["NativeGraph", "NativeGraphUnavailable", "ContextTruncated",
+           "native_available"]
 
 _ERR = 1024
 
 
 class NativeGraphUnavailable(RuntimeError):
     pass
+
+
+class ContextTruncated(RuntimeError):
+    """The emitted-node buffer bound, so part of the context was dropped.
+
+    Nodes and cells are different quantities -- a row whose feature columns are
+    all null costs zero cells but still occupies a node slot -- so a buffer
+    sized from the cell budget can bind on a real graph. That silently drops
+    the tail of a context before the model ever sees it, which is invisible in
+    every metric except accuracy. It is an error, never a truncation.
+    """
 
 
 def _candidate_paths() -> list[Path]:
@@ -174,6 +186,12 @@ class NativeGraph:
             raise RuntimeError(
                 err.value.decode("utf-8", "replace") or "assemble failed")
         n = count.value
+        if n >= max_nodes:
+            raise ContextTruncated(
+                f"context for node {target} filled the emitted-node buffer "
+                f"({n} of {max_nodes}); the rest of the context was dropped. "
+                f"Size max_nodes from the graph, not from max_context_cells: "
+                f"a zero-cell row still occupies a node slot.")
         return out[:n], focal[:n]
 
     def __del__(self) -> None:

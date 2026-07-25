@@ -30,6 +30,13 @@ class BatchedStub:
         self.batch_size = batch_size
         self.batches: list[int] = []
 
+    def task_spec(self, query, task_type):
+        # Real backends provide this, and shared-context chunk sizing needs it.
+        # Without it the engine warns and guesses a split -- correct behaviour,
+        # but it means the test was not exercising the sizing path at all.
+        from relativedb.task import TaskSpec
+        return TaskSpec.from_query(query, task_type)
+
     def score(self, query, task_type, contexts, model_uri, config):
         self.batches.append(len(contexts))
         binary = task_type is TaskType.BINARY_CLASSIFICATION

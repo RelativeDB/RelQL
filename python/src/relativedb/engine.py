@@ -94,6 +94,32 @@ class AssumptionNotAppliedWarning(UserWarning):
     """An ASSUMING assignment targeted a table absent from the context."""
 
 
+class ProtocolFallbackWarning(UserWarning):
+    """Execution silently took a different protocol than the one requested.
+
+    These fallbacks change predictions -- a cohort scored per-entity is not the
+    cohort scored in one shared context, and a different chunk split gives
+    every member a different context. They used to happen quietly, which is how
+    a run could be compared against a recording made under a different protocol
+    and read as a regression. Set RELATIVEDB_STRICT=1 to make them raise.
+    """
+
+
+def _strict() -> bool:
+    """RELATIVEDB_STRICT=1 turns a silent protocol fallback into an error.
+
+    Benchmarks and conformance runs should set it: there, a fallback is a bug
+    to find, not a degradation to absorb.
+    """
+    return os.environ.get("RELATIVEDB_STRICT", "").lower() in ("1", "true", "yes")
+
+
+def _fallback(message: str) -> None:
+    if _strict():
+        raise ExecutionError(f"{message} (RELATIVEDB_STRICT=1)")
+    warnings.warn(message, ProtocolFallbackWarning, stacklevel=3)
+
+
 
 class ContextTruncationWarning(UserWarning):
     """A windowed COUNT/SUM/AVG was computed over a fanout-truncated context,
@@ -732,7 +758,10 @@ class Engine:
             got = self.traversal.cohort_targets(
                 entity_table, list(group), anchor, task_spec,
                 history=self.context_policy.num_history_windows)
-        except Exception:
+        except Exception as exc:
+            _fallback(f"shared-context chunk sizing failed ({type(exc).__name__}: "
+                      f"{exc}); falling back to a guessed split, which changes "
+                      f"every member's context")
             got = None
         if got is None:
             # No shared state: the caller will fall back to per-entity
