@@ -9,6 +9,24 @@ the RelQL grammar may still change between minor versions.
 
 ## [Unreleased]
 
+### Added
+- **`ABLATE TABLE` actually ablates.** It parsed, validated, and then
+  silently changed nothing — the plan even printed "declared, not applied".
+  Every row of the ablated table is now dropped from each scored context.
+  Unknown table names and the entity table are rejected with an
+  `ExecutionError` instead of ablating nothing.
+- **`EXPLAIN ABLATE`** (alias for the existing `EXPLAIN ABLATION`) scores the
+  query as written, then re-scores once per candidate ablation — every
+  non-entity schema table present in the contexts and every declared non-key
+  column carrying values (time columns excluded; the target column included,
+  since the entity's own cell is masked either way and its ablation measures
+  reliance on sibling rows' past outcomes) — and ranks candidates by
+  `mean_abs_delta`, how far dropping them moves the predictions. Near zero
+  means the model is not using it — a good ablation; large means
+  load-bearing. The report lands in `ExplainResult.ablation` and in
+  `render()`; `predictions` carries the baseline. One cohort forward per
+  candidate, so cost scales with schema width.
+
 ### Fixed
 - **`ASSUMING` counterfactuals actually counterfact.** An assignment on the
   entity table (`ASSUMING c.plan = 'premium'`) now intervenes on the entity's

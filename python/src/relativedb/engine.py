@@ -28,7 +28,7 @@ from .errors import ExecutionError
 from .evaluate import eval_bool
 from .model import ModelConfig
 from .plan import QueryPlan, assumptions, build_plan, pinned_ids, pure_pin
-from .relql.ast import AggFunc, Explain, ParsedQuery, TaskType
+from .relql.ast import Ablation, AggFunc, Explain, ParsedQuery, TaskType
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema, TableDef, ValueType
@@ -94,6 +94,24 @@ def _apply_assumptions(assignments: list[tuple[str, str, Any]],
                          truncated_children=ctx.truncated_children,
                          hit_cell_budget=ctx.hit_cell_budget,
                          focal_row_keys=ctx.focal_row_keys,
+                         node_ids=dict(ctx.node_ids))
+
+
+def _apply_ablations(ablations, ctx: "EntityContext") -> "EntityContext":
+    """A copy of ``ctx`` with every row of each ablated table removed —
+    ``ABLATE TABLE t`` scores the query as if ``t`` did not exist. The engine
+    rejects ablating the entity table before this runs, so the entity's own
+    row is never at risk. Rows are dropped, not blanked: a blanked row would
+    still spend context budget and carry its FK structure."""
+    if not ablations:
+        return ctx
+    drop = {a.name for a in ablations}
+    rows = [r for r in ctx.rows if r.table not in drop]
+    return EntityContext(entity_id=ctx.entity_id, anchor=ctx.anchor, rows=rows,
+                         truncated_children=ctx.truncated_children,
+                         hit_cell_budget=ctx.hit_cell_budget,
+                         focal_row_keys=frozenset(
+                             k for k in ctx.focal_row_keys if k[0] not in drop),
                          node_ids=dict(ctx.node_ids))
 
 
@@ -502,14 +520,17 @@ def _pred_to_dict(p: "EntityPrediction") -> dict:
 @dataclass(frozen=True)
 class ExplainResult:
     """The result of :meth:`Engine.explain`. ``plan`` is always present;
-    ``context`` is populated for CONTEXT/ANALYZE; ``predictions`` only for
-    ANALYZE. ``render()`` produces the human TEXT or machine JSON form."""
+    ``context`` is populated for CONTEXT/ANALYZE; ``predictions`` for
+    ANALYZE (scored as written) and ABLATION (the baseline); ``ablation``
+    is the EXPLAIN ABLATE impact ranking. ``render()`` produces the human
+    TEXT or machine JSON form."""
 
     mode: str                        # PLAN | CONTEXT | ANALYZE | ABLATION
     format: str                      # TEXT | JSON
     plan: dict
     context: Optional[dict] = None
     predictions: Optional[tuple["EntityPrediction", ...]] = None
+    ablation: Optional[dict] = None
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -521,6 +542,8 @@ class ExplainResult:
             d["context"] = self.context
         if self.predictions is not None:
             d["predictions"] = [_pred_to_dict(p) for p in self.predictions]
+        if self.ablation is not None:
+            d["ablation"] = self.ablation
         return d
 
     def render(self) -> str:
@@ -584,6 +607,24 @@ class ExplainResult:
                     lines.append(
                         f"    - {name}: rows={t['rows']} cells={t['cells']} "
                         f"min_time={t['min_time']} max_time={t['max_time']}")
+        if self.ablation is not None:
+            a = self.ablation
+            lines.append("")
+            lines.append("ABLATION")
+            base = a.get("baseline")
+            lines.append(f"  metric:   {a.get('metric')}")
+            if base:
+                lines.append(f"  baseline: mean={base['mean']:.6g} "
+                             f"n={base['n']}")
+            lines.append(f"  forwards: {a.get('model_forwards')}")
+            for e in a.get("candidates", []):
+                lines.append(
+                    f"  - [{e['kind']}] {e['name']}: "
+                    f"mean_abs_delta={e['mean_abs_delta']:.6g} "
+                    f"mean_delta={e['mean_delta']:+.6g} "
+                    f"max_abs_delta={e['max_abs_delta']:.6g}")
+            if a.get("note"):
+                lines.append(f"  note: {a['note']}")
         if self.predictions is not None:
             lines.append("")
             lines.append("PREDICTIONS")
@@ -717,6 +758,20 @@ class Engine:
             self._csc_index = CscIndex.build(
                 self.schema, self.wiring, allow_missing_scanners=True)
 
+    def _check_ablations(self, pq: ParsedQuery) -> None:
+        """ABLATE TABLE names must be real and must not be the entity table:
+        dropping the entity's own row leaves nothing to predict about, and a
+        typo'd table name would silently ablate nothing."""
+        for ab in pq.ablations:
+            if self.schema.table(ab.name) is None:
+                raise ExecutionError(
+                    f"ABLATE TABLE {ab.name!r}: unknown table")
+            if ab.name == pq.entity_key.table:
+                raise ExecutionError(
+                    f"cannot ablate the entity table {ab.name!r}: the "
+                    f"prediction is about its rows. Ablate the tables around "
+                    f"it, or use EXPLAIN ABLATE to rank per-column impact.")
+
     def _require_backend(self) -> ModelBackend:
         """Scoring paths (execute, EXPLAIN ANALYZE) need a model backend; the
         engine ships none. Parse/validate/EXPLAIN PLAN/CONTEXT/AS OF never
@@ -783,6 +838,7 @@ class Engine:
         # threads through the temporal bound and pseudo-anchors unchanged.
         input = replace(input, anchor_time=self._effective_anchor(pq, input))
         entity_table = pq.entity_key.table
+        self._check_ablations(pq)
         ids = self._resolve_entity_ids(pq, input)
         assumed = assumptions(pq.assuming) if pq.assuming is not None else []
         backend = self._require_backend()
@@ -853,6 +909,9 @@ class Engine:
                 "regression targets")
         if pq.assuming is not None:
             raise ExecutionError("shared_context does not support ASSUMING")
+        if pq.ablations:
+            raise ExecutionError("shared_context does not support ABLATE; "
+                                 "ablated queries score per-entity")
         # per_entity_anchor cohorts are handled by the caller: it groups ids
         # whose anchors are exactly equal and prepares each group separately,
         # so within this call every id shares the seed's anchor.
@@ -1286,14 +1345,14 @@ class Engine:
 
         # The same planner execute() uses, so EXPLAIN describes the run that
         # would actually happen rather than a separately-derived description.
+        self._check_ablations(pq)
         plan = self._plan(pq, input, effective, logical=_logical).to_dict()
         context: Optional[dict] = None
         predictions: Optional[tuple[EntityPrediction, ...]] = None
+        ablation: Optional[dict] = None
 
         if mode == "ABLATION":
-            plan["warnings"] = list(plan.get("warnings", [])) + [
-                "ablation not implemented — declared ABLATE tables are not "
-                "applied"]
+            ablation, predictions = self._ablation_report(pq, input, effective)
 
         if mode in ("CONTEXT", "ANALYZE"):
             context, contexts = self._assemble_report(pq, input, effective)
@@ -1304,12 +1363,14 @@ class Engine:
                     pq, task_type, contexts, model_uri, self.model_config))
 
         return ExplainResult(mode=mode, format=fmt, plan=plan,
-                             context=context, predictions=predictions)
+                             context=context, predictions=predictions,
+                             ablation=ablation)
 
-    def _assemble_report(self, pq: ParsedQuery, input: ExecutionInput,
-                         effective: Optional[datetime]):
-        """Assemble per-entity context via the normal path (no scoring) and
-        summarize it (contract: EXPLAIN CONTEXT)."""
+    def _score_ready_contexts(self, pq: ParsedQuery, input: ExecutionInput,
+                              effective: Optional[datetime]
+                              ) -> list[EntityContext]:
+        """Contexts exactly as scoring would see them: assembled, WHERE-
+        filtered, declared ablations dropped, assumptions applied."""
         eff_input = replace(input, anchor_time=effective)
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, eff_input)
@@ -1320,7 +1381,112 @@ class Engine:
             ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
                 continue
+            ctx = _apply_ablations(pq.ablations, ctx)
             contexts.append(_apply_assumptions(assumed, ctx, entity_table))
+        return contexts
+
+    def _ablation_report(self, pq: ParsedQuery, input: ExecutionInput,
+                         effective: Optional[datetime]):
+        """Contract: EXPLAIN ABLATE. Score the query as written, then once
+        per candidate ablation — every non-entity schema table present in the
+        contexts, and every declared non-key column carrying values — and
+        rank candidates by how far dropping them moves the predictions.
+        Large movement means the model leans on it; near zero means it is
+        not earning its context budget and is a good ablation. One cohort
+        forward per candidate, so cost scales with schema width, not data."""
+        entity_table = pq.entity_key.table
+        contexts = self._score_ready_contexts(pq, input, effective)
+        task_type = pq.task_type(self.schema)
+        metric = ("probability"
+                  if task_type is TaskType.BINARY_CLASSIFICATION
+                  else "expected_value")
+        if not contexts:
+            return ({"metric": metric, "baseline": None, "candidates": [],
+                     "model_forwards": 0}, ())
+        model_uri = self.model_config.model_uri_for(task_type)
+        backend = self._require_backend()
+
+        def score(ctxs):
+            preds = list(backend.score(pq, task_type, ctxs, model_uri,
+                                       self.model_config))
+            return preds, [p.probability if p.probability is not None
+                           else p.value for p in preds]
+
+        base_preds, base = score(contexts)
+
+        # Candidates come from what is actually in these contexts, minus the
+        # entity table (its rows are the task), anything already ablated by
+        # the query, and time columns (a task-table timestamp is re-derived
+        # at serialization, so dropping the cell measures nothing). The
+        # target column stays IN: the entity's own cell is masked either
+        # way, so its ablation measures reliance on sibling rows' past
+        # outcomes — usually the most load-bearing input there is.
+        already = {a.name for a in pq.ablations}
+        tables: set = set()
+        columns: set = set()
+        for c in contexts:
+            for r in c.rows:
+                tdef = self.schema.table(r.table)
+                if tdef is None:
+                    continue
+                if r.table != entity_table and r.table not in already:
+                    tables.add(r.table)
+                for col, v in r.cells.items():
+                    if (v is None or col == tdef.primary_key
+                            or col == tdef.time_column
+                            or tdef.column(col) is None):
+                        continue
+                    columns.add((r.table, col))
+
+        def drop_column(table, col):
+            return [replace(c, rows=[
+                replace(r, cells={k: v for k, v in r.cells.items()
+                                  if k != col})
+                if r.table == table else r for r in c.rows])
+                for c in contexts]
+
+        entries: list[dict] = []
+        forwards = 1
+
+        def measure(kind, name, ctxs):
+            nonlocal forwards
+            _, vals = score(ctxs)
+            forwards += 1
+            deltas = [v - b for v, b in zip(vals, base)
+                      if v is not None and b is not None]
+            n = len(deltas)
+            entries.append({
+                "kind": kind, "name": name, "n": n,
+                "mean_delta": sum(deltas) / n if n else 0.0,
+                "mean_abs_delta": sum(abs(d) for d in deltas) / n if n else 0.0,
+                "max_abs_delta": max((abs(d) for d in deltas), default=0.0),
+            })
+
+        for t in sorted(tables):
+            measure("table", t,
+                    [_apply_ablations([Ablation("table", t)], c)
+                     for c in contexts])
+        for t, col in sorted(columns):
+            measure("column", f"{t}.{col}", drop_column(t, col))
+        entries.sort(key=lambda e: -e["mean_abs_delta"])
+        known = [b for b in base if b is not None]
+        report = {
+            "metric": metric,
+            "baseline": {"n": len(known),
+                         "mean": sum(known) / len(known) if known else None},
+            "candidates": entries,
+            "model_forwards": forwards,
+            "note": ("mean_abs_delta: how far the prediction moves when this "
+                     "is dropped. Near zero = the model is not using it — a "
+                     "good ablation; large = load-bearing, keep it."),
+        }
+        return report, tuple(base_preds)
+
+    def _assemble_report(self, pq: ParsedQuery, input: ExecutionInput,
+                         effective: Optional[datetime]):
+        """Assemble per-entity context via the normal path (no scoring) and
+        summarize it (contract: EXPLAIN CONTEXT)."""
+        contexts = self._score_ready_contexts(pq, input, effective)
 
         tables: dict[str, dict] = {}
         links_traversed = 0

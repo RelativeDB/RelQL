@@ -406,7 +406,8 @@ def build_plan(schema: Schema, pq: ParsedQuery, input, *,
         assuming_present=logical["assuming_present"],
         assuming=logical["assuming"],
         as_of=as_of,
-        ablations=tuple({"table": name, "note": "declared, not applied"}
+        ablations=tuple({"table": name,
+                         "note": "applied: rows dropped from every context"}
                         for name in logical["ablations"]),
         warnings=tuple(logical["warnings"]),
         strategy=_strategy_for(input),

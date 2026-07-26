@@ -517,7 +517,7 @@ class Parser {
       q.explain.mode = ExplainMode::CONTEXT;
     else if (accept("ANALYZE"))
       q.explain.mode = ExplainMode::ANALYZE;
-    else if (accept("ABLATION"))
+    else if (accept("ABLATION") || accept("ABLATE"))
       q.explain.mode = ExplainMode::ABLATION;
     if (accept("FORMAT")) {
       if (accept("TEXT"))

@@ -41,7 +41,7 @@ class ExecutionRequest:
 
 def _context_builder(engine: "Engine", req: ExecutionRequest):
     """Assemble one entity's context, or None when WHERE excludes it."""
-    from .engine import _apply_assumptions
+    from .engine import _apply_ablations, _apply_assumptions
 
     def build(eid) -> Optional["EntityContext"]:
         anchor = engine._anchor_for(req.entity_table, eid, req.input)
@@ -52,6 +52,9 @@ def _context_builder(engine: "Engine", req: ExecutionRequest):
         if (req.pq.where is not None
                 and not engine._where_ok(req.pq, ctx, req.entity_table)):
             return None
+        # Ablate first, then assume: assuming on an ablated table should
+        # warn as inert, not resurrect the rows.
+        ctx = _apply_ablations(req.pq.ablations, ctx)
         return _apply_assumptions(req.assumed, ctx, req.entity_table)
 
     return build

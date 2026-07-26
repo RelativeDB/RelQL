@@ -276,6 +276,31 @@ trusting a flat curve on your variable of interest. Verified working: the
 `text_length` sweep shows a monotonic dose-response (20 chars −14%, 300 chars
 +2.6% on one sample).
 
+## 6b. ABLATE and EXPLAIN ABLATE (added 2026-07)
+
+`ABLATE TABLE t` drops every row of `t` from each scored context (it used to
+parse and silently do nothing). Unknown tables and the entity table error.
+
+`EXPLAIN ABLATE <query>` (alias of `EXPLAIN ABLATION`) is the feature-
+importance tool: it scores the query as written, then once per candidate —
+every non-entity table in the contexts and every declared non-key column
+with values — and ranks by `mean_abs_delta` in `result.ablation`:
+
+```python
+res = engine.execute(ExecutionInput(query="EXPLAIN ABLATE " + q,
+                                    anchor_time=anchor, params=params))
+for e in res.ablation["candidates"]:
+    print(e["kind"], e["name"], e["mean_abs_delta"])
+```
+
+Reading it: near-zero `mean_abs_delta` = the model is not using it — a good
+ablation, and a candidate for cutting from the schema to free context budget;
+large = load-bearing. The **target column ranks too**: the entity's own cell
+is masked either way, so its entry measures reliance on sibling rows' past
+outcomes — expect it on top for autocorrelated targets (verified: dropping
+`posts.engagement` history moved predictions by ~100% of baseline). Cost is
+one cohort forward per candidate — run it on a sample of ids, not the corpus.
+
 ## 7. Training
 
 - **`fit_head` cannot do binary/regression.** It raises: *"frozen task-head

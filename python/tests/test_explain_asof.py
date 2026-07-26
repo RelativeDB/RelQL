@@ -179,15 +179,21 @@ def test_explain_analyze_has_predictions(churn_schema, churn_wiring,
     assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
 
 
-def test_explain_ablation_warns_not_implemented(churn_schema, churn_wiring):
-    eng = Engine(churn_schema, churn_wiring)
+def test_explain_ablation_scores_and_reports(churn_schema, churn_wiring,
+                                             stub_backend):
+    eng = Engine(churn_schema, churn_wiring, model_backend=stub_backend)
     res = eng.explain(ExecutionInput(
         query="EXPLAIN ABLATION PREDICT COUNT(orders.*) OVER (90 DAYS "
               "FOLLOWING) = 0 FROM customers "
               "ABLATE TABLE products", anchor_time=T0))
     assert res.mode == "ABLATION"
-    assert any("ablation not implemented" in w for w in res.plan["warnings"])
+    assert res.ablation is not None
+    assert res.ablation["metric"] == "probability"
+    assert res.predictions is not None            # the baseline scores
     assert any(a["table"] == "products" for a in res.plan["ablations"])
+    # products is already ablated by the query: not a candidate again
+    assert not any(e["kind"] == "table" and e["name"] == "products"
+                   for e in res.ablation["candidates"])
 
 
 # ---------------------------------------------------------------------------
