@@ -147,10 +147,24 @@ jobs:
       name: pypi
       url: https://pypi.org/p/relativedb
     permissions:
-      id-token: write        # trusted publishing; no stored API token
+      id-token: write        # trusted publishing, when it is configured
     steps:
       - uses: actions/download-artifact@v8
         with:
           name: verified-distributions
           path: dist
+      # Trusted publishing is the better mechanism and stays the default: if a
+      # publisher is configured on PyPI, OIDC is used and the token below is
+      # never read. But this repository asserted OIDC without anyone
+      # configuring the publisher, so the first real release attempt died at
+      # "Publisher with matching claims was not found" -- having uploaded
+      # nothing, which is the one merciful part of that failure.
+      #
+      # PYPI_API_TOKEN is the credential 0.1.0/0.1.1 actually shipped with and
+      # it is still in this repository's secrets. Passing it makes the publish
+      # work today; configure a trusted publisher (owner RelativeDB, repo
+      # RelQL, workflow release-libraries.yml, environment pypi) and this line
+      # can be deleted along with the secret.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
