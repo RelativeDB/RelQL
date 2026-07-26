@@ -31,7 +31,7 @@ from .plan import QueryPlan, assumptions, build_plan, pinned_ids, pure_pin
 from .relql.ast import AggFunc, Explain, ParsedQuery, TaskType
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
-from .schema import Schema
+from .schema import Schema, TableDef, ValueType
 from .traversal import (BreadthFirstTraversal, GraphTraversal,
                         ReferenceTraversal)
 
@@ -40,6 +40,7 @@ __all__ = [
     "EntityPrediction", "PredictionResult", "ExplainResult", "ModelBackend",
     "Engine", "ExecutionError",
     "ContextTruncationWarning", "AssumptionNotAppliedWarning",
+    "ContextCompositionWarning", "InvisibleTableWarning",
     "GraphTraversal", "BreadthFirstTraversal", "ReferenceTraversal",
 ]
 
@@ -50,23 +51,45 @@ _COUNTING_AGGS = frozenset({AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG})
 
 
 def _apply_assumptions(assignments: list[tuple[str, str, Any]],
-                       ctx: "EntityContext") -> "EntityContext":
+                       ctx: "EntityContext",
+                       entity_table: Optional[str] = None) -> "EntityContext":
     """A copy of ``ctx`` in which the assumed values hold.
 
-    Every context row of an assigned table gets the new cell value — assuming
-    `orders.status = 'shipped'` means *these* orders are shipped. Rows are
-    replaced rather than mutated: retrievers and the CSC index hand out shared
-    Row objects, so writing through one would corrupt every other entity's
-    context.
+    An assignment on the **entity table** intervenes on the entity's own row
+    only: ``ASSUMING c.plan = 'premium'`` changes *this* customer, while any
+    sibling rows of the same table stay factual. That is more than semantics —
+    zero-shot normalization derives column statistics inside each context, so
+    overwriting every row of the table flattens the column to a constant, and
+    a constant numeric column normalizes to zero *regardless of the constant*:
+    the assumed value would be erased before it reached the model. Keeping the
+    siblings factual is what preserves the scale the assumed value is measured
+    against.
+
+    An assignment on any other table keeps the broad meaning: every context
+    row of that table gets the value — assuming ``orders.status = 'shipped'``
+    means *these* orders are shipped.
+
+    Rows are replaced rather than mutated: retrievers and the CSC index hand
+    out shared Row objects, so writing through one would corrupt every other
+    entity's context.
     """
     if not assignments:
         return ctx
     by_table: dict[str, dict[str, Any]] = {}
     for table, col, value in assignments:
         by_table.setdefault(table, {})[col] = value
-    rows = [replace(r, cells={**r.cells, **by_table[r.table]})
-            if r.table in by_table else r
-            for r in ctx.rows]
+    entity_key = ((entity_table, ctx.entity_id)
+                  if entity_table is not None else None)
+
+    def patched(r):
+        patch = by_table.get(r.table)
+        if patch is None:
+            return r
+        if r.table == entity_table and r.key != entity_key:
+            return r                              # siblings stay factual
+        return replace(r, cells={**r.cells, **patch})
+
+    rows = [patched(r) for r in ctx.rows]
     return EntityContext(entity_id=ctx.entity_id, anchor=ctx.anchor, rows=rows,
                          truncated_children=ctx.truncated_children,
                          hit_cell_budget=ctx.hit_cell_budget,
@@ -75,9 +98,21 @@ def _apply_assumptions(assignments: list[tuple[str, str, Any]],
 
 
 def _warn_inert_assumptions(assignments: list[tuple[str, str, Any]],
-                            contexts: list["EntityContext"]) -> None:
-    """An assumption about a table that never appears in any context changes
-    nothing. That is the failure ASSUMING used to have wholesale, so say it."""
+                            contexts: list["EntityContext"],
+                            entity_table: Optional[str] = None,
+                            schema: Optional[Schema] = None) -> None:
+    """Say it when an ASSUMING assignment cannot reach the model.
+
+    Three ways an assumption goes silently inert, each reported rather than
+    swallowed:
+
+    * the assigned table never appears in any context;
+    * the assignment targets the entity table but the entity's own row is
+      missing from the context (only siblings made it in);
+    * the assigned column is numeric/boolean and ends up **constant** within
+      every context — zero-shot normalization maps a constant column to zero,
+      erasing which constant it was.
+    """
     if not assignments or not contexts:
         return
     present = {r.table for c in contexts for r in c.rows}
@@ -89,9 +124,181 @@ def _warn_inert_assumptions(assignments: list[tuple[str, str, Any]],
             f"assumption changes nothing that reaches the model",
             AssumptionNotAppliedWarning, stacklevel=3)
 
+    if entity_table is not None:
+        entity_assigned = [c for t, c, _ in assignments if t == entity_table]
+        if entity_assigned:
+            absent = sum(
+                1 for c in contexts
+                if not any(r.key == (entity_table, c.entity_id)
+                           for r in c.rows))
+            if absent:
+                warnings.warn(
+                    f"ASSUMING on {entity_table}.{entity_assigned[0]}: the "
+                    f"entity's own row is missing from {absent} of "
+                    f"{len(contexts)} contexts, so the assumption cannot be "
+                    f"applied there", AssumptionNotAppliedWarning,
+                    stacklevel=3)
+
+    for table, col, _ in assignments:
+        if schema is not None:
+            tdef = schema.table(table)
+            cdef = tdef.column(col) if tdef is not None else None
+            if cdef is None or cdef.type not in (ValueType.NUMBER,
+                                                 ValueType.BOOLEAN):
+                continue                # text embeds; datetime pools globally
+        flattened = 0
+        populated = 0
+        for c in contexts:
+            vals = {r.cells.get(col) for r in c.rows
+                    if r.table == table and col in r.cells}
+            if vals:
+                populated += 1
+                if len(vals) == 1:
+                    flattened += 1
+        if populated and flattened == populated:
+            warnings.warn(
+                f"ASSUMING leaves {table}.{col} constant across the context "
+                f"in all {populated} contexts; zero-shot normalization maps a "
+                f"constant numeric column to zero, so the assumed value is "
+                f"erased before it reaches the model. Keep factual sibling "
+                f"rows of {table} in the context, or use reference "
+                f"normalization (column_stats)",
+                AssumptionNotAppliedWarning, stacklevel=3)
+
 
 class AssumptionNotAppliedWarning(UserWarning):
-    """An ASSUMING assignment targeted a table absent from the context."""
+    """An ASSUMING assignment could not (fully) reach the model input."""
+
+
+# Loud-degradation thresholds for assembled contexts. A single truncated
+# context is routine; a cohort where most contexts truncate, or where one
+# table swallows the budget, is a schema problem the caller should hear about
+# once, at the end, instead of piecing it together from per-entity warnings.
+_TRUNCATION_WARN_SHARE = 0.5
+_DOMINANCE_WARN_SHARE = 0.6
+# Below this many cells across the cohort, dominance says nothing: tiny test
+# fixtures and single-entity probes are trivially lopsided.
+_DOMINANCE_MIN_CELLS = 256
+
+
+class ContextCompositionWarning(UserWarning):
+    """Assembled contexts truncated en masse or dominated by one table."""
+
+
+class InvisibleTableWarning(UserWarning):
+    """A schema table whose rows serialize to zero feature tokens.
+
+    The serialization contract emits one token per feature cell, and a row's
+    foreign-key links ride on the tokens it emits — so a table of pure FK
+    rows (a follows/likes edge table with no payload columns) enters the
+    context, costs nothing against the budget, and never reaches the model
+    at all. The connection the row exists to represent is silently lost.
+    """
+
+
+def _invisible_fix_hint(table: str, schema: Schema) -> str:
+    links = [l.fk_column for l in schema.links_from(table)]
+    if links:
+        return (f"If a key itself carries signal (a handle, a name, a "
+                f"category), set feature_type on that link — e.g. "
+                f"LinkDef({table!r}, {links[0]!r}, ..., "
+                f"feature_type=ValueType.TEXT) — so its value is emitted as "
+                f"a feature token. Otherwise add a payload column or "
+                f"summarize the edges into a table with measured columns.")
+    return "Add a payload column so its rows have something to emit."
+
+
+def _warn_invisible_tables(schema: Schema) -> None:
+    """Statically provable at construction: no non-key columns and no
+    feature-typed link means every row of the table emits zero tokens."""
+    for tbl in schema.tables:
+        if any(c.name != tbl.primary_key for c in tbl.columns):
+            continue
+        if any(l.feature_type is not None for l in schema.links_from(tbl.name)):
+            continue
+        warnings.warn(
+            f"every row of table {tbl.name!r} will serialize to zero tokens: "
+            f"it has no non-key columns and none of its links sets "
+            f"feature_type. Its rows can enter the context but the model "
+            f"never sees them — or the link structure they carry. "
+            f"{_invisible_fix_hint(tbl.name, schema)}",
+            InvisibleTableWarning, stacklevel=3)
+
+
+def _emitted_cells(r: Row, tdef: "TableDef",
+                   fk_feature_cols: Sequence[str]) -> int:
+    """Feature tokens this row actually contributes to the model input:
+    declared non-key non-null cells plus feature-typed FK values. A bare
+    row timestamp is not emitted for database rows and does not count."""
+    n = sum(1 for col, v in r.cells.items()
+            if col != tdef.primary_key and tdef.column(col) is not None
+            and v is not None)
+    return n + sum(1 for fk in fk_feature_cols
+                   if r.parents.get(fk) is not None)
+
+
+def _warn_context_health(contexts: list["EntityContext"],
+                         schema: Optional[Schema],
+                         policy: "ContextPolicy") -> None:
+    """One aggregate report on what actually reached the model.
+
+    Found the hard way: an experiment ran for hours with 100% of contexts
+    truncated and one event table holding 69% of every context's cells — the
+    model never saw the columns that mattered, and nothing said so except a
+    per-entity warning stream nobody reads at cohort scale. This is the
+    end-of-run summary that makes those two failure shapes loud.
+    """
+    if not contexts:
+        return
+    hit = sum(1 for c in contexts if c.hit_cell_budget)
+    if hit and hit / len(contexts) >= _TRUNCATION_WARN_SHARE:
+        warnings.warn(
+            f"{hit} of {len(contexts)} contexts hit the cell budget "
+            f"(max_context_cells={policy.max_context_cells}); the tail of "
+            f"every truncated context never reached the model. Raise the "
+            f"budget or reshape the schema — EXPLAIN CONTEXT shows where "
+            f"the cells go", ContextCompositionWarning, stacklevel=3)
+
+    fk_features = ({tbl.name: [l.fk_column
+                               for l in schema.links_from(tbl.name)
+                               if l.feature_type is not None]
+                    for tbl in schema.tables} if schema is not None else {})
+    cells: dict[str, int] = {}
+    rows_seen: dict[str, int] = {}
+    total = 0
+    for c in contexts:
+        for r in c.rows:
+            # Virtual task rows (task_*) are engine-generated; dominance is a
+            # statement about the USER's schema, so only its tables count.
+            if schema is not None:
+                tdef = schema.table(r.table)
+                if tdef is None:
+                    continue
+                n = _emitted_cells(r, tdef, fk_features.get(r.table, ()))
+            else:
+                n = len(r.cells) + (1 if r.timestamp is not None else 0)
+            cells[r.table] = cells.get(r.table, 0) + n
+            rows_seen[r.table] = rows_seen.get(r.table, 0) + 1
+            total += n
+    if schema is not None:
+        for table, nrows in rows_seen.items():
+            if cells.get(table, 0) == 0:
+                warnings.warn(
+                    f"table {table!r} contributed {nrows} context row(s) but "
+                    f"zero feature cells — none of it reached the model "
+                    f"(all-FK rows, undeclared columns, or all-null values). "
+                    f"{_invisible_fix_hint(table, schema)}",
+                    ContextCompositionWarning, stacklevel=3)
+    if total >= _DOMINANCE_MIN_CELLS and len(cells) > 1:
+        table, top = max(cells.items(), key=lambda kv: kv[1])
+        if top / total >= _DOMINANCE_WARN_SHARE:
+            warnings.warn(
+                f"table {table!r} holds {top / total:.0%} of all context "
+                f"cells; one table is crowding the rest of the schema out of "
+                f"the model's context. Summarize high-cardinality event "
+                f"tables into period tables whose rows carry several "
+                f"meaningful columns, or cap that link's fanout",
+                ContextCompositionWarning, stacklevel=3)
 
 
 class ProtocolFallbackWarning(UserWarning):
@@ -234,6 +441,9 @@ class EntityContext:
 
     @property
     def cell_count(self) -> int:
+        """Raw cell tally for diagnostics. Schema-blind: it cannot see
+        feature-typed FK values or declared-column filtering, so it is an
+        approximation of what serialization emits, not a promise."""
         return sum(len(r.cells) + (1 if r.timestamp is not None else 0)
                    for r in self.rows)
 
@@ -485,6 +695,7 @@ class Engine:
                  traversal: Optional[GraphTraversal] = None):
         self.schema = schema
         self.wiring = wiring
+        _warn_invisible_tables(schema)
         self.model_config = model_config or ModelConfig.defaults()
         self.model_backend: Optional[ModelBackend] = model_backend
         self.context_policy = context_policy or ContextPolicy()
@@ -1109,10 +1320,19 @@ class Engine:
             ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
             if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
                 continue
-            contexts.append(_apply_assumptions(assumed, ctx))
+            contexts.append(_apply_assumptions(assumed, ctx, entity_table))
 
         tables: dict[str, dict] = {}
         links_traversed = 0
+        # FK values a link opts into emitting (feature_type) are model input
+        # too. EXPLAIN once counted only r.cells, which made feature-bearing
+        # links — and any table whose rows carry nothing but FKs — report zero
+        # cells while the model saw their tokens. What EXPLAIN prints must be
+        # what the model gets.
+        fk_features = {
+            tbl.name: [l.fk_column for l in self.schema.links_from(tbl.name)
+                       if l.feature_type is not None]
+            for tbl in self.schema.tables}
         for ctx in contexts:
             for r in ctx.rows:
                 t = tables.setdefault(
@@ -1120,6 +1340,8 @@ class Engine:
                               "min_time": None, "max_time": None})
                 t["rows"] += 1
                 t["cells"] += len(r.cells) + (1 if r.timestamp is not None else 0)
+                t["cells"] += sum(1 for fk in fk_features.get(r.table, ())
+                                  if r.parents.get(fk) is not None)
                 links_traversed += len(r.parents)
                 if r.timestamp is not None:
                     ts = r.timestamp.isoformat()

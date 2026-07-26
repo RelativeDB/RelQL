@@ -17,11 +17,12 @@ from .model import (DEFAULT_CLASSIFICATION_MODEL_URI, DEFAULT_EMBEDDING_MODEL,
 from .task import TaskSpec, TaskSpecFactory, canonical_target
 from .traversal import (BreadthFirstTraversal, GraphAccess, GraphTraversal,
                         ReferenceTraversal, TraversalResult)
-from .engine import (AssumptionNotAppliedWarning, ContextPolicy,
+from .engine import (AssumptionNotAppliedWarning,
+                     ContextCompositionWarning, ContextPolicy,
                      ContextTruncationWarning, Engine, EntityContext,
                      EntityPrediction, ExecutionError, ExecutionInput,
-                     ExplainResult, ModelBackend, PredictionResult,
-                     SamplerMode)
+                     ExplainResult, InvisibleTableWarning, ModelBackend,
+                     PredictionResult, SamplerMode)
 from .csc import CscIndex
 
 
@@ -51,6 +52,7 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "Engine", "ExecutionInput", "ExecutionError", "ContextPolicy",
     "ContextTruncationWarning", "AssumptionNotAppliedWarning",
+    "ContextCompositionWarning", "InvisibleTableWarning",
     "SamplerMode", "PredictionResult", "ExplainResult",
     "EntityPrediction", "EntityContext",
     "ModelBackend", "CscIndex",

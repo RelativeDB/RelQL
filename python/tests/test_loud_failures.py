@@ -174,3 +174,143 @@ def test_context_truncation_is_an_error():
     # A buffer far smaller than the context must raise, not truncate.
     with pytest.raises(ContextTruncated, match="max_nodes|emitted-node buffer"):
         g.assemble(0, float("inf"), None, _P(), max_nodes=4)
+
+
+# --------------------------------------------------------------------------
+# cohort-level context health: mass truncation and one-table dominance
+# --------------------------------------------------------------------------
+# Found in the field: an experiment ran with 100% of contexts truncated and a
+# single event table holding 69% of every context's cells. The model never saw
+# the discriminating columns, and the only tell was a per-entity warning
+# stream nobody reads at cohort scale. _warn_context_health is the aggregate
+# report; these drive both failure shapes and the quiet path.
+
+from relativedb import ContextCompositionWarning, ContextPolicy, Row
+from relativedb.engine import EntityContext, _warn_context_health
+
+
+def _ctx(rows, *, hit=False, entity_id="E1"):
+    return EntityContext(entity_id=entity_id, anchor=ANCHOR, rows=tuple(rows),
+                         hit_cell_budget=hit, focal_row_keys=frozenset(),
+                         node_ids={})
+
+
+def _like_rows(n):
+    return [Row("likes", f"l{i}", {"at": dt("2026-06-01")},
+                timestamp=dt("2026-06-01"), parents={"post_id": "p1"})
+            for i in range(n)]
+
+
+def _post_rows(n):
+    return [Row("posts", f"p{i}", {"created_at": dt("2026-06-01"),
+                                   "text_length": 100.0, "engagement": 5.0},
+                timestamp=dt("2026-06-01"))
+            for i in range(n)]
+
+
+def test_mass_truncation_is_summarized_once(churn_schema):
+    contexts = [_ctx(_post_rows(2), hit=True, entity_id=f"E{i}")
+                for i in range(4)]
+    with pytest.warns(ContextCompositionWarning,
+                      match="4 of 4 contexts hit the cell budget"):
+        _warn_context_health(contexts, None, ContextPolicy())
+
+
+def test_dominant_table_is_called_out(churn_schema):
+    # 200 like-rows at 2 cells each vs 10 post rows at 4: likes hold ~91%,
+    # comfortably above both the share threshold and the cohort-size floor.
+    contexts = [_ctx(_like_rows(200) + _post_rows(10))]
+    with pytest.warns(ContextCompositionWarning, match="'likes' holds"):
+        _warn_context_health(contexts, None, ContextPolicy())
+
+
+def test_balanced_untruncated_contexts_stay_quiet(churn_schema):
+    # 100x2 = 200 like cells vs 50x4 = 200 post cells: an even split, above
+    # the cohort floor so silence means the threshold held, not the floor.
+    contexts = [_ctx(_like_rows(100) + _post_rows(50))]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ContextCompositionWarning)
+        _warn_context_health(contexts, None, ContextPolicy())
+
+
+def test_single_table_context_never_reports_dominance(churn_schema):
+    # A one-table schema is trivially "dominated"; that is not a finding.
+    contexts = [_ctx(_like_rows(200))]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ContextCompositionWarning)
+        _warn_context_health(contexts, None, ContextPolicy())
+
+
+# --------------------------------------------------------------------------
+# invisible tables: rows that serialize to zero tokens
+# --------------------------------------------------------------------------
+# Serialization emits one token per feature cell, and a row's FK links ride on
+# the tokens it emits. A pure edge table (follows/likes with no payload
+# columns) therefore enters the context at zero cell cost and never reaches
+# the model at all — the connection each row exists to represent is lost.
+# Found in the field: a follow graph that contributed nothing until its links
+# got feature_type. Two layers of noise: provable at schema time, and observed
+# at cohort time (rows arrived, no cells survived).
+
+from relativedb import (InvisibleTableWarning, LinkDef, Schema, TableDef,
+                        ValueType)
+from relativedb.engine import _warn_invisible_tables
+
+
+def _edge_schema(*, feature_type=None, payload=False):
+    follows = TableDef.new_table("follows").primary_key("follow_id")
+    if payload:
+        follows = follows.column("weight", ValueType.NUMBER)
+    return (Schema.new_schema()
+            .table(TableDef.new_table("accounts")
+                   .column("followers", ValueType.NUMBER)
+                   .primary_key("account_id").build())
+            .table(follows.build())
+            .link(LinkDef("follows", "follower_id", "accounts", feature_type))
+            .link(LinkDef("follows", "followee_id", "accounts"))
+            .build())
+
+
+def test_all_fk_table_warns_at_engine_construction():
+    with pytest.warns(InvisibleTableWarning, match="'follows'.*zero tokens"):
+        Engine(_edge_schema(),
+               in_memory_wiring({"accounts": [], "follows": []}),
+               model_backend=_Stub())
+
+
+def test_feature_typed_link_makes_the_table_visible():
+    # The FK value itself can be real signal (a handle, a name); feature_type
+    # emits it, so the table is no longer invisible and must not warn.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", InvisibleTableWarning)
+        _warn_invisible_tables(_edge_schema(feature_type=ValueType.TEXT))
+
+
+def test_payload_column_makes_the_table_visible():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", InvisibleTableWarning)
+        _warn_invisible_tables(_edge_schema(payload=True))
+
+
+def _follow_rows(n, *, schema_visible=False):
+    return [Row("follows", f"f{i}",
+                {"weight": 1.0} if schema_visible else {},
+                parents={"follower_id": f"a{i}", "followee_id": "a0"})
+            for i in range(n)]
+
+
+def test_zero_emitted_cells_reported_at_cohort_time():
+    schema = _edge_schema()
+    contexts = [_ctx(_follow_rows(3))]
+    with pytest.warns(ContextCompositionWarning,
+                      match="'follows' contributed 3 context row"):
+        _warn_context_health(contexts, schema, ContextPolicy())
+
+
+def test_feature_typed_fk_counts_as_an_emitted_cell():
+    # Same rows, but the link now emits the FK value: not invisible.
+    schema = _edge_schema(feature_type=ValueType.TEXT)
+    contexts = [_ctx(_follow_rows(3))]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ContextCompositionWarning)
+        _warn_context_health(contexts, schema, ContextPolicy())

@@ -212,3 +212,39 @@ def test_render_text_contains_target_and_task(churn_schema, churn_wiring):
     assert "binary_classification" in text
     assert "COUNT(orders.*)" in text        # the target expression
     assert "PLAN" in text
+
+
+def test_explain_context_counts_fk_feature_cells(churn_schema, stub_backend):
+    ANCHOR = dt("2026-07-01")
+    """A link that opts into feature emission (LinkDef.feature_type) adds one
+    token per populated FK to the model input; EXPLAIN CONTEXT must count it.
+    It once counted only r.cells, so feature-bearing links — and tables whose
+    rows carry nothing but FKs — reported zero cells while the model saw their
+    tokens, which made the knob look inert to anyone measuring it."""
+    from relativedb import LinkDef, Schema, TableDef, ValueType
+    from conftest import churn_rows, in_memory_wiring
+
+    def build(feature_type):
+        base = churn_schema
+        links = [LinkDef("orders", "customer_id", "customers", feature_type),
+                 LinkDef("orders", "product_id", "products", feature_type)]
+        schema = Schema(tuple(base.tables), tuple(links))
+        return Engine(schema, in_memory_wiring(churn_rows()),
+                      model_backend=stub_backend)
+
+    # Entity table = orders: the FK columns live on the entity row itself,
+    # so the context is guaranteed to hold FK-bearing rows.
+    query = ("EXPLAIN CONTEXT PREDICT orders.qty FROM orders "
+             "WHERE orders.order_id IN :ids RETURN EXPECTED VALUE")
+
+    plain = build(None).execute(ExecutionInput(
+        query=query, anchor_time=ANCHOR, params={"ids": ["O1"]}))
+    with_fk = build(ValueType.TEXT).execute(ExecutionInput(
+        query=query, anchor_time=ANCHOR, params={"ids": ["O1"]}))
+
+    orders_plain = plain.context["tables"]["orders"]["cells"]
+    orders_fk = with_fk.context["tables"]["orders"]["cells"]
+    n_orders = with_fk.context["tables"]["orders"]["rows"]
+    assert n_orders > 0
+    # two feature-bearing links, both FKs populated on every order row
+    assert orders_fk == orders_plain + 2 * n_orders

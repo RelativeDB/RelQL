@@ -190,6 +190,9 @@ class BreadthFirstTraversal:
         cells = 0
         truncated = 0
         hit_budget = False
+        fk_features = {t.name: [l.fk_column for l in schema.links_from(t.name)
+                                if l.feature_type is not None]
+                       for t in schema.tables}
 
         def admit(candidates, is_focal=False):
             nonlocal cells, hit_budget
@@ -198,6 +201,8 @@ class BreadthFirstTraversal:
                 if not bound.admits_row(row) or row.key in visited:
                     continue
                 cost = len(row.cells) + (1 if row.timestamp is not None else 0)
+                cost += sum(1 for fk in fk_features.get(row.table, ())
+                            if row.parents.get(fk) is not None)
                 if rows and cells + cost > policy.max_context_cells:
                     hit_budget = True
                     break

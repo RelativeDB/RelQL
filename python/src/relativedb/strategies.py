@@ -52,7 +52,7 @@ def _context_builder(engine: "Engine", req: ExecutionRequest):
         if (req.pq.where is not None
                 and not engine._where_ok(req.pq, ctx, req.entity_table)):
             return None
-        return _apply_assumptions(req.assumed, ctx)
+        return _apply_assumptions(req.assumed, ctx, req.entity_table)
 
     return build
 
@@ -133,7 +133,8 @@ def _score_pipelined(engine: "Engine", req: ExecutionRequest, build,
 
 
 def run_per_entity(engine: "Engine", req: ExecutionRequest):
-    from .engine import PredictionResult, _warn_inert_assumptions
+    from .engine import (PredictionResult, _warn_context_health,
+                         _warn_inert_assumptions)
 
     build = _context_builder(engine, req)
     chunk_size = req.plan.scoring_batch_size or 0
@@ -141,7 +142,9 @@ def run_per_entity(engine: "Engine", req: ExecutionRequest):
         contexts, preds = _score_pipelined(engine, req, build, chunk_size)
     else:
         contexts, preds = _score_serial(engine, req, build)
-    _warn_inert_assumptions(req.assumed, contexts)
+    _warn_inert_assumptions(req.assumed, contexts,
+                            req.entity_table, engine.schema)
+    _warn_context_health(contexts, engine.schema, engine.context_policy)
     return PredictionResult(
         task_type=req.plan.task_type, predictions=tuple(preds),
         model_uri=req.plan.model_uri,

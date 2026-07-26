@@ -9,6 +9,50 @@ the RelQL grammar may still change between minor versions.
 
 ## [Unreleased]
 
+### Fixed
+- **`ASSUMING` counterfactuals actually counterfact.** An assignment on the
+  entity table (`ASSUMING c.plan = 'premium'`) now intervenes on the entity's
+  own row only; sibling rows of the same table stay factual. Previously every
+  context row of the table was overwritten, which — combined with zero-shot
+  normalization deriving column statistics per context — flattened the column
+  to a constant that normalized to zero regardless of the assumed value:
+  `ASSUMING x = TRUE` and `ASSUMING x = FALSE` produced identical model
+  inputs. Assignments on non-entity tables keep the documented broad
+  semantics ("these orders are shipped").
+- **EXPLAIN CONTEXT counts FK-feature cells.** Links that opt into feature
+  emission (`LinkDef.feature_type`) always added one token per populated FK
+  to the model input, but the EXPLAIN CONTEXT cell accounting ignored them —
+  a table whose rows carry nothing but FKs reported zero cells, making the
+  knob look inert to anyone measuring it. What EXPLAIN prints now matches
+  what the model gets.
+
+### Added
+- **`AssumptionNotAppliedWarning` covers three inert-assumption shapes:**
+  assigned table absent from context (existing), the entity's own row missing
+  from the context, and a numeric/boolean assignment that leaves the column
+  constant in-context — where zero-shot normalization would erase which
+  constant it was.
+- **`ContextCompositionWarning`** — one aggregate, end-of-run report per
+  `execute()` when ≥50% of a cohort's contexts hit the cell budget or one
+  schema table holds ≥60% of all context cells (cohorts above ~256 cells;
+  virtual task rows excluded). Both failure shapes previously surfaced only
+  as a per-entity warning stream or a hand-run EXPLAIN CONTEXT. It also
+  reports a schema table that contributed context rows but zero feature
+  cells — nothing of it reached the model. Table shares are now measured in
+  *emitted* cells (declared non-key non-null columns plus feature-typed FK
+  values) rather than raw cell counts.
+- **`InvisibleTableWarning`** at `Engine` construction for a table that is
+  statically unseeable: no non-key columns and no `feature_type` on any of
+  its links. Serialization emits one token per feature cell and FK links
+  ride on those tokens, so a pure edge table (follows/likes with no payload)
+  enters the context at zero cost and never reaches the model — including
+  the link structure its rows exist to represent. The warning points at the
+  fix: when the key itself carries signal (a handle, a name, a category),
+  set `feature_type` on that link so the value is emitted; otherwise add a
+  payload column or summarize the edges. The legacy `BreadthFirstTraversal`
+  cell-cost model now also counts feature-typed FK values, matching the
+  reference traversal and what serialization emits.
+
 ## [0.1.2] — 2026-07-25
 
 ### Added
