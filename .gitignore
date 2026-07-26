@@ -35,3 +35,6 @@ wheelhouse-*/
 .coverage.*
 coverage-python.xml
 coverage-cpp.xml
+
+# claude code agent worktrees
+.claude/worktrees/
