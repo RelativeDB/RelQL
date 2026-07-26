@@ -9,6 +9,19 @@ the RelQL grammar may still change between minor versions.
 
 ## [Unreleased]
 
+### Changed
+- **The declared anchor is the traversal's fallback cutoff.** An undated
+  focal row used to mean "no cutoff": the walk graph admitted rows dated
+  after `AS OF`, f2p parent edges were followed unconditionally (a session
+  row stamped at close — after the anchor — was serialized into the
+  context), the factory overlay mapped a missing cutoff to `+inf`, and the
+  columnar path did the same. All of these now fall back to `bound.as_of`,
+  and the walk-graph cache key includes it. The same fallback ends the
+  starvation twin: a query-aware walk from an undated entity used to drop
+  every dated child, so a customer's own orders never reached its context —
+  they do now, up to the anchor. Direct-target sampling fixtures were
+  regenerated for the new (correct) contexts.
+
 ### Fixed (2026-07 review sweep)
 - **Derived training labels are database-exact.** `fit_head`/`finetune`
   labels (when no `labels` dict is supplied) were evaluated over an

@@ -243,6 +243,59 @@ def test_fully_dangling_link_warns_at_index_build():
 # EXPLAIN tells the truth about aggregate ASSUMING
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# traversal temporal conformance: the declared anchor is the fallback cutoff
+# ---------------------------------------------------------------------------
+
+def test_undated_entity_gets_its_dated_children_up_to_the_anchor():
+    """The old query-aware walk left an undated seed's cutoff as None and
+    dropped every dated child — a customer's own orders never reached its
+    context. The declared anchor is the fallback now: pre-anchor orders are
+    admitted, the future one (O4, July 5) still is not."""
+    engine = _engine()
+    q = ("PREDICT customers.age FROM customers "
+         "WHERE customers.customer_id IN :ids RETURN EXPECTED VALUE")
+    pq = validate(parse(q), engine.schema,
+                  {"ids": ["C7"]}).query.bind_params({"ids": ["C7"]})
+    ctx = engine.assemble_context("customers", "C7", ANCHOR, query=pq)
+    orders = {r.id for r in ctx.rows if r.table == "orders"}
+    assert {"O1", "O2"} <= orders
+    assert "O4" not in orders          # dated after the anchor
+
+
+def test_future_dated_parent_is_not_pulled_into_context():
+    """f2p edges used to be followed unconditionally: a parent row dated
+    after the anchor was serialized into the context."""
+    T = lambda d: datetime(2026, 7, d, tzinfo=timezone.utc)
+    schema = (Schema.new_schema()
+              .table(TableDef.new_table("sessions")
+                     .column("closed_at", ValueType.DATETIME)
+                     .column("score", ValueType.NUMBER)
+                     .primary_key("session_id").time_column("closed_at")
+                     .build())
+              .table(TableDef.new_table("events")
+                     .column("at", ValueType.DATETIME)
+                     .column("kind", ValueType.TEXT)
+                     .primary_key("event_id").time_column("at").build())
+              .link(LinkDef("events", "session_id", "sessions"))
+              .build())
+    rows = {
+        # the session row is stamped at close — AFTER the anchor
+        "sessions": [Row("sessions", "s1",
+                         {"closed_at": T(9), "score": 5.0}, T(9))],
+        "events": [Row("events", f"e{i}", {"at": T(i), "kind": "click"},
+                       T(i), {"session_id": "s1"}) for i in (1, 2, 3)],
+    }
+    engine = Engine(schema, in_memory_wiring(rows), model_backend=_Stub())
+    q = ("PREDICT events.kind FROM events "
+         "WHERE events.event_id IN :ids RETURN CLASS")
+    pq = validate(parse(q), engine.schema,
+                  {"ids": ["e2"]}).query.bind_params({"ids": ["e2"]})
+    ctx = engine.assemble_context("events", "e2", T(5), query=pq)
+    assert not any(r.table == "sessions" for r in ctx.rows), \
+        "session closes at T9 > anchor T5: it is the future"
+
+
 def test_explain_renders_aggregate_assuming():
     engine = _engine()
     res = engine.explain(ExecutionInput(

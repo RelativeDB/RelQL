@@ -538,8 +538,14 @@ class ReferenceTraversal:
             return result
 
         def temporally_valid(row, anchor):
-            return (row.timestamp is None or anchor.timestamp is None
-                    or row.timestamp <= anchor.timestamp)
+            # An undated focal row used to mean "no cutoff at all": every
+            # dated row — including rows AFTER bound.as_of — passed. The
+            # anchor the caller declared is the fallback, not infinity.
+            if row.timestamp is None:
+                return True
+            if anchor.timestamp is not None:
+                return row.timestamp <= anchor.timestamp
+            return bound.admits(row.timestamp)
 
         target_node_idx = (task_node_ids.get(target.key)
                            if target.key in task_node_ids
@@ -567,7 +573,11 @@ class ReferenceTraversal:
             cached = walk_neighbor_cache.get(row.key)
             if cached is not None:
                 return cached
-            result = tuple(parents(row)) + tuple(
+            # Parents are filtered too: an f2p edge to a row dated after the
+            # anchor used to be followed unconditionally, serializing a
+            # future parent's cells into the context.
+            result = tuple(p for p in parents(row)
+                           if temporally_valid(p, target)) + tuple(
                 r for r in p2f_walk.get(row.key, ())
                 if temporally_valid(r, target))
             walk_neighbor_cache[row.key] = result
@@ -580,7 +590,11 @@ class ReferenceTraversal:
         native_lib = load_lib()._lib
 
         graph_identity = getattr(graph, "index", graph)
-        graph_key = (id(graph_identity), target.table, target.timestamp)
+        # bound.as_of is part of the graph identity: with an undated target
+        # the cutoff falls back to it, so two AS OF anchors must not share
+        # one cached walk graph.
+        graph_key = (id(graph_identity), target.table, target.timestamp,
+                     bound.as_of)
         cached_graph = (self._native_graph_value
                         if task_spec is not None and task_spec.direct_target
                         and self._native_graph_key == graph_key else None)
@@ -730,9 +744,12 @@ class ReferenceTraversal:
                     if is_focal:
                         focal.add(row.key)
                 for parent in parents(row):
-                    f2p_stack.append((depth + 1, parent))
-                seed_cutoff = (seed.timestamp if query is not None
-                               else (seed.timestamp or bound.as_of))
+                    if temporally_valid(parent, target):
+                        f2p_stack.append((depth + 1, parent))
+                # An undated seed falls back to the declared anchor: the old
+                # query-aware branch left seed_cutoff as None, which starved
+                # undated entities of every dated child.
+                seed_cutoff = seed.timestamp or bound.as_of
                 valid_kids = [
                     r for r in p2f.get(row.key, [])
                     if r.timestamp is None or (
@@ -895,6 +912,10 @@ class ReferenceTraversal:
         """
         cutoff_row = state["by_key"].get(target_key)
         cutoff = cutoff_row.timestamp if cutoff_row is not None else None
+        if cutoff is None:
+            # An undated focal row used to map to cutoff = +inf — every
+            # edge and row admitted regardless of the declared anchor.
+            cutoff = state.get("bound_as_of")
         if "cutoff" in state and state["cutoff"] == cutoff:
             return
 
@@ -912,7 +933,10 @@ class ReferenceTraversal:
             for i, row in enumerate(rows):
                 for parent in parents(row):
                     flat.append(node_pos[parent.key])
-                    edge_ts.append(-math.inf)   # parents are always admitted
+                    # a dated parent obeys the cutoff like any other row;
+                    # only static parents are unconditionally admitted
+                    edge_ts.append(-math.inf if parent.timestamp is None
+                                   else parent.timestamp.timestamp())
                 for child in p2f_walk.get(row.key, ()):
                     flat.append(node_pos[child.key])
                     edge_ts.append(-math.inf if child.timestamp is None
@@ -1136,6 +1160,7 @@ class ReferenceTraversal:
             "node_ids": tuple({**physical_node_ids, **task_node_ids}.items()),
             "db_tables": {table.name for table in schema.tables},
             "masked_key": target_key,
+            "bound_as_of": bound.as_of,
         }
         self._factory_overlay(state, target_key)
         return state
@@ -1180,7 +1205,7 @@ class ReferenceTraversal:
         target = by_key.get(target_key)
         if target is None or not bound.admits_row(target):
             return TraversalResult()
-        if target.timestamp != state["cutoff"]:
+        if (target.timestamp or state.get("bound_as_of")) != state["cutoff"]:
             # Different anchor (per-entity-anchor tasks): rebuild the shared
             # state around this cutoff.
             state = self._factory_shared_build(
@@ -1212,12 +1237,14 @@ class ReferenceTraversal:
             node_keys=state["node_keys"],
             node_id_of=lambda key: task_node_ids.get(
                 key, physical_node_ids.get(key)),
-            node_ids=state["node_ids"])
+            node_ids=state["node_ids"],
+            bound_as_of=state.get("bound_as_of"))
 
     def _shared_tail(self, schema, policy, *, task_spec, target,
                      target_node_idx, target_position, by_key, get_children,
                      parents, temporally_valid, fallback_rows, db_tables,
                      sampling_table, offsets, neighbors, eligible, node_keys,
+                     bound_as_of=None,
                      node_id_of, node_ids) -> TraversalResult:
         """Walk + tiering + BFS emission over a prepared shared graph.
 
@@ -1338,8 +1365,9 @@ class ReferenceTraversal:
                     if is_focal:
                         focal.add(row.key)
                 for parent in parents(row):
-                    f2p_stack.append((depth + 1, parent))
-                seed_cutoff = seed.timestamp
+                    if temporally_valid(parent):
+                        f2p_stack.append((depth + 1, parent))
+                seed_cutoff = seed.timestamp or bound_as_of
                 valid_kids = [
                     r for r in (get_children(row.key) or [])
                     if r.timestamp is None or (

@@ -575,7 +575,10 @@ class ColumnarTraversal:
             return TraversalResult()
         cutoff_f = float(s.node_ts[target])
         if math.isnan(cutoff_f):
-            cutoff_f = math.inf
+            # An undated focal row falls back to the DECLARED anchor, not to
+            # +inf — +inf admitted every row in the store, including the
+            # future the anchor exists to hide.
+            cutoff_f = anchor_f if not math.isnan(anchor_f) else math.inf
 
         # The walk mask depends only on the task table and the cut-off, and a
         # cohort scored at one anchor shares both -- rebuilding it per target

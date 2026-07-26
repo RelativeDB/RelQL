@@ -40,9 +40,8 @@ def _engine(churn_schema, stub_backend):
 def _context(engine, query, entity_id="C7"):
     """Parse the query and hand-build a context holding the entity row, a
     sibling customer, and the entity's pre-anchor orders. Synthetic on
-    purpose: the reference traversal does not expand children of an undated
-    entity row, and these tests are about assumption semantics, not
-    traversal reach."""
+    purpose: these tests are about assumption semantics, not traversal
+    reach, so the context is pinned by hand."""
     from relativedb.engine import EntityContext
     pq = validate(parse(query), engine.schema,
                   {"ids": [entity_id]}).query.bind_params({"ids": [entity_id]})
