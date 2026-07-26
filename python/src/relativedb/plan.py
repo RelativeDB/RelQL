@@ -23,9 +23,9 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .errors import ExecutionError
-from .relql.ast import (Aggregation, Arith, BoolOp, Case, ColumnRef, Condition,
-                        Func, Lit, LogicalOp, Not, Operator, ParsedQuery,
-                        TaskType, Window)
+from .relql.ast import (AggFunc, Aggregation, Arith, BoolOp, Case, ColumnRef,
+                        Condition, Func, Lit, LogicalOp, Not, Operator,
+                        ParsedQuery, TaskType, Window)
 from .schema import Schema
 
 __all__ = ["QueryPlan", "build_plan"]
@@ -163,29 +163,67 @@ def pinned_ids(where: Any, entity_key: ColumnRef) -> Optional[list[Any]]:
     return None
 
 
-def assumptions(expr: Any) -> list[tuple[str, str, Any]]:
-    """The `(table, column, value)` assignments an ASSUMING clause states.
+_AGG_ASSUMABLE_OPS = (Operator.GE, Operator.GT, Operator.EQ,
+                      Operator.LE, Operator.LT)
 
-    Only shapes with one concrete answer qualify: `column = literal`, and those
-    joined by AND. An inequality, an `IN`, an `OR`/`NOT`, or an aggregate
-    condition constrains the world without saying what it *is* — there is no
-    single context that satisfies it — so those raise rather than being quietly
-    dropped.
+
+def _walk_assuming(expr: Any):
+    """Yield each applicable ASSUMING conjunct as ``("assign", (t, c, v))``
+    or ``("agg", (aggregation, op, count))``; raise on anything else.
+
+    Two shapes have one concrete answer the engine can build: a value
+    assignment (`column = literal`) and an aggregate count bound
+    (`COUNT(t.*) OVER (...) >= k`, or EXISTS/NOT EXISTS) — the latter is
+    realized by adding or removing the entity's own event rows until the
+    bound holds. An `IN`, an `OR`, or an inequality on a plain column still
+    describes a set of possible worlds rather than one, so those raise
+    rather than being quietly dropped.
     """
     if isinstance(expr, LogicalOp) and expr.op is BoolOp.AND:
-        return assumptions(expr.left) + assumptions(expr.right)
+        yield from _walk_assuming(expr.left)
+        yield from _walk_assuming(expr.right)
+        return
     if (isinstance(expr, Condition) and expr.op is Operator.EQ
             and isinstance(expr.left, ColumnRef)
             and expr.left.column != "*"
             and expr.right_expr is None
             and not isinstance(expr.right, tuple)):
-        return [(expr.left.table, expr.left.column, expr.right)]
+        yield ("assign", (expr.left.table, expr.left.column, expr.right))
+        return
+    if (isinstance(expr, Condition) and isinstance(expr.left, Aggregation)
+            and expr.left.func in (AggFunc.COUNT, AggFunc.EXISTS)
+            and expr.op in _AGG_ASSUMABLE_OPS
+            and expr.right_expr is None
+            and isinstance(expr.right, (int, float))
+            and not isinstance(expr.right, bool)):
+        yield ("agg", (expr.left, expr.op, expr.right))
+        return
+    if isinstance(expr, Aggregation) and expr.func is AggFunc.EXISTS:
+        yield ("agg", (expr, Operator.GE, 1))
+        return
+    if (isinstance(expr, Not) and isinstance(expr.expr, Aggregation)
+            and expr.expr.func is AggFunc.EXISTS):
+        yield ("agg", (expr.expr, Operator.EQ, 0))
+        return
     raise ExecutionError(
         f"ASSUMING {_expr_str(expr)!r} cannot be applied: a counterfactual "
-        f"must assign concrete values — `column = literal`, optionally joined "
-        f"by AND. Inequalities, IN, OR/NOT and aggregate conditions describe a "
-        f"set of possible worlds rather than one, so the engine cannot build "
-        f"the context they imply.")
+        f"must state one concrete world — `column = literal`, or a count "
+        f"bound like `COUNT(t.*) OVER (...) >= k` / `EXISTS(t.*)`, joined "
+        f"by AND. IN, OR, and inequalities on plain columns describe a set "
+        f"of possible worlds, so the engine cannot build the context they "
+        f"imply.")
+
+
+def assumptions(expr: Any) -> list[tuple[str, str, Any]]:
+    """The `(table, column, value)` assignments an ASSUMING clause states."""
+    return [item for kind, item in _walk_assuming(expr) if kind == "assign"]
+
+
+def aggregate_assumptions(expr: Any) -> list[tuple[Any, Operator, Any]]:
+    """The `(aggregation, op, count)` bounds an ASSUMING clause states."""
+    if expr is None:
+        return []
+    return [item for kind, item in _walk_assuming(expr) if kind == "agg"]
 
 
 def assuming_plan(expr: Any) -> Optional[str]:
@@ -194,8 +232,15 @@ def assuming_plan(expr: Any) -> Optional[str]:
     if expr is None:
         return None
     try:
-        return ", ".join(f"{t}.{c} := {_lit_str(v)}"
-                         for t, c, v in assumptions(expr))
+        parts = []
+        for kind, item in _walk_assuming(expr):
+            if kind == "assign":
+                t, c, v = item
+                parts.append(f"{t}.{c} := {_lit_str(v)}")
+            else:
+                agg, op, bound = item
+                parts.append(f"{_expr_str(agg)} {op.value} {bound}")
+        return ", ".join(parts)
     except ExecutionError:
         return None
 

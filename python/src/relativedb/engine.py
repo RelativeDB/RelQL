@@ -16,7 +16,7 @@ import json
 import os
 import warnings
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Optional, Protocol, Sequence, Union
 
@@ -27,8 +27,10 @@ from .csc import CscIndex
 from .errors import ExecutionError
 from .evaluate import eval_bool
 from .model import ModelConfig
-from .plan import QueryPlan, assumptions, build_plan, pinned_ids, pure_pin
-from .relql.ast import Ablation, AggFunc, Explain, ParsedQuery, TaskType
+from .plan import (QueryPlan, aggregate_assumptions, assumptions, build_plan,
+                   pinned_ids, pure_pin)
+from .relql.ast import (Ablation, AggFunc, Explain, Operator, ParsedQuery,
+                        TaskType, _find_aggregations)
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema, TableDef, ValueType
@@ -112,6 +114,126 @@ def _apply_ablations(ablations, ctx: "EntityContext") -> "EntityContext":
                          hit_cell_budget=ctx.hit_cell_budget,
                          focal_row_keys=frozenset(
                              k for k in ctx.focal_row_keys if k[0] not in drop),
+                         node_ids=dict(ctx.node_ids))
+
+
+def _apply_aggregate_assumptions(agg_conds, ctx: "EntityContext",
+                                 entity_table: str,
+                                 schema: Optional[Schema],
+                                 fetch_template=None) -> "EntityContext":
+    """Reshape the context so an ``ASSUMING COUNT(t.*) OVER (...) >= k``
+    (or EXISTS / NOT EXISTS) bound holds for the entity.
+
+    The counterfactual is realized structurally: the entity's own in-window
+    rows of ``t`` are counted, and the context gains cloned copies of its
+    most recent row (re-timestamped inside the window) or loses its oldest
+    rows until the bound is met. Clones inherit the template's cells, so the
+    synthetic history looks like "more of the same" rather than empty rows
+    the model cannot see. Every unsatisfiable case raises — a counterfactual
+    that silently did not hold would poison the comparison it exists for.
+    """
+    from .evaluate import _rows_in_window, _window_bounds
+
+    if not agg_conds:
+        return ctx
+    rows = list(ctx.rows)
+    focal = set(ctx.focal_row_keys)
+    for n, (agg, op, bound) in enumerate(agg_conds):
+        table = agg.column.table
+        if agg.func not in (AggFunc.COUNT, AggFunc.EXISTS):
+            raise ExecutionError(
+                f"ASSUMING supports COUNT and EXISTS bounds; "
+                f"{agg.func.name} describes a value the engine cannot build "
+                f"rows for")
+        if agg.filter is not None:
+            raise ExecutionError(
+                "ASSUMING a filtered COUNT(t.* WHERE ...) is not supported: "
+                "synthesized rows would have to satisfy the filter. Assume "
+                "the plain count, or assign the filtered column explicitly.")
+        if table == entity_table:
+            raise ExecutionError(
+                f"cannot assume a count over the entity table {table!r}: "
+                f"each context holds this one entity, not a population of "
+                f"them")
+        if float(bound) != int(bound) or bound < 0:
+            raise ExecutionError(
+                f"ASSUMING COUNT(...) needs a non-negative integer bound, "
+                f"got {bound!r}")
+        bound = int(bound)
+
+        mine = [r for r in rows if r.table == table
+                and (not focal or r.key in focal)]
+        col = agg.column.column
+        counted = [r for r in _rows_in_window(mine, agg.window, ctx.anchor)
+                   if col == "*" or r.cells.get(col) is not None]
+        c = len(counted)
+        target = {Operator.GE: max(c, bound),
+                  Operator.GT: max(c, bound + 1),
+                  Operator.EQ: bound,
+                  Operator.LE: min(c, bound),
+                  Operator.LT: min(c, bound - 1)}[op]
+        if target < 0:
+            raise ExecutionError(
+                f"ASSUMING COUNT(...) {op.value} {bound} demands a negative "
+                f"count")
+
+        if target > c:
+            # newest in-window row, else the entity's newest row of the
+            # table, else any context row of the table re-parented to the
+            # entity, else a row fetched from the database — the clone must
+            # carry real cells to be visible.
+            def usable(candidates):
+                return [r for r in candidates
+                        if col == "*" or r.cells.get(col) is not None]
+            pool = (usable(counted) or usable(mine)
+                    or usable(r for r in rows if r.table == table))
+            if not pool and fetch_template is not None:
+                pool = usable(fetch_template(table))
+            if not pool:
+                raise ExecutionError(
+                    f"ASSUMING a count on {table!r} needs at least one row "
+                    f"of that table to clone — none in the context or the "
+                    f"database (an empty synthetic row would be invisible "
+                    f"to the model)")
+            template = max(pool, key=lambda r: (r.timestamp is not None,
+                                                r.timestamp or ctx.anchor))
+            lo = hi = None
+            if agg.window is not None and ctx.anchor is not None:
+                lo, hi = _window_bounds(agg.window, ctx.anchor)
+            base_ts = hi or ctx.anchor or template.timestamp
+            fk = next((l.fk_column for l in (schema.links_from(table)
+                                             if schema else [])
+                       if l.to_table == entity_table), None)
+            tdef = schema.table(table) if schema else None
+            for i in range(1, target - c + 1):
+                ts = (base_ts - timedelta(seconds=i)
+                      if base_ts is not None else None)
+                if ts is not None and lo is not None and ts <= lo:
+                    raise ExecutionError(
+                        f"ASSUMING COUNT window on {table!r} is too narrow "
+                        f"to hold {target} distinct rows")
+                cells = dict(template.cells)
+                if tdef is not None and tdef.time_column in cells:
+                    cells[tdef.time_column] = ts
+                parents = dict(template.parents)
+                if fk is not None:
+                    parents[fk] = ctx.entity_id
+                clone = Row(table, f"__assumed__:{table}:{n}:{i}",
+                            cells, ts, parents)
+                rows.append(clone)
+                if focal:
+                    focal.add(clone.key)
+        elif target < c:
+            # keep the newest `target` in-window rows; drop the oldest
+            drop = {r.key for r in counted[:c - target]}
+            rows = [r for r in rows if r.key not in drop]
+            focal -= drop
+
+    return EntityContext(entity_id=ctx.entity_id, anchor=ctx.anchor,
+                         rows=rows,
+                         truncated_children=ctx.truncated_children,
+                         hit_cell_budget=ctx.hit_cell_budget,
+                         focal_row_keys=frozenset(focal),
                          node_ids=dict(ctx.node_ids))
 
 
@@ -813,6 +935,15 @@ class Engine:
         result = self.traversal.traverse(
             self.schema, sampler, entity_table, entity_id, bound, policy,
             query=query)
+        if not result.rows:
+            # A typo'd id, an int/str key mismatch, or a temporally
+            # inadmissible row all land here — and used to be scored as a
+            # normal prediction over an empty context, indistinguishable
+            # from a real entity with no history.
+            _fallback(f"entity {entity_table}={entity_id!r} assembled an "
+                      f"EMPTY context (unknown id, key-type mismatch, or "
+                      f"row not admissible at the anchor); scoring it would "
+                      f"predict from nothing")
         return EntityContext(
             entity_id=entity_id, anchor=bound.as_of, rows=list(result.rows),
             truncated_children=result.truncated_children,
@@ -1207,8 +1338,10 @@ class Engine:
             "contexts_hit_cell_budget": sum(1 for c in contexts if c.hit_cell_budget),
             "fanout_per_hop": self.context_policy.fanout_at(0),
         }
-        # Truncation only distorts *count-like* aggregates (COUNT/SUM/AVG over a
-        # window). Warn once per execute when it actually bites those.
+        # Truncation only distorts *count-like* aggregates (COUNT/SUM/AVG over
+        # a window) in the TARGET. WHERE aggregations are evaluated against
+        # the database (`_where_agg_rows`), so truncation cannot bias the
+        # cohort. Warn once per execute when it actually bites.
         windowed = any(a.window is not None and a.func in _COUNTING_AGGS
                        for a in pq.target_aggregations)
         if n_trunc and windowed:
@@ -1220,8 +1353,95 @@ class Engine:
                 ContextTruncationWarning, stacklevel=2)
         return stats
 
+    def _assumption_template_fetch(self, ctx: EntityContext,
+                                   entity_table: str):
+        """Database fallback for ASSUMING COUNT clone templates: the entity's
+        own newest rows of the table, else the newest row anywhere in it."""
+        def fetch(table: str) -> list[Row]:
+            bound = (TemporalBound.at_or_before(ctx.anchor)
+                     if ctx.anchor is not None else TemporalBound.unbounded())
+            link = next((l for l in self.schema.links_from(table)
+                         if l.to_table == entity_table), None)
+            if link is not None:
+                rows = list(self._sampler().children(link, ctx.entity_id,
+                                                     bound, 64))
+                if rows:
+                    return rows
+            scanner = self.wiring.scanners.get(table)
+            if scanner is None:
+                return []
+            newest: Optional[Row] = None
+            for r in scanner(table, bound):
+                if newest is None or _newest_first_key(r) < _newest_first_key(newest):
+                    newest = r
+            return [newest] if newest is not None else []
+        return fetch
+
+    # WHERE aggregations are evaluated against the database, capped here so a
+    # pathological fan-out fails loudly instead of silently saturating.
+    _WHERE_FETCH_LIMIT = 1_000_000
+
+    def _label_rows(self, pq: ParsedQuery, entity_table: str, eid: Any,
+                    anchor: Optional[datetime]
+                    ) -> tuple[dict[str, list[Row]], dict[str, Any]]:
+        """Database-exact rows and entity cells for evaluating the target as
+        GROUND TRUTH (training labels, ranking relevance).
+
+        Labels used to be derived from an assembled context — a sample built
+        for the model that carries peer entities' rows (a peer's event
+        counted into this entity's label) and is fanout/budget truncated (a
+        heavy entity's own events under-counted). A label is a fact: fetch
+        the entity's rows through the wiring, bounded at each window's far
+        edge (``end_delta``, not span — an offset window's tail was being
+        cut off).
+        """
+        aggs = _find_aggregations(pq.target)
+        ent = self._sampler().entities(entity_table, [eid],
+                                       TemporalBound.unbounded())
+        cells = dict(ent[0].cells) if ent else {}
+        horizon: dict[str, Optional[datetime]] = {}
+        for a in aggs:
+            table = a.column.table
+            if table == entity_table:
+                continue
+            if a.window is None or anchor is None:
+                horizon[table] = None            # unbounded fetch
+                continue
+            end = a.window.end_delta()
+            hi = None if end == timedelta.max else anchor + max(
+                end, timedelta(0))
+            prev = horizon.get(table, anchor)
+            horizon[table] = (None if prev is None or hi is None
+                              else max(prev, hi))
+        out: dict[str, list[Row]] = {entity_table: list(ent)}
+        sampler = self._sampler()
+        for table, hi in horizon.items():
+            link = next((l for l in self.schema.links_from(table)
+                         if l.to_table == entity_table), None)
+            if link is None:
+                raise ExecutionError(
+                    f"the target aggregates {table!r}, which has no direct "
+                    f"link to {entity_table!r}; a derived label cannot "
+                    f"attribute its rows to one entity. Supply labels "
+                    f"explicitly.")
+            bound = (TemporalBound.at_or_before(hi) if hi is not None
+                     else TemporalBound.unbounded())
+            rows = list(sampler.children(link, eid, bound,
+                                         self._WHERE_FETCH_LIMIT))
+            if len(rows) >= self._WHERE_FETCH_LIMIT:
+                raise ExecutionError(
+                    f"label fetch for {table!r} hit the row cap for entity "
+                    f"{eid!r}; the derived label would be silently wrong")
+            out[table] = rows
+        return out, cells
+
     def _where_ok(self, pq: ParsedQuery, ctx: EntityContext,
-                  entity_table: str) -> bool:
+                  entity_table: str,
+                  anchor_override: Optional[datetime] = None) -> bool:
+        # WHERE is a factual filter at the query's anchor. When
+        # context_anchor_time decouples the context "now", the override keeps
+        # WHERE at the true anchor instead of the context's.
+        anchor = anchor_override or ctx.anchor
         cells = dict(ctx.entity_cells(entity_table))
         # The primary key is the row's identity, not one of its cells, so a
         # predicate on it (`WHERE t.pk IN :ids`) would otherwise see NULL and
@@ -1229,7 +1449,64 @@ class Engine:
         pk = pq.entity_key.column
         if pk:
             cells.setdefault(pk, ctx.entity_id)
-        return eval_bool(pq.where, ctx.rows_by_table(), cells, ctx.anchor)
+        return eval_bool(
+            pq.where, self._where_agg_rows(pq, ctx, entity_table, anchor),
+            cells, anchor, entity_table=entity_table)
+
+    def _where_agg_rows(self, pq: ParsedQuery, ctx: EntityContext,
+                        entity_table: str,
+                        anchor: Optional[datetime] = None
+                        ) -> dict[str, list[Row]]:
+        """Database-exact rows for each table a WHERE aggregation touches.
+
+        WHERE is a factual cohort filter, so its counts must be facts. They
+        used to be computed over the assembled context, which is a *sample*
+        built for the model — it carries peer entities' rows (so
+        ``COUNT(orders.*) > 0`` passed for a customer who never ordered) and,
+        depending on the task shape, can omit the entity's own children (so
+        the same count read zero for a customer with orders). Fetching the
+        entity's rows through the wiring answers from the data instead.
+        Aggregations on tables with no direct link to the entity raise: a
+        multi-hop count needs a join this filter does not do, and a wrong
+        cohort is worse than a failed statement.
+        """
+        aggs = _find_aggregations(pq.where)
+        for a in aggs:
+            if a.window is not None and a.window.end > 0:
+                raise ExecutionError(
+                    f"WHERE window on {a.column.table!r} faces the future "
+                    f"(FOLLOWING); a cohort filter is factual and its rows "
+                    f"are fetched at or before the anchor, so this window "
+                    f"can never match anything. Use a PRECEDING window.")
+        tables = {a.column.table for a in aggs}
+        if not tables:
+            return {}
+        anchor = anchor if anchor is not None else ctx.anchor
+        bound = (TemporalBound.at_or_before(anchor)
+                 if anchor is not None else TemporalBound.unbounded())
+        sampler = self._sampler()
+        out: dict[str, list[Row]] = {}
+        for table in tables:
+            if table == entity_table:
+                out[table] = [r for r in ctx.rows
+                              if r.key == (entity_table, ctx.entity_id)]
+                continue
+            link = next((l for l in self.schema.links_from(table)
+                         if l.to_table == entity_table), None)
+            if link is None:
+                raise ExecutionError(
+                    f"WHERE aggregates over {table!r}, which has no direct "
+                    f"link to the entity table {entity_table!r}; the filter "
+                    f"cannot attribute its rows to one entity")
+            rows = list(sampler.children(link, ctx.entity_id, bound,
+                                         self._WHERE_FETCH_LIMIT))
+            if len(rows) >= self._WHERE_FETCH_LIMIT:
+                raise ExecutionError(
+                    f"WHERE aggregation over {table!r} hit the "
+                    f"{self._WHERE_FETCH_LIMIT}-row fetch cap for entity "
+                    f"{ctx.entity_id!r}; the count would be silently wrong")
+            out[table] = rows
+        return out
 
     def _resolve_entity_ids(self, pq: ParsedQuery,
                             input: ExecutionInput) -> list[Any]:
@@ -1259,8 +1536,19 @@ class Engine:
         if input.per_entity_anchor:
             rows = self._sampler().entities(entity_table, [entity_id],
                                             TemporalBound.unbounded())
-            if rows and rows[0].timestamp is not None:
-                return rows[0].timestamp
+            ts = rows[0].timestamp if rows else None
+            if ts is not None:
+                # An entity's own timestamp never overrides a declared AS OF
+                # forward: that would score past the anchor the user pinned.
+                return min(ts, anchor) if anchor is not None else ts
+            if anchor is None:
+                raise ExecutionError(
+                    f"per_entity_anchor: entity {entity_id!r} has no dated "
+                    f"row and no anchor_time was given — its context would "
+                    f"be unbounded and read the future")
+            _fallback(f"per_entity_anchor: entity {entity_id!r} has no "
+                      f"dated row; falling back to the shared anchor "
+                      f"{anchor.isoformat()}")
         return anchor
 
     # -- AS OF: resolve the effective anchor --------------------------------
@@ -1357,6 +1645,11 @@ class Engine:
         if mode in ("CONTEXT", "ANALYZE"):
             context, contexts = self._assemble_report(pq, input, effective)
             if mode == "ANALYZE":
+                if input.shared_context or input.hurdle_gate is not None:
+                    plan["warnings"] = list(plan.get("warnings", [])) + [
+                        "EXPLAIN ANALYZE scores per-entity; the "
+                        "shared-context/hurdle strategy named in this plan "
+                        "is not applied to these predictions"]
                 task_type = pq.task_type(self.schema)
                 model_uri = self.model_config.model_uri_for(task_type)
                 predictions = tuple(self._require_backend().score(
@@ -1375,13 +1668,20 @@ class Engine:
         entity_table = pq.entity_key.table
         ids = self._resolve_entity_ids(pq, eff_input)
         assumed = assumptions(pq.assuming) if pq.assuming is not None else []
+        agg_assumed = aggregate_assumptions(pq.assuming)
+        where_anchor = (eff_input.anchor_time
+                        if eff_input.context_anchor_time is not None else None)
         contexts: list[EntityContext] = []
         for eid in ids:
             anchor = self._anchor_for(entity_table, eid, eff_input)
             ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
-            if pq.where is not None and not self._where_ok(pq, ctx, entity_table):
+            if pq.where is not None and not self._where_ok(
+                    pq, ctx, entity_table, where_anchor):
                 continue
             ctx = _apply_ablations(pq.ablations, ctx)
+            ctx = _apply_aggregate_assumptions(
+                agg_assumed, ctx, entity_table, self.schema,
+                self._assumption_template_fetch(ctx, entity_table))
             contexts.append(_apply_assumptions(assumed, ctx, entity_table))
         return contexts
 

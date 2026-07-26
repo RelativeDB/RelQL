@@ -200,9 +200,36 @@ bool pinned_ids(const Expr* where, const std::string& table,
   return false;
 }
 
-// The (table, column, value) assignments an ASSUMING clause states. Only
-// `column = literal` joined by AND has one concrete answer; anything else
+// The assignments and count bounds an ASSUMING clause states. Two shapes
+// have one concrete answer the engine can build: `column = literal`, and a
+// COUNT/EXISTS bound (`COUNT(t.*) OVER (...) >= k`, EXISTS, NOT EXISTS) —
+// realized by adding or removing the entity's own rows. Anything else
 // describes a set of possible worlds, so it is reported rather than applied.
+bool assuming_count_bound(const Expr* e, std::string& out) {
+  auto agg_ok = [](const Expr* a) {
+    return a && a->kind == ExprKind::Agg &&
+           (a->func == AggFunc::COUNT || a->func == AggFunc::EXISTS);
+  };
+  if (e->kind == ExprKind::Cond && agg_ok(e->left.get()) && !e->right_expr &&
+      (e->right.kind == LitKind::Int || e->right.kind == LitKind::Float) &&
+      (e->op == Operator::GE || e->op == Operator::GT ||
+       e->op == Operator::EQ || e->op == Operator::LE ||
+       e->op == Operator::LT)) {
+    out = expr_to_string(*e);
+    return true;
+  }
+  if (agg_ok(e) && e->func == AggFunc::EXISTS) {
+    out = expr_to_string(*e);
+    return true;
+  }
+  if (e->kind == ExprKind::Not && agg_ok(e->inner.get()) &&
+      e->inner->func == AggFunc::EXISTS) {
+    out = expr_to_string(*e);
+    return true;
+  }
+  return false;
+}
+
 bool assuming_assignments(const Expr* e, std::string& out) {
   if (!e) return false;
   if (e->kind == ExprKind::Logic && e->bop == BoolOp::AND) {
@@ -218,7 +245,7 @@ bool assuming_assignments(const Expr* e, std::string& out) {
     out = e->left->table + "." + e->left->column + " := " + lit_str(e->right);
     return true;
   }
-  return false;
+  return assuming_count_bound(e, out);
 }
 
 const char* default_output(TaskType t) {
@@ -377,11 +404,11 @@ LogicalPlan build_logical_plan(const ParsedQuery& q, const Schema& schema) {
       // clause is reported rather than raised.
       p.warnings.push_back(
           "ASSUMING '" + expr_to_string(*q.assuming) +
-          "' cannot be applied: a counterfactual must assign concrete values "
-          "- `column = literal`, optionally joined by AND. Inequalities, IN, "
-          "OR/NOT and aggregate conditions describe a set of possible worlds "
-          "rather than one, so the engine cannot build the context they "
-          "imply.");
+          "' cannot be applied: a counterfactual must state one concrete "
+          "world - `column = literal`, or a count bound like `COUNT(t.*) "
+          "OVER (...) >= k` / EXISTS(t.*), joined by AND. IN, OR, and "
+          "inequalities on plain columns describe a set of possible worlds, "
+          "so the engine cannot build the context they imply.");
     }
   }
 

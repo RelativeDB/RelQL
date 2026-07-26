@@ -41,7 +41,15 @@ class ExecutionRequest:
 
 def _context_builder(engine: "Engine", req: ExecutionRequest):
     """Assemble one entity's context, or None when WHERE excludes it."""
-    from .engine import _apply_ablations, _apply_assumptions
+    from .engine import (_apply_ablations, _apply_aggregate_assumptions,
+                         _apply_assumptions)
+    from .plan import aggregate_assumptions
+
+    agg_assumed = aggregate_assumptions(req.pq.assuming)
+    # WHERE stays at the query's factual anchor even when
+    # context_anchor_time decouples the context "now".
+    where_anchor = (req.input.anchor_time
+                    if req.input.context_anchor_time is not None else None)
 
     def build(eid) -> Optional["EntityContext"]:
         anchor = engine._anchor_for(req.entity_table, eid, req.input)
@@ -50,11 +58,15 @@ def _context_builder(engine: "Engine", req: ExecutionRequest):
         # WHERE selects who to score and is factual; the counterfactual is
         # applied afterwards, to the context that actually gets scored.
         if (req.pq.where is not None
-                and not engine._where_ok(req.pq, ctx, req.entity_table)):
+                and not engine._where_ok(req.pq, ctx, req.entity_table,
+                                         where_anchor)):
             return None
         # Ablate first, then assume: assuming on an ablated table should
         # warn as inert, not resurrect the rows.
         ctx = _apply_ablations(req.pq.ablations, ctx)
+        ctx = _apply_aggregate_assumptions(
+            agg_assumed, ctx, req.entity_table, engine.schema,
+            engine._assumption_template_fetch(ctx, req.entity_table))
         return _apply_assumptions(req.assumed, ctx, req.entity_table)
 
     return build

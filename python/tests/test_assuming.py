@@ -157,3 +157,110 @@ def test_end_to_end_execute_applies_and_scores(churn_schema, stub_backend):
                "ASSUMING customers.age = 99 RETURN EXPECTED VALUE"),
         anchor_time=ANCHOR, params={"ids": ["C7"]}))
     assert len(result.predictions) == 1
+
+
+# ---------------------------------------------------------------------------
+# aggregate counterfactuals: ASSUMING COUNT(...) >= k / EXISTS / NOT EXISTS
+# ---------------------------------------------------------------------------
+# The bound is realized structurally: the entity's own in-window rows are
+# cloned (newest first, re-timestamped inside the window) or dropped (oldest
+# first) until the count holds. Clones inherit real cells — an empty synthetic
+# row would be invisible to the model (see InvisibleTableWarning).
+
+from relativedb.engine import _apply_aggregate_assumptions
+from relativedb.errors import ExecutionError
+from relativedb.plan import aggregate_assumptions
+
+
+def _agg_conds(engine, assuming_clause, entity_id="C9"):
+    query = ("PREDICT customers.age FROM customers "
+             "WHERE customers.customer_id IN :ids "
+             f"ASSUMING {assuming_clause} RETURN EXPECTED VALUE")
+    pq = validate(parse(query), engine.schema,
+                  {"ids": [entity_id]}).query.bind_params({"ids": [entity_id]})
+    return aggregate_assumptions(pq.assuming)
+
+
+def _entity_orders(ctx, entity_id):
+    return [r for r in ctx.rows if r.table == "orders"
+            and r.parents.get("customer_id") == entity_id]
+
+
+def test_assume_count_clones_rows_for_an_inactive_entity(
+        churn_schema, stub_backend):
+    """C9 never ordered; ASSUMING COUNT >= 3 must build the history."""
+    engine = _engine(churn_schema, stub_backend)
+    ctx = engine.assemble_context("customers", "C9", ANCHOR)
+    assert not _entity_orders(ctx, "C9")
+    conds = _agg_conds(engine,
+                       "COUNT(orders.*) OVER (180 DAYS PRECEDING) >= 3")
+    out = _apply_aggregate_assumptions(conds, ctx, "customers", engine.schema)
+    mine = _entity_orders(out, "C9")
+    assert len(mine) == 3
+    for r in mine:
+        assert r.cells.get("qty") is not None        # cloned, not empty
+        assert r.timestamp is not None and r.timestamp <= ANCHOR
+        assert r.timestamp > ANCHOR - __import__("datetime").timedelta(days=180)
+        assert r.key in out.focal_row_keys           # counts as the entity's
+
+
+def test_assume_count_already_satisfied_is_a_no_op(churn_schema, stub_backend):
+    engine = _engine(churn_schema, stub_backend)
+    ctx = engine.assemble_context("customers", "C7", ANCHOR)
+    conds = _agg_conds(engine,
+                       "COUNT(orders.*) OVER (365 DAYS PRECEDING) >= 1", "C7")
+    out = _apply_aggregate_assumptions(conds, ctx, "customers", engine.schema)
+    assert [r.key for r in out.rows] == [r.key for r in ctx.rows]
+
+
+def test_assume_exact_count_drops_oldest_first(churn_schema, stub_backend):
+    """C7 has O1 (March) and O2 (May); COUNT = 1 keeps the newest."""
+    engine = _engine(churn_schema, stub_backend)
+    ctx = engine.assemble_context("customers", "C7", ANCHOR)
+    conds = _agg_conds(engine,
+                       "COUNT(orders.*) OVER (365 DAYS PRECEDING) = 1", "C7")
+    out = _apply_aggregate_assumptions(conds, ctx, "customers", engine.schema)
+    kept = _entity_orders(out, "C7")
+    assert [r.id for r in kept] == ["O2"]
+
+
+def test_assume_not_exists_clears_the_entitys_window(
+        churn_schema, stub_backend):
+    engine = _engine(churn_schema, stub_backend)
+    ctx = engine.assemble_context("customers", "C7", ANCHOR)
+    conds = _agg_conds(engine,
+                       "NOT EXISTS(orders.*) OVER (365 DAYS PRECEDING)", "C7")
+    out = _apply_aggregate_assumptions(conds, ctx, "customers", engine.schema)
+    assert not _entity_orders(out, "C7")
+    # peers' orders are context evidence, not the entity's history: kept
+    assert any(r.table == "orders" for r in out.rows)
+
+
+def test_assume_count_end_to_end(churn_schema, stub_backend):
+    engine = _engine(churn_schema, stub_backend)
+    result = engine.execute(ExecutionInput(
+        query=("PREDICT customers.age FROM customers "
+               "WHERE customers.customer_id IN :ids "
+               "ASSUMING COUNT(orders.*) OVER (180 DAYS PRECEDING) >= 3 "
+               "RETURN EXPECTED VALUE"),
+        anchor_time=ANCHOR, params={"ids": ["C9"]}))
+    assert len(result.predictions) == 1
+
+
+def test_unsupported_aggregate_assumptions_fail_loudly(
+        churn_schema, stub_backend):
+    engine = _engine(churn_schema, stub_backend)
+    ctx = engine.assemble_context("customers", "C7", ANCHOR)
+
+    # only COUNT/EXISTS bounds are buildable; other aggregates never were
+    with pytest.raises(ExecutionError, match="possible worlds"):
+        _agg_conds(engine, "SUM(orders.qty) OVER (90 DAYS PRECEDING) >= 10",
+                   "C7")
+    # a filtered COUNT extracts but cannot be synthesized: loud, with the fix
+    conds = _agg_conds(engine, "COUNT(orders.* WHERE orders.qty = 1) "
+                               "OVER (90 DAYS PRECEDING) >= 2", "C7")
+    with pytest.raises(ExecutionError, match="filtered"):
+        _apply_aggregate_assumptions(conds, ctx, "customers", engine.schema)
+    # inequality on a plain column is still not a buildable world
+    with pytest.raises(ExecutionError, match="possible worlds"):
+        _agg_conds(engine, "customers.age >= 30", "C7")

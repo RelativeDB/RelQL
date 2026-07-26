@@ -34,7 +34,7 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -43,8 +43,8 @@ import numpy as np
 from .engine import EntityContext, EntityPrediction, ModelBackend
 from .evaluate import eval_bool, eval_value
 from .model import ModelConfig, NormalizationMode
-from .relql.ast import (Aggregation, Arith, Case, ColumnRef, Condition, Func,
-                        LogicalOp, Not, ParsedQuery, TaskType)
+from .relql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef,
+                        Condition, Func, LogicalOp, Not, ParsedQuery, TaskType)
 from .retrieve import RetrieverWiring, TemporalBound
 from .schema import Schema, ValueType
 from .task import TaskSpec, TaskSpecFactory
@@ -1467,13 +1467,20 @@ class RtNativeBackend:
             return []
         mode = self._mode(config)
         if task_type is TaskType.MULTICLASS_CLASSIFICATION:
-            return self._score_multiclass(query, contexts, model_uri, mode)
+            return self._by_anchor(
+                contexts,
+                lambda cs: self._score_multiclass(query, cs, model_uri, mode))
         if task_type is TaskType.MULTILABEL_RANKING:
-            return self._score_ranking(query, contexts, model_uri, mode)
+            return self._by_anchor(
+                contexts,
+                lambda cs: self._score_ranking(query, cs, model_uri, mode))
         model = self._model_for(model_uri)
+        head = self._head_for(task_type)
+        if task_type is TaskType.FORECASTING and (query.num_forecasts or 1) > 1:
+            return self._score_forecast(query, task_type, contexts, model,
+                                        mode, head)
         seqs, label_mu, label_sd = self._build_sequences(
             query, task_type, contexts, normalization_mode=mode)
-        head = self._head_for(task_type)
         if head is not None:
             # trained head over the frozen backbone's target-cell features
             scores = head.predict(self._encode(model, seqs))[:, 0]
@@ -1493,12 +1500,69 @@ class RtNativeBackend:
                 # twice and inflates the error by orders of magnitude.
                 v = s if head is not None else s * sd + mu
                 if task_type is TaskType.FORECASTING:
-                    n = query.num_forecasts or 1
                     preds.append(EntityPrediction(ctx.entity_id, value=v,
-                                                  forecast=tuple([v] * n)))
+                                                  forecast=(v,)))
                 else:
                     preds.append(EntityPrediction(ctx.entity_id, value=v))
         return preds
+
+    @staticmethod
+    def _by_anchor(contexts: list[EntityContext], run):
+        """Run a scorer once per distinct context anchor.
+
+        Class domains and ranking candidates are scanned at a batch-wide
+        bound; under per-entity anchors that bound used to be max(anchors),
+        so an early-anchored entity's candidate rows included other
+        entities' futures. Grouping keeps every scan at its own anchor."""
+        anchors = {c.anchor for c in contexts}
+        if len(anchors) <= 1:
+            return run(contexts)
+        by_index: dict[int, EntityPrediction] = {}
+        for anchor in sorted(anchors, key=lambda a: (a is not None, a)):
+            picked = [(i, c) for i, c in enumerate(contexts)
+                      if c.anchor == anchor]
+            for (i, _), pred in zip(picked, run([c for _, c in picked])):
+                by_index[i] = pred
+        return [by_index[i] for i in range(len(contexts))]
+
+    def _score_forecast(self, query: ParsedQuery, task_type: TaskType,
+                        contexts: list[EntityContext], model, mode,
+                        head) -> list[EntityPrediction]:
+        """HORIZONS N [STEP d]: one forward per horizon.
+
+        Horizon k re-asks the same masked question with the target token
+        stamped at ``anchor + k*step`` — the model's task row encodes *when*
+        the window starts, so moving its timestamp is the native way to ask
+        about a later window. Context rows and self-label history stay at
+        the base anchor: the evidence is factual, only the question moves.
+        (Previously HORIZONS N returned one prediction copied N times.)"""
+        n = query.num_forecasts or 1
+        window = next((a.window for a in query.target_aggregations
+                       if a.window is not None), None)
+        if window is None:
+            raise RtNativeError(
+                "HORIZONS > 1 needs a windowed aggregation target")
+        step = (window.unit.delta(window.step) if window.step is not None
+                else window.span())
+        if step is None:
+            raise RtNativeError(
+                "HORIZONS > 1 over an unbounded window needs an explicit "
+                "STEP; there is no frame width to stride by")
+        per_ctx: list[list[float]] = [[] for _ in contexts]
+        for k in range(n):
+            seqs, label_mu, label_sd = self._build_sequences(
+                query, task_type, contexts, normalization_mode=mode,
+                target_time_shift=step * k if k else None)
+            if head is not None:
+                scores = head.predict(self._encode(model, seqs))[:, 0]
+            else:
+                scores = self._forward_batched(model, seqs)
+            for i, (s, mu, sd) in enumerate(zip(scores, label_mu, label_sd)):
+                per_ctx[i].append(float(s) if head is not None
+                                  else float(s) * sd + mu)
+        return [EntityPrediction(ctx.entity_id, value=vals[0],
+                                 forecast=tuple(vals))
+                for ctx, vals in zip(contexts, per_ctx)]
 
     @staticmethod
     def _shape_binary(entity_id: Any, ret_kind: Optional[str],
@@ -1611,6 +1675,7 @@ class RtNativeBackend:
                        ctx: EntityContext, fk_to_parent: dict, labels: list,
                        *, target_sem: int = SEM_NUMBER,
                        task_spec: Optional[TaskSpec] = None,
+                       target_time_shift: Optional[timedelta] = None,
                        ) -> tuple[_Seq, dict, int, int]:
         """Assemble one entity's context into a token sequence. Returns
         ``(seq, node_of, entity_node, tgt_idx)``. ``target_sem`` overrides the
@@ -1684,12 +1749,17 @@ class RtNativeBackend:
         seq.add(tgt_node, tgt_parents, task_spec.target_column,
                 task_spec.table_name, target_sem, None, target=True)
         # The reference contract is target cell first, including for a derived
-        # task row; its timestamp follows the masked target token.
-        if (not task_spec.direct_target and ctx.anchor is not None
-                and (focal_task is None
+        # task row; its timestamp follows the masked target token. A horizon
+        # shift moves ONLY this token: the question is asked about a later
+        # window while the evidence stays at the base anchor.
+        tgt_time = (ctx.anchor + target_time_shift
+                    if target_time_shift is not None and ctx.anchor is not None
+                    else ctx.anchor)
+        if (not task_spec.direct_target and tgt_time is not None
+                and (target_time_shift is not None or focal_task is None
                      or task_spec.time_column not in focal_task.cells)):
             seq.add(tgt_node, tgt_parents, task_spec.time_column,
-                    task_spec.table_name, SEM_DATETIME, ctx.anchor)
+                    task_spec.table_name, SEM_DATETIME, tgt_time)
 
         # -- past outcomes of the same task (self labels, F65) --
         materialized_labels = [
@@ -1710,11 +1780,21 @@ class RtNativeBackend:
                 labels.append(label)
 
         # -- one token per feature cell of every context row --
+        # Under a horizon shift the focal task row's own time cell is
+        # suppressed: the shifted token above already answers "when", and
+        # emitting both timestamps would give the model two contradictory
+        # anchors for one masked question.
+        shift_key = (focal_task.key
+                     if (target_time_shift is not None
+                         and not task_spec.direct_target
+                         and focal_task is not None) else None)
         for r in ctx.rows:
             parents = row_parents(r)
             rnode = node_of[r.key]
             is_entity_row = r.key == (entity_table, ctx.entity_id)
             for col, v in r.cells.items():
+                if r.key == shift_key and col == task_spec.time_column:
+                    continue
                 if len(seq) >= self.max_seq_len:
                     # Truncation is never silent: it falls hardest on the
                     # busiest entities, which in an imbalanced task tend to be
@@ -1765,6 +1845,7 @@ class RtNativeBackend:
                          target_sem: int = SEM_NUMBER,
                          normalization_mode: Optional[NormalizationMode | str] = None,
                          task_spec: Optional[TaskSpec] = None,
+                         target_time_shift: Optional[timedelta] = None,
                          ) -> tuple[list[_Seq], list[float], list[float]]:
         fk_to_parent = self._fk_to_parent()
         task_spec = task_spec or self.task_spec(query, task_type)
@@ -1777,7 +1858,8 @@ class RtNativeBackend:
             labels: list[float] = []
             seq, node_of, _, _ = self._build_ctx_seq(
                 query, task_type, ctx, fk_to_parent, labels,
-                target_sem=target_sem, task_spec=task_spec)
+                target_sem=target_sem, task_spec=task_spec,
+                target_time_shift=target_time_shift)
             # A node can be token-less because the configured sequence budget
             # clipped its cells, not because its schema has no features. Do
             # not misdiagnose an intentional context cap as a connectivity
@@ -2004,6 +2086,12 @@ class RtNativeBackend:
             if v is not None:
                 seen.add(str(v))
         labels = sorted(seen, key=lambda s: s.encode("utf-8"))
+        if len(labels) > MAX_MULTICLASS_CLASSES:
+            warnings.warn(
+                f"multiclass domain for {table}.{column} has {len(labels)} "
+                f"distinct values; only the first {MAX_MULTICLASS_CLASSES} "
+                f"(byte-sorted) can ever be predicted — the rest are "
+                f"unreachable classes", stacklevel=3)
         return labels[:MAX_MULTICLASS_CLASSES]
 
     def _rank_candidates(self, parent_table: str,
@@ -2023,6 +2111,12 @@ class RtNativeBackend:
             ids.sort()
         else:
             ids.sort(key=lambda i: str(i).encode("utf-8"))
+        if len(ids) > MAX_RANK_CANDIDATES:
+            warnings.warn(
+                f"ranking candidate set for {parent_table!r} has {len(ids)} "
+                f"rows; only the first {MAX_RANK_CANDIDATES} (sorted) can be "
+                f"ranked — candidates past the cap can never appear in "
+                f"results", stacklevel=3)
         return [rows_by_id[i] for i in ids[:MAX_RANK_CANDIDATES]]
 
     # -- multiclass (CONTRACT.md §2) ----------------------------------------
@@ -2032,6 +2126,16 @@ class RtNativeBackend:
                           mode: NormalizationMode) -> list[EntityPrediction]:
         model = self._model_for(model_uri)
         col = self._target_column(query)
+        decorative = next((a for a in query.target_aggregations
+                           if a.window is not None or a.filter is not None
+                           or a.func not in (AggFunc.FIRST, AggFunc.LAST)),
+                          None)
+        if decorative is not None:
+            warnings.warn(
+                "multiclass scoring reduces the target to its raw column: "
+                "the aggregation's function, window, and inline filter do "
+                "not affect the class domain or the prediction",
+                stacklevel=3)
         head = self._head_for(TaskType.MULTICLASS_CLASSIFICATION)
         if head is not None:
             return self._score_multiclass_head(query, contexts, model, head,
@@ -2258,6 +2362,11 @@ class RtNativeBackend:
                 f"column: "
                 f"{fk_ref} is not an FK to a parent table")
         parent_table = link.to_table
+        if query.top_k is None:
+            warnings.warn(
+                "LIST_DISTINCT/ARRAY_AGG target without RANK TOP K returns "
+                "only the single top-ranked candidate; write RANK TOP K for "
+                "a K-element result", stacklevel=3)
         k = query.top_k or 1
         bound = self._batch_bound(contexts)
         candidates = self._rank_candidates(parent_table, bound)

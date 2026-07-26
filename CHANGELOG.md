@@ -9,7 +9,80 @@ the RelQL grammar may still change between minor versions.
 
 ## [Unreleased]
 
+### Fixed (2026-07 review sweep)
+- **Derived training labels are database-exact.** `fit_head`/`finetune`
+  labels (when no `labels` dict is supplied) were evaluated over an
+  assembled context — a sample that carries peer entities' rows (a peer's
+  event counted into this entity's label; measured: derived 3.0 vs truth 2)
+  and truncates heavy entities' own events. Labels and ranking relevance now
+  fetch the entity's rows through the wiring, bounded at each window's far
+  edge (`end_delta`, fixing the offset-window tail cut too). Aggregating a
+  table with no direct link to the entity raises. Dropped NULL-label
+  examples are now counted and warned about.
+- **Inline aggregation filters see FK columns.** `COUNT(t.* WHERE t.fk = v)`
+  compared `row.cells` only, so FK predicates matched nothing (and
+  `IS NULL` matched everything).
+- **Bare cross-table columns in scalar positions raise.**
+  `WHERE orders.status = 'open'` on `FROM customers` validated and then
+  silently read the customer's row, filtering every entity out.
+- **Loud evaluation everywhere:** a windowed aggregation with no anchor
+  raises instead of silently ignoring the window; `SUM`/`AVG`/`MIN`/`MAX`
+  over non-numeric values raise instead of returning 0.0/NULL; cross-type
+  comparisons raise instead of returning False; a WHERE window facing the
+  future (FOLLOWING) is rejected as unsatisfiable.
+- **Empty contexts warn.** A typo'd or temporally inadmissible entity id
+  used to be scored on zero rows and returned as a normal prediction; it
+  now warns (raises under `RELATIVEDB_STRICT=1`).
+- **Anchor integrity.** `per_entity_anchor` no longer overrides a declared
+  `AS OF` forward (clamped with `min`), warns when an entity has no dated
+  row, and refuses to assemble an unbounded context; WHERE stays at the
+  query's factual anchor when `context_anchor_time` decouples the context;
+  multiclass/ranking batches with mixed per-entity anchors are scored per
+  anchor group instead of scanning candidates at `max(anchors)`.
+- **A fully dangling link warns at index build** (every FK value unmatched —
+  the int-vs-str key mismatch that silently severed a whole link).
+- **EXPLAIN honesty:** aggregate `ASSUMING` bounds render in the plan
+  (previously `assuming: none` plus a stale "cannot be applied" warning);
+  EXPLAIN ANALYZE warns that shared-context/hurdle strategies are not
+  applied to its predictions; the multiclass path warns that aggregation
+  function/window/filter do not affect scoring; ranking without
+  `RANK TOP K` warns that it returns top-1; the 1000-class/candidate caps
+  warn when they truncate.
+
 ### Added
+- **Stepped multi-horizon forecasting.** `OVER (7 DAYS FOLLOWING HORIZONS 4
+  [STEP 7 DAYS])` now runs one model forward per horizon, re-asking the
+  masked question with the target token stamped at `anchor + k*step` while
+  context and self-label history stay at the base anchor. Previously the
+  N-horizon forecast was one prediction copied N times, silently. `STEP`
+  defaults to the frame width; an unbounded window requires an explicit
+  `STEP`.
+
+### Fixed
+- **WHERE aggregations are database-exact.** `WHERE COUNT(orders.*) OVER
+  (14 DAYS PRECEDING) > 0` was evaluated over the assembled context — a
+  *sample* built for the model that carries peer entities' rows (so the
+  count passed for a customer who never ordered) and, per task shape, can
+  omit the entity's own children (so the same count read zero for a customer
+  with orders). Cohort filters are facts: the entity's rows are now fetched
+  through the wiring, exact regardless of context budget. Aggregations on a
+  table with no direct link to the entity raise instead of guessing, as does
+  hitting the 1M-row fetch cap.
+- **No best-effort expression evaluation.** An inline aggregation filter the
+  evaluator could not run used to keep the row silently — turning
+  `COUNT(t.* WHERE ...)` into `COUNT(t.*)` — and a filter naming another
+  table's column silently compared NULL and dropped every row. Both now
+  raise and fail the statement.
+
+### Added
+- **`ASSUMING COUNT(t.*) OVER (...) >= k`** (and `>`, `=`, `<=`, `<`,
+  `EXISTS`, `NOT EXISTS`): aggregate counterfactuals, realized structurally.
+  The entity's in-window rows are cloned (newest first, re-timestamped
+  inside the window, re-parented to the entity, template fetched from the
+  database when the context has none) or dropped (oldest first) until the
+  bound holds — so the model sees the assumed history, not a constraint it
+  cannot read. Unsatisfiable shapes (other aggregate functions, filtered
+  counts, fractional bounds, bounds on the entity table) raise.
 - **`ABLATE TABLE` actually ablates.** It parsed, validated, and then
   silently changed nothing — the plan even printed "declared, not applied".
   Every row of the ablated table is now dropped from each scored context.

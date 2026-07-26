@@ -19,7 +19,6 @@ import numpy as np
 
 from .errors import ExecutionError
 from .evaluate import eval_bool, eval_value
-from .plan import target_span
 from .relql.ast import ParsedQuery, TaskType
 from .relql.parser import parse, validate
 from .retrieve import TemporalBound
@@ -87,8 +86,8 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
             TemporalBound.at_or_before(max(anchors)))
 
     examples: list[tuple[EntityContext, float]] = []
-    span = target_span(pq)
     entity_table = pq.entity_key.table
+    dropped = 0
     for anchor in anchors:
         ids = (list(entity_ids) if entity_ids is not None else
                engine._resolve_entity_ids(
@@ -96,16 +95,20 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
         for eid in ids:
             if labels is not None and (eid, anchor) not in labels:
                 continue
+            # features see only what was knowable at the anchor; the label
+            # is a fact fetched from the database (engine._label_rows), not
+            # read off an assembled context sample.
             ctx = engine.assemble_context(entity_table, eid, anchor, query=pq)
-            label_ctx = (None if labels is not None else
-                         engine.assemble_context(
-                             entity_table, eid,
-                             None if span is None else anchor + span,
-                             query=pq))
-            y = _scalar_label(engine, pq, task_type, label_ctx, anchor,
-                                   labels, eid, [])
+            y = _scalar_label(engine, pq, task_type, anchor, labels, eid, [])
             if y is not None:
                 examples.append((ctx, float(y)))
+            else:
+                dropped += 1
+    if dropped:
+        warnings.warn(
+            f"fine-tuning dropped {dropped} example(s) whose derived label "
+            f"was NULL (empty target window or non-numeric outcome)",
+            UserWarning, stacklevel=2)
     if not examples:
         raise ExecutionError(
             "full-model fine-tuning produced no training examples")
@@ -224,11 +227,11 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
             TemporalBound.at_or_before(max(anchors)))
 
     entity_table = pq.entity_key.table
-    span = target_span(pq)
     ys: list[float] = []
     groups: list[int] = [0]
     classes: list[Any] = []
     skipped = 0
+    skipped_scalar = 0
     scalar_examples: list[tuple[EntityContext, float]] = []
     ranking_examples: list[tuple[EntityContext, str, list, list[float]]] = []
 
@@ -246,17 +249,11 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
             # or shows the ones before it their own outcome.
             if labels is not None and (eid, t) not in labels:
                 continue
-            # features see only what was knowable at the anchor...
+            # features see only what was knowable at the anchor; the label
+            # is a FACT and is derived from the database (engine._label_rows),
+            # never from an assembled context — a context is a sample that
+            # carries peer entities' rows and truncates the entity's own.
             ctx = engine.assemble_context(entity_table, eid, t, query=pq)
-            # ...the label reads the window after it, but only when the
-            # label has to be *derived*. A supplied label needs no context,
-            # and assembling one anyway doubled the cost of every fit --
-            # unbounded, when the target names no window.
-            label_ctx = (None if labels is not None
-                         else engine.assemble_context(
-                             entity_table, eid,
-                             None if span is None else t + span,
-                             query=pq))
             if task_type is TaskType.MULTILABEL_RANKING:
                 parent = backend.ranking_parent_table(pq)
                 cands = backend._rank_candidates(
@@ -264,8 +261,7 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
                     else TemporalBound.unbounded())
                 if not cands:
                     continue
-                rel = _ranking_relevance(engine, pq, label_ctx, t, cands,
-                                              labels, eid)
+                rel = _ranking_relevance(engine, pq, t, cands, labels, eid)
                 if not any(r > 0 for r in rel):
                     # listwise cross-entropy needs a positive in the group;
                     # an entity that interacted with nothing in the window
@@ -276,9 +272,10 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
                 ys.extend(rel)
                 groups.append(len(ys))
             else:
-                y = _scalar_label(engine, pq, task_type, label_ctx, t,
-                                       labels, eid, classes)
+                y = _scalar_label(engine, pq, task_type, t, labels, eid,
+                                  classes)
                 if y is None:
+                    skipped_scalar += 1
                     continue
                 scalar_examples.append((ctx, float(y)))
                 ys.append(float(y))
@@ -295,6 +292,12 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
             f"positive relevance in the target window; listwise loss needs "
             f"at least one relevant candidate per group",
             UserWarning, stacklevel=2)
+    if skipped_scalar:
+        warnings.warn(
+            f"task-head fitting dropped {skipped_scalar} example(s) whose "
+            f"derived label was NULL (empty target window or non-numeric "
+            f"outcome); the training set is biased toward entities with "
+            f"history", UserWarning, stacklevel=2)
     task_spec = backend.task_spec(pq, task_type)
     if normalization_mode is NormalizationMode.REFERENCE:
         # A derived target is materialized as a real task column by the
@@ -335,17 +338,24 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
         weight_decay=weight_decay, classes=classes,
         normalization_mode=normalization_mode)
 
-def _scalar_label(engine, pq, task_type, label_ctx, t, labels, eid, classes):
-    """The outcome the query asks about, as it actually turned out."""
+def _scalar_label(engine, pq, task_type, t, labels, eid, classes):
+    """The outcome the query asks about, as it actually turned out.
+
+    "Actually" is load-bearing: the rows come from the database via
+    ``engine._label_rows``, entity-scoped and bounded at the window's far
+    edge — not from an assembled context, whose peer rows used to count
+    into this entity's label and whose fanout caps under-counted it."""
+    entity_table = pq.entity_key.table
     if labels is not None and (eid, t) in labels:
         v = labels[(eid, t)]
     else:
-        rows = label_ctx.rows_by_table()
-        cells = label_ctx.entity_cells(pq.entity_key.table)
+        rows, cells = engine._label_rows(pq, entity_table, eid, t)
         if task_type is TaskType.BINARY_CLASSIFICATION:
-            v = 1.0 if eval_bool(pq.target, rows, cells, t) else 0.0
+            v = 1.0 if eval_bool(pq.target, rows, cells, t,
+                                 entity_table=entity_table) else 0.0
         else:
-            v = eval_value(pq.target, rows, cells, t)
+            v = eval_value(pq.target, rows, cells, t,
+                           entity_table=entity_table)
     if task_type is TaskType.MULTICLASS_CLASSIFICATION:
         if v is None:
             return None
@@ -358,13 +368,17 @@ def _scalar_label(engine, pq, task_type, label_ctx, t, labels, eid, classes):
         return None
     return float(v)
 
-def _ranking_relevance(engine, pq, label_ctx, t, candidates, labels, eid):
-    """Per-candidate relevance: which candidate ids actually turned up in
-    the target's window after the anchor."""
+def _ranking_relevance(engine, pq, t, candidates, labels, eid):
+    """Per-candidate relevance: which candidate ids the ENTITY actually
+    touched in the target's window — from the database, not the context
+    sample (peer interactions used to mark candidates relevant that this
+    entity never touched)."""
+    entity_table = pq.entity_key.table
     if labels is not None and (eid, t) in labels:
         given = labels[(eid, t)] or {}
         return [float(given.get(c.id, 0.0)) for c in candidates]
-    observed = eval_value(pq.target, label_ctx.rows_by_table(),
-                          label_ctx.entity_cells(pq.entity_key.table), t)
+    rows, cells = engine._label_rows(pq, entity_table, eid, t)
+    observed = eval_value(pq.target, rows, cells, t,
+                          entity_table=entity_table)
     seen = {str(x) for x in (observed or [])}
     return [1.0 if str(c.id) in seen else 0.0 for c in candidates]

@@ -31,7 +31,14 @@ def _window_bounds(window: Window, anchor: datetime) -> tuple[Optional[datetime]
 
 def _rows_in_window(rows: list[Row], window: Optional[Window],
                     anchor: Optional[datetime]) -> list[Row]:
-    if window is None or anchor is None:
+    if window is not None and anchor is None:
+        # An explicitly written window with nothing to anchor it used to be
+        # silently ignored — COUNT(...) OVER (14 DAYS PRECEDING) quietly
+        # counted all of history. Loud instead.
+        raise EvalError(
+            "a windowed aggregation needs an anchor time; execute with "
+            "anchor_time (or AS OF) so the window has a reference point")
+    if window is None:
         picked = list(rows)
     else:
         lo, hi = _window_bounds(window, anchor)
@@ -69,8 +76,14 @@ def eval_row_predicate(expr: TargetExpr, row: Row) -> bool:
     if isinstance(expr, Condition):
         if not isinstance(expr.left, ColumnRef):
             raise EvalError("inline aggregation filters must compare columns")
-        left = row.cells.get(expr.left.column) if expr.left.table == row.table else None
-        return _compare(expr.op, left, expr.right)
+        if expr.left.table != row.table:
+            raise EvalError(
+                f"inline filter references {expr.left.table}."
+                f"{expr.left.column} while filtering rows of {row.table!r}; "
+                f"filters can only use the aggregated table's own columns")
+        # _cell, not cells.get: FK columns live in row.parents, and a filter
+        # like `WHERE t.product_id = 5` used to compare None for every row.
+        return _compare(expr.op, _cell(row, expr.left.column), expr.right)
     raise EvalError(f"unsupported row predicate: {expr!r}")
 
 
@@ -80,41 +93,55 @@ def _agg_rows(agg: Aggregation, rows_by_table: dict[str, list[Row]],
     rows = _rows_in_window(rows, agg.window, anchor)
     if agg.filter is not None:
         # Only conditions on the aggregated table's own columns are applied
-        # row-wise; conditions on parent tables would need a join (not needed
-        # by the baseline).
-        rows = [r for r in rows if _row_filter_ok(agg.filter, r)]
+        # row-wise; conditions on parent tables would need a join. A filter
+        # this evaluator cannot run raises: silently keeping the row turned
+        # `COUNT(t.* WHERE ...)` into `COUNT(t.*)` with no warning, and a
+        # wrong count is worse than a failed statement.
+        rows = [r for r in rows if eval_row_predicate(agg.filter, r)]
     return rows
-
-
-def _row_filter_ok(expr: TargetExpr, row: Row) -> bool:
-    try:
-        return eval_row_predicate(expr, row)
-    except EvalError:
-        return True  # unevaluable sub-filter: keep the row (best effort)
 
 
 def eval_value(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
                entity_cells: dict[str, Any],
-               anchor: Optional[datetime]) -> Any:
-    """Evaluate a valueExpr (aggregation or static column) over the context."""
+               anchor: Optional[datetime], *,
+               entity_table: Optional[str] = None) -> Any:
+    """Evaluate a valueExpr (aggregation or static column) over the context.
+
+    ``entity_table``, when given, makes a bare column reference on any OTHER
+    table an error: a scalar position reads the entity's own row, and
+    ``WHERE orders.status = 'open'`` on ``FROM customers`` used to silently
+    read the customer's (usually nonexistent) ``status`` cell and filter
+    everyone out."""
     if isinstance(expr, ColumnRef):
+        if entity_table is not None and expr.table != entity_table:
+            raise EvalError(
+                f"bare column {expr.table}.{expr.column} in a scalar "
+                f"position reads the entity row, but the entity table is "
+                f"{entity_table!r}; aggregate the other table "
+                f"(COUNT/EXISTS/...) instead")
         return entity_cells.get(expr.column)
     if isinstance(expr, Lit):
         return expr.value
     if isinstance(expr, Arith):
-        return _eval_arith(expr, rows_by_table, entity_cells, anchor)
+        return _eval_arith(expr, rows_by_table, entity_cells, anchor,
+                           entity_table)
     if isinstance(expr, Func):
-        return _eval_func(expr, rows_by_table, entity_cells, anchor)
+        return _eval_func(expr, rows_by_table, entity_cells, anchor,
+                          entity_table)
     if isinstance(expr, Case):
         for cond, then in expr.whens:
-            if eval_bool(cond, rows_by_table, entity_cells, anchor):
-                return eval_value(then, rows_by_table, entity_cells, anchor)
+            if eval_bool(cond, rows_by_table, entity_cells, anchor,
+                         entity_table=entity_table):
+                return eval_value(then, rows_by_table, entity_cells, anchor,
+                                  entity_table=entity_table)
         if expr.else_ is not None:
-            return eval_value(expr.else_, rows_by_table, entity_cells, anchor)
+            return eval_value(expr.else_, rows_by_table, entity_cells, anchor,
+                              entity_table=entity_table)
         return None
     if isinstance(expr, (Condition, LogicalOp, Not)):
         # a boolean expression used in value position -> 0/1
-        return eval_bool(expr, rows_by_table, entity_cells, anchor)
+        return eval_bool(expr, rows_by_table, entity_cells, anchor,
+                         entity_table=entity_table)
     if not isinstance(expr, Aggregation):
         raise EvalError(f"not a value expression: {expr!r}")
     rows = _agg_rows(expr, rows_by_table, anchor)
@@ -141,6 +168,16 @@ def eval_value(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
         return values[0] if values else None
     if expr.func is AggFunc.LAST:
         return values[-1] if values else None
+    bad = [v for v in values
+           if v is not None and not isinstance(v, (int, float, bool))]
+    if bad:
+        # SUM over a column of numeric strings used to return a confident
+        # 0.0; AVG/MIN/MAX quietly dropped the values. A whole column of
+        # the wrong type is a structural error, not a NULL.
+        raise EvalError(
+            f"{expr.func.name}({expr.column.table}.{col}) over non-numeric "
+            f"values (e.g. {bad[0]!r}); declare and store the column as a "
+            f"number")
     nums = [float(v) for v in values if isinstance(v, (int, float, bool))]
     if expr.func is AggFunc.SUM:
         return float(sum(nums))
@@ -163,9 +200,12 @@ def _as_num(v: Any) -> Optional[float]:
     return None
 
 
-def _eval_arith(expr: Arith, rows_by_table, entity_cells, anchor) -> Any:
-    l = _as_num(eval_value(expr.left, rows_by_table, entity_cells, anchor))
-    r = _as_num(eval_value(expr.right, rows_by_table, entity_cells, anchor))
+def _eval_arith(expr: Arith, rows_by_table, entity_cells, anchor,
+                entity_table=None) -> Any:
+    l = _as_num(eval_value(expr.left, rows_by_table, entity_cells, anchor,
+                           entity_table=entity_table))
+    r = _as_num(eval_value(expr.right, rows_by_table, entity_cells, anchor,
+                           entity_table=entity_table))
     if l is None or r is None:                 # SQL NULL propagation
         return None
     if expr.op == "+":
@@ -179,9 +219,11 @@ def _eval_arith(expr: Arith, rows_by_table, entity_cells, anchor) -> Any:
     raise EvalError(f"unsupported arithmetic op {expr.op!r}")
 
 
-def _eval_func(expr: Func, rows_by_table, entity_cells, anchor) -> Any:
+def _eval_func(expr: Func, rows_by_table, entity_cells, anchor,
+               entity_table=None) -> Any:
     name = expr.name.upper()
-    raw = [eval_value(a, rows_by_table, entity_cells, anchor) for a in expr.args]
+    raw = [eval_value(a, rows_by_table, entity_cells, anchor,
+                      entity_table=entity_table) for a in expr.args]
     if name == "COALESCE":
         return next((v for v in raw if v is not None), None)
     if name == "NULLIF":
@@ -262,26 +304,38 @@ def _compare(op: Operator, left: Any, right: Any) -> bool:
         if op is Operator.LE:
             return l <= r
     except TypeError:
-        return False
+        # `'85' > 100` used to silently be False for every row, quietly
+        # emptying a cohort over one mistyped column.
+        raise EvalError(
+            f"cannot compare {type(left).__name__} {left!r} with "
+            f"{type(right).__name__} {right!r}; the column's stored type "
+            f"does not match the literal") from None
     raise EvalError(f"unsupported operator {op}")
 
 
 def eval_bool(expr: TargetExpr, rows_by_table: dict[str, list[Row]],
               entity_cells: dict[str, Any],
-              anchor: Optional[datetime]) -> bool:
+              anchor: Optional[datetime], *,
+              entity_table: Optional[str] = None) -> bool:
     if isinstance(expr, LogicalOp):
-        l = eval_bool(expr.left, rows_by_table, entity_cells, anchor)
+        l = eval_bool(expr.left, rows_by_table, entity_cells, anchor,
+                      entity_table=entity_table)
         if expr.op.name == "AND":
-            return l and eval_bool(expr.right, rows_by_table, entity_cells, anchor)
-        return l or eval_bool(expr.right, rows_by_table, entity_cells, anchor)
+            return l and eval_bool(expr.right, rows_by_table, entity_cells,
+                                   anchor, entity_table=entity_table)
+        return l or eval_bool(expr.right, rows_by_table, entity_cells, anchor,
+                              entity_table=entity_table)
     if isinstance(expr, Not):
-        return not eval_bool(expr.expr, rows_by_table, entity_cells, anchor)
+        return not eval_bool(expr.expr, rows_by_table, entity_cells, anchor,
+                             entity_table=entity_table)
     if isinstance(expr, Condition):
-        left = eval_value(expr.left, rows_by_table, entity_cells, anchor)
+        left = eval_value(expr.left, rows_by_table, entity_cells, anchor,
+                          entity_table=entity_table)
         right = expr.right
         if expr.right_expr is not None:
             right = eval_value(expr.right_expr, rows_by_table, entity_cells,
-                               anchor)
+                               anchor, entity_table=entity_table)
         return _compare(expr.op, left, right)
-    value = eval_value(expr, rows_by_table, entity_cells, anchor)
+    value = eval_value(expr, rows_by_table, entity_cells, anchor,
+                       entity_table=entity_table)
     return bool(value)

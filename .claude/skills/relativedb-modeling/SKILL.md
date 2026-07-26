@@ -230,6 +230,36 @@ comparison targets (`>= k`), `RETURN PROBABILITY` / `RETURN EXPECTED VALUE`,
 column targets (`PREDICT posts.topic ... WHERE posts.topic IS NULL`),
 `EXPLAIN CONTEXT`, `ASSUMING`.
 
+### WHERE aggregations are database-exact (fixed 2026-07)
+
+`WHERE COUNT(orders.*) OVER (14 DAYS PRECEDING) > 0` — the churn-cohort
+shape — is evaluated against the **wiring**, not the sampled context, so the
+cohort is exact regardless of context budget. Requirements: the aggregated
+table needs a direct link to the entity table (multi-hop counts raise), and
+an inline filter must use the aggregated table's own columns (anything the
+evaluator cannot run raises — no best-effort counting). Historical bug:
+these counts were computed over the context, which both over-counted (peer
+entities' rows) and under-counted (the entity's own children missing under
+some task shapes).
+
+### Facts come from the database; the context is only for the model (2026-07)
+
+Three surfaces read *facts* and are now database-exact, never
+context-sampled: WHERE aggregations, derived training labels
+(`fit_head`/`finetune` without a `labels` dict), and ranking relevance.
+Each fetches the entity's own rows through the wiring — peer rows can't
+contaminate them and fanout caps can't truncate them. Requirement for all
+three: the aggregated table needs a direct link to the entity table.
+
+Evaluation is loud: no anchor + explicit window, SUM/AVG over non-numeric
+values, cross-type comparisons, cross-table bare columns in scalar
+positions, FOLLOWING windows in WHERE, and typo'd entity ids (empty
+context) all raise or warn instead of silently returning something wrong.
+
+`HORIZONS N [STEP d]` is real now: one forward per horizon with the target
+token stamped at `anchor + k*step` (evidence stays at the base anchor).
+Before 2026-07 it returned one prediction copied N times.
+
 ### Per-entity anchors are one execution each
 
 `ExecutionInput` takes a single `anchor_time`. If each entity needs its own
@@ -268,6 +298,25 @@ context; the entity's own row is missing from the context; or a numeric/
 boolean assignment leaves the column **constant** in-context (zero-shot
 normalization erases which constant it was — keep factual sibling rows, or
 use reference normalization).
+
+### Aggregate counterfactuals: ASSUMING COUNT (added 2026-07)
+
+`ASSUMING COUNT(battles.*) OVER (14 DAYS PRECEDING) >= 3` (also `>`, `=`,
+`<=`, `<`, `EXISTS`, `NOT EXISTS`) is realized **structurally**: the
+entity's in-window rows are cloned (newest first, re-timestamped inside the
+window, re-parented to the entity; template fetched from the database if the
+context holds none) or dropped (oldest first) until the bound holds. The
+model sees the assumed history as rows, which is the only thing it can read.
+Notes:
+
+* The bound is about the **model's world** — the context — not the database.
+  If the traversal did not include the entity's rows, `NOT EXISTS` is a
+  no-op and `>= k` adds k clones.
+* Unsupported and loud: SUM/AVG/… bounds, filtered `COUNT(t.* WHERE ...)`,
+  fractional or negative bounds, bounds on the entity table itself.
+* Composes with assignments: `ASSUMING orders.qty = 5 AND COUNT(orders.*)
+  OVER (90 DAYS PRECEDING) >= 2` clones first, then assigns (clones get the
+  value too).
 
 ### Still run a positive control
 

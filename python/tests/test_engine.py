@@ -388,7 +388,9 @@ def test_assuming_does_not_mutate_shared_rows():
     "customers.age > 30",                                   # inequality
     "customers.plan IN ('a', 'b')",                         # a set, not a value
     "customers.plan = 'a' OR customers.plan = 'b'",          # two worlds
-    "COUNT(orders.*) OVER (7 DAYS FOLLOWING) > 2",           # aggregate
+    # COUNT/EXISTS bounds are now realizable (rows are cloned or dropped
+    # until the bound holds); other aggregates still are not.
+    "AVG(orders.qty) OVER (7 DAYS PRECEDING) > 2",
 ])
 def test_assuming_rejects_conditions_it_cannot_realize(clause):
     """These describe a set of possible worlds, not one context. Silently

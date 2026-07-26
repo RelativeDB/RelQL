@@ -10,6 +10,7 @@ dependency (the same native library the RT-J model and RelQL parser require).
 from __future__ import annotations
 
 import math
+import warnings
 from types import MappingProxyType
 from typing import Any, Optional, Sequence
 
@@ -74,17 +75,31 @@ class CscIndex:
         ep: list[int] = []
         ec: list[int] = []
         et: list[float] = []
+        dangling = 0
+        candidates = 0
         for ci, row in enumerate(children):
             pid = row.parents.get(link.fk_column)
             if pid is None:
                 continue
             for one in (pid if isinstance(pid, (list, tuple)) else (pid,)):
+                candidates += 1
                 pi = parent_dense.get(one)
                 if pi is None:
-                    continue  # dangling FK: edge dropped, row still scannable
+                    dangling += 1  # edge dropped, row still scannable
+                    continue
                 ep.append(pi)
                 ec.append(ci)
                 et.append(_epoch(row))
+        if candidates and not ep:
+            # A handful of dangling FKs is data; ALL of them dangling is a
+            # key-type mismatch (int pk vs str FK after a CSV round-trip)
+            # that silently severs the whole link — children() returns
+            # nothing, WHERE counts read 0 for everyone.
+            warnings.warn(
+                f"link {link.from_table}.{link.fk_column} -> "
+                f"{link.to_table}: all {candidates} FK values are dangling "
+                f"(no matching parent id). Likely a key-type mismatch; the "
+                f"link is effectively severed.", UserWarning, stacklevel=4)
         return NativeCsc(n_parents, ep, ec, et)
 
     # -- sampler surface ----------------------------------------------------
