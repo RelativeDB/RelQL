@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rt_metal_alloc.h"
 #include "rt_metal_opts.h"
 #include "rt_internal.hpp"
 #include "rt_train.hpp"
@@ -265,25 +266,13 @@ struct FullCtx {
 // calls later with no allocation anywhere in the traceback. A full-model
 // training context holds w+g+m+v for every parameter, so several live models
 // can exhaust a smaller device long before anything else complains.
-[[noreturn]] void alloc_failed(id<MTLDevice> d, size_t n) {
-  throw std::runtime_error(
-      "rt/full-train: Metal could not allocate "+std::to_string(n)+" bytes ("+
-      std::to_string(d.currentAllocatedSize)+" already allocated on "+
-      d.name.UTF8String+", recommended working set "+
-      std::to_string(d.recommendedMaxWorkingSetSize)+
-      " bytes). Fewer live models, or a smaller batch, will fit.");
-}
+// A training context holds w+g+m+v for every parameter, so this is the path
+// most likely to exhaust a device: several live models is gigabytes.
 id<MTLBuffer> buffer(id<MTLDevice> d, size_t n) {
-  id<MTLBuffer> b=[d newBufferWithLength:std::max<size_t>(n, 4)
-                                 options:MTLResourceStorageModeShared];
-  if(!b)alloc_failed(d,n);
-  return b;
+  return detail::metal_buffer(d, n, "rt/full-train");
 }
 id<MTLBuffer> upload(id<MTLDevice> d, const void* p, size_t n) {
-  id<MTLBuffer> b=[d newBufferWithBytes:p length:std::max<size_t>(n, 4)
-                                options:MTLResourceStorageModeShared];
-  if(!b)alloc_failed(d,n);
-  return b;
+  return detail::metal_buffer(d, p, n, "rt/full-train");
 }
 
 FullCtx* make_full_ctx(Model& model) {

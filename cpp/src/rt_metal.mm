@@ -38,6 +38,7 @@
 #include <tuple>
 #include <vector>
 
+#include "rt_metal_alloc.h"
 #include "rt_metal_opts.h"
 #include "rt_internal.hpp"
 
@@ -601,14 +602,12 @@ id<MTLDevice> pick_device() {
 }
 
 id<MTLBuffer> upload(id<MTLDevice> dev, const float* p, size_t n) {
-  return [dev newBufferWithBytes:p
-                          length:n * sizeof(float)
-                         options:MTLResourceStorageModeShared];
+  return metal_buffer(dev, p, n * sizeof(float), "rt/metal");
 }
 
 void ensure(id<MTLDevice> dev, id<MTLBuffer> __strong& buf, size_t bytes) {
   if (!buf || buf.length < bytes)
-    buf = [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    buf = metal_buffer(dev, bytes, "rt/metal");
 }
 
 MetalCtx* make_ctx(const Model& m) {
@@ -676,13 +675,12 @@ MetalCtx* make_ctx(const Model& m) {
     if (w.type == WType::F32) {
       g.w = upload(ctx->dev, w.f32, (size_t)w.out * w.in);
     } else {
-      g.w = [ctx->dev newBufferWithBytes:w.q
-                                  length:row_bytes(w.type, w.in) * w.out
-                                 options:MTLResourceStorageModeShared];
+      g.w = metal_buffer(ctx->dev, w.q, row_bytes(w.type, w.in) * w.out,
+                         "rt/metal: quantized weights");
       size_t sb = scale_bytes(w.type, w.in) * w.out;
-      g.s = sb ? [ctx->dev newBufferWithBytes:w.qs
-                                       length:sb
-                                      options:MTLResourceStorageModeShared]
+      // nil here means "this dtype carries no scales", not a failed
+      // allocation, so the zero case stays nil deliberately.
+      g.s = sb ? metal_buffer(ctx->dev, w.qs, sb, "rt/metal: weight scales")
                : nil;
     }
     return g;
@@ -706,8 +704,7 @@ MetalCtx* make_ctx(const Model& m) {
       g.w13.out = 2 * kDFF;
       g.w13.in = kD;
       const size_t one_bytes = (size_t)kDFF * row_bytes(blk.w1.type, kD);
-      g.w13.w = [ctx->dev newBufferWithLength:2 * one_bytes
-                                      options:MTLResourceStorageModeShared];
+      g.w13.w = metal_buffer(ctx->dev, 2 * one_bytes, "rt/metal: fused w13");
       const void* w1 = blk.w1.type == WType::F32 ? (const void*)blk.w1.f32
                                                  : (const void*)blk.w1.q;
       const void* w3 = blk.w3.type == WType::F32 ? (const void*)blk.w3.f32
@@ -925,6 +922,15 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
       auto t0 = std::chrono::steady_clock::now();
       [cb commit];
       [cb waitUntilCompleted];
+      // Each stage boundary retires a whole command buffer and starts a new
+      // one, so an intermediate failure is the last anyone could hear of it --
+      // the check after the final commit only ever sees the last buffer. A
+      // profiling run that half-executed would otherwise report plausible
+      // timings for work that never happened.
+      if (cb.status == MTLCommandBufferStatusError)
+        throw std::runtime_error(
+            std::string("rt/metal: command buffer failed at stage ") + label +
+            ": " + (cb.error ? cb.error.localizedDescription.UTF8String : "?"));
       prof[label] += std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0).count();
       cb = [ctx.queue commandBuffer];

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "rt_metal_alloc.h"
 #include "rt_metal_opts.h"
 #include "rt_train.hpp"
 
@@ -249,12 +250,10 @@ FineTuneResult fit_head_metal(FineTuneHead& head, const float* features,
                            : (uint32_t)N;
     const size_t P = (size_t)C * kDModel;
     auto bytes = [&](const void* p, size_t n) {
-      return [ctx.dev newBufferWithBytes:p length:n
-                                  options:MTLResourceStorageModeShared];
+      return detail::metal_buffer(ctx.dev, p, n, "rt/head-train");
     };
     auto empty = [&](size_t n) {
-      return [ctx.dev newBufferWithLength:n
-                                   options:MTLResourceStorageModeShared];
+      return detail::metal_buffer(ctx.dev, n, "rt/head-train");
     };
     id<MTLBuffer> bx = bytes(features, (size_t)N * kDModel * sizeof(float));
     id<MTLBuffer> by = bytes(labels, (size_t)N * sizeof(float));
