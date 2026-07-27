@@ -4,10 +4,12 @@ Notable changes to the `relativedb` Python package and the `librt_c` engine
 behind it. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Only 0.1.0 and 0.1.1 are on PyPI. The engine is pre-1.0: the Python API and
-the RelQL grammar may still change between minor versions.
+The engine is pre-1.0: the Python API and the RelQL grammar may still change
+between minor versions.
 
 ## [Unreleased]
+
+## [0.1.3] — 2026-07-26
 
 ### Changed
 - **The declared anchor is the traversal's fallback cutoff.** An undated
@@ -238,7 +240,8 @@ First release.
   regression targets.
 - Apache-2.0 license; macOS arm64 wheel with the engine bundled.
 
-[Unreleased]: https://github.com/RelativeDB/RelQL/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/RelativeDB/RelQL/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/RelativeDB/RelQL/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/RelativeDB/RelQL/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/RelativeDB/RelQL/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/RelativeDB/RelQL/releases/tag/v0.1.0
