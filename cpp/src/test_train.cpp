@@ -55,73 +55,85 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!rt::device_available(rt::Device::MPS)) {
-    std::puts("SKIP: Metal unavailable");
+  const bool has_mps = rt::device_available(rt::Device::MPS);
+  const bool has_cuda = rt::device_available(rt::Device::CUDA);
+  if (!has_mps && !has_cuda) {
+    std::puts("SKIP: no GPU fine-tuning backend available");
     return 0;
   }
 
-  // Three-class linearly separable frozen features.
-  constexpr int C = 3, N = 18, D = rt::kDModel;
-  std::vector<float> x((size_t)N * D, 0.f), y(N);
-  for (int i = 0; i < N; i++) {
-    int c = i % C;
-    y[i] = (float)c;
-    x[(size_t)i * D + c] = 2.f;
-    x[(size_t)i * D + 8 + c] = 1.f;
-  }
-  rt::FineTuneHead mc;
-  mc.task = rt::FineTuneTask::Multiclass;
-  mc.outputs = C;
-  mc.weight.assign((size_t)C * D, 0.f);
-  mc.bias.assign(C, 0.f);
-  rt::FineTuneOptions o;
-  o.epochs = 80;
-  o.learning_rate = 0.03f;
-  o.weight_decay = 0.f;
-  auto mr = rt::fit_head_metal(mc, x.data(), y.data(), N, nullptr, 0, o);
-  auto logits = mc.predict(x.data(), N);
-  int correct = 0;
-  for (int i = 0; i < N; i++)
-    correct += argmax(&logits[(size_t)i * C], C) == (int)y[i];
-  if (!(mr.final_loss < mr.initial_loss * 0.1f) || correct != N) {
-    std::fprintf(stderr, "multiclass failed: loss %.6f -> %.6f, %d/%d\n",
-                 mr.initial_loss, mr.final_loss, correct, N);
-    return 1;
-  }
+  float mc_initial = 0.f, mc_final = 0.f, rk_initial = 0.f, rk_final = 0.f;
+  for (int dev = 0; dev < 2; dev++) {
+    if ((dev == 0 && !has_mps) || (dev == 1 && !has_cuda)) continue;
+    auto fit = dev == 0 ? rt::fit_head_metal : rt::fit_head_cuda;
+    const char* name = dev == 0 ? "metal" : "cuda";
 
-  // Two listwise groups. The relevant candidate is encoded by feature 0.
-  constexpr int RN = 8;
-  std::vector<float> rx((size_t)RN * D, 0.f), ry(RN, 0.f);
-  int32_t offsets[] = {0, 4, 8};
-  ry[2] = 1.f; ry[7] = 1.f;
-  rx[(size_t)2 * D] = 2.f; rx[(size_t)7 * D] = 2.f;
-  for (int i = 0; i < RN; i++) rx[(size_t)i * D + 3] = (float)i / RN;
-  rt::FineTuneHead rank;
-  rank.task = rt::FineTuneTask::Ranking;
-  rank.outputs = 1;
-  rank.weight.assign(D, 0.f);
-  rank.bias.assign(1, 0.f);
-  o.epochs = 80;
-  auto rr = rt::fit_head_metal(rank, rx.data(), ry.data(), RN, offsets, 2, o);
-  auto scores = rank.predict(rx.data(), RN);
-  bool ranked = scores[2] > scores[0] && scores[2] > scores[1] &&
-                scores[2] > scores[3] && scores[7] > scores[4] &&
-                scores[7] > scores[5] && scores[7] > scores[6];
-  if (!(rr.final_loss < rr.initial_loss * 0.2f) || !ranked) {
-    std::fprintf(stderr, "ranking failed: loss %.6f -> %.6f\n",
-                 rr.initial_loss, rr.final_loss);
-    return 1;
-  }
+    // Three-class linearly separable frozen features.
+    constexpr int C = 3, N = 18, D = rt::kDModel;
+    std::vector<float> x((size_t)N * D, 0.f), y(N);
+    for (int i = 0; i < N; i++) {
+      int c = i % C;
+      y[i] = (float)c;
+      x[(size_t)i * D + c] = 2.f;
+      x[(size_t)i * D + 8 + c] = 1.f;
+    }
+    rt::FineTuneHead mc;
+    mc.task = rt::FineTuneTask::Multiclass;
+    mc.outputs = C;
+    mc.weight.assign((size_t)C * D, 0.f);
+    mc.bias.assign(C, 0.f);
+    rt::FineTuneOptions o;
+    o.epochs = 80;
+    o.learning_rate = 0.03f;
+    o.weight_decay = 0.f;
+    auto mr = fit(mc, x.data(), y.data(), N, nullptr, 0, o);
+    auto logits = mc.predict(x.data(), N);
+    int correct = 0;
+    for (int i = 0; i < N; i++)
+      correct += argmax(&logits[(size_t)i * C], C) == (int)y[i];
+    if (!(mr.final_loss < mr.initial_loss * 0.1f) || correct != N) {
+      std::fprintf(stderr, "%s multiclass failed: loss %.6f -> %.6f, %d/%d\n",
+                   name, mr.initial_loss, mr.final_loss, correct, N);
+      return 1;
+    }
+    mc_initial = mr.initial_loss; mc_final = mr.final_loss;
 
-  const char* path = "/tmp/rt_train_test.safetensors";
-  mc.save(path);
-  auto loaded = rt::FineTuneHead::load(path);
-  auto logits2 = loaded.predict(x.data(), N);
-  if (logits != logits2) {
-    std::fputs("checkpoint round-trip failed\n", stderr);
-    return 1;
+    // Two listwise groups. The relevant candidate is encoded by feature 0.
+    constexpr int RN = 8;
+    std::vector<float> rx((size_t)RN * D, 0.f), ry(RN, 0.f);
+    int32_t offsets[] = {0, 4, 8};
+    ry[2] = 1.f; ry[7] = 1.f;
+    rx[(size_t)2 * D] = 2.f; rx[(size_t)7 * D] = 2.f;
+    for (int i = 0; i < RN; i++) rx[(size_t)i * D + 3] = (float)i / RN;
+    rt::FineTuneHead rank;
+    rank.task = rt::FineTuneTask::Ranking;
+    rank.outputs = 1;
+    rank.weight.assign(D, 0.f);
+    rank.bias.assign(1, 0.f);
+    o.epochs = 80;
+    auto rr = fit(rank, rx.data(), ry.data(), RN, offsets, 2, o);
+    auto scores = rank.predict(rx.data(), RN);
+    bool ranked = scores[2] > scores[0] && scores[2] > scores[1] &&
+                  scores[2] > scores[3] && scores[7] > scores[4] &&
+                  scores[7] > scores[5] && scores[7] > scores[6];
+    if (!(rr.final_loss < rr.initial_loss * 0.2f) || !ranked) {
+      std::fprintf(stderr, "%s ranking failed: loss %.6f -> %.6f\n",
+                   name, rr.initial_loss, rr.final_loss);
+      return 1;
+    }
+    rk_initial = rr.initial_loss; rk_final = rr.final_loss;
+
+    const char* path = "/tmp/rt_train_test.safetensors";
+    mc.save(path);
+    auto loaded = rt::FineTuneHead::load(path);
+    auto logits2 = loaded.predict(x.data(), N);
+    if (logits != logits2) {
+      std::fprintf(stderr, "%s checkpoint round-trip failed\n", name);
+      return 1;
+    }
+    std::remove(path);
+    std::printf("HEAD %s PASS\n", name);
   }
-  std::remove(path);
   if (argc >= 3) {
     std::string dir=argv[1];rt::Batch batch;batch.S=16;
     batch.node_idxs=read_bin<int64_t>(dir+"/node_idxs.bin");batch.B=(int)batch.node_idxs.size()/batch.S;
@@ -132,12 +144,17 @@ int main(int argc, char** argv) {
     batch.boolean_v=read_bin<float>(dir+"/boolean_values.bin");batch.text_v=read_bin<float>(dir+"/text_values.bin");
     batch.col_name_v=read_bin<float>(dir+"/col_name_values.bin");
     rt::Model full=rt::Model::load(argv[2]);
+    const bool cuda_full=rt::full_finetune_cuda_available();
+    auto full_step=[&](rt::Model&mm,const rt::FullFineTuneOptions&fo){
+      return cuda_full?rt::fit_model_cuda_step(mm,batch,fo)
+                     :rt::fit_model_metal_step(mm,batch,fo);};
+    const char* backend=cuda_full?"CUDA":"MPS";
     const char* changed_keys[]={"enc_dict.col_name.weight","mask_embs.number",
       "blocks.0.attns.col.wq.weight","blocks.11.ffn.w3.weight",
       "norm_out.scale","dec_dict.number.weight"};
     std::vector<std::vector<float>> before;
     for(const char* key:changed_keys)before.push_back(full.store.at(key).data);
-    rt::FullFineTuneOptions fo;fo.learning_rate=1e-6f;auto step=rt::fit_model_metal_step(full,batch,fo);
+    rt::FullFineTuneOptions fo;fo.learning_rate=1e-6f;auto step=full_step(full,fo);
     bool changed=true;
     for(size_t k=0;k<before.size();k++)changed&=before[k]!=full.store.at(changed_keys[k]).data;
     if(!std::isfinite(step.loss)||!std::isfinite(step.grad_norm)||!changed){
@@ -146,9 +163,21 @@ int main(int argc, char** argv) {
     const char* fullpath="/tmp/rt_full_train_test.safetensors";full.save(fullpath);
     rt::Model round=rt::Model::load(fullpath);std::remove(fullpath);
     if(round.store.at(changed_keys[2]).data!=full.store.at(changed_keys[2]).data){std::fputs("full checkpoint round-trip failed\n",stderr);return 1;}
-    std::printf("FULL MODEL MPS PASS loss %.6f grad %.6f seconds %.3f\n",step.loss,step.grad_norm,step.seconds);
+    if(cuda_full){
+      // Central finite differences over representative parameters pin the
+      // whole CUDA backward pass against the CUDA loss.
+      rt::Model fresh=rt::Model::load(argv[2]);
+      auto gc=rt::check_model_cuda_gradients(fresh,batch);
+      if(gc.checked<8||gc.max_relative_error>0.05f){
+        std::fprintf(stderr,"CUDA gradient check failed: checked=%d abs=%.3e rel=%.3e\n",
+                     gc.checked,gc.max_absolute_error,gc.max_relative_error);return 1;
+      }
+      std::printf("CUDA GRADCHECK PASS checked %d abs %.3e rel %.3e\n",
+                  gc.checked,gc.max_absolute_error,gc.max_relative_error);
+    }
+    std::printf("FULL MODEL %s PASS loss %.6f grad %.6f seconds %.3f\n",backend,step.loss,step.grad_norm,step.seconds);
   }
   std::printf("TRAIN TEST PASS multiclass %.6f->%.6f ranking %.6f->%.6f\n",
-              mr.initial_loss, mr.final_loss, rr.initial_loss, rr.final_loss);
+              mc_initial, mc_final, rk_initial, rk_final);
   return 0;
 }

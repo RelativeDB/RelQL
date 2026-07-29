@@ -46,7 +46,7 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
              weight_decay: float = 1e-2,
              grad_clip_norm: float = 1.0,
              model_uri: Optional[str] = None):
-    """Fine-tune the complete RT-J checkpoint with native C++/MPS.
+    """Fine-tune the complete RT-J checkpoint with native C++ (Metal or CUDA).
 
     Unlike :meth:`fit_head`, this differentiates through all transformer
     blocks, encoders, learned masks, normalization scales, and the number
@@ -55,15 +55,17 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     """
     from .model import NormalizationMode
     from .rt_native import (ColumnStats, FineTunedCheckpoint,
-                            RT_DEVICE_MPS, RtNativeError, load_lib,
+                            RtNativeError, load_lib,
                             resolve_model_path)
     backend = engine._require_backend()
     if not hasattr(backend, "_build_sequences"):
         raise ExecutionError(
             "full-backbone fine-tuning requires RtNativeBackend")
     lib = load_lib(backend._lib_path)
-    if not lib.device_available(RT_DEVICE_MPS):
-        raise ExecutionError("full-model fine-tuning requires Apple MPS")
+    if not lib.full_finetune_available():
+        raise ExecutionError(
+            "full-model fine-tuning requires a GPU training backend "
+            "(Apple Metal 3 or CUDA)")
     if not anchors:
         raise ExecutionError("full-model fine-tuning needs at least one anchor")
     if epochs <= 0 or batch_size <= 0:

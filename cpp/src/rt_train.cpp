@@ -170,6 +170,47 @@ FineTuneHead FineTuneHead::load(const std::string& path) {
   return h;
 }
 
+namespace detail {
+
+void check_head_inputs(const FineTuneHead& h, const float* x, const float* y,
+                       int N, const int32_t* offsets, int G,
+                       const FineTuneOptions& o) {
+  if (!x || !y || N <= 0) throw std::runtime_error("fine-tuning data is empty");
+  if (h.outputs <= 0 || h.weight.size() != (size_t)h.outputs * kDModel ||
+      h.bias.size() != (size_t)h.outputs)
+    throw std::runtime_error("fine-tune head tensor shape mismatch");
+  if (h.task != FineTuneTask::Multiclass && h.outputs != 1)
+    throw std::runtime_error("scalar task head must have one output");
+  if (o.epochs <= 0 || !(o.learning_rate > 0.f) || o.weight_decay < 0.f ||
+      !(o.beta1 >= 0.f && o.beta1 < 1.f) ||
+      !(o.beta2 >= 0.f && o.beta2 < 1.f) || !(o.epsilon > 0.f))
+    throw std::runtime_error("invalid fine-tuning options");
+  for (int i = 0; i < N; i++) {
+    if (!std::isfinite(y[i])) throw std::runtime_error("label is not finite");
+    if (h.task == FineTuneTask::Binary && (y[i] < 0.f || y[i] > 1.f))
+      throw std::runtime_error("binary label must be in [0,1]");
+    if (h.task == FineTuneTask::Multiclass &&
+        (y[i] < 0.f || y[i] >= h.outputs || y[i] != std::floor(y[i])))
+      throw std::runtime_error("multiclass label is out of range");
+    if (h.task == FineTuneTask::Ranking && y[i] < 0.f)
+      throw std::runtime_error("ranking relevance must be non-negative");
+  }
+  if (h.task == FineTuneTask::Ranking) {
+    if (!offsets || G <= 0 || offsets[0] != 0 || offsets[G] != N)
+      throw std::runtime_error("ranking group offsets must span [0,N]");
+    for (int g = 0; g < G; g++) {
+      if (offsets[g] >= offsets[g + 1])
+        throw std::runtime_error("ranking groups must be non-empty");
+      float rel = 0.f;
+      for (int i = offsets[g]; i < offsets[g + 1]; i++) rel += y[i];
+      if (!(rel > 0.f))
+        throw std::runtime_error("every ranking group needs positive relevance");
+    }
+  }
+}
+
+}  // namespace detail
+
 #ifndef RT_METAL
 FineTuneResult fit_head_metal(FineTuneHead&, const float*, const float*, int,
                               const int32_t*, int,
@@ -189,6 +230,28 @@ void load_model_metal_optimizer(Model&, const std::string&) {
 }
 FullGradientCheck check_model_metal_gradients(Model&, const Batch&, float) {
   throw std::runtime_error("full-model Metal fine-tuning backend was not compiled");
+}
+#endif
+
+#ifndef RT_CUDA
+FineTuneResult fit_head_cuda(FineTuneHead&, const float*, const float*, int,
+                             const int32_t*, int, const FineTuneOptions&) {
+  throw std::runtime_error("CUDA fine-tuning backend was not compiled");
+}
+bool full_finetune_cuda_available() { return false; }
+FullFineTuneStep fit_model_cuda_step(Model&, const Batch&,
+                                     const FullFineTuneOptions&) {
+  throw std::runtime_error("full-model CUDA fine-tuning backend was not compiled");
+}
+void reset_model_cuda_optimizer(Model& model) { model.training_ctx.reset(); }
+void save_model_cuda_optimizer(Model&, const std::string&) {
+  throw std::runtime_error("full-model CUDA fine-tuning backend was not compiled");
+}
+void load_model_cuda_optimizer(Model&, const std::string&) {
+  throw std::runtime_error("full-model CUDA fine-tuning backend was not compiled");
+}
+FullGradientCheck check_model_cuda_gradients(Model&, const Batch&, float) {
+  throw std::runtime_error("full-model CUDA fine-tuning backend was not compiled");
 }
 #endif
 

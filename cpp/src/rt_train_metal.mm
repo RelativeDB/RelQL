@@ -198,42 +198,6 @@ TrainMetalCtx& train_ctx() {
   return ctx;
 }
 
-void check_inputs(const FineTuneHead& h, const float* x, const float* y, int N,
-                  const int32_t* offsets, int G, const FineTuneOptions& o) {
-  if (!x || !y || N <= 0) throw std::runtime_error("fine-tuning data is empty");
-  if (h.outputs <= 0 || h.weight.size() != (size_t)h.outputs * kDModel ||
-      h.bias.size() != (size_t)h.outputs)
-    throw std::runtime_error("fine-tune head tensor shape mismatch");
-  if (h.task != FineTuneTask::Multiclass && h.outputs != 1)
-    throw std::runtime_error("scalar task head must have one output");
-  if (o.epochs <= 0 || !(o.learning_rate > 0.f) || o.weight_decay < 0.f ||
-      !(o.beta1 >= 0.f && o.beta1 < 1.f) ||
-      !(o.beta2 >= 0.f && o.beta2 < 1.f) || !(o.epsilon > 0.f))
-    throw std::runtime_error("invalid fine-tuning options");
-  for (int i = 0; i < N; i++) {
-    if (!std::isfinite(y[i])) throw std::runtime_error("label is not finite");
-    if (h.task == FineTuneTask::Binary && (y[i] < 0.f || y[i] > 1.f))
-      throw std::runtime_error("binary label must be in [0,1]");
-    if (h.task == FineTuneTask::Multiclass &&
-        (y[i] < 0.f || y[i] >= h.outputs || y[i] != std::floor(y[i])))
-      throw std::runtime_error("multiclass label is out of range");
-    if (h.task == FineTuneTask::Ranking && y[i] < 0.f)
-      throw std::runtime_error("ranking relevance must be non-negative");
-  }
-  if (h.task == FineTuneTask::Ranking) {
-    if (!offsets || G <= 0 || offsets[0] != 0 || offsets[G] != N)
-      throw std::runtime_error("ranking group offsets must span [0,N]");
-    for (int g = 0; g < G; g++) {
-      if (offsets[g] >= offsets[g + 1])
-        throw std::runtime_error("ranking groups must be non-empty");
-      float rel = 0.f;
-      for (int i = offsets[g]; i < offsets[g + 1]; i++) rel += y[i];
-      if (!(rel > 0.f))
-        throw std::runtime_error("every ranking group needs positive relevance");
-    }
-  }
-}
-
 }  // namespace
 
 FineTuneResult fit_head_metal(FineTuneHead& head, const float* features,
@@ -241,7 +205,8 @@ FineTuneResult fit_head_metal(FineTuneHead& head, const float* features,
                               const int32_t* group_offsets, int n_groups,
                               const FineTuneOptions& opts) {
   @autoreleasepool {
-    check_inputs(head, features, labels, N, group_offsets, n_groups, opts);
+    detail::check_head_inputs(head, features, labels, N, group_offsets,
+                              n_groups, opts);
     TrainMetalCtx& ctx = train_ctx();
     std::lock_guard<std::mutex> lock(ctx.mu);
     const uint32_t C = (uint32_t)head.outputs;

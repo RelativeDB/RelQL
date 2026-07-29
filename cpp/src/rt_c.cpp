@@ -71,6 +71,8 @@ int rt_device_available(int32_t device) {
 int rt_full_finetune_available(void) {
 #ifdef RT_METAL
   return rt::full_finetune_available() ? 1 : 0;
+#elif defined(RT_CUDA)
+  return rt::full_finetune_cuda_available() ? 1 : 0;
 #else
   return 0;
 #endif
@@ -412,6 +414,44 @@ int rt_finetune_head_fit_metal(rt_finetune_head* h, int32_t N,
   }
 }
 
+int rt_finetune_head_fit_device(rt_finetune_head* h, int32_t N,
+                                const float* features, const float* labels,
+                                const int32_t* group_offsets, int32_t n_groups,
+                                int32_t epochs, float learning_rate,
+                                float weight_decay, int32_t device,
+                                float* out_initial_loss, float* out_final_loss,
+                                double* out_seconds,
+                                char* err, size_t errlen) {
+  try {
+    if (!h) throw std::runtime_error("fine-tune head is required");
+    rt::FineTuneOptions opts;
+    opts.epochs = epochs;
+    opts.learning_rate = learning_rate;
+    opts.weight_decay = weight_decay;
+    rt::FineTuneResult r;
+    switch (device) {
+      case RT_DEVICE_MPS:
+        r = rt::fit_head_metal(h->head, features, labels, N, group_offsets,
+                               n_groups, opts);
+        break;
+      case RT_DEVICE_CUDA:
+        r = rt::fit_head_cuda(h->head, features, labels, N, group_offsets,
+                              n_groups, opts);
+        break;
+      default:
+        throw std::runtime_error("head fitting requires a GPU device "
+                                 "(RT_DEVICE_MPS or RT_DEVICE_CUDA)");
+    }
+    if (out_initial_loss) *out_initial_loss = r.initial_loss;
+    if (out_final_loss) *out_final_loss = r.final_loss;
+    if (out_seconds) *out_seconds = r.seconds;
+    return 0;
+  } catch (const std::exception& e) {
+    set_err(err, errlen, e.what());
+    return 1;
+  }
+}
+
 int rt_finetune_head_predict(const rt_finetune_head* h, int32_t N,
                              const float* features, float* out_logits,
                              char* err, size_t errlen) {
@@ -449,7 +489,11 @@ int rt_model_finetune_step_metal(
     if (!m) throw std::runtime_error("model is required");
     rt::Batch b=make_batch(B,S,node_idxs,f2p,col_idxs,table_idxs,is_padding,sem_types,is_target,number_v,datetime_v,boolean_v,text_v,col_name_v);
     rt::FullFineTuneOptions o;o.learning_rate=learning_rate;o.weight_decay=weight_decay;o.grad_clip_norm=grad_clip_norm;
+    #ifdef RT_CUDA
+    rt::FullFineTuneStep r=rt::fit_model_cuda_step(m->model,b,o);
+#else
     rt::FullFineTuneStep r=rt::fit_model_metal_step(m->model,b,o);
+#endif
     if(out_loss)*out_loss=r.loss;if(out_grad_norm)*out_grad_norm=r.grad_norm;
     if(out_step)*out_step=r.step;if(out_seconds)*out_seconds=r.seconds;return 0;
   } catch(const std::exception& e){set_err(err,errlen,e.what());return 1;}
@@ -466,19 +510,71 @@ int rt_model_finetune_microbatch_metal(
   try{if(!m)throw std::runtime_error("model is required");
     rt::Batch b=make_batch(B,S,node_idxs,f2p,col_idxs,table_idxs,is_padding,sem_types,is_target,number_v,datetime_v,boolean_v,text_v,col_name_v);
     rt::FullFineTuneOptions o;o.learning_rate=learning_rate;o.weight_decay=weight_decay;o.grad_clip_norm=grad_clip_norm;o.apply_update=apply_update!=0;
-    auto r=rt::fit_model_metal_step(m->model,b,o);if(out_loss)*out_loss=r.loss;if(out_grad_norm)*out_grad_norm=r.grad_norm;
+    #ifdef RT_CUDA
+    auto r=rt::fit_model_cuda_step(m->model,b,o);
+#else
+    auto r=rt::fit_model_metal_step(m->model,b,o);
+#endif
+    if(out_loss)*out_loss=r.loss;if(out_grad_norm)*out_grad_norm=r.grad_norm;
     if(out_step)*out_step=r.step;if(out_accumulated_microbatches)*out_accumulated_microbatches=r.accumulated_microbatches;
     if(out_updated)*out_updated=r.updated?1:0;if(out_seconds)*out_seconds=r.seconds;return 0;
   }catch(const std::exception&e){set_err(err,errlen,e.what());return 1;}
 }
 
+int rt_model_finetune_step_device(
+    rt_model* m, int32_t B, int32_t S,
+    const int64_t* node_idxs, const int64_t* f2p,
+    const int64_t* col_idxs, const int64_t* table_idxs,
+    const uint8_t* is_padding, const int64_t* sem_types,
+    const uint8_t* is_target, const float* number_v,
+    const float* datetime_v, const float* boolean_v,
+    const float* text_v, const float* col_name_v,
+    float learning_rate, float weight_decay, float grad_clip_norm,
+    int32_t device,
+    float* out_loss, float* out_grad_norm, uint64_t* out_step,
+    double* out_seconds, char* err, size_t errlen) {
+  try {
+    if (!m) throw std::runtime_error("model is required");
+    rt::Batch b=make_batch(B,S,node_idxs,f2p,col_idxs,table_idxs,is_padding,sem_types,is_target,number_v,datetime_v,boolean_v,text_v,col_name_v);
+    rt::FullFineTuneOptions o;o.learning_rate=learning_rate;o.weight_decay=weight_decay;o.grad_clip_norm=grad_clip_norm;
+    rt::FullFineTuneStep r;
+    switch (device) {
+      case RT_DEVICE_MPS: r=rt::fit_model_metal_step(m->model,b,o); break;
+      case RT_DEVICE_CUDA: r=rt::fit_model_cuda_step(m->model,b,o); break;
+      default: throw std::runtime_error("full fine-tuning requires a GPU "
+                                        "device (RT_DEVICE_MPS or RT_DEVICE_CUDA)");
+    }
+    if(out_loss)*out_loss=r.loss;if(out_grad_norm)*out_grad_norm=r.grad_norm;
+    if(out_step)*out_step=r.step;if(out_seconds)*out_seconds=r.seconds;return 0;
+  } catch(const std::exception& e){set_err(err,errlen,e.what());return 1;}
+}
+
+int rt_full_finetune_available_device(int32_t device) {
+  switch (device) {
+    case RT_DEVICE_MPS: return rt::full_finetune_available() ? 1 : 0;
+    case RT_DEVICE_CUDA: return rt::full_finetune_cuda_available() ? 1 : 0;
+    default: return 0;
+  }
+}
+
+// One GPU training backend exists per platform (Metal on macOS, CUDA on
+// Linux), and the optimizer state file format is shared, so the state ABI
+// dispatches to whichever backend this build carries.
 int rt_model_finetune_optimizer_save(rt_model*m,const char*path,char*err,size_t errlen){
+#ifdef RT_CUDA
+  try{if(!m||!path)throw std::runtime_error("model and optimizer path are required");rt::save_model_cuda_optimizer(m->model,path);return 0;}
+#else
   try{if(!m||!path)throw std::runtime_error("model and optimizer path are required");rt::save_model_metal_optimizer(m->model,path);return 0;}
+#endif
   catch(const std::exception&e){set_err(err,errlen,e.what());return 1;}
 }
 
 int rt_model_finetune_optimizer_load(rt_model*m,const char*path,char*err,size_t errlen){
+#ifdef RT_CUDA
+  try{if(!m||!path)throw std::runtime_error("model and optimizer path are required");rt::load_model_cuda_optimizer(m->model,path);return 0;}
+#else
   try{if(!m||!path)throw std::runtime_error("model and optimizer path are required");rt::load_model_metal_optimizer(m->model,path);return 0;}
+#endif
   catch(const std::exception&e){set_err(err,errlen,e.what());return 1;}
 }
 
@@ -491,7 +587,11 @@ int rt_model_finetune_gradient_check_metal(
     char*err,size_t errlen){
   try{if(!m)throw std::runtime_error("model is required");
     rt::Batch b=make_batch(B,S,node_idxs,f2p,col_idxs,table_idxs,is_padding,sem_types,is_target,number_v,datetime_v,boolean_v,text_v,col_name_v);
+    #ifdef RT_CUDA
+    auto r=rt::check_model_cuda_gradients(m->model,b,epsilon);
+#else
     auto r=rt::check_model_metal_gradients(m->model,b,epsilon);
+#endif
     if(out_max_absolute_error)*out_max_absolute_error=r.max_absolute_error;
     if(out_max_relative_error)*out_max_relative_error=r.max_relative_error;if(out_checked)*out_checked=r.checked;return 0;
   }catch(const std::exception&e){set_err(err,errlen,e.what());return 1;}

@@ -1501,7 +1501,8 @@ Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
 #endif
     case Device::CUDA:
 #ifdef RT_CUDA
-      detail::run_blocks_cuda(m, prep, out, opts.debug_taps);
+      detail::run_blocks_cuda(m, prep, out, opts.debug_taps,
+                              opts.want_target_features);
       return out;
 #else
       break;

@@ -496,6 +496,37 @@ __global__ void k_swiglu_packed(const float* __restrict__ ff13,
   ffa[gid] = (a / (1.f + expf(-a))) * b;
 }
 
+// Frozen-backbone features: tfeat[b] = Σ_target-cells rmsnorm(x[row]) *
+// norm_scale, the output-normalized final hidden state summed over the batch
+// row's target cells (matches the CPU/Metal reduction). One warp per batch
+// row; rows are streamed so multiple targets accumulate in order.
+__global__ void k_target_feats(const float* __restrict__ x,
+                               const uint8_t* __restrict__ is_target,
+                               const float* __restrict__ norm_scale,
+                               float* __restrict__ tfeat, int S) {
+  int b = blockIdx.x;
+  int lane = threadIdx.x;
+  float acc[kD / 32];
+#pragma unroll
+  for (int i = 0; i < kD / 32; i++) acc[i] = 0.f;
+  for (int s = 0; s < S; s++) {
+    size_t row = (size_t)b * S + s;
+    if (!is_target[row]) continue;
+    const float* xr = x + row * kD;
+    float ss = 0.f;
+    for (int i = lane; i < kD; i += 32) ss += xr[i] * xr[i];
+    ss = warp_sum(ss);
+    float inv = rsqrtf(ss / kD + kNormEps);
+#pragma unroll
+    for (int i = 0; i < kD / 32; i++) {
+      int d = lane + 32 * i;
+      acc[i] += xr[d] * inv * norm_scale[d];
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < kD / 32; i++) tfeat[(size_t)b * kD + lane + 32 * i] = acc[i];
+}
+
 // yhat[row] = dec_b + dot(rmsnorm(x[row]) * norm_scale, dec_w). Warp per row.
 __global__ void k_head(const float* __restrict__ x,
                        const float* __restrict__ norm_scale,
@@ -550,16 +581,20 @@ struct CudaCtx {
   AttnPWorkGpu* pwork[3] = {};         // flash split-K chunk items
   AttnRWorkGpu* rwork[3] = {};         // flash split-K reduce items
   float* partials = nullptr;           // split-K partial {m, l, o[64]} states
+  uint8_t* tgt = nullptr;              // sorted_is_target for feature gather
+  float* tfeat = nullptr;              // [B, kD] target features
   size_t cap_bs = 0, cap_q[3] = {}, cap_k[3] = {}, cap_w[3] = {};
   size_t cap_pw[3] = {}, cap_rw[3] = {}, cap_part = 0;
+  size_t cap_tgt = 0, cap_tf = 0;
   std::vector<void*> owned;            // every cudaMalloc for cleanup
 
   ~CudaCtx() {
     for (void* p : owned) cudaFree(p);
     for (float* p : {x, xn, qkvg, att, ffa, ffb, ff13, yhat, tap, xqs,
-                     partials})
+                     partials, tfeat})
       cudaFree(p);
     cudaFree(xq);
+    cudaFree(tgt);
     for (int a = 0; a < 3; a++) {
       cudaFree(qidx[a]);
       cudaFree(kidx[a]);
@@ -753,7 +788,7 @@ bool cuda_available() {
 }
 
 void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
-                     bool debug_taps) {
+                     bool debug_taps, bool want_target_features) {
   // ---- lazy per-model context --------------------------------------------
   static std::mutex init_mu;
   std::shared_ptr<void>& slot = m.device_ctx[(int)Device::CUDA];
@@ -943,6 +978,18 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
   // ---- output norm + number head -----------------------------------------
   k_head<<<(int)BS, 32, 0, st>>>(ctx.x, ctx.norm_out, ctx.dec_w, ctx.dec_b,
                                  ctx.yhat);
+  if (want_target_features) {
+    grow(&ctx.tgt, &ctx.cap_tgt, BS);
+    grow(&ctx.tfeat, &ctx.cap_tf, (size_t)B * kD);
+    RT_CU(cudaMemcpyAsync(ctx.tgt, out.sorted_is_target.data(), BS,
+                          cudaMemcpyHostToDevice, st));
+    k_target_feats<<<B, 32, 0, st>>>(ctx.x, ctx.tgt, ctx.norm_out, ctx.tfeat,
+                                     S);
+    out.target_features.resize((size_t)B * kD);
+    RT_CU(cudaMemcpyAsync(out.target_features.data(), ctx.tfeat,
+                          (size_t)B * kD * sizeof(float),
+                          cudaMemcpyDeviceToHost, st));
+  }
 
   RT_CU(cudaMemcpyAsync(out.yhat_number.data(), ctx.yhat, BS * sizeof(float),
                         cudaMemcpyDeviceToHost, st));

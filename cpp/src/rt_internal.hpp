@@ -71,7 +71,7 @@ void run_blocks_metal(const Model& m, Prepared& prep, Output& out,
 #ifdef RT_CUDA
 bool cuda_available();
 void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
-                     bool debug_taps);
+                     bool debug_taps, bool want_target_features = false);
 #endif
 
 }  // namespace detail

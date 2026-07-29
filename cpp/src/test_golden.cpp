@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   printf("device: %s\n", rt::device_name(opts.device));
-  opts.want_target_features = opts.device != rt::Device::CUDA;
+  opts.want_target_features = true;
 
   // Shapes for the demo batch are fixed by the dump; B falls out of the file
   // size once S is known (S=16 by default, --seq for the long-context dump).

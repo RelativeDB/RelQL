@@ -36,7 +36,7 @@ The exact `rt/model.py` (main branch) forward pass:
   (`bool_as_num`)
 - safetensors loading (bf16 → fp32) with a built-in header parser — no JSON dep
 
-## Full-checkpoint MPS fine-tuning
+## Full-checkpoint GPU fine-tuning (MPS and CUDA)
 
 `rt_full_train_metal.mm` implements scalar-task end-to-end fine-tuning without
 Torch. Forward, activation-gradient, and weight-gradient GEMMs use
@@ -45,6 +45,18 @@ column/feature/neighbor attention and backward pass, RMSNorm/QK-RMSNorm,
 gating, SwiGLU, Huber loss, global gradient clipping, and AdamW. The forward
 tape checkpoints block boundaries and recomputes one block at a time during
 backward, keeping 8,192-cell memory bounded on Apple Silicon.
+
+`rt_full_train_cuda.cu` is the CUDA twin (`fit_model_cuda_step`, exposed
+through the same `_metal`-suffixed C ABI entries, which dispatch to whichever
+backend the build carries). Same kernels with native float atomics, cuBLAS
+GEMMs, and stream-ordered scratch (`cudaMallocAsync`) that frees each block's
+recomputed tape as soon as it is consumed — an 8,192-cell batch-one step fits
+a 12GB RTX 5070 (~5.5s). Verified by central finite differences over
+representative parameters on device (`check_model_cuda_gradients`, run by
+`rt_train_test`) and by loss agreement with the MPS implementation to 1e-6.
+Optimizer state files are interchangeable between backends. Task-head fitting
+similarly runs on either GPU (`fit_head_metal` / `fit_head_cuda`) with
+identical loss trajectories.
 
 `fit_model_metal_step` updates encoders, mask embeddings, every transformer
 block, learned scales/norms, and the numeric decoder. Optimizer moments persist
@@ -170,8 +182,10 @@ as many rows. K-chunks are staged in threadgroup memory with **in-register
 dequant on the DRAM load**, accumulated via `simdgroup_float8x8` MMA
 (K-chunks of 32 align with
 Q4's group size, so each staged row-chunk touches one scale pair). CUDA runs
-the same qgemm design as a `k_qgemm` kernel (verified against the reference
-dequant numerically; pending a run on CUDA hardware). fp32 checkpoints take
+the same qgemm design as a `k_qgemm` kernel; q8 additionally quantizes
+activations per row on device and runs true int8×int8 on the dp4a units
+(validated on an RTX 5070: golden parity for fp32/f16, CPU-matching drift for
+q8/q4). fp32 checkpoints take
 the exact same code paths as before (Accelerate / MPS / cuBLAS). On CPU, f16
 micro-batches (≤4 rows) skip the dequant pass and stream half weights
 through a NEON widening kernel (2–3x at M=1; above that the AMX GEMM wins

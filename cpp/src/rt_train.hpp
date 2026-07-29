@@ -82,6 +82,17 @@ void reset_model_metal_optimizer(Model& model);
 void save_model_metal_optimizer(Model& model, const std::string& path);
 void load_model_metal_optimizer(Model& model, const std::string& path);
 
+// The same full fine-tuning surface on CUDA (throws when not compiled in).
+// CUDA has native float atomics on every supported device, so availability is
+// just "a CUDA device exists". The optimizer state file format is shared with
+// Metal — state saved on one backend loads on the other.
+bool full_finetune_cuda_available();
+FullFineTuneStep fit_model_cuda_step(Model& model, const Batch& batch,
+                                     const FullFineTuneOptions& opts = {});
+void reset_model_cuda_optimizer(Model& model);
+void save_model_cuda_optimizer(Model& model, const std::string& path);
+void load_model_cuda_optimizer(Model& model, const std::string& path);
+
 struct FullGradientCheck {
   float max_absolute_error = 0.f;
   float max_relative_error = 0.f;
@@ -92,6 +103,8 @@ struct FullGradientCheck {
 // encoder, attention, FFN, norm, and decoder parameters.
 FullGradientCheck check_model_metal_gradients(Model& model, const Batch& batch,
                                               float epsilon = 1e-3f);
+FullGradientCheck check_model_cuda_gradients(Model& model, const Batch& batch,
+                                             float epsilon = 1e-3f);
 
 struct FineTuneHead {
   FineTuneTask task = FineTuneTask::Binary;
@@ -135,5 +148,18 @@ FineTuneResult fit_head_metal(FineTuneHead& head, const float* features,
                               const float* labels, int N,
                               const int32_t* group_offsets, int n_groups,
                               const FineTuneOptions& opts = {});
+
+// Same contract on the CUDA backend (throws when not compiled in).
+FineTuneResult fit_head_cuda(FineTuneHead& head, const float* features,
+                             const float* labels, int N,
+                             const int32_t* group_offsets, int n_groups,
+                             const FineTuneOptions& opts = {});
+
+namespace detail {
+// Shared head/label/option validation for every fit_head backend.
+void check_head_inputs(const FineTuneHead& h, const float* x, const float* y,
+                       int N, const int32_t* offsets, int G,
+                       const FineTuneOptions& o);
+}  // namespace detail
 
 }  // namespace rt

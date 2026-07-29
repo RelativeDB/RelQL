@@ -454,6 +454,18 @@ class RtLib:
             ctypes.POINTER(ctypes.c_float),  # out_final_loss
             ctypes.POINTER(ctypes.c_double), # out_seconds
             ctypes.c_char_p, ctypes.c_size_t]
+        if hasattr(lib, "rt_finetune_head_fit_device"):
+            lib.rt_finetune_head_fit_device.restype = ctypes.c_int
+            lib.rt_finetune_head_fit_device.argtypes = [
+                ctypes.c_void_p, ctypes.c_int32,
+                f32p, f32p,                  # features [N,512], labels [N]
+                i32p, ctypes.c_int32,        # group_offsets, n_groups
+                ctypes.c_int32, ctypes.c_float, ctypes.c_float,  # epochs, lr, wd
+                ctypes.c_int32,              # device
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.c_char_p, ctypes.c_size_t]
         lib.rt_finetune_head_predict.restype = ctypes.c_int
         lib.rt_finetune_head_predict.argtypes = [
             ctypes.c_void_p, ctypes.c_int32, f32p, f32p,
@@ -1300,8 +1312,12 @@ class RtNativeBackend:
     def _resolve_device(self) -> int:
         if self.device is None:
             lib = load_lib(self._lib_path)
-            self.device = (RT_DEVICE_MPS if lib.device_available(RT_DEVICE_MPS)
-                           else RT_DEVICE_CPU)
+            if lib.device_available(RT_DEVICE_MPS):
+                self.device = RT_DEVICE_MPS
+            elif lib.device_available(RT_DEVICE_CUDA):
+                self.device = RT_DEVICE_CUDA
+            else:
+                self.device = RT_DEVICE_CPU
         return self.device
 
     def _encode(self, model: RtModel, seqs: list["_Seq"]) -> np.ndarray:
@@ -2210,14 +2226,19 @@ class RtNativeBackend:
                  ) -> "FineTunedHead":
         """Fit a task head on frozen features ``[N, 512]``.
 
-        Training runs on Metal; inference on the resulting head is plain CPU
-        (``rt_finetune_head_predict``), so a head trained here serves anywhere.
+        Training runs on the GPU (Metal or CUDA); inference on the resulting
+        head is plain CPU (``rt_finetune_head_predict``), so a head trained
+        here serves anywhere.
         """
         lib = load_lib(self._lib_path)
         ft_task = _FT_TASK_OF[task_type]
-        if not lib.device_available(RT_DEVICE_MPS):
+        if lib.device_available(RT_DEVICE_MPS):
+            fit_device = RT_DEVICE_MPS
+        elif lib.device_available(RT_DEVICE_CUDA):
+            fit_device = RT_DEVICE_CUDA
+        else:
             raise RtNativeError(
-                "task-head fitting requires a Metal device (rt_finetune_head_fit_metal); "
+                "task-head fitting requires a GPU device (Metal or CUDA); "
                 "this build or machine has none. Scoring is unaffected.")
         n_outputs = len(classes) if ft_task == FT_MULTICLASS else 1
 
@@ -2266,15 +2287,22 @@ class RtNativeBackend:
         i_loss = ctypes.c_float(0.0)
         f_loss = ctypes.c_float(0.0)
         secs = ctypes.c_double(0.0)
-        rc = lib._lib.rt_finetune_head_fit_metal(
-            handle, int(y.shape[0]), f, y, go, int(n_groups), int(epochs),
-            float(learning_rate), float(weight_decay),
-            ctypes.byref(i_loss), ctypes.byref(f_loss), ctypes.byref(secs),
-            err, len(err))
+        if hasattr(lib._lib, "rt_finetune_head_fit_device"):
+            rc = lib._lib.rt_finetune_head_fit_device(
+                handle, int(y.shape[0]), f, y, go, int(n_groups), int(epochs),
+                float(learning_rate), float(weight_decay), int(fit_device),
+                ctypes.byref(i_loss), ctypes.byref(f_loss), ctypes.byref(secs),
+                err, len(err))
+        else:
+            rc = lib._lib.rt_finetune_head_fit_metal(
+                handle, int(y.shape[0]), f, y, go, int(n_groups), int(epochs),
+                float(learning_rate), float(weight_decay),
+                ctypes.byref(i_loss), ctypes.byref(f_loss), ctypes.byref(secs),
+                err, len(err))
         if rc != 0:
             lib._lib.rt_finetune_head_free(handle)
             raise RtNativeError(
-                f"rt_finetune_head_fit_metal failed: "
+                f"fine-tune head fit failed: "
                 f"{err.value.decode('utf-8', 'replace')}")
         mode = NormalizationMode.coerce(normalization_mode)
         return FineTunedHead(lib, handle, task=ft_task,

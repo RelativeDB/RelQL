@@ -202,6 +202,17 @@ int rt_finetune_head_fit_metal(rt_finetune_head*, int32_t N,
                                double* out_seconds,
                                char* err, size_t errlen);
 
+/* Same training contract on an explicit device (RT_DEVICE_MPS or
+ * RT_DEVICE_CUDA; RT_DEVICE_CPU is rejected — the head trains on a GPU). */
+int rt_finetune_head_fit_device(rt_finetune_head*, int32_t N,
+                                const float* features, const float* labels,
+                                const int32_t* group_offsets, int32_t n_groups,
+                                int32_t epochs, float learning_rate,
+                                float weight_decay, int32_t device,
+                                float* out_initial_loss, float* out_final_loss,
+                                double* out_seconds,
+                                char* err, size_t errlen);
+
 /* Raw logits/scores [N,n_outputs], evaluated on CPU for portable inference. */
 int rt_finetune_head_predict(const rt_finetune_head*, int32_t N,
                              const float* features, float* out_logits,
@@ -215,6 +226,24 @@ int32_t rt_finetune_head_task(const rt_finetune_head*);
  * the reference Huber objective. The optimizer state persists on rt_model.
  * This path is native C++/Metal and does not use Python autograd.
  */
+/* Same step on an explicit device (RT_DEVICE_MPS or RT_DEVICE_CUDA). Probe
+ * with rt_full_finetune_available_device. Optimizer state files are shared
+ * between backends. */
+int rt_model_finetune_step_device(
+    rt_model*, int32_t B, int32_t S,
+    const int64_t* node_idxs, const int64_t* f2p,
+    const int64_t* col_idxs, const int64_t* table_idxs,
+    const uint8_t* is_padding, const int64_t* sem_types,
+    const uint8_t* is_target, const float* number_v,
+    const float* datetime_v, const float* boolean_v,
+    const float* text_v, const float* col_name_v,
+    float learning_rate, float weight_decay, float grad_clip_norm,
+    int32_t device,
+    float* out_loss, float* out_grad_norm, uint64_t* out_step,
+    double* out_seconds, char* err, size_t errlen);
+
+int rt_full_finetune_available_device(int32_t device);
+
 int rt_model_finetune_step_metal(
     rt_model*, int32_t B, int32_t S,
     const int64_t* node_idxs, const int64_t* f2p,
