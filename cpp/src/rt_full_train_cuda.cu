@@ -41,7 +41,10 @@ struct AdamArgs { uint32_t n, step; float lr, wd, b1, b2, eps, clip; };
     cudaError_t e_ = (call);                                            \
     if (e_ != cudaSuccess)                                              \
       throw std::runtime_error(std::string("rt/full-train-cuda: ") +    \
-                               cudaGetErrorString(e_));                 \
+                               cudaGetErrorString(e_) + " at " +        \
+                               __FILE__ + ":" +                         \
+                               std::to_string(__LINE__) + " [" +        \
+                               #call + "]");                            \
   } while (0)
 
 #define RT_CUBLAS(call)                                                 \
@@ -49,7 +52,10 @@ struct AdamArgs { uint32_t n, step; float lr, wd, b1, b2, eps, clip; };
     cublasStatus_t s_ = (call);                                         \
     if (s_ != CUBLAS_STATUS_SUCCESS)                                    \
       throw std::runtime_error("rt/full-train-cuda: cublas error " +    \
-                               std::to_string((int)s_));                \
+                               std::to_string((int)s_) + " at " +       \
+                               __FILE__ + ":" +                         \
+                               std::to_string(__LINE__) + " [" +        \
+                               #call + "]");                            \
   } while (0)
 
 __device__ inline float wsum(float v) {
@@ -409,8 +415,13 @@ void release_to(FullCtx& c, size_t mk, const float* keep = nullptr) {
 }
 
 float* upload(FullCtx& c, const void* src, size_t bytes) {
-  float* p = buffer(c, bytes);
-  RT_CU(cudaMemcpyAsync(p, src, bytes, cudaMemcpyHostToDevice, c.stream));
+  // Callers pad empty uploads to a minimum size so downstream pointers stay
+  // valid (see the std::max(1, …) group-buffer sites) — but an empty vector's
+  // data() is null, and cudaMemcpyAsync rejects a null source outright with
+  // "invalid argument". Allocate the placeholder, skip the copy.
+  float* p = buffer(c, std::max<size_t>(bytes, 4));
+  if (src != nullptr && bytes > 0)
+    RT_CU(cudaMemcpyAsync(p, src, bytes, cudaMemcpyHostToDevice, c.stream));
   return p;
 }
 
@@ -465,7 +476,14 @@ void flush(FullCtx& c) {
   RT_CU(cudaGetLastError());
 }
 
-inline unsigned nb(size_t n) { return (unsigned)((n + 255) / 256); }
+// A launch with gridDim.x == 0 is rejected by CUDA with cudaErrorInvalidValue
+// ("invalid argument"); Metal treats an empty dispatch as a no-op, so an empty
+// batch component only fails here. Every kernel below bounds-checks its index,
+// so rounding an empty range up to one block is safe and does nothing.
+inline unsigned nb(size_t n) { return n ? (unsigned)((n + 255) / 256) : 1u; }
+
+// The same guard for grids sized directly from a count rather than via nb().
+inline unsigned ng(size_t n) { return n ? (unsigned)n : 1u; }
 
 void zero(FullCtx& c, float* x, size_t n) {
   RT_CU(cudaMemsetAsync(x, 0, n * 4, c.stream));
@@ -522,11 +540,11 @@ struct FfnTape { float *x, *xn, *a, *b, *y, *out; };
 
 void rms_forward(FullCtx& c, const float* x, Param& s, float* y, size_t rows,
                  uint32_t n) {
-  k_rms_fwd<<<(unsigned)rows, 32, 0, c.stream>>>(x, s.w, y, n);
+  k_rms_fwd<<<ng(rows), 32, 0, c.stream>>>(x, s.w, y, n);
 }
 void rms_backward(FullCtx& c, const float* x, const float* y, Param& s,
                   const float* dy, float* dx, size_t rows, uint32_t n) {
-  k_rms_dx<<<(unsigned)rows, 32, 0, c.stream>>>(x, s.w, dy, dx, n);
+  k_rms_dx<<<ng(rows), 32, 0, c.stream>>>(x, s.w, dy, dx, n);
   k_rms_ds<<<nb(n), 256, 0, c.stream>>>(y, s.w, dy, s.g, (uint32_t)rows, n);
 }
 
@@ -556,13 +574,13 @@ AttnTape attention_forward(FullCtx& c, int b, int a, float* x, size_t rows,
   t.qn = buffer(c, bytes); t.kn = buffer(c, bytes);
   Param& qns = P(c, p + "q_norm.scale");
   Param& kns = P(c, p + "k_norm.scale");
-  k_qnorm_fwd<<<(unsigned)(rows * H), 32, 0, c.stream>>>(t.q, qns.w, t.qn);
-  k_qnorm_fwd<<<(unsigned)(rows * H), 32, 0, c.stream>>>(t.k, kns.w, t.kn);
+  k_qnorm_fwd<<<ng(rows * H), 32, 0, c.stream>>>(t.q, qns.w, t.qn);
+  k_qnorm_fwd<<<ng(rows * H), 32, 0, c.stream>>>(t.k, kns.w, t.kn);
   t.a = buffer(c, bytes);
   zero(c, t.a, n);
   Param& hs = P(c, p + "scale");
   if (gb.nw)
-    k_attn_fwd<<<(unsigned)gb.nw, 32, 0, c.stream>>>(t.qn, t.kn, t.v, t.a,
+    k_attn_fwd<<<ng(gb.nw), 32, 0, c.stream>>>(t.qn, t.kn, t.v, t.a,
                                                      gb.qi, gb.ki, gb.w, hs.w);
   t.y = buffer(c, bytes);
   k_gate_fwd<<<nb(n), 256, 0, c.stream>>>(t.a, t.g, t.y, (uint32_t)n);
@@ -642,7 +660,7 @@ float* attention_backward(FullCtx& c, int b, int a, const AttnTape& t,
   zero(c, dqn, n); zero(c, dkn, n); zero(c, dv, n);
   Param& hs = P(c, p + "scale");
   if (gb.nw)
-    k_attn_bwd<<<(unsigned)gb.nw, 32, 0, c.stream>>>(
+    k_attn_bwd<<<ng(gb.nw), 32, 0, c.stream>>>(
         t.qn, t.kn, t.v, t.a, da, dqn, dkn, dv, gb.qi, gb.ki, gb.w, hs.w,
         hs.g);
   float* dq = buffer(c, bytes);
@@ -651,8 +669,8 @@ float* attention_backward(FullCtx& c, int b, int a, const AttnTape& t,
   Param& qns = P(c, p + "q_norm.scale");
   Param& kns = P(c, p + "k_norm.scale");
   uint32_t nseg = (uint32_t)(rows * H);
-  k_qnorm_dx<<<nseg, 32, 0, c.stream>>>(t.q, qns.w, dqn, dq);
-  k_qnorm_dx<<<nseg, 32, 0, c.stream>>>(t.k, kns.w, dkn, dk);
+  k_qnorm_dx<<<ng(nseg), 32, 0, c.stream>>>(t.q, qns.w, dqn, dq);
+  k_qnorm_dx<<<ng(nseg), 32, 0, c.stream>>>(t.k, kns.w, dkn, dk);
   k_qnorm_ds<<<nb(HD), 256, 0, c.stream>>>(t.qn, qns.w, dqn, qns.g, nseg);
   k_qnorm_ds<<<nb(HD), 256, 0, c.stream>>>(t.kn, kns.w, dkn, kns.g, nseg);
   float* dxn = buffer(c, bytes);

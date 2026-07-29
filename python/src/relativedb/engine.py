@@ -1520,6 +1520,17 @@ class Engine:
         pinned = pinned_ids(pq.where, pq.entity_key)
         if pinned is not None:
             return pinned
+        if input.params and "ids" in input.params:
+            # The caller clearly meant to score a cohort, but nothing in the
+            # query consumes the binding. Scoring the whole table instead
+            # once collated thousands of unrequested contexts into a single
+            # forward and took the host to its memory limit. validate()
+            # rejects this for text queries; this covers the bound-AST path.
+            raise ExecutionError(
+                f"params['ids'] was provided but the query never references "
+                f":ids, which would score the whole {pq.entity_key.table!r} "
+                f"table. Pin the cohort with WHERE {pq.entity_key.table}."
+                f"{pq.entity_key.column} IN :ids")
         ids = self._sampler().all_ids(pq.entity_key.table)
         if ids is None:
             raise ExecutionError(

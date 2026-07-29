@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from relativedb import (MissingParameterError, RelqlSyntaxError,
-                        RelqlValidationError, parse, validate)
+                        RelqlValidationError, UnreferencedParameterError,
+                        parse, validate)
 from relativedb.relql import (AggFunc, Aggregation, Arith, AsOf, Case, ColumnRef,
                           Condition, Explain, Func, Lit, LogicalOp, Not,
                           Operator, Param, RankKind, ReturnSpec, TaskType,
@@ -416,12 +417,36 @@ def test_missing_parameter_names_itself():
     pq = parse("PREDICT NOT EXISTS(orders.*) FROM customers "
                "WHERE customers.customer_id IN :ids")
     with pytest.raises(MissingParameterError, match="ids"):
-        pq.bind_params({"other": 1})
+        pq.bind_params({})
 
 
-def test_query_without_parameters_is_unchanged_by_binding():
+def test_unreferenced_parameter_fails_instead_of_being_dropped():
+    """A binding the query never consumes is the whole-table-scan bug in
+    waiting (params={'ids': ...} without IN :ids) — it must fail at bind
+    time, never be ignored."""
+    pq = parse("PREDICT NOT EXISTS(orders.*) FROM customers "
+               "WHERE customers.customer_id IN :ids")
+    with pytest.raises(UnreferencedParameterError, match="other"):
+        pq.bind_params({"ids": ["C1"], "other": 1})
+
+
+def test_query_without_parameters_rejects_a_supplied_binding():
     pq = parse("PREDICT NOT EXISTS(orders.*) FROM customers")
-    assert pq.bind_params({"unused": 1}) is pq
+    with pytest.raises(UnreferencedParameterError, match="unused"):
+        pq.bind_params({"unused": 1})
+    # No params supplied stays a no-op.
+    assert pq.bind_params({}) is pq
+    assert pq.bind_params(None) is pq
+
+
+def test_rebinding_an_already_bound_query_is_idempotent():
+    """validate() folds params into literals; re-binding the same params on
+    the bound query is an established engine pattern and must not trip the
+    unreferenced-binding check — the source text still references them."""
+    pq = parse("PREDICT NOT EXISTS(orders.*) FROM customers "
+               "WHERE customers.customer_id IN :ids")
+    bound = pq.bind_params({"ids": ["C1"]})
+    assert bound.bind_params({"ids": ["C1"]}) is bound
 
 
 # ---------------------------------------------------------------------------

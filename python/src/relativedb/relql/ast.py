@@ -16,6 +16,7 @@ __all__ = [
     "Arith", "Func", "Case", "Lit",
     "Explain", "AsOf", "Ablation", "ReturnSpec", "Param",
     "TargetExpr", "ParsedQuery", "RankKind", "MissingParameterError",
+    "UnreferencedParameterError",
 ]
 
 
@@ -28,6 +29,26 @@ class MissingParameterError(KeyError):
         super().__init__(
             f"query references bind parameter :{name}, which was not supplied "
             f"(params given: {have})")
+
+
+class UnreferencedParameterError(ValueError):
+    """A supplied parameter is never referenced by the query.
+
+    Silently dropping the binding is how a caller who meant ``WHERE pk IN
+    :ids`` ends up scoring the whole table — the mismatch has to fail at
+    bind time, where the fix is obvious, not surface as a resource blowup.
+    """
+
+    def __init__(self, names, referenced) -> None:
+        self.names = sorted(map(str, names))
+        refs = ", ".join(f":{n}" for n in sorted(map(str, referenced))) \
+            or "no parameters"
+        supplied = ", ".join(self.names)
+        super().__init__(
+            f"params [{supplied}] were supplied but the query never "
+            f"references them (query binds {refs}). Every supplied "
+            f"parameter must appear as :name in the query — to score a "
+            f"cohort, pin it with WHERE <table>.<pk> IN :ids")
 
 
 class AggFunc(Enum):
@@ -310,6 +331,34 @@ def _has_params(expr) -> bool:
     return False
 
 
+def _param_names(expr) -> set:
+    """Every ``:name`` referenced in ``expr`` — the mirror of :func:`_bind`,
+    so any position that binds is a position that counts as referenced."""
+    if expr is None:
+        return set()
+    if isinstance(expr, Param):
+        return {expr.name}
+    if isinstance(expr, Condition):
+        return _param_names(expr.left) | _param_names(expr.right_expr)
+    if isinstance(expr, LogicalOp):
+        return _param_names(expr.left) | _param_names(expr.right)
+    if isinstance(expr, Not):
+        return _param_names(expr.expr)
+    if isinstance(expr, Arith):
+        return _param_names(expr.left) | _param_names(expr.right)
+    if isinstance(expr, Func):
+        return set().union(*(_param_names(a) for a in expr.args)) \
+            if expr.args else set()
+    if isinstance(expr, Case):
+        out = _param_names(expr.else_)
+        for c, t in expr.whens:
+            out |= _param_names(c) | _param_names(t)
+        return out
+    if isinstance(expr, Aggregation):
+        return _param_names(expr.filter)
+    return set()
+
+
 def _find_aggregations(expr: TargetExpr) -> list[Aggregation]:
     if isinstance(expr, Aggregation):
         return [expr]
@@ -404,11 +453,37 @@ class ParsedQuery:
         return (_has_params(self.target) or _has_params(self.where)
                 or _has_params(self.assuming))
 
+    def param_names(self) -> set:
+        """Every ``:name`` this query references, including an ``AS OF
+        :name`` anchor (bound from params at execution, not by
+        :meth:`bind_params`)."""
+        names = (_param_names(self.target) | _param_names(self.where)
+                 | _param_names(self.assuming))
+        if self.as_of is not None and self.as_of.kind == "param":
+            names.add(self.as_of.value)
+        return names
+
     def bind_params(self, params: Optional[dict]) -> "ParsedQuery":
         """Return this query with every ``:name`` replaced by its value from
         ``params``. Raises :class:`MissingParameterError` for an unsupplied
-        name. A no-op when the query has no parameters."""
+        name and :class:`UnreferencedParameterError` for a supplied name the
+        query never references — a dropped binding usually means the caller
+        thought they were pinning a cohort. A no-op when the query has no
+        parameters and none were supplied."""
         import dataclasses
+        if params:
+            referenced = self.param_names()
+            extra = set(params) - referenced
+            if extra and self.text:
+                # A query validate() already bound has its Params folded into
+                # literals, but re-binding the same params is an established
+                # idempotent pattern — the source text still says which names
+                # the query references.
+                import re
+                extra -= set(re.findall(r"(?<![:\w]):([A-Za-z_]\w*)",
+                                        self.text))
+            if extra:
+                raise UnreferencedParameterError(extra, referenced)
         if not self.has_params:
             return self
         p = params or {}

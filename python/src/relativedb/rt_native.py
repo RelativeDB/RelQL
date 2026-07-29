@@ -1457,9 +1457,17 @@ class RtNativeBackend:
                 f"{missing[:3]!r}")
         return preds
 
+    # Physical forward bound when the caller sets none. Collation materializes
+    # two [B, S, 384] float32 channels (text_v / col_name_v) — ~6 MB per
+    # sequence at S=2048 — so an unbounded cohort is an unbounded host
+    # allocation: 4201 entities through one collate reached ~40 GB and got the
+    # serving process OOM-killed. 64 caps a chunk near 400 MB; per-sequence
+    # normalization makes chunking bit-identical to one call.
+    DEFAULT_PHYSICAL_BATCH = 64
+
     def _forward_batched(self, model: RtModel, seqs: list["_Seq"], **kwargs):
         """Run bounded physical forwards while preserving logical ordering."""
-        bs = self.batch_size or len(seqs)
+        bs = self.batch_size or self.DEFAULT_PHYSICAL_BATCH
         if not seqs or len(seqs) <= bs:
             return self._forward(model, seqs, **kwargs)
         chunks = [self._forward(model, seqs[i:i + bs], **kwargs)

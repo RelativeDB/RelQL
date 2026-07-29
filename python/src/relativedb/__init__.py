@@ -9,8 +9,8 @@ from .retrieve import (CohortRetriever, EntityRetriever, LinkRetriever, Row,
                        RetrieverWiring, TableScanner, TemporalBound,
                        WiringError)
 from .relql import (MissingParameterError, ParsedQuery, RelqlSyntaxError,
-                  RelqlValidationError, TaskType, ValidatedQuery, parse,
-                  validate)
+                  RelqlValidationError, TaskType, UnreferencedParameterError,
+                  ValidatedQuery, parse, validate)
 from .model import (DEFAULT_CLASSIFICATION_MODEL_URI, DEFAULT_EMBEDDING_MODEL,
                     DEFAULT_REGRESSION_MODEL_URI, EmbeddingMismatchError,
                     ModelConfig, NormalizationMode)
@@ -24,6 +24,7 @@ from .engine import (AssumptionNotAppliedWarning,
                      ExplainResult, InvisibleTableWarning, ModelBackend,
                      PredictionResult, SamplerMode)
 from .csc import CscIndex
+from .remote import RemoteBackend, RemoteScoringError
 
 
 def __getattr__(name):
@@ -48,6 +49,7 @@ __all__ = [
     "LinkRetriever", "CohortRetriever", "TableScanner", "WiringError",
     "parse", "validate", "ParsedQuery", "ValidatedQuery", "TaskType",
     "RelqlSyntaxError", "RelqlValidationError", "MissingParameterError",
+    "UnreferencedParameterError",
     "ModelConfig", "NormalizationMode", "EmbeddingMismatchError",
     "TaskSpec", "TaskSpecFactory", "canonical_target",
     "GraphAccess", "GraphTraversal", "TraversalResult",
@@ -60,6 +62,7 @@ __all__ = [
     "SamplerMode", "PredictionResult", "ExplainResult",
     "EntityPrediction", "EntityContext",
     "ModelBackend", "CscIndex",
+    "RemoteBackend", "RemoteScoringError",
     "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
     "ContextConnectivityWarning", "ColumnStats", "FineTunedHead",
     "FineTunedCheckpoint",

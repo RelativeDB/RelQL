@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .ast import ParsedQuery, TaskType
+from .ast import ParsedQuery, TaskType, UnreferencedParameterError
 
 __all__ = ["parse", "validate", "RelqlSyntaxError", "RelqlValidationError",
            "ValidatedQuery"]
@@ -77,6 +77,20 @@ def validate(query, schema, params=None) -> ValidatedQuery:
     from .native import analyze_native, params_to_json
 
     text = query if isinstance(query, str) else query.text
+    if params and text:
+        # A supplied binding the query never references is a hard error, not
+        # a no-op: the C++ binder would drop it silently, and a dropped
+        # cohort pin (`params={"ids": ...}` without `IN :ids`) turns into a
+        # whole-table scan. The C++ pass rebinds from the TEXT, so the check
+        # must parse the text too — a ParsedQuery handed back in (the engine
+        # re-validates bound queries) may already have its params folded into
+        # literals. The no-text already-bound path is not checked here: its
+        # params are the consumed bindings of the query it was derived from,
+        # and the engine's cohort resolution guards the dangerous case.
+        ref = parse(text)
+        extra = set(params) - ref.param_names()
+        if extra:
+            raise UnreferencedParameterError(extra, ref.param_names())
     if not text:
         # An already-bound query built by AST surgery rather than written by a
         # user -- the engine's hurdle composition derives one. There is no

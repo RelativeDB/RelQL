@@ -314,3 +314,28 @@ def test_feature_typed_fk_counts_as_an_emitted_cell():
     with warnings.catch_warnings():
         warnings.simplefilter("error", ContextCompositionWarning)
         _warn_context_health(contexts, schema, ContextPolicy())
+
+
+# --------------------------------------------------------------------------
+# unreferenced bindings
+# --------------------------------------------------------------------------
+
+def test_unconsumed_ids_binding_fails_instead_of_scanning_the_table(churn_schema):
+    """params={'ids': ...} against a query with no `IN :ids` once scored the
+    whole table — thousands of unrequested contexts collated into one forward
+    took the serving host to its memory limit. The mismatch must fail at
+    validation, where the fix is a one-line WHERE clause."""
+    from relativedb import UnreferencedParameterError
+    eng = _engine(churn_schema)
+    unpinned = ("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
+                "FROM customers")
+    with pytest.raises(UnreferencedParameterError, match="ids"):
+        eng.execute(ExecutionInput(query=unpinned, anchor_time=ANCHOR,
+                                   params={"ids": IDS}))
+
+
+def test_pinned_ids_binding_still_scores(churn_schema):
+    eng = _engine(churn_schema)
+    res = eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                                     params={"ids": IDS}))
+    assert [p.id for p in res.predictions] == IDS
