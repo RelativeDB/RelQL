@@ -212,6 +212,7 @@ void check_head_inputs(const FineTuneHead& h, const float* x, const float* y,
 }  // namespace detail
 
 #ifndef RT_METAL
+bool full_finetune_available() { return false; }
 FineTuneResult fit_head_metal(FineTuneHead&, const float*, const float*, int,
                               const int32_t*, int,
                               const FineTuneOptions&) {

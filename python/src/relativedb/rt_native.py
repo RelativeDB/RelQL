@@ -1083,15 +1083,19 @@ class TextEmbedder:
                     "pip install sentence-transformers") from e
             # Device is configurable, as it is in the reference
             # (rt/embed.py takes it as a parameter and the evaluator passes
-            # the run's device). CPU stays the default so nothing moves
-            # unless a caller asks: off CUDA the reference is fp32 too, so
-            # this is a kernel-ordering difference, not a dtype change -- but
-            # it is still a difference, and embeddings feed every prediction.
-            #
-            # It is worth asking for: text embedding is HALF the wall clock of
-            # a large task (measured: 361s of 719s on rel-trial/site-success),
-            # far more than context assembly or the model forward.
-            device = os.environ.get("RELATIVEDB_EMBED_DEVICE", "cpu")
+            # the run's device). Text embedding is HALF the wall clock of a
+            # large task (measured: 361s of 719s on rel-trial/site-success),
+            # far more than context assembly or the model forward — so on a
+            # CUDA machine the encoder defaults to the GPU, matching the
+            # reference evaluator's CUDA runs (fp32 either way; any remaining
+            # difference is kernel ordering). Everywhere else CPU stays the
+            # default so nothing moves unless a caller asks.
+            # RELATIVEDB_EMBED_DEVICE overrides in both directions
+            # (e.g. "cpu" to pin reproducibility on a CUDA box, or "mps").
+            device = os.environ.get("RELATIVEDB_EMBED_DEVICE")
+            if device is None:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
             self._model = SentenceTransformer(
                 f"sentence-transformers/{self.model_name}", device=device)
             # Left at the encoder's shipped 128 word-piece window ON PURPOSE.
