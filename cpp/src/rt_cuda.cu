@@ -8,19 +8,27 @@
 // custom qgemm (32x32 output tiles, shared-memory-staged in-register
 // dequant — the fp32 weight tile never exists in DRAM). All quantized
 // weights stay quantized-resident. Custom kernels handle the rest:
-//  - rmsnorm_rows: one warp per row (pre-norms, d=512)
-//  - qknorm: in-place QK-RMSNorm per (token, head) on the fused qkvg buffer
-//  - attn: one block per (group, query-tile) work item; each warp owns a
-//    (query, head) pair and streams the shared key list with a single-pass
-//    online softmax — the same query-group sparsity as the CPU/MPS paths,
-//    with the identical bf16-rounded log(kv) query scaling
-//  - gate_mul / swiglu / head: elementwise gating, SwiGLU, fused output head
+//  - rmsnorm_rows(_clear): one warp per row (pre-norms, d=512); the attn
+//    pre-norm also clears the attention output row in the same pass
+//  - attn: tiled like the Metal kernel — one 256-thread block per work item
+//    of at most kMQ queries; K/V rows are staged into shared memory kTK at a
+//    time so each staged row serves every (query, head) pair in the item,
+//    with QK-RMSNorm fused at load and the sigmoid output gate fused at the
+//    write. Same single-pass online softmax and bf16-rounded log(kv) query
+//    scaling as the CPU/MPS paths.
+//  - attn_part / attn_reduce: flash split-K for groups whose key list
+//    exceeds kFlashSplit — chunks stream in parallel blocks, partial
+//    {m, l, o} states merge with the online-softmax identity
+//  - swiglu_packed / head: SwiGLU on the stacked [w1;w3] GEMM output, fused
+//    output-norm + number head. w1/w3 upload stacked so the FFN up-projection
+//    is one GEMM.
 // Weights are uploaded once per model; activation/index buffers grow on
 // demand and are reused. Forwards on one model are serialized by the ctx.
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -57,6 +65,23 @@ struct AttnWorkGpu {
   int qstart, tq, kstart, nk, rowbase;
   float logkv;
 };
+
+// Host mirrors of the flash split-K work items (see attn_part/attn_reduce).
+struct AttnPWorkGpu {
+  int qstart, tq, kstart, nk, rowbase;
+  float logkv;
+  int part;      // float offset of this chunk's partials
+};
+struct AttnRWorkGpu {
+  int qstart, tq, rowbase, part, nchunks;
+};
+
+// A group whose shared key list exceeds kFlashSplit is split into
+// kFlashChunk-key chunks, each streamed by an independent block.
+constexpr int kFlashChunk = 256;
+constexpr int kFlashSplit = 512;
+constexpr int kMQ = 8;    // queries per tiled-attention work item
+constexpr int kTK = 6;    // keys staged per shared-memory tile
 
 __device__ inline float warp_sum(float v) {
   for (int off = 16; off > 0; off >>= 1)
@@ -219,9 +244,13 @@ __global__ void k_qgemm_i8(const int8_t* __restrict__ xq,
 }
 
 // out[row] = rmsnorm(in[row]) * scale, rows of length n. One warp per row.
+// CLEAR also zeroes clear[row] in the same pass (the attention output row —
+// positions no work item writes must contribute zero to the wo projection).
+template <bool CLEAR>
 __global__ void k_rmsnorm_rows(const float* __restrict__ in,
                                float* __restrict__ out,
-                               const float* __restrict__ scale, int n) {
+                               const float* __restrict__ scale, int n,
+                               float* __restrict__ clear) {
   int row = blockIdx.x;
   int lane = threadIdx.x;
   const float* x = in + (size_t)row * n;
@@ -230,82 +259,241 @@ __global__ void k_rmsnorm_rows(const float* __restrict__ in,
   for (int i = lane; i < n; i += 32) ss += x[i] * x[i];
   ss = warp_sum(ss);
   float inv = rsqrtf(ss / n + kNormEps);
-  for (int i = lane; i < n; i += 32) y[i] = x[i] * inv * scale[i];
+  for (int i = lane; i < n; i += 32) {
+    y[i] = x[i] * inv * scale[i];
+    if (CLEAR) clear[(size_t)row * n + i] = 0.f;
+  }
 }
 
-// In-place QK-RMSNorm on the fused qkvg buffer (row = [q|k|v|g]).
-// One warp per (token, head, q-or-k) segment of 64 floats.
-__global__ void k_qknorm(float* __restrict__ qkvg,
-                         const float* __restrict__ q_scale,
-                         const float* __restrict__ k_scale) {
-  int tg = blockIdx.x;
-  int lane = threadIdx.x;
-  int token = tg / 16, seg = tg % 16;
-  int head = seg / 2, isk = seg % 2;
-  float* x = qkvg + (size_t)token * kC4 + isk * kD + head * kHeadDim;
-  const float* scale = isk ? k_scale : q_scale;
-  float a = x[lane], b = x[lane + 32];
-  float ss = warp_sum(a * a + b * b);
-  float inv = rsqrtf(ss / kHeadDim + kNormEps);
-  x[lane] = a * inv * scale[lane];
-  x[lane + 32] = b * inv * scale[lane + 32];
-}
-
-// One block per work item; each warp streams the key list for a
-// (query, head) pair with an online softmax. q/k already QK-normed.
+// Tiled attention (CUDA port of the Metal kernel). One 256-thread block
+// (8 warps) per work item of at most kMQ queries; warp `sg` owns the
+// (query, head) pairs {sg, sg+8, ...} with their online-softmax state in
+// registers. K/V rows are staged into shared memory kTK at a time by all
+// 256 threads, so each staged row serves every query and head in the item
+// instead of being re-streamed from DRAM per (query, head). QK-RMSNorm is
+// fused: queries normalize at load, keys normalize in the staged tile.
+// The sigmoid output gate is fused at the write — each (query, head)
+// segment is written by exactly one pair of one group.
 __global__ void k_attn(const float* __restrict__ qkvg, float* __restrict__ att,
                        const int* __restrict__ qidx,
                        const int* __restrict__ kidx,
                        const AttnWorkGpu* __restrict__ work,
-                       const float* __restrict__ head_scale) {
+                       const float* __restrict__ head_scale,
+                       const float* __restrict__ q_norm,
+                       const float* __restrict__ k_norm) {
+  __shared__ float Kt[kTK * kD];
+  __shared__ float Vt[kTK * kD];
   const AttnWorkGpu w = work[blockIdx.x];
-  int lane = threadIdx.x % 32;
-  int warp = threadIdx.x / 32;
-  int nwarp = blockDim.x / 32;
-  for (int p = warp; p < w.tq * kHeads; p += nwarp) {
-    int r = p / kHeads, h = p % kHeads;
-    size_t qrow = (size_t)(w.rowbase + qidx[w.qstart + r]);
-    const float* q = qkvg + qrow * kC4 + h * kHeadDim;
-    float qscale = head_scale[h] * w.logkv / kHeadDim;
-    float q0 = q[2 * lane] * qscale;
-    float q1 = q[2 * lane + 1] * qscale;
-    float mx = -INFINITY, den = 0.f, a0 = 0.f, a1 = 0.f;
-    for (int j = 0; j < w.nk; j++) {
-      size_t krow = (size_t)(w.rowbase + kidx[w.kstart + j]);
-      const float* k = qkvg + krow * kC4 + kD + h * kHeadDim;
-      float score = warp_sum(q0 * k[2 * lane] + q1 * k[2 * lane + 1]);
-      const float* v = k + kD;
-      float nm = fmaxf(mx, score);
-      float corr = expf(mx - nm);
-      float wt = expf(score - nm);
-      den = den * corr + wt;
-      a0 = a0 * corr + wt * v[2 * lane];
-      a1 = a1 * corr + wt * v[2 * lane + 1];
-      mx = nm;
+  const int lane = threadIdx.x % 32;
+  const int sg = threadIdx.x / 32;
+  const int tid = threadIdx.x;
+  const int npair = w.tq * kHeads;
+  float q0v[kMQ], q1v[kMQ], mx[kMQ], den[kMQ], a0[kMQ], a1[kMQ];
+  size_t orow[kMQ];
+  for (int s = 0; s < kMQ; s++) {
+    mx[s] = -INFINITY; den[s] = 0.f; a0[s] = 0.f; a1[s] = 0.f;
+    int p = sg + s * 8;
+    if (p < npair) {
+      int r = p / kHeads, h = p % kHeads;
+      size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + r]);
+      const float* q = qkvg + qrowi * kC4 + h * kHeadDim;
+      float r0 = q[2 * lane], r1 = q[2 * lane + 1];
+      float inv = rsqrtf(warp_sum(r0 * r0 + r1 * r1) / kHeadDim + kNormEps);
+      float qscale = head_scale[h] * w.logkv / kHeadDim;
+      q0v[s] = r0 * inv * q_norm[2 * lane] * qscale;
+      q1v[s] = r1 * inv * q_norm[2 * lane + 1] * qscale;
+      orow[s] = qrowi * kD + h * kHeadDim;
     }
-    float* o = att + qrow * kD + h * kHeadDim;
-    o[2 * lane] = a0 / den;
-    o[2 * lane + 1] = a1 / den;
+  }
+  for (int k0 = 0; k0 < w.nk; k0 += kTK) {
+    const int kn = min(kTK, w.nk - k0);
+    __syncthreads();                     // previous tile fully consumed
+    for (int i = tid; i < kn * kD; i += 256) {
+      int j = i / kD, d = i % kD;
+      size_t krow = (size_t)(w.rowbase + kidx[w.kstart + k0 + j]) * kC4;
+      Kt[j * kD + d] = qkvg[krow + kD + d];
+      Vt[j * kD + d] = qkvg[krow + 2 * kD + d];
+    }
+    __syncthreads();
+    // Fused QK-RMSNorm (key half): normalize the staged tile in place, one
+    // warp per (key, head) segment.
+    for (int seg = sg; seg < kn * kHeads; seg += 8) {
+      int j = seg / kHeads, h = seg % kHeads;
+      float* kk = Kt + j * kD + h * kHeadDim;
+      float a = kk[2 * lane], b = kk[2 * lane + 1];
+      float invk = rsqrtf(warp_sum(a * a + b * b) / kHeadDim + kNormEps);
+      kk[2 * lane] = a * invk * k_norm[2 * lane];
+      kk[2 * lane + 1] = b * invk * k_norm[2 * lane + 1];
+    }
+    __syncthreads();
+    for (int j = 0; j < kn; j++) {
+      for (int s = 0; s < kMQ; s++) {
+        int p = sg + s * 8;
+        if (p >= npair) continue;
+        int h = p % kHeads;
+        const float* k = Kt + j * kD + h * kHeadDim;
+        float score = warp_sum(q0v[s] * k[2 * lane] + q1v[s] * k[2 * lane + 1]);
+        const float* v = Vt + j * kD + h * kHeadDim;
+        float nm = fmaxf(mx[s], score);
+        float corr = expf(mx[s] - nm);
+        float wt = expf(score - nm);
+        den[s] = den[s] * corr + wt;
+        a0[s] = a0[s] * corr + wt * v[2 * lane];
+        a1[s] = a1[s] * corr + wt * v[2 * lane + 1];
+        mx[s] = nm;
+      }
+    }
+  }
+  for (int s = 0; s < kMQ; s++) {
+    int p = sg + s * 8;
+    if (p >= npair) continue;
+    int r = p / kHeads, h = p % kHeads;
+    size_t grow = (size_t)(w.rowbase + qidx[w.qstart + r]) * kC4 + 3 * kD +
+                  h * kHeadDim;
+    float g0 = 2.f / (1.f + expf(-qkvg[grow + 2 * lane]));
+    float g1 = 2.f / (1.f + expf(-qkvg[grow + 2 * lane + 1]));
+    float* o = att + orow[s];
+    o[2 * lane] = a0[s] / den[s] * g0;
+    o[2 * lane + 1] = a1[s] / den[s] * g1;
   }
 }
 
-// att *= 2*sigmoid(g), g = qkvg[token, 3D + d].
-__global__ void k_gate_mul(float* __restrict__ att,
-                           const float* __restrict__ qkvg, size_t total) {
-  size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (gid >= total) return;
-  size_t token = gid / kD, d = gid % kD;
-  float g = qkvg[token * kC4 + 3 * kD + d];
-  att[gid] *= 2.f / (1.f + expf(-g));
+// Flash split-K attention for long key lists: same tiled streaming as
+// k_attn, but only over this work item's key chunk, emitting per-
+// (query, head, chunk) partials {running max m, denom l, unnormalized
+// weighted-V sum o[64]} at float offset w.part + (r*8+h)*66.
+__global__ void k_attn_part(const float* __restrict__ qkvg,
+                            float* __restrict__ partials,
+                            const int* __restrict__ qidx,
+                            const int* __restrict__ kidx,
+                            const AttnPWorkGpu* __restrict__ work,
+                            const float* __restrict__ head_scale,
+                            const float* __restrict__ q_norm,
+                            const float* __restrict__ k_norm) {
+  __shared__ float Kt[kTK * kD];
+  __shared__ float Vt[kTK * kD];
+  const AttnPWorkGpu w = work[blockIdx.x];
+  const int lane = threadIdx.x % 32;
+  const int sg = threadIdx.x / 32;
+  const int tid = threadIdx.x;
+  const int npair = w.tq * kHeads;
+  float q0v[kMQ], q1v[kMQ], mx[kMQ], den[kMQ], a0[kMQ], a1[kMQ];
+  for (int s = 0; s < kMQ; s++) {
+    mx[s] = -INFINITY; den[s] = 0.f; a0[s] = 0.f; a1[s] = 0.f;
+    int p = sg + s * 8;
+    if (p < npair) {
+      int r = p / kHeads, h = p % kHeads;
+      size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + r]);
+      const float* q = qkvg + qrowi * kC4 + h * kHeadDim;
+      float r0 = q[2 * lane], r1 = q[2 * lane + 1];
+      float inv = rsqrtf(warp_sum(r0 * r0 + r1 * r1) / kHeadDim + kNormEps);
+      float qscale = head_scale[h] * w.logkv / kHeadDim;
+      q0v[s] = r0 * inv * q_norm[2 * lane] * qscale;
+      q1v[s] = r1 * inv * q_norm[2 * lane + 1] * qscale;
+    }
+  }
+  for (int k0 = 0; k0 < w.nk; k0 += kTK) {
+    const int kn = min(kTK, w.nk - k0);
+    __syncthreads();
+    for (int i = tid; i < kn * kD; i += 256) {
+      int j = i / kD, d = i % kD;
+      size_t krow = (size_t)(w.rowbase + kidx[w.kstart + k0 + j]) * kC4;
+      Kt[j * kD + d] = qkvg[krow + kD + d];
+      Vt[j * kD + d] = qkvg[krow + 2 * kD + d];
+    }
+    __syncthreads();
+    for (int seg = sg; seg < kn * kHeads; seg += 8) {
+      int j = seg / kHeads, h = seg % kHeads;
+      float* kk = Kt + j * kD + h * kHeadDim;
+      float a = kk[2 * lane], b = kk[2 * lane + 1];
+      float invk = rsqrtf(warp_sum(a * a + b * b) / kHeadDim + kNormEps);
+      kk[2 * lane] = a * invk * k_norm[2 * lane];
+      kk[2 * lane + 1] = b * invk * k_norm[2 * lane + 1];
+    }
+    __syncthreads();
+    for (int j = 0; j < kn; j++) {
+      for (int s = 0; s < kMQ; s++) {
+        int p = sg + s * 8;
+        if (p >= npair) continue;
+        int h = p % kHeads;
+        const float* k = Kt + j * kD + h * kHeadDim;
+        float score = warp_sum(q0v[s] * k[2 * lane] + q1v[s] * k[2 * lane + 1]);
+        const float* v = Vt + j * kD + h * kHeadDim;
+        float nm = fmaxf(mx[s], score);
+        float corr = expf(mx[s] - nm);
+        float wt = expf(score - nm);
+        den[s] = den[s] * corr + wt;
+        a0[s] = a0[s] * corr + wt * v[2 * lane];
+        a1[s] = a1[s] * corr + wt * v[2 * lane + 1];
+        mx[s] = nm;
+      }
+    }
+  }
+  for (int s = 0; s < kMQ; s++) {
+    int p = sg + s * 8;
+    if (p >= npair) continue;
+    int r = p / kHeads, h = p % kHeads;
+    float* o = partials + w.part + (size_t)(r * 8 + h) * 66;
+    if (lane == 0) { o[0] = mx[s]; o[1] = den[s]; }
+    o[2 + 2 * lane] = a0[s];
+    o[2 + 2 * lane + 1] = a1[s];
+  }
 }
 
-// ffa = silu(ffa) * ffb.
+// Merge the chunk partials with the online-softmax identity
+// l = Σ l_c·exp(m_c-M), o = Σ o_c·exp(m_c-M); gate fused at the write.
+__global__ void k_attn_reduce(const float* __restrict__ partials,
+                              float* __restrict__ att,
+                              const int* __restrict__ qidx,
+                              const AttnRWorkGpu* __restrict__ work,
+                              const float* __restrict__ qkvg) {
+  const AttnRWorkGpu w = work[blockIdx.x];
+  const int lane = threadIdx.x % 32;
+  const int sg = threadIdx.x / 32;
+  const int nsg = blockDim.x / 32;
+  const size_t cstride = (size_t)w.tq * 8 * 66;
+  for (int p = sg; p < w.tq * kHeads; p += nsg) {
+    int r = p / kHeads, h = p % kHeads;
+    const float* base = partials + w.part + (size_t)(r * 8 + h) * 66;
+    float M = -INFINITY;
+    for (int c = 0; c < w.nchunks; c++) M = fmaxf(M, base[c * cstride]);
+    float l = 0.f, o0 = 0.f, o1 = 0.f;
+    for (int c = 0; c < w.nchunks; c++) {
+      const float* pc = base + c * cstride;
+      float f = expf(pc[0] - M);
+      l += pc[1] * f;
+      o0 += pc[2 + 2 * lane] * f;
+      o1 += pc[2 + 2 * lane + 1] * f;
+    }
+    size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + r]);
+    size_t grow = qrowi * kC4 + 3 * kD + h * kHeadDim;
+    float g0 = 2.f / (1.f + expf(-qkvg[grow + 2 * lane]));
+    float g1 = 2.f / (1.f + expf(-qkvg[grow + 2 * lane + 1]));
+    float* o = att + qrowi * kD + h * kHeadDim;
+    o[2 * lane] = o0 / l * g0;
+    o[2 * lane + 1] = o1 / l * g1;
+  }
+}
+
+// ffa = silu(ffa) * ffb (separate w1/w3 fallback when dtypes differ).
 __global__ void k_swiglu(float* __restrict__ ffa,
                          const float* __restrict__ ffb, size_t total) {
   size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (gid >= total) return;
   float a = ffa[gid];
   ffa[gid] = (a / (1.f + expf(-a))) * ffb[gid];
+}
+
+// ffa[row, d] = silu(ff13[row, d]) * ff13[row, kDFF + d] — SwiGLU on the
+// stacked [w1; w3] GEMM output.
+__global__ void k_swiglu_packed(const float* __restrict__ ff13,
+                                float* __restrict__ ffa, size_t total) {
+  size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= total) return;
+  size_t row = gid / kDFF, d = gid % kDFF;
+  float a = ff13[row * (2 * kDFF) + d];
+  float b = ff13[row * (2 * kDFF) + kDFF + d];
+  ffa[gid] = (a / (1.f + expf(-a))) * b;
 }
 
 // yhat[row] = dec_b + dot(rmsnorm(x[row]) * norm_scale, dec_w). Warp per row.
@@ -339,7 +527,7 @@ struct GpuWeight {
 
 struct BlockWeights {
   GpuWeight wqkvg[3], wo[3];           // per attention type (col, feat, nbr)
-  GpuWeight w1, w2, w3;
+  GpuWeight w1, w2, w3, w13;           // w13 = stacked [w1; w3] (one GEMM)
   float* norm[4];
   float *q_norm[3], *k_norm[3], *head_scale[3];
 };
@@ -353,22 +541,31 @@ struct CudaCtx {
   float dec_b = 0.f;
   // grow-on-demand activation / index buffers
   float *x = nullptr, *xn = nullptr, *qkvg = nullptr, *att = nullptr;
-  float *ffa = nullptr, *ffb = nullptr, *yhat = nullptr, *tap = nullptr;
+  float *ffa = nullptr, *ffb = nullptr, *ff13 = nullptr;
+  float *yhat = nullptr, *tap = nullptr;
   int8_t* xq = nullptr;                // int8 activations for Q8 projections
   float* xqs = nullptr;                // per-row activation scales
   int *qidx[3] = {}, *kidx[3] = {};
   AttnWorkGpu* work[3] = {};
+  AttnPWorkGpu* pwork[3] = {};         // flash split-K chunk items
+  AttnRWorkGpu* rwork[3] = {};         // flash split-K reduce items
+  float* partials = nullptr;           // split-K partial {m, l, o[64]} states
   size_t cap_bs = 0, cap_q[3] = {}, cap_k[3] = {}, cap_w[3] = {};
+  size_t cap_pw[3] = {}, cap_rw[3] = {}, cap_part = 0;
   std::vector<void*> owned;            // every cudaMalloc for cleanup
 
   ~CudaCtx() {
     for (void* p : owned) cudaFree(p);
-    for (float* p : {x, xn, qkvg, att, ffa, ffb, yhat, tap, xqs}) cudaFree(p);
+    for (float* p : {x, xn, qkvg, att, ffa, ffb, ff13, yhat, tap, xqs,
+                     partials})
+      cudaFree(p);
     cudaFree(xq);
     for (int a = 0; a < 3; a++) {
       cudaFree(qidx[a]);
       cudaFree(kidx[a]);
       cudaFree(work[a]);
+      cudaFree(pwork[a]);
+      cudaFree(rwork[a]);
     }
     if (blas) cublasDestroy(blas);
     if (stream) cudaStreamDestroy(stream);
@@ -410,6 +607,46 @@ GpuWeight upload_weight(CudaCtx* ctx, const Weight& w) {
   return g;
 }
 
+// Stacked [w1; w3] upload so the FFN up-projection runs as one GEMM. Rows
+// quantize independently in every format, so stacking is plain payload (and
+// scale) concatenation. Returns type-less (out=0) when the dtypes differ.
+GpuWeight upload_stacked(CudaCtx* ctx, const Weight& w1, const Weight& w3) {
+  GpuWeight g;
+  if (w1.type != w3.type || w1.in != w3.in) return g;
+  g.type = w1.type;
+  g.out = w1.out + w3.out;
+  g.in = w1.in;
+  if (w1.type == WType::F32) {
+    float* d = nullptr;
+    size_t n1 = (size_t)w1.out * w1.in, n3 = (size_t)w3.out * w3.in;
+    RT_CU(cudaMalloc(&d, (n1 + n3) * sizeof(float)));
+    RT_CU(cudaMemcpy(d, w1.f32, n1 * 4, cudaMemcpyHostToDevice));
+    RT_CU(cudaMemcpy(d + n1, w3.f32, n3 * 4, cudaMemcpyHostToDevice));
+    ctx->owned.push_back(d);
+    g.f32 = d;
+    return g;
+  }
+  size_t rb1 = row_bytes(w1.type, w1.in) * (size_t)w1.out;
+  size_t rb3 = row_bytes(w3.type, w3.in) * (size_t)w3.out;
+  uint8_t* q = nullptr;
+  RT_CU(cudaMalloc(&q, rb1 + rb3));
+  RT_CU(cudaMemcpy(q, w1.q, rb1, cudaMemcpyHostToDevice));
+  RT_CU(cudaMemcpy(q + rb1, w3.q, rb3, cudaMemcpyHostToDevice));
+  ctx->owned.push_back(q);
+  g.q = q;
+  size_t sb1 = scale_bytes(w1.type, w1.in) * (size_t)w1.out;
+  size_t sb3 = scale_bytes(w3.type, w3.in) * (size_t)w3.out;
+  if (sb1 + sb3) {
+    uint8_t* s = nullptr;
+    RT_CU(cudaMalloc(&s, sb1 + sb3));
+    RT_CU(cudaMemcpy(s, w1.qs, sb1, cudaMemcpyHostToDevice));
+    RT_CU(cudaMemcpy(s + sb1, w3.qs, sb3, cudaMemcpyHostToDevice));
+    ctx->owned.push_back(s);
+    g.s = s;
+  }
+  return g;
+}
+
 CudaCtx* make_ctx(const Model& m) {
   auto* ctx = new CudaCtx();
   try {
@@ -428,9 +665,12 @@ CudaCtx* make_ctx(const Model& m) {
         g.norm[a] = dev_upload(ctx, blk.norm[a], kD);
       }
       g.norm[3] = dev_upload(ctx, blk.norm[3], kD);
-      g.w1 = upload_weight(ctx, blk.w1);
+      g.w13 = upload_stacked(ctx, blk.w1, blk.w3);
+      if (!g.w13.out) {                // dtype mismatch: separate projections
+        g.w1 = upload_weight(ctx, blk.w1);
+        g.w3 = upload_weight(ctx, blk.w3);
+      }
       g.w2 = upload_weight(ctx, blk.w2);
-      g.w3 = upload_weight(ctx, blk.w3);
     }
     ctx->norm_out = dev_upload(ctx, m.norm_out, kD);
     ctx->dec_w = dev_upload(ctx, m.dec_number.w, kD);
@@ -522,15 +762,22 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     if (!slot) slot.reset(make_ctx(m), [](void* p) { delete (CudaCtx*)p; });
   }
   CudaCtx& ctx = *(CudaCtx*)slot.get();
-  std::lock_guard<std::mutex> lk(ctx.mu);
-  cudaStream_t st = ctx.stream;
 
   const int B = prep.B, S = prep.S;
   const size_t BS = (size_t)B * S;
 
   // ---- flatten group indices / work items for the GPU --------------------
+  // Pure host work on prep — runs before taking the ctx lock so concurrent
+  // forwards overlap their CPU flattening with another forward's GPU time.
+  // Small groups (nk <= kFlashSplit) run the single-pass tiled kernel; large
+  // groups split into kFlashChunk-key chunks for attn_part -> attn_reduce.
+  // Both tiled kernels take at most kMQ queries per item (per-pair softmax
+  // state lives in registers), so prep's kQTile items are sub-tiled here.
   std::vector<int32_t> qflat[3], kflat[3];
   std::vector<AttnWorkGpu> wflat[3];
+  std::vector<AttnPWorkGpu> pflat[3];
+  std::vector<AttnRWorkGpu> rflat[3];
+  size_t part_floats[3] = {0, 0, 0};
   const std::vector<Groups>* gsets[3] = {&prep.g_col, &prep.g_feat,
                                          &prep.g_nbr};
   for (int a = 0; a < 3; a++) {
@@ -548,16 +795,42 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
       qflat[a].insert(qflat[a].end(), G.q.begin(), G.q.end());
       kflat[a].insert(kflat[a].end(), G.k.begin(), G.k.end());
     }
-    wflat[a].reserve(prep.work[a].size());
+    size_t poff = 0;
     for (const Work& W : prep.work[a]) {
       const Groups& G = (*gsets[a])[W.b];
-      wflat[a].push_back({qbase[W.b] + G.qoff[W.g] + W.q0, W.q1 - W.q0,
-                          kbase[W.b] + G.koff[W.g],
-                          G.koff[W.g + 1] - G.koff[W.g], W.b * S, W.logkv});
+      const int qs = qbase[W.b] + G.qoff[W.g] + W.q0;
+      const int tq = W.q1 - W.q0;
+      const int ks = kbase[W.b] + G.koff[W.g];
+      const int nk = G.koff[W.g + 1] - G.koff[W.g];
+      if (nk <= kFlashSplit) {
+        for (int sub = 0; sub < tq; sub += kMQ)
+          wflat[a].push_back({qs + sub, std::min(kMQ, tq - sub), ks, nk,
+                              W.b * S, W.logkv});
+        continue;
+      }
+      const int nchunks = (nk + kFlashChunk - 1) / kFlashChunk;
+      const int item_base = (int)poff;
+      for (int c = 0; c < nchunks; c++) {
+        const int c0 = c * kFlashChunk;
+        const int cnk = std::min(kFlashChunk, nk - c0);
+        for (int sub = 0; sub < tq; sub += kMQ)
+          pflat[a].push_back({qs + sub, std::min(kMQ, tq - sub), ks + c0, cnk,
+                              W.b * S, W.logkv,
+                              item_base + c * (tq * 8 * 66) + sub * 8 * 66});
+      }
+      rflat[a].push_back({qs, tq, W.b * S, item_base, nchunks});
+      poff += (size_t)nchunks * tq * 8 * 66;
     }
+    part_floats[a] = poff;
   }
+  const size_t part_max =
+      std::max({part_floats[0], part_floats[1], part_floats[2], (size_t)1});
+
+  std::lock_guard<std::mutex> lk(ctx.mu);
+  cudaStream_t st = ctx.stream;
 
   // ---- buffers -----------------------------------------------------------
+  const bool packed_ffn = ctx.blk[0].w13.out != 0;
   if (ctx.cap_bs < BS) {
     for (float** p : {&ctx.x, &ctx.xn, &ctx.att, &ctx.tap}) {
       if (*p) RT_CU(cudaFree(*p));
@@ -569,10 +842,21 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
       *p = nullptr;
       RT_CU(cudaMalloc(p, BS * (size_t)kC4 * sizeof(float)));
     }
-    for (float** p : {&ctx.ffa, &ctx.ffb}) {
-      if (*p) RT_CU(cudaFree(*p));
-      *p = nullptr;
-      RT_CU(cudaMalloc(p, BS * (size_t)kDFF * sizeof(float)));
+    if (packed_ffn) {
+      for (float** p : {&ctx.ffa}) {
+        if (*p) RT_CU(cudaFree(*p));
+        *p = nullptr;
+        RT_CU(cudaMalloc(p, BS * (size_t)kDFF * sizeof(float)));
+      }
+      if (ctx.ff13) RT_CU(cudaFree(ctx.ff13));
+      ctx.ff13 = nullptr;
+      RT_CU(cudaMalloc(&ctx.ff13, BS * (size_t)(2 * kDFF) * sizeof(float)));
+    } else {
+      for (float** p : {&ctx.ffa, &ctx.ffb}) {
+        if (*p) RT_CU(cudaFree(*p));
+        *p = nullptr;
+        RT_CU(cudaMalloc(p, BS * (size_t)kDFF * sizeof(float)));
+      }
     }
     if (ctx.yhat) RT_CU(cudaFree(ctx.yhat));
     ctx.yhat = nullptr;
@@ -585,10 +869,13 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     RT_CU(cudaMalloc(&ctx.xqs, BS * sizeof(float)));
     ctx.cap_bs = BS;
   }
+  grow(&ctx.partials, &ctx.cap_part, part_max);
   for (int a = 0; a < 3; a++) {
     grow(&ctx.qidx[a], &ctx.cap_q[a], std::max<size_t>(1, qflat[a].size()));
     grow(&ctx.kidx[a], &ctx.cap_k[a], std::max<size_t>(1, kflat[a].size()));
     grow(&ctx.work[a], &ctx.cap_w[a], std::max<size_t>(1, wflat[a].size()));
+    grow(&ctx.pwork[a], &ctx.cap_pw[a], std::max<size_t>(1, pflat[a].size()));
+    grow(&ctx.rwork[a], &ctx.cap_rw[a], std::max<size_t>(1, rflat[a].size()));
     RT_CU(cudaMemcpyAsync(ctx.qidx[a], qflat[a].data(), qflat[a].size() * 4,
                           cudaMemcpyHostToDevice, st));
     RT_CU(cudaMemcpyAsync(ctx.kidx[a], kflat[a].data(), kflat[a].size() * 4,
@@ -596,6 +883,14 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     RT_CU(cudaMemcpyAsync(ctx.work[a], wflat[a].data(),
                           wflat[a].size() * sizeof(AttnWorkGpu),
                           cudaMemcpyHostToDevice, st));
+    if (!pflat[a].empty())
+      RT_CU(cudaMemcpyAsync(ctx.pwork[a], pflat[a].data(),
+                            pflat[a].size() * sizeof(AttnPWorkGpu),
+                            cudaMemcpyHostToDevice, st));
+    if (!rflat[a].empty())
+      RT_CU(cudaMemcpyAsync(ctx.rwork[a], rflat[a].data(),
+                            rflat[a].size() * sizeof(AttnRWorkGpu),
+                            cudaMemcpyHostToDevice, st));
   }
   RT_CU(cudaMemcpyAsync(ctx.x, prep.x.data(), BS * kD * sizeof(float),
                         cudaMemcpyHostToDevice, st));
@@ -608,25 +903,37 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
   for (int blk_i = 0; blk_i < kBlocks; blk_i++) {
     const BlockWeights& gw = ctx.blk[blk_i];
     for (int a = 0; a < 3; a++) {
-      k_rmsnorm_rows<<<(int)BS, 32, 0, st>>>(ctx.x, ctx.xn, gw.norm[a], kD);
+      // Pre-norm + clear the attention output in one row pass.
+      k_rmsnorm_rows<true><<<(int)BS, 32, 0, st>>>(ctx.x, ctx.xn, gw.norm[a],
+                                                   kD, ctx.att);
       proj(ctx, ctx.xn, gw.wqkvg[a], ctx.qkvg, (int)BS, 0.f);
-      k_qknorm<<<(int)BS * 16, 32, 0, st>>>(ctx.qkvg, gw.q_norm[a],
-                                            gw.k_norm[a]);
-      RT_CU(cudaMemsetAsync(ctx.att, 0, BS * kD * sizeof(float), st));
+      // Attention with fused QK-RMSNorm and output gating.
       if (!wflat[a].empty())
-        k_attn<<<(int)wflat[a].size(), 128, 0, st>>>(
+        k_attn<<<(int)wflat[a].size(), 256, 0, st>>>(
             ctx.qkvg, ctx.att, ctx.qidx[a], ctx.kidx[a], ctx.work[a],
-            gw.head_scale[a]);
-      k_gate_mul<<<blocks_for(BS * kD), kThreads, 0, st>>>(ctx.att, ctx.qkvg,
-                                                           BS * kD);
+            gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
+      if (!rflat[a].empty()) {           // flash split-K large groups
+        k_attn_part<<<(int)pflat[a].size(), 256, 0, st>>>(
+            ctx.qkvg, ctx.partials, ctx.qidx[a], ctx.kidx[a], ctx.pwork[a],
+            gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
+        k_attn_reduce<<<(int)rflat[a].size(), 128, 0, st>>>(
+            ctx.partials, ctx.att, ctx.qidx[a], ctx.rwork[a], ctx.qkvg);
+      }
       proj(ctx, ctx.att, gw.wo[a], ctx.x, (int)BS, 1.f);
     }
-    // FFN: x += w2( silu(w1 xn) * w3 xn )
-    k_rmsnorm_rows<<<(int)BS, 32, 0, st>>>(ctx.x, ctx.xn, gw.norm[3], kD);
-    proj(ctx, ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
-    proj(ctx, ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
-    k_swiglu<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(ctx.ffa, ctx.ffb,
-                                                         BS * kDFF);
+    // FFN: x += w2( silu(w1 xn) * w3 xn ), up-projection as one stacked GEMM
+    k_rmsnorm_rows<false><<<(int)BS, 32, 0, st>>>(ctx.x, ctx.xn, gw.norm[3],
+                                                  kD, nullptr);
+    if (packed_ffn) {
+      proj(ctx, ctx.xn, gw.w13, ctx.ff13, (int)BS, 0.f);
+      k_swiglu_packed<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(
+          ctx.ff13, ctx.ffa, BS * kDFF);
+    } else {
+      proj(ctx, ctx.xn, gw.w1, ctx.ffa, (int)BS, 0.f);
+      proj(ctx, ctx.xn, gw.w3, ctx.ffb, (int)BS, 0.f);
+      k_swiglu<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(ctx.ffa, ctx.ffb,
+                                                           BS * kDFF);
+    }
     proj(ctx, ctx.ffa, gw.w2, ctx.x, (int)BS, 1.f);
     if (blk_i == 0 && debug_taps)
       RT_CU(cudaMemcpyAsync(ctx.tap, ctx.x, BS * kD * sizeof(float),

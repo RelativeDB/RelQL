@@ -134,6 +134,10 @@ target_link_libraries(rt_test rt)
 add_executable(rt_bench src/bench.cpp)
 target_link_libraries(rt_bench rt)
 
+# Concurrent-request (multiuser serving shape) benchmark.
+add_executable(rt_bench_mu src/bench_multiuser.cpp)
+target_link_libraries(rt_bench_mu rt)
+
 add_executable(rt_train_test src/test_train.cpp)
 target_link_libraries(rt_train_test rt)
 

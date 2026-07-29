@@ -396,6 +396,10 @@ class Pool {
       for (int i = 0; i < total; i++) fn(0, i);
       return;
     }
+    // One job at a time: concurrent forwards (multiuser serving) queue here
+    // instead of clobbering the shared job_/next_/done_ state, which parked
+    // every thread in the process on cv_done_ forever.
+    std::lock_guard<std::mutex> run_lk(run_mu_);
     {
       std::lock_guard<std::mutex> lk(mu_);
       job_ = &fn;
@@ -451,6 +455,7 @@ class Pool {
     }
   }
   std::vector<std::thread> workers_;
+  std::mutex run_mu_;                  // serializes whole jobs (see run())
   std::mutex mu_;
   std::condition_variable cv_, cv_done_;
   const std::function<void(int, int)>* job_ = nullptr;
