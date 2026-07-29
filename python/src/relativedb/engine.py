@@ -1576,6 +1576,15 @@ class Engine:
         :func:`relativedb.training.fit_head`."""
         return _training.fit_head(self, *args, **kwargs)
 
+    def fit_xgboost(self, *args, **kwargs):
+        """Fit an XGBoost model on labelled anchors — the third adaptation
+        path next to :meth:`fit_head` and :meth:`finetune`, for queries the
+        flat-feature planner accepts. Returns the fitted
+        :class:`~relativedb.xgb.XgboostBackend`; assign it to
+        ``model_backend`` to serve. See :func:`relativedb.xgb.fit_xgboost`."""
+        from . import xgb as _xgb                 # optional dependency
+        return _xgb.fit_xgboost(self, *args, **kwargs)
+
     def _scalar_label(self, *args, **kwargs):
         return _training._scalar_label(self, *args, **kwargs)
 

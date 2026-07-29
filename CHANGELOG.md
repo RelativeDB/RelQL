@@ -9,6 +9,28 @@ between minor versions.
 
 ## [Unreleased]
 
+### Added
+- **XGBoost flat-feature backend.** The C++ layer gains a flat-feature
+  planner/evaluator (`cpp/src/flat.*`, exposed as `relql_flat_analyze` /
+  `relql_flat_features` in `librt_c`): it decides whether a RelQL query can
+  run as flat features at all (scalar regression/binary, one horizon, no
+  RANK, no ASSUMING, no ABLATE), derives the feature columns from the query
+  and schema (entity scalars, the target mirrored into recent past windows,
+  the WHERE clause's own aggregates, and the standard per-table
+  COUNT/recency/SUM/AVG/MAX recipe), and evaluates them over assembled
+  contexts with the engine's window semantics (`(anchor+start, anchor+end]`,
+  NaN for missing). `relativedb.xgb.XgboostBackend` (optional extra
+  `relativedb[xgboost]`, XGBoost >= 3.3) wires that matrix into an XGBoost
+  model: `Engine.fit_xgboost(query, anchors)` is the adaptation path next
+  to `fit_head`/`finetune` with the same supervision contract (past-bounded
+  contexts, database-exact derived labels), `save()`/`load()` persist the
+  model with its feature schema, and the fitted backend serves
+  `Engine.execute` through the `ModelBackend` protocol. When the installed
+  XGBoost build has CUDA and a device is visible, fitting and scoring run
+  with `device="cuda"`. `analyze_flat()` answers "can this query run here"
+  without raising, so callers can route ineligible queries to the sequence
+  model.
+
 ## [0.1.3] — 2026-07-26
 
 ### Changed

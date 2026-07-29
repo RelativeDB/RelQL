@@ -106,7 +106,7 @@ endif()
 # schema-aware semantic pass (validation, task-type inference) that each
 # binding used to reimplement in its own language.
 add_library(relql STATIC src/relql.cpp src/schema.cpp src/analyze.cpp
-                        src/plan.cpp src/json.cpp)
+                        src/plan.cpp src/json.cpp src/flat.cpp)
 target_include_directories(relql PUBLIC src)
 target_link_libraries(relql PUBLIC rt_flags)
 
@@ -122,6 +122,7 @@ target_link_libraries(csc PUBLIC rt_flags)
 
 add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
                         src/schema.cpp src/analyze.cpp src/plan.cpp src/json.cpp
+                        src/flat.cpp src/flat_c.cpp
                         src/csc_c.cpp src/csc.cpp
                         src/graph.cpp src/graph_c.cpp)
 target_link_libraries(rt_c PRIVATE rt)
@@ -154,6 +155,12 @@ target_link_libraries(relql_test relql)
 add_executable(analyze_test src/test_analyze.cpp)
 target_link_libraries(analyze_test relql)
 
+# Flat-feature planner/evaluator behind the XGBoost binding. flat_c.cpp is
+# compiled in directly (like csc_test) so the C ABI is exercised without the
+# engine shared library.
+add_executable(flat_test src/test_flat.cpp src/flat_c.cpp)
+target_link_libraries(flat_test relql)
+
 # csc_c.cpp is compiled in directly (rather than linking rt_c) so the test
 # exercises the C ABI without dragging in the whole engine shared library.
 add_executable(graph_test src/test_graph.cpp)
@@ -171,6 +178,7 @@ if(BUILD_TESTING)
   # Self-contained: randomized CSC adjacency batteries with fixed seeds.
   add_test(NAME csc COMMAND csc_test)
   add_test(NAME analyze COMMAND analyze_test)
+  add_test(NAME flat COMMAND flat_test)
   add_test(NAME graph COMMAND graph_test)
 
   # Needs the RelQL corpus, which lives in the python package. Pass it as an

@@ -33,6 +33,10 @@ def __getattr__(name):
                 "FineTunedCheckpoint", "ColumnStats"):
         from . import rt_native
         return getattr(rt_native, name)
+    if name in ("XgboostBackend", "XgboostUnavailableError", "FlatAnalysis",
+                "analyze_flat", "fit_xgboost"):
+        from . import xgb
+        return getattr(xgb, name)
     raise AttributeError(f"module 'relativedb' has no attribute {name!r}")
 
 
@@ -59,4 +63,6 @@ __all__ = [
     "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
     "ContextConnectivityWarning", "ColumnStats", "FineTunedHead",
     "FineTunedCheckpoint",
+    "XgboostBackend", "XgboostUnavailableError", "FlatAnalysis",
+    "analyze_flat", "fit_xgboost",
 ]
