@@ -1047,6 +1047,36 @@ float bf16_round(float f) {
 // ---------------------------------------------------------------------------
 // batch preparation (device-independent, always on CPU)
 // ---------------------------------------------------------------------------
+
+// Run fn(b) for every batch row, striping rows across a short-lived thread
+// pool. Rows only touch b-indexed slices, so this is safe for the sort and
+// group-build stages; work-item tiling stays serial to keep item order (and
+// thus GPU launch order) deterministic.
+template <typename F>
+static void for_rows(int B, F&& fn) {
+  static const int cap = [] {
+    const char* env = std::getenv("RT_PREPARE_THREADS");
+    if (env) return std::max(1, std::atoi(env));
+    // Half the cores by default: the server runs concurrent prepares
+    // (RT_SERVE_PREP_THREADS), and two forwards each spawning a full-width
+    // pool would oversubscribe the box.
+    return (int)std::max(1u, std::thread::hardware_concurrency() / 2);
+  }();
+  const int nt = std::min(B, cap);
+  if (nt <= 1) {
+    for (int b = 0; b < B; b++) fn(b);
+    return;
+  }
+  std::atomic<int> next{0};
+  std::vector<std::thread> ts;
+  ts.reserve(nt);
+  for (int t = 0; t < nt; t++)
+    ts.emplace_back([&] {
+      for (int b; (b = next.fetch_add(1)) < B;) fn(b);
+    });
+  for (auto& t : ts) t.join();
+}
+
 Prepared prepare(const Model& m, const Batch& batch, Output& out,
                  bool debug_taps, bool host_embed) {
   // RT_PREPARE_PROFILE=1: per-stage wall split to stderr.
@@ -1076,7 +1106,7 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
   pad.resize((size_t)B * S);
   std::vector<float> numv((size_t)B * S), datv((size_t)B * S), boolv((size_t)B * S);
   std::vector<float> textv((size_t)B * S * kDText), colv((size_t)B * S * kDText);
-  for (int b = 0; b < B; b++) {
+  for_rows(B, [&](int b) {
     std::vector<int> order(S);
     std::iota(order.begin(), order.end(), 0);
     const int64_t* ci = &batch.col_idxs[(size_t)b * S];
@@ -1104,7 +1134,7 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
       std::memcpy(&colv[di * kDText], &batch.col_name_v[si * kDText], kDText * 4);
       out.sorted_is_target[di] = tgt[di];
     }
-  }
+  });
 
   stage("sort");
 
@@ -1115,7 +1145,7 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
   std::vector<Groups>& g_col = prep.g_col;
   std::vector<Groups>& g_feat = prep.g_feat;
   std::vector<Groups>& g_nbr = prep.g_nbr;
-  for (int b = 0; b < B; b++) {
+  for_rows(B, [&](int b) {
     const size_t base = (size_t)b * S;
     std::unordered_map<int64_t, std::vector<int>> by_coltab, by_node, nbr_of;
     for (int s = 0; s < S; s++) {
@@ -1188,7 +1218,7 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
       auto it = nbr_of.find(nid);
       if (it != nbr_of.end()) g_nbr[b].add(mem, it->second);
     }
-  }
+  });
 
   stage("groups");
 
