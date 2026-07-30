@@ -1374,8 +1374,7 @@ void gemm(CudaSlot& s, const float* x, const float* w, float* y, int M, int N,
 // true-int8 dp4a GEMM (mirrors the CPU SDOT path); q4 runs the
 // dequant-in-register qgemm. Weights stay quantized-resident. beta is only
 // ever 0 or 1. RT_CUDA_F16_QGEMM=1 forces f16 back onto the qgemm kernel
-// (parity bisection knob). RT_CUDA_F32_PROJ_OUT restores full-width
-// projection intermediates.
+// (parity bisection knob).
 void proj(CudaSlot& s, const float* x, const GpuWeight& w, float* y, int M,
           float beta, const __half* xh_pre = nullptr) {
   if (w.type == WType::F32) {
@@ -1478,16 +1477,11 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     if (!slot) slot.reset(make_ctx(m), [](void* p) { delete (CudaCtx*)p; });
   }
   CudaCtx& ctx = *(CudaCtx*)slot.get();
-  static const bool h16_proj_out =
-      std::getenv("RT_CUDA_F32_PROJ_OUT") == nullptr;
-  bool use_h16_ff13 = h16_proj_out &&
-                      std::getenv("RT_CUDA_F16_QGEMM") == nullptr;
+  bool use_h16_ff13 = std::getenv("RT_CUDA_F16_QGEMM") == nullptr;
   for (int b = 0; b < kBlocks && use_h16_ff13; b++)
     use_h16_ff13 &= ctx.blk[b].w13.out != 0 &&
                     ctx.blk[b].w13.type == WType::F16;
-  bool use_h16_qkvg = h16_proj_out &&
-                      std::getenv("RT_CUDA_F32_QKVG") == nullptr &&
-                      std::getenv("RT_CUDA_F16_QGEMM") == nullptr &&
+  bool use_h16_qkvg = std::getenv("RT_CUDA_F16_QGEMM") == nullptr &&
                       std::getenv("RT_CUDA_ATTN_V2") == nullptr;
   for (int b = 0; b < kBlocks && use_h16_qkvg; b++)
     for (int a = 0; a < 3; a++)
