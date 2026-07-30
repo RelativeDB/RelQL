@@ -1,6 +1,7 @@
 #include "rt.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -1077,6 +1078,23 @@ static void for_rows(int B, F&& fn) {
   for (auto& t : ts) t.join();
 }
 
+using FeatureGroupKey = std::array<int64_t, 1 + kMaxF2p>;
+
+struct FeatureGroupKeyHash {
+  size_t operator()(const FeatureGroupKey& key) const noexcept {
+    // SplitMix64 finalizer, chained across the fixed-width integer key. This
+    // avoids allocating and hashing a 72-byte std::string for every token.
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (int64_t value : key) {
+      uint64_t z = static_cast<uint64_t>(value) + h;
+      z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+      z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+      h ^= z ^ (z >> 31);
+    }
+    return static_cast<size_t>(h);
+  }
+};
+
 Prepared prepare(const Model& m, const Batch& batch, Output& out,
                  bool debug_taps, bool host_embed) {
   // RT_PREPARE_PROFILE=1: per-stage wall split to stderr.
@@ -1107,17 +1125,23 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
   std::vector<float> numv((size_t)B * S), datv((size_t)B * S), boolv((size_t)B * S);
   std::vector<float> textv((size_t)B * S * kDText), colv((size_t)B * S * kDText);
   for_rows(B, [&](int b) {
-    std::vector<int> order(S);
-    std::iota(order.begin(), order.end(), 0);
+    struct SortEntry {
+      int64_t key;
+      int index;
+    };
+    std::vector<SortEntry> order(S);
     const int64_t* ci = &batch.col_idxs[(size_t)b * S];
     const uint8_t* pi = &batch.is_padding[(size_t)b * S];
-    std::stable_sort(order.begin(), order.end(), [&](int a, int c) {
-      int64_t ka = pi[a] ? INT64_MAX : ci[a];
-      int64_t kc = pi[c] ? INT64_MAX : ci[c];
-      return ka < kc;
+    for (int s = 0; s < S; s++)
+      order[s] = {pi[s] ? INT64_MAX : ci[s], s};
+    // Stable sorting by column is exactly a total order by (column, source
+    // index). Making the tie-break explicit lets std::sort use its faster
+    // in-place implementation without changing the sorted token sequence.
+    std::sort(order.begin(), order.end(), [](SortEntry a, SortEntry c) {
+      return a.key != c.key ? a.key < c.key : a.index < c.index;
     });
     for (int s = 0; s < S; s++) {
-      int src = order[s];
+      int src = order[s].index;
       size_t di = (size_t)b * S + s, si = (size_t)b * S + src;
       out.sort_idxs[di] = src;
       node[di] = batch.node_idxs[si];
@@ -1148,6 +1172,9 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
   for_rows(B, [&](int b) {
     const size_t base = (size_t)b * S;
     std::unordered_map<int64_t, std::vector<int>> by_coltab, by_node, nbr_of;
+    by_coltab.reserve(S);
+    by_node.reserve(S);
+    nbr_of.reserve(S);
     for (int s = 0; s < S; s++) {
       if (pad[base + s]) continue;
       by_coltab[(colid[base + s] << 32) ^ tabid[base + s]].push_back(s);
@@ -1179,14 +1206,17 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
     // feat: tokens sharing (node, f2p list) share the key list — own row plus
     // rows referenced by the foreign keys (dedup: a parent id equal to own
     // node or a repeated parent must not double-count)
-    std::unordered_map<std::string, int> fid;
+    std::unordered_map<FeatureGroupKey, int, FeatureGroupKeyHash> fid;
     std::vector<std::vector<int>> fmem;
+    fid.reserve(S);
+    fmem.reserve(S);
     for (int s = 0; s < S; s++) {
       if (pad[base + s]) continue;
-      char kb[8 * (1 + kMaxF2p)];
-      std::memcpy(kb, &node[base + s], 8);
-      std::memcpy(kb + 8, &f2p[(base + s) * kMaxF2p], kMaxF2p * 8);
-      auto [it, fresh] = fid.try_emplace(std::string(kb, sizeof kb), (int)fmem.size());
+      FeatureGroupKey key;
+      key[0] = node[base + s];
+      std::memcpy(key.data() + 1, &f2p[(base + s) * kMaxF2p],
+                  kMaxF2p * sizeof(int64_t));
+      auto [it, fresh] = fid.try_emplace(key, (int)fmem.size());
       if (fresh) fmem.emplace_back();
       fmem[it->second].push_back(s);
     }

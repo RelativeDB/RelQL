@@ -257,7 +257,8 @@ __global__ void k_rmsnorm_rows(const float* __restrict__ in,
                                float* __restrict__ out,
                                const float* __restrict__ scale, int n,
                                float* __restrict__ clear,
-                               __half* __restrict__ outh = nullptr) {
+                               __half* __restrict__ outh = nullptr,
+                               __half* __restrict__ clearh = nullptr) {
   int row = blockIdx.x;
   int lane = threadIdx.x;
   const float* x = in + (size_t)row * n;
@@ -273,7 +274,12 @@ __global__ void k_rmsnorm_rows(const float* __restrict__ in,
     // projection skips its f32->f16 pass; rounding point is unchanged.
     if (yh) yh[i] = __float2half(v);
     else y[i] = v;
-    if (CLEAR) clear[(size_t)row * n + i] = 0.f;
+    if (CLEAR) {
+      if (clearh)
+        clearh[(size_t)row * n + i] = __float2half(0.f);
+      else
+        clear[(size_t)row * n + i] = 0.f;
+    }
   }
 }
 
@@ -286,13 +292,15 @@ __global__ void k_rmsnorm_rows(const float* __restrict__ in,
 // fused: queries normalize at load, keys normalize in the staged tile.
 // The sigmoid output gate is fused at the write — each (query, head)
 // segment is written by exactly one pair of one group.
-__global__ void k_attn(const float* __restrict__ qkvg, float* __restrict__ att,
+template <typename Q>
+__global__ void k_attn(const Q* __restrict__ qkvg, float* __restrict__ att,
                        const int* __restrict__ qidx,
                        const int* __restrict__ kidx,
                        const AttnWorkGpu* __restrict__ work,
                        const float* __restrict__ head_scale,
                        const float* __restrict__ q_norm,
-                       const float* __restrict__ k_norm) {
+                       const float* __restrict__ k_norm,
+                       __half* __restrict__ atth = nullptr) {
   __shared__ float Kt[kTK * kD];
   __shared__ float Vt[kTK * kD];
   const AttnWorkGpu w = work[blockIdx.x];
@@ -308,7 +316,7 @@ __global__ void k_attn(const float* __restrict__ qkvg, float* __restrict__ att,
     if (p < npair) {
       int r = p / kHeads, h = p % kHeads;
       size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + r]);
-      const float* q = qkvg + qrowi * kC4 + h * kHeadDim;
+      const Q* q = qkvg + qrowi * kC4 + h * kHeadDim;
       float r0 = q[2 * lane], r1 = q[2 * lane + 1];
       float inv = rsqrtf(warp_sum(r0 * r0 + r1 * r1) / kHeadDim + kNormEps);
       float qscale = head_scale[h] * w.logkv / kHeadDim * kLog2e;
@@ -398,11 +406,18 @@ __global__ void k_attn(const float* __restrict__ qkvg, float* __restrict__ att,
     int r = p / kHeads, h = p % kHeads;
     size_t grow = (size_t)(w.rowbase + qidx[w.qstart + r]) * kC4 + 3 * kD +
                   h * kHeadDim;
-    float g0 = 2.f / (1.f + __expf(-qkvg[grow + 2 * lane]));
-    float g1 = 2.f / (1.f + __expf(-qkvg[grow + 2 * lane + 1]));
-    float* o = att + orow[s];
-    o[2 * lane] = a0[s] / den[s] * g0;
-    o[2 * lane + 1] = a1[s] / den[s] * g1;
+    float g0 = 2.f / (1.f + __expf(-(float)qkvg[grow + 2 * lane]));
+    float g1 =
+        2.f / (1.f + __expf(-(float)qkvg[grow + 2 * lane + 1]));
+    if (atth) {
+      __half* oh = atth + orow[s];
+      oh[2 * lane] = __float2half(a0[s] / den[s] * g0);
+      oh[2 * lane + 1] = __float2half(a1[s] / den[s] * g1);
+    } else {
+      float* o = att + orow[s];
+      o[2 * lane] = a0[s] / den[s] * g0;
+      o[2 * lane + 1] = a1[s] / den[s] * g1;
+    }
   }
 }
 
@@ -424,8 +439,7 @@ constexpr size_t kMmaSmem =
     (size_t)kMmaQ * kD * sizeof(__half)      // Qs
     + (size_t)kHeads * kMmaQ * kMmaK * sizeof(float)   // per-warp S scratch
     + (size_t)kHeads * kMmaQ * kMmaK * sizeof(__half)  // per-warp P
-    + (size_t)kHeads * kMmaQ * sizeof(float)           // per-warp row corr
-    + (size_t)kMmaQ * kD * sizeof(float);              // O accumulator
+    + (size_t)kHeads * kMmaQ * sizeof(float);          // per-warp row corr
 
 // K/V prepack for the tensor-core path: every mma work item of the same
 // group used to re-read, re-normalize, and fp16-convert the same key rows
@@ -436,7 +450,8 @@ constexpr size_t kMmaSmem =
 // per-tile conversion. The +kMmaK padding tail rows are zeroed; reads past a
 // group's kn land there or in the next group's rows, and both are masked out
 // of the softmax and P.
-__global__ void k_prep_kv(const float* __restrict__ qkvg,
+template <typename Q>
+__global__ void k_prep_kv(const Q* __restrict__ qkvg,
                           const int32_t* __restrict__ kabs, int n,
                           const float* __restrict__ k_norm,
                           __half* __restrict__ kp, __half* __restrict__ vp) {
@@ -451,36 +466,39 @@ __global__ void k_prep_kv(const float* __restrict__ qkvg,
     }
     return;
   }
-  const float* kg = qkvg + (size_t)kabs[i] * kC4 + kD + h * kHeadDim;
-  const float* vg = qkvg + (size_t)kabs[i] * kC4 + 2 * kD + h * kHeadDim;
+  const Q* kg = qkvg + (size_t)kabs[i] * kC4 + kD + h * kHeadDim;
+  const Q* vg = qkvg + (size_t)kabs[i] * kC4 + 2 * kD + h * kHeadDim;
   float ss = 0.f;
-  for (int d = lane; d < kHeadDim; d += 32) ss += kg[d] * kg[d];
+  for (int d = lane; d < kHeadDim; d += 32) {
+    const float v = (float)kg[d];
+    ss += v * v;
+  }
   for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
   const float inv = rsqrtf(ss / kHeadDim + kNormEps);
   for (int d = lane; d < kHeadDim; d += 32) {
-    kd[d] = __float2half(kg[d] * inv * k_norm[d]);
-    vd[d] = __float2half(vg[d]);
+    kd[d] = __float2half((float)kg[d] * inv * k_norm[d]);
+    vd[d] = __float2half((float)vg[d]);
   }
 }
 
-__global__ void k_attn_mma(const float* __restrict__ qkvg,
+template <typename Q>
+__global__ void k_attn_mma(const Q* __restrict__ qkvg,
                            float* __restrict__ att,
                            const int* __restrict__ qidx,
                            const __half* __restrict__ kp,
                            const __half* __restrict__ vp,
                            const AttnWorkGpu* __restrict__ work,
                            const float* __restrict__ head_scale,
-                           const float* __restrict__ q_norm) {
+                           const float* __restrict__ q_norm,
+                           __half* __restrict__ atth = nullptr) {
   extern __shared__ unsigned char smraw[];
   __half* Qs = (__half*)smraw;                         // [kMmaQ][kD]
   float* Sw = (float*)(Qs + (size_t)kMmaQ * kD);       // [kHeads][16][16]
   __half* Pw = (__half*)(Sw + (size_t)kHeads * kMmaQ * kMmaK);  // [kHeads][16][16]
   float* Cw = (float*)(Pw + (size_t)kHeads * kMmaQ * kMmaK);    // [kHeads][16]
-  float* Ot = Cw + (size_t)kHeads * kMmaQ;             // [kMmaQ][kD]
   const AttnWorkGpu w = work[blockIdx.x];
   const int lane = threadIdx.x % 32;
   const int wid = threadIdx.x / 32;    // warp == head
-  const int tid = threadIdx.x;
 
   // ---- stage Q (normalized, scaled, fp16) + zero O; once per item --------
   // Warp-cooperative: warp w stages rows {2w, 2w+1}; per head segment the
@@ -489,7 +507,7 @@ __global__ void k_attn_mma(const float* __restrict__ qkvg,
   for (int r = wid * 2; r < wid * 2 + 2; r++) {
     __half* dst = Qs + (size_t)r * kD;
     if (r < w.tq) {
-      const float* qg = qkvg +
+      const Q* qg = qkvg +
           (size_t)(w.rowbase + qidx[w.qstart + r]) * kC4;
       for (int h = 0; h < kHeads; h++) {
         const float v0 = qg[h * kHeadDim + lane];
@@ -506,15 +524,21 @@ __global__ void k_attn_mma(const float* __restrict__ qkvg,
       for (int d = lane; d < kD; d += 32) dst[d] = __float2half(0.f);
     }
   }
-  for (size_t i = tid; i < (size_t)kMmaQ * kD; i += 256) Ot[i] = 0.f;
   // per-row softmax state, mirrored in the row's lane pair (r = lane>>1)
   const int myrow = lane >> 1;
   float mx = -INFINITY, den = 0.f;
 
+  // O lives in mma.m16n8k16 accumulator fragments: 8 column slabs of the
+  // head's 64 dims, 4 f32 each. The documented C layout puts this thread's
+  // values at rows {lane/4, lane/4+8}, cols (lane%4)*2+{0,1} of each slab,
+  // so the per-tile softmax correction is a plain register multiply.
+  float oreg[8][4] = {};
+  const int fr0 = lane >> 2, fr1 = (lane >> 2) + 8;
+  const int fkb = (lane & 3) * 2;
+
   namespace wm = nvcuda::wmma;
   wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> af;
   wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> bf;
-  wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::row_major> vf;
   wm::fragment<wm::accumulator, 16, 16, 16, float> cf;
   float* mySw = Sw + (size_t)wid * kMmaQ * kMmaK;
   __half* myPw = Pw + (size_t)wid * kMmaQ * kMmaK;
@@ -525,7 +549,6 @@ __global__ void k_attn_mma(const float* __restrict__ qkvg,
     // K/V tiles come prepacked (normalized fp16) from global; rows past kn
     // belong to the padding tail or the next group and are masked below.
     const __half* Kt = kp + (size_t)(w.kstart + k0) * kD + wid * kHeadDim;
-    const __half* Vt = vp + (size_t)(w.kstart + k0) * kD + wid * kHeadDim;
 
     // ---- scores: S = Q_h K_h^T via HMMA, fp32 accumulate ------------------
     for (int j = 0; j < kMmaK; j += 16) {
@@ -562,40 +585,70 @@ __global__ void k_attn_mma(const float* __restrict__ qkvg,
     }
     __syncwarp();
 
-    // ---- O += P V via HMMA; route fragments through the scratch -----------
-    for (int nf = 0; nf < kHeadDim / 16; nf++) {
-      wm::fill_fragment(cf, 0.f);
+    // ---- O = corr*O + P V via raw mma.sync, accumulators in registers -----
+    {
+      const float cr0 = Cw[wid * kMmaQ + fr0];
+      const float cr1 = Cw[wid * kMmaQ + fr1];
+      for (int sl = 0; sl < 8; sl++) {
+        oreg[sl][0] *= cr0; oreg[sl][1] *= cr0;
+        oreg[sl][2] *= cr1; oreg[sl][3] *= cr1;
+      }
       for (int kk2 = 0; kk2 < kMmaK; kk2 += 16) {
-        wm::load_matrix_sync(af, myPw + kk2, kMmaK);
-        wm::load_matrix_sync(vf, Vt + (size_t)kk2 * kD + nf * 16, kD);
-        wm::mma_sync(cf, af, vf, cf);
+        const unsigned a0 =
+            *(const unsigned*)(myPw + fr0 * kMmaK + kk2 + fkb);
+        const unsigned a1 =
+            *(const unsigned*)(myPw + fr1 * kMmaK + kk2 + fkb);
+        const unsigned a2 =
+            *(const unsigned*)(myPw + fr0 * kMmaK + kk2 + 8 + fkb);
+        const unsigned a3 =
+            *(const unsigned*)(myPw + fr1 * kMmaK + kk2 + 8 + fkb);
+        const __half* vb =
+            vp + (size_t)(w.kstart + k0 + kk2) * kD + wid * kHeadDim;
+        for (int sl = 0; sl < 8; sl++) {
+          const int col = sl * 8 + (lane >> 2);
+          __half2 b0h = __halves2half2(vb[(size_t)fkb * kD + col],
+                                       vb[(size_t)(fkb + 1) * kD + col]);
+          __half2 b1h = __halves2half2(vb[(size_t)(fkb + 8) * kD + col],
+                                       vb[(size_t)(fkb + 9) * kD + col]);
+          const unsigned b0 = *(const unsigned*)&b0h;
+          const unsigned b1 = *(const unsigned*)&b1h;
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+              : "+f"(oreg[sl][0]), "+f"(oreg[sl][1]), "+f"(oreg[sl][2]),
+                "+f"(oreg[sl][3])
+              : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
       }
-      wm::store_matrix_sync(mySw, cf, kMmaK, wm::mem_row_major);
-      __syncwarp();
-      // corr folded in here: one read-modify-write of O per tile, not two
-      for (int i = lane; i < kMmaQ * 16; i += 32) {
-        int r = i / 16, c = i % 16;
-        float* o = Ot + (size_t)r * kD + wid * kHeadDim + nf * 16 + c;
-        *o = *o * Cw[wid * kMmaQ + r] + mySw[r * kMmaK + c];
-      }
-      __syncwarp();
     }
+    __syncwarp();
   }
 
-  // ---- finalize: divide by denom, fuse the sigmoid gate, write ------------
-  // Lane-per-dimension over each row: coalesced smem reads + global writes;
-  // each row's denominator is fetched from its owning lane pair by shuffle.
-  __syncwarp();
-  for (int q = 0; q < w.tq && q < kMmaQ; q++) {
+  // ---- finalize from registers: divide, gate, write this thread's cells ---
+  for (int rr = 0; rr < 2; rr++) {
+    const int q = rr ? fr1 : fr0;
+    // q differs per lane, so the shuffle must run in all lanes (full mask)
+    // before the tq guard — a divergent continue here is UB.
     const float dq = __shfl_sync(0xffffffffu, den, 2 * q);
+    if (q >= w.tq) continue;
     const float invden = dq > 0.f ? 1.f / dq : 0.f;
     const size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + q]);
-    const float* g = qkvg + qrowi * kC4 + 3 * kD + wid * kHeadDim;
+    const Q* g = qkvg + qrowi * kC4 + 3 * kD + wid * kHeadDim;
     float* o = att + qrowi * kD + wid * kHeadDim;
-    const float* ot = Ot + (size_t)q * kD + wid * kHeadDim;
-    for (int d = lane; d < kHeadDim; d += 32) {
-      float gate = 2.f / (1.f + __expf(-g[d]));
-      o[d] = ot[d] * invden * gate;
+    __half* oh = atth ? atth + qrowi * kD + wid * kHeadDim : nullptr;
+    for (int sl = 0; sl < 8; sl++) {
+      const int d0 = sl * 8 + fkb, d1 = d0 + 1;
+      const float v0 = oreg[sl][rr * 2 + 0] * invden;
+      const float v1 = oreg[sl][rr * 2 + 1] * invden;
+      const float g0 = 2.f / (1.f + __expf(-(float)g[d0]));
+      const float g1 = 2.f / (1.f + __expf(-(float)g[d1]));
+      if (oh) {
+        oh[d0] = __float2half(v0 * g0);
+        oh[d1] = __float2half(v1 * g1);
+      } else {
+        o[d0] = v0 * g0;
+        o[d1] = v1 * g1;
+      }
     }
   }
 }
@@ -722,7 +775,8 @@ __global__ void k_attn2(const float* __restrict__ qkvg, float* __restrict__ att,
 // k_attn, but only over this work item's key chunk, emitting per-
 // (query, head, chunk) partials {running max m, denom l, unnormalized
 // weighted-V sum o[64]} at float offset w.part + (r*8+h)*66.
-__global__ void k_attn_part(const float* __restrict__ qkvg,
+template <typename Q>
+__global__ void k_attn_part(const Q* __restrict__ qkvg,
                             float* __restrict__ partials,
                             const int* __restrict__ qidx,
                             const int* __restrict__ kidx,
@@ -744,7 +798,7 @@ __global__ void k_attn_part(const float* __restrict__ qkvg,
     if (p < npair) {
       int r = p / kHeads, h = p % kHeads;
       size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + r]);
-      const float* q = qkvg + qrowi * kC4 + h * kHeadDim;
+      const Q* q = qkvg + qrowi * kC4 + h * kHeadDim;
       float r0 = q[2 * lane], r1 = q[2 * lane + 1];
       float inv = rsqrtf(warp_sum(r0 * r0 + r1 * r1) / kHeadDim + kNormEps);
       float qscale = head_scale[h] * w.logkv / kHeadDim;
@@ -802,11 +856,13 @@ __global__ void k_attn_part(const float* __restrict__ qkvg,
 
 // Merge the chunk partials with the online-softmax identity
 // l = Σ l_c·exp(m_c-M), o = Σ o_c·exp(m_c-M); gate fused at the write.
+template <typename Q>
 __global__ void k_attn_reduce(const float* __restrict__ partials,
                               float* __restrict__ att,
                               const int* __restrict__ qidx,
                               const AttnRWorkGpu* __restrict__ work,
-                              const float* __restrict__ qkvg) {
+                              const Q* __restrict__ qkvg,
+                              __half* __restrict__ atth = nullptr) {
   const AttnRWorkGpu w = work[blockIdx.x];
   const int lane = threadIdx.x % 32;
   const int sg = threadIdx.x / 32;
@@ -827,11 +883,18 @@ __global__ void k_attn_reduce(const float* __restrict__ partials,
     }
     size_t qrowi = (size_t)(w.rowbase + qidx[w.qstart + r]);
     size_t grow = qrowi * kC4 + 3 * kD + h * kHeadDim;
-    float g0 = 2.f / (1.f + __expf(-qkvg[grow + 2 * lane]));
-    float g1 = 2.f / (1.f + __expf(-qkvg[grow + 2 * lane + 1]));
-    float* o = att + qrowi * kD + h * kHeadDim;
-    o[2 * lane] = o0 / l * g0;
-    o[2 * lane + 1] = o1 / l * g1;
+    float g0 = 2.f / (1.f + __expf(-(float)qkvg[grow + 2 * lane]));
+    float g1 =
+        2.f / (1.f + __expf(-(float)qkvg[grow + 2 * lane + 1]));
+    if (atth) {
+      __half* oh = atth + qrowi * kD + h * kHeadDim;
+      oh[2 * lane] = __float2half(o0 / l * g0);
+      oh[2 * lane + 1] = __float2half(o1 / l * g1);
+    } else {
+      float* o = att + qrowi * kD + h * kHeadDim;
+      o[2 * lane] = o0 / l * g0;
+      o[2 * lane + 1] = o1 / l * g1;
+    }
   }
 }
 
@@ -854,6 +917,22 @@ __global__ void k_swiglu_packed(const float* __restrict__ ff13,
   size_t row = gid / kDFF, d = gid % kDFF;
   float a = ff13[row * (2 * kDFF) + d];
   float b = ff13[row * (2 * kDFF) + kDFF + d];
+  const float v = (a / (1.f + __expf(-a))) * b;
+  if (ffah) ffah[gid] = __float2half(v);
+  else ffa[gid] = v;
+}
+
+// Same operation when the stacked projection writes its intermediate in
+// fp16. Accumulation inside cuBLAS remains fp32; only the materialized
+// w1/w3 activation is narrowed, halving both its write and this kernel's read.
+__global__ void k_swiglu_packed_h16(const __half* __restrict__ ff13,
+                                    float* __restrict__ ffa, size_t total,
+                                    __half* __restrict__ ffah = nullptr) {
+  size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= total) return;
+  size_t row = gid / kDFF, d = gid % kDFF;
+  float a = __half2float(ff13[row * (2 * kDFF) + d]);
+  float b = __half2float(ff13[row * (2 * kDFF) + kDFF + d]);
   const float v = (a / (1.f + __expf(-a))) * b;
   if (ffah) ffah[gid] = __float2half(v);
   else ffa[gid] = v;
@@ -944,6 +1023,9 @@ struct CudaSlot {
   int32_t* kabsd[3] = {};              // absolute token row per kflat entry
   __half *kp = nullptr, *vp = nullptr; // prepacked normalized-K / V (fp16)
   __half *xnh = nullptr, *ffah = nullptr;  // fp16 producer outputs (fused)
+  __half* qkvgh = nullptr;                 // fp16 Q/K/V/gate intermediate
+  __half* ff13h = nullptr;                 // fp16 stacked FFN intermediate
+  __half* atth = nullptr;                  // fp16 attention output (fused)
   AttnWorkGpu* work[3] = {};
   AttnWorkGpu* mwork[3] = {};          // tensor-core (mma) work items
   AttnPWorkGpu* pwork[3] = {};         // flash split-K chunk items
@@ -984,6 +1066,9 @@ struct CudaSlot {
     cudaFree(vp);
     cudaFree(xnh);
     cudaFree(ffah);
+    cudaFree(qkvgh);
+    cudaFree(ff13h);
+    cudaFree(atth);
     if (blas) cublasDestroy(blas);
     if (stream) cudaStreamDestroy(stream);
   }
@@ -1289,7 +1374,8 @@ void gemm(CudaSlot& s, const float* x, const float* w, float* y, int M, int N,
 // true-int8 dp4a GEMM (mirrors the CPU SDOT path); q4 runs the
 // dequant-in-register qgemm. Weights stay quantized-resident. beta is only
 // ever 0 or 1. RT_CUDA_F16_QGEMM=1 forces f16 back onto the qgemm kernel
-// (parity bisection knob).
+// (parity bisection knob). RT_CUDA_F32_PROJ_OUT restores full-width
+// projection intermediates.
 void proj(CudaSlot& s, const float* x, const GpuWeight& w, float* y, int M,
           float beta, const __half* xh_pre = nullptr) {
   if (w.type == WType::F32) {
@@ -1351,6 +1437,18 @@ void proj(CudaSlot& s, const float* x, const GpuWeight& w, float* y, int M,
   }
 }
 
+// F16-weight projection with an F16 materialized result. Tensor-core
+// multiply and accumulation stay fp32; cuBLAS performs the final conversion
+// while storing C, avoiding a separate full-width fp32 intermediate.
+void proj_h16(CudaSlot& s, const GpuWeight& w, __half* y, int M,
+              const __half* x) {
+  const float alpha = 1.f, beta = 0.f;
+  RT_CUBLAS(cublasGemmEx(
+      s.blas, CUBLAS_OP_T, CUBLAS_OP_N, w.out, M, w.in, &alpha, w.q,
+      CUDA_R_16F, w.in, x, CUDA_R_16F, w.in, &beta, y, CUDA_R_16F, w.out,
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
 template <typename T>
 void grow(T** p, size_t* cap, size_t need) {
   if (*cap >= need) return;
@@ -1380,6 +1478,20 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     if (!slot) slot.reset(make_ctx(m), [](void* p) { delete (CudaCtx*)p; });
   }
   CudaCtx& ctx = *(CudaCtx*)slot.get();
+  static const bool h16_proj_out =
+      std::getenv("RT_CUDA_F32_PROJ_OUT") == nullptr;
+  bool use_h16_ff13 = h16_proj_out &&
+                      std::getenv("RT_CUDA_F16_QGEMM") == nullptr;
+  for (int b = 0; b < kBlocks && use_h16_ff13; b++)
+    use_h16_ff13 &= ctx.blk[b].w13.out != 0 &&
+                    ctx.blk[b].w13.type == WType::F16;
+  bool use_h16_qkvg = h16_proj_out &&
+                      std::getenv("RT_CUDA_F32_QKVG") == nullptr &&
+                      std::getenv("RT_CUDA_F16_QGEMM") == nullptr &&
+                      std::getenv("RT_CUDA_ATTN_V2") == nullptr;
+  for (int b = 0; b < kBlocks && use_h16_qkvg; b++)
+    for (int a = 0; a < 3; a++)
+      use_h16_qkvg &= ctx.blk[b].wqkvg[a].type == WType::F16;
 
   const int B = prep.B, S = prep.S;
   const size_t BS = (size_t)B * S;
@@ -1465,11 +1577,14 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
       *p = nullptr;
       RT_CU(cudaMalloc(p, BS * kD * sizeof(float)));
     }
-    for (float** p : {&sl.qkvg}) {
-      if (*p) RT_CU(cudaFree(*p));
-      *p = nullptr;
-      RT_CU(cudaMalloc(p, BS * (size_t)kC4 * sizeof(float)));
-    }
+    if (sl.qkvg) RT_CU(cudaFree(sl.qkvg));
+    if (sl.qkvgh) RT_CU(cudaFree(sl.qkvgh));
+    sl.qkvg = nullptr;
+    sl.qkvgh = nullptr;
+    if (use_h16_qkvg)
+      RT_CU(cudaMalloc(&sl.qkvgh, BS * (size_t)kC4 * sizeof(__half)));
+    else
+      RT_CU(cudaMalloc(&sl.qkvg, BS * (size_t)kC4 * sizeof(float)));
     if (packed_ffn) {
       for (float** p : {&sl.ffa}) {
         if (*p) RT_CU(cudaFree(*p));
@@ -1477,8 +1592,15 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
         RT_CU(cudaMalloc(p, BS * (size_t)kDFF * sizeof(float)));
       }
       if (sl.ff13) RT_CU(cudaFree(sl.ff13));
+      if (sl.ff13h) RT_CU(cudaFree(sl.ff13h));
       sl.ff13 = nullptr;
-      RT_CU(cudaMalloc(&sl.ff13, BS * (size_t)(2 * kDFF) * sizeof(float)));
+      sl.ff13h = nullptr;
+      if (use_h16_ff13)
+        RT_CU(cudaMalloc(&sl.ff13h,
+                         BS * (size_t)(2 * kDFF) * sizeof(__half)));
+      else
+        RT_CU(cudaMalloc(&sl.ff13,
+                         BS * (size_t)(2 * kDFF) * sizeof(float)));
     } else {
       for (float** p : {&sl.ffa, &sl.ffb}) {
         if (*p) RT_CU(cudaFree(*p));
@@ -1489,12 +1611,13 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     if (sl.yhat) RT_CU(cudaFree(sl.yhat));
     sl.yhat = nullptr;
     RT_CU(cudaMalloc(&sl.yhat, BS * sizeof(float)));
-    for (__half** p : {&sl.xnh, &sl.ffah}) {
+    for (__half** p : {&sl.xnh, &sl.ffah, &sl.atth}) {
       if (*p) RT_CU(cudaFree(*p));
       *p = nullptr;
     }
     RT_CU(cudaMalloc(&sl.xnh, BS * (size_t)kD * sizeof(__half)));
     RT_CU(cudaMalloc(&sl.ffah, BS * (size_t)kDFF * sizeof(__half)));
+    RT_CU(cudaMalloc(&sl.atth, BS * (size_t)kD * sizeof(__half)));
     if (sl.xq) RT_CU(cudaFree(sl.xq));
     sl.xq = nullptr;
     RT_CU(cudaMalloc(&sl.xq, BS * (size_t)kDFF));
@@ -1631,13 +1754,25 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
     const BlockWeights& gw = ctx.blk[blk_i];
     for (int a = 0; a < 3; a++) {
       const bool h16a = fuse_h16 && gw.wqkvg[a].type == WType::F16;
-      // Pre-norm + clear the attention output in one row pass.
-      k_rmsnorm_rows<true><<<(int)BS, 32, 0, st>>>(sl.x, sl.xn, gw.norm[a],
-                                                   kD, sl.att,
-                                                   h16a ? sl.xnh : nullptr);
+      static const bool attn_v2_env = std::getenv("RT_CUDA_ATTN_V2") != nullptr;
+      const bool h16o =
+          fuse_h16 && !attn_v2_env && gw.wo[a].type == WType::F16;
+      // Pre-norm + clear the attention output in one row pass. Uncovered
+      // attention rows must read as zero in either output dtype.
+      if (h16o) {
+        k_rmsnorm_rows<true><<<(int)BS, 32, 0, st>>>(
+            sl.x, sl.xn, gw.norm[a], kD, nullptr, h16a ? sl.xnh : nullptr,
+            sl.atth);
+      } else {
+        k_rmsnorm_rows<true><<<(int)BS, 32, 0, st>>>(
+            sl.x, sl.xn, gw.norm[a], kD, sl.att, h16a ? sl.xnh : nullptr);
+      }
       mark(0);
-      proj(sl, sl.xn, gw.wqkvg[a], sl.qkvg, (int)BS, 0.f,
-           h16a ? sl.xnh : nullptr);
+      if (use_h16_qkvg)
+        proj_h16(sl, gw.wqkvg[a], sl.qkvgh, (int)BS, sl.xnh);
+      else
+        proj(sl, sl.xn, gw.wqkvg[a], sl.qkvg, (int)BS, 0.f,
+             h16a ? sl.xnh : nullptr);
       mark(1);
       lap(0, 0, 1);
       // Attention with fused QK-RMSNorm and output gating.
@@ -1654,38 +1789,74 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
           k_attn2<<<(int)wflat[a].size(), 256, kAttn2Smem, st>>>(
               sl.qkvg, sl.att, sl.qidx[a], sl.kidx[a], sl.work[a],
               gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
+        else if (use_h16_qkvg)
+          k_attn<__half><<<(int)wflat[a].size(), 256, 0, st>>>(
+              sl.qkvgh, sl.att, sl.qidx[a], sl.kidx[a], sl.work[a],
+              gw.head_scale[a], gw.q_norm[a], gw.k_norm[a],
+              h16o ? sl.atth : nullptr);
         else
-          k_attn<<<(int)wflat[a].size(), 256, 0, st>>>(
+          k_attn<float><<<(int)wflat[a].size(), 256, 0, st>>>(
               sl.qkvg, sl.att, sl.qidx[a], sl.kidx[a], sl.work[a],
-              gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
+              gw.head_scale[a], gw.q_norm[a], gw.k_norm[a],
+              h16o ? sl.atth : nullptr);
       }
       if (!mflat[a].empty()) {
-        static const bool mma_ok = [] {
+        static const bool mma_ok_f32 = [] {
           return cudaFuncSetAttribute(
-                     k_attn_mma, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                     k_attn_mma<float>,
+                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                      (int)kMmaSmem) == cudaSuccess;
         }();
+        static const bool mma_ok_f16 = [] {
+          return cudaFuncSetAttribute(
+                     k_attn_mma<__half>,
+                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                     (int)kMmaSmem) == cudaSuccess;
+        }();
+        const bool mma_ok = use_h16_qkvg ? mma_ok_f16 : mma_ok_f32;
         if (!mma_ok)
           throw std::runtime_error("rt/cuda: k_attn_mma smem opt-in failed "
                                    "(set RT_CUDA_ATTN_MMA=0)");
-        k_prep_kv<<<(int)kflat[a].size() + kMmaK, 256, 0, st>>>(
-            sl.qkvg, sl.kabsd[a], (int)kflat[a].size(), gw.k_norm[a],
-            sl.kp, sl.vp);
-        k_attn_mma<<<(int)mflat[a].size(), 256, kMmaSmem, st>>>(
-            sl.qkvg, sl.att, sl.qidx[a], sl.kp, sl.vp, sl.mwork[a],
-            gw.head_scale[a], gw.q_norm[a]);
+        if (use_h16_qkvg) {
+          k_prep_kv<__half>
+              <<<(int)kflat[a].size() + kMmaK, 256, 0, st>>>(
+                  sl.qkvgh, sl.kabsd[a], (int)kflat[a].size(), gw.k_norm[a],
+                  sl.kp, sl.vp);
+          k_attn_mma<__half><<<(int)mflat[a].size(), 256, kMmaSmem, st>>>(
+              sl.qkvgh, sl.att, sl.qidx[a], sl.kp, sl.vp, sl.mwork[a],
+              gw.head_scale[a], gw.q_norm[a], h16o ? sl.atth : nullptr);
+        } else {
+          k_prep_kv<float>
+              <<<(int)kflat[a].size() + kMmaK, 256, 0, st>>>(
+                  sl.qkvg, sl.kabsd[a], (int)kflat[a].size(), gw.k_norm[a],
+                  sl.kp, sl.vp);
+          k_attn_mma<float><<<(int)mflat[a].size(), 256, kMmaSmem, st>>>(
+              sl.qkvg, sl.att, sl.qidx[a], sl.kp, sl.vp, sl.mwork[a],
+              gw.head_scale[a], gw.q_norm[a], h16o ? sl.atth : nullptr);
+        }
       }
       if (!rflat[a].empty()) {           // flash split-K large groups
-        k_attn_part<<<(int)pflat[a].size(), 256, 0, st>>>(
-            sl.qkvg, sl.partials, sl.qidx[a], sl.kidx[a], sl.pwork[a],
-            gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
-        k_attn_reduce<<<(int)rflat[a].size(), 128, 0, st>>>(
-            sl.partials, sl.att, sl.qidx[a], sl.rwork[a], sl.qkvg);
+        if (use_h16_qkvg) {
+          k_attn_part<__half><<<(int)pflat[a].size(), 256, 0, st>>>(
+              sl.qkvgh, sl.partials, sl.qidx[a], sl.kidx[a], sl.pwork[a],
+              gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
+          k_attn_reduce<__half><<<(int)rflat[a].size(), 128, 0, st>>>(
+              sl.partials, sl.att, sl.qidx[a], sl.rwork[a], sl.qkvgh,
+              h16o ? sl.atth : nullptr);
+        } else {
+          k_attn_part<float><<<(int)pflat[a].size(), 256, 0, st>>>(
+              sl.qkvg, sl.partials, sl.qidx[a], sl.kidx[a], sl.pwork[a],
+              gw.head_scale[a], gw.q_norm[a], gw.k_norm[a]);
+          k_attn_reduce<float><<<(int)rflat[a].size(), 128, 0, st>>>(
+              sl.partials, sl.att, sl.qidx[a], sl.rwork[a], sl.qkvg,
+              h16o ? sl.atth : nullptr);
+        }
       }
       mark(2);
       lap(1, 1, 2);
       lap(3 + a, 1, 2);
-      proj(sl, sl.att, gw.wo[a], sl.x, (int)BS, 1.f);
+      proj(sl, sl.att, gw.wo[a], sl.x, (int)BS, 1.f,
+           h16o ? sl.atth : nullptr);
       mark(3);
       lap(0, 2, 3);
     }
@@ -1697,12 +1868,19 @@ void run_blocks_cuda(const Model& m, Prepared& prep, Output& out,
                                                   h16f ? sl.xnh : nullptr);
     mark(4);
     if (packed_ffn) {
-      proj(sl, sl.xn, gw.w13, sl.ff13, (int)BS, 0.f,
-           h16f ? sl.xnh : nullptr);
+      if (use_h16_ff13)
+        proj_h16(sl, gw.w13, sl.ff13h, (int)BS, sl.xnh);
+      else
+        proj(sl, sl.xn, gw.w13, sl.ff13, (int)BS, 0.f,
+             h16f ? sl.xnh : nullptr);
       mark(5);
       lap(0, 4, 5);
-      k_swiglu_packed<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(
-          sl.ff13, sl.ffa, BS * kDFF, h16w2 ? sl.ffah : nullptr);
+      if (use_h16_ff13)
+        k_swiglu_packed_h16<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(
+            sl.ff13h, sl.ffa, BS * kDFF, h16w2 ? sl.ffah : nullptr);
+      else
+        k_swiglu_packed<<<blocks_for(BS * kDFF), kThreads, 0, st>>>(
+            sl.ff13, sl.ffa, BS * kDFF, h16w2 ? sl.ffah : nullptr);
     } else {
       proj(sl, sl.xn, gw.w1, sl.ffa, (int)BS, 0.f);
       proj(sl, sl.xn, gw.w3, sl.ffb, (int)BS, 0.f);

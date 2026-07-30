@@ -16,11 +16,12 @@ class NativeReferenceAdapter:
     def __init__(self, checkpoint: str, library: str | None, native_device: str,
                  heads: dict[str, str] | None = None, collect: bool = False):
         from relativedb_engine import (FineTunedHead, RT_DEVICE_CPU,
-                                          RT_DEVICE_MPS, load_lib,
-                                          resolve_model_path)
+                                      RT_DEVICE_CUDA, RT_DEVICE_MPS, load_lib,
+                                      resolve_model_path)
 
         self.model = load_lib(library).load_model(resolve_model_path(checkpoint))
-        self.device = {"cpu": RT_DEVICE_CPU, "mps": RT_DEVICE_MPS}[native_device]
+        self.device = {"cpu": RT_DEVICE_CPU, "mps": RT_DEVICE_MPS,
+                       "cuda": RT_DEVICE_CUDA}[native_device]
         self.heads = {name: FineTunedHead.load(path)
                       for name, path in (heads or {}).items()}
         self.collect = collect
@@ -99,7 +100,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1,
                         help="examples per evaluator batch; context length is unchanged")
     parser.add_argument("--library")
-    parser.add_argument("--native-device", choices=("cpu", "mps"), default="mps")
+    parser.add_argument("--native-device", choices=("cpu", "mps", "cuda"),
+                        default="mps")
     parser.add_argument("--heads-json",
                         help="optional task-id -> FineTunedHead path JSON")
     args = parser.parse_args()

@@ -127,6 +127,10 @@ endif()
 add_library(rt_c SHARED src/rt_c.cpp src/json.cpp
                         src/flat.cpp src/flat_c.cpp
                         src/minilm.cpp src/minilm_c.cpp)
+if(RT_CUDA)
+  target_sources(rt_c PRIVATE src/minilm_cuda.cu)
+  set_target_properties(rt_c PROPERTIES CUDA_STANDARD 17)
+endif()
 target_link_libraries(rt_c PRIVATE rt)
 target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)
