@@ -198,8 +198,6 @@ namespace {
 [[maybe_unused]] bool cpu_has_i8mm() {
 #if defined(RT_SDOT)
   static const bool v = [] {
-    if (const char* e = std::getenv("RT_NO_I8MM"))   // force the SDOT path
-      if (e[0] == '1') return false;
 #if defined(__APPLE__)
     int r = 0;
     size_t s = sizeof r;
@@ -747,15 +745,6 @@ bool matmul_q8_pair(const float* x, const Weight& w0, float* y0,
 // even-index bytes then 16 odd) so the two nibble planes of one 16-byte
 // weight load dot against contiguous vectors. Activation quantization noise
 // matches the Q8 path (absmax/127); the m_g * S_g term stays exact.
-// Escape hatch env RT_NO_Q4_SDOT forces the tile-dequant path.
-bool use_q4_sdot() {
-  static const bool v = [] {
-    const char* e = std::getenv("RT_NO_Q4_SDOT");
-    return !(e && e[0] == '1');
-  }();
-  return v;
-}
-
 struct Q4Activations {
   int rows = 0, K = 0;
   std::vector<int8_t> q;               // [rows, K] deinterleaved per 32-group
@@ -885,7 +874,7 @@ void matmul_q4_sdot(const float* x, const Weight& w, float* y, int rows) {
 bool matmul_q4_pair(const float* x, const Weight& w0, float* y0,
                     const Weight& w1, float* y1, int rows) {
   if (w0.type != WType::Q4 || w1.type != WType::Q4 || w0.in != w1.in ||
-      !use_q4_sdot() || w0.out % 4 != 0 || w1.out % 4 != 0 ||
+      w0.out % 4 != 0 || w1.out % 4 != 0 ||
       w0.in % 32 != 0 || w0.in / 32 > 64)
     return false;
   auto a = quantize_q4_rows(x, rows, w0.in);
@@ -905,15 +894,7 @@ bool matmul_q4_pair(const float* x, const Weight& w0, float* y0,
 // streaming NEON wins 2.7x at M=1 and 1.2x at M=4, but the tile-dequant +
 // Accelerate path wins 3x by M=16 and 12x by M=128 — AMX outruns the NEON
 // FMA units as soon as the dequant cost is amortized over enough rows.
-// Escape hatch env RT_NO_F16_NEON forces tile-dequant (mirrors RT_NO_I8MM).
 constexpr int kF16NeonMaxRows = 4;
-bool use_f16_neon() {
-  static const bool v = [] {
-    const char* e = std::getenv("RT_NO_F16_NEON");
-    return !(e && e[0] == '1');
-  }();
-  return v;
-}
 
 void matmul_f16_neon(const float* x, const Weight& w, float* y, int rows) {
   const float16_t* wq = reinterpret_cast<const float16_t*>(w.q);
@@ -986,12 +967,12 @@ void matmul_w(const float* x, const Weight& w, float* y, int rows,
     matmul_q8_sdot(x, w, y, rows);
     return;
   }
-  if (w.type == WType::Q4 && use_q4_sdot() && w.out % 4 == 0 &&
+  if (w.type == WType::Q4 && w.out % 4 == 0 &&
       w.in % 32 == 0 && w.in / 32 <= 64) {
     matmul_q4_sdot(x, w, y, rows);
     return;
   }
-  if (w.type == WType::F16 && rows <= kF16NeonMaxRows && use_f16_neon() &&
+  if (w.type == WType::F16 && rows <= kF16NeonMaxRows &&
       w.out % 4 == 0 && w.in % 8 == 0) {
     matmul_f16_neon(x, w, y, rows);
     return;
@@ -1097,16 +1078,6 @@ struct FeatureGroupKeyHash {
 
 Prepared prepare(const Model& m, const Batch& batch, Output& out,
                  bool debug_taps, bool host_embed) {
-  // RT_PREPARE_PROFILE=1: per-stage wall split to stderr.
-  static const bool pprof = std::getenv("RT_PREPARE_PROFILE") != nullptr;
-  auto pt = std::chrono::steady_clock::now();
-  auto stage = [&](const char* name) {
-    if (!pprof) return;
-    const auto now = std::chrono::steady_clock::now();
-    fprintf(stderr, "[rt-prepare] %s %.1fms\n", name,
-            std::chrono::duration<double, std::milli>(now - pt).count());
-    pt = now;
-  };
   const int B = batch.B, S = batch.S, D = kDModel;
   Prepared prep;
   prep.B = B; prep.S = S;
@@ -1159,8 +1130,6 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
       out.sorted_is_target[di] = tgt[di];
     }
   });
-
-  stage("sort");
 
   // ---- build query-groups for the three attention types -------------------
   // (queries sharing a key list are grouped so attention runs as GEMMs;
@@ -1250,8 +1219,6 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
     }
   });
 
-  stage("groups");
-
   // ---- attention work items: (batch row, group, query tile) ---------------
   auto tiles = [&](const std::vector<Groups>& gs, std::vector<Work>& w) {
     for (int b = 0; b < B; b++)
@@ -1268,8 +1235,6 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
   tiles(g_feat, prep.work[1]);
   tiles(g_nbr, prep.work[2]);
 
-  stage("tiles");
-
   // ---- embeddings ---------------------------------------------------------
   const size_t BS = (size_t)B * S;
   if (!host_embed && !debug_taps) {   // the device embeds; ship channels
@@ -1282,7 +1247,6 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
     prep.sem8.resize(BS);
     prep.tgt8.assign(tgt.begin(), tgt.end());
     for (size_t i = 0; i < BS; i++) prep.sem8[i] = (uint8_t)sem[i];
-    stage("embed");
     return prep;
   }
   prep.x.assign(BS * D, 0.f);
@@ -1320,7 +1284,6 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
       }
     }
   }
-  stage("embed");
   if (debug_taps) out.x_embed = x;
   return prep;
 }
@@ -1558,30 +1521,9 @@ bool device_available(Device d) {
 
 Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
   Output out;
-  // RT_FORWARD_PROFILE=1: coarse prepare-vs-blocks wall split to stderr.
-  const bool fprof = std::getenv("RT_FORWARD_PROFILE") != nullptr;
-  // CUDA embeds on the device (RT_CUDA_HOST_EMBED=1 reverts for bisection).
-  const bool host_embed =
-      opts.device != Device::CUDA ||
-      std::getenv("RT_CUDA_HOST_EMBED") != nullptr;
-  auto t0 = std::chrono::steady_clock::now();
+  const bool host_embed = opts.device != Device::CUDA;
   detail::Prepared prep =
       detail::prepare(m, batch, out, opts.debug_taps, host_embed);
-  if (fprof) {
-    fprintf(stderr, "[rt-forward] prepare %.1fms\n",
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count());
-    t0 = std::chrono::steady_clock::now();
-  }
-  struct BlocksTimer {
-    bool on; std::chrono::steady_clock::time_point t;
-    ~BlocksTimer() {
-      if (on)
-        fprintf(stderr, "[rt-forward] blocks  %.1fms\n",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t).count());
-    }
-  } bt{fprof, t0};
   switch (opts.device) {
     case Device::CPU:
       detail::run_blocks_cpu(m, prep, out, opts.n_threads, opts.debug_taps,

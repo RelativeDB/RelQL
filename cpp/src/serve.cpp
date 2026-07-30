@@ -451,9 +451,7 @@ void prep_loop(Service& svc) {
         pg->merged = merge_batches(raw, S);
         b = &pg->merged;
       }
-      const bool host_embed =
-          group[0]->opts.device != rt::Device::CUDA ||
-          std::getenv("RT_CUDA_HOST_EMBED") != nullptr;
+      const bool host_embed = group[0]->opts.device != rt::Device::CUDA;
       pg->prep = rt::detail::prepare(*group[0]->model, *b, pg->out,
                                      /*debug_taps=*/false, host_embed);
     } catch (...) {

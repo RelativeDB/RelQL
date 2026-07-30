@@ -447,8 +447,7 @@ bool MiniLM::encode(const std::vector<std::string>& texts, bool normalize,
 #ifdef RT_CUDA
   // The 12-block BERT is GPU work: a CUDA device encodes thousands of long
   // texts in seconds where a (often cgroup-capped) CPU takes minutes.
-  // RT_MINILM_CPU=1 forces the CPU path (parity bisection knob).
-  if (std::getenv("RT_MINILM_CPU") == nullptr && detail::cuda_available()) {
+  if (detail::cuda_available()) {
     detail::HostWeights hw{im.word_emb, im.pos_emb,   im.type_emb,
                            im.eln_w,    im.eln_b,     im.layers,
                            im.vocab_rows};
