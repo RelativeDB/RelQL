@@ -158,7 +158,13 @@ int main(int argc, char** argv) {
   printf("batched vs single-row  max|Δ| = %.3e\n", max_dev_single);
   printf("batched vs permuted    max|Δ| = %.3e\n", max_dev_perm);
   printf("duplicate rows in batch max|Δ| = %.3e\n", max_dev_dup);
-  bool ok = max_dev_single < 1e-5 && max_dev_perm < 1e-5 && max_dev_dup < 1e-6;
+  // Non-fp32 checkpoints run tensor-core GEMMs (cublasGemmEx) whose reduction
+  // order varies with batch M, so cross-batch-size agreement is only ~1e-4.
+  // Within one batch (duplicate rows) outputs must still match exactly.
+  bool f32_ckpt = true;
+  for (auto& [k, t] : model.store) f32_ckpt = f32_ckpt && t.qtype == 0;
+  const double tol = f32_ckpt ? 1e-5 : 5e-4;
+  bool ok = max_dev_single < tol && max_dev_perm < tol && max_dev_dup < 1e-6;
   printf(ok ? "BATCHING OK\n" : "BATCHING FAIL\n");
 
   // Long-context cross-device check: S=2048 has key lists well past any
@@ -206,6 +212,9 @@ int main(int argc, char** argv) {
   printf("\n== speed: batched long context ==\n");
   bench(synth(8, 1024, 4), 3);
   bench(synth(8, 2048, 12), 2);
+  bench(synth(4, 8192, 22), 2);
+  bench(synth(8, 8192, 23), 2);
+  bench(synth(16, 8192, 24), 2);
 
   // ---- 3. memory after the big forward ------------------------------------
   printf("\n== memory after S=2048/B=8 forwards ==\n");

@@ -170,6 +170,10 @@ std::unordered_map<std::string, Tensor> load_safetensors(const std::string& path
       t.shape[1] *= 2;
       read_raw(e, t.qdata);
       read_raw(sit->second, t.qscale);
+    } else if (e.dtype == "I64") {
+      // Bookkeeping buffers (BERT-family position_ids) — no compute path
+      // reads them; skip rather than refuse the whole checkpoint.
+      continue;
     } else {
       throw std::runtime_error("unsupported dtype " + e.dtype + " for " + name);
     }
@@ -1044,7 +1048,17 @@ float bf16_round(float f) {
 // batch preparation (device-independent, always on CPU)
 // ---------------------------------------------------------------------------
 Prepared prepare(const Model& m, const Batch& batch, Output& out,
-                 bool debug_taps) {
+                 bool debug_taps, bool host_embed) {
+  // RT_PREPARE_PROFILE=1: per-stage wall split to stderr.
+  static const bool pprof = std::getenv("RT_PREPARE_PROFILE") != nullptr;
+  auto pt = std::chrono::steady_clock::now();
+  auto stage = [&](const char* name) {
+    if (!pprof) return;
+    const auto now = std::chrono::steady_clock::now();
+    fprintf(stderr, "[rt-prepare] %s %.1fms\n", name,
+            std::chrono::duration<double, std::milli>(now - pt).count());
+    pt = now;
+  };
   const int B = batch.B, S = batch.S, D = kDModel;
   Prepared prep;
   prep.B = B; prep.S = S;
@@ -1091,6 +1105,8 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
       out.sorted_is_target[di] = tgt[di];
     }
   }
+
+  stage("sort");
 
   // ---- build query-groups for the three attention types -------------------
   // (queries sharing a key list are grouped so attention runs as GEMMs;
@@ -1174,6 +1190,8 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
     }
   }
 
+  stage("groups");
+
   // ---- attention work items: (batch row, group, query tile) ---------------
   auto tiles = [&](const std::vector<Groups>& gs, std::vector<Work>& w) {
     for (int b = 0; b < B; b++)
@@ -1190,8 +1208,23 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
   tiles(g_feat, prep.work[1]);
   tiles(g_nbr, prep.work[2]);
 
+  stage("tiles");
+
   // ---- embeddings ---------------------------------------------------------
   const size_t BS = (size_t)B * S;
+  if (!host_embed && !debug_taps) {   // the device embeds; ship channels
+    prep.device_embed = true;
+    prep.colv = std::move(colv);
+    prep.textv = std::move(textv);
+    prep.numv = std::move(numv);
+    prep.datv = std::move(datv);
+    prep.boolv = std::move(boolv);
+    prep.sem8.resize(BS);
+    prep.tgt8.assign(tgt.begin(), tgt.end());
+    for (size_t i = 0; i < BS; i++) prep.sem8[i] = (uint8_t)sem[i];
+    stage("embed");
+    return prep;
+  }
   prep.x.assign(BS * D, 0.f);
   std::vector<float>& x = prep.x;
   std::vector<float> tmp(BS * D);
@@ -1227,6 +1260,7 @@ Prepared prepare(const Model& m, const Batch& batch, Output& out,
       }
     }
   }
+  stage("embed");
   if (debug_taps) out.x_embed = x;
   return prep;
 }
@@ -1466,8 +1500,13 @@ Output forward(const Model& m, const Batch& batch, const ForwardOpts& opts) {
   Output out;
   // RT_FORWARD_PROFILE=1: coarse prepare-vs-blocks wall split to stderr.
   const bool fprof = std::getenv("RT_FORWARD_PROFILE") != nullptr;
+  // CUDA embeds on the device (RT_CUDA_HOST_EMBED=1 reverts for bisection).
+  const bool host_embed =
+      opts.device != Device::CUDA ||
+      std::getenv("RT_CUDA_HOST_EMBED") != nullptr;
   auto t0 = std::chrono::steady_clock::now();
-  detail::Prepared prep = detail::prepare(m, batch, out, opts.debug_taps);
+  detail::Prepared prep =
+      detail::prepare(m, batch, out, opts.debug_taps, host_embed);
   if (fprof) {
     fprintf(stderr, "[rt-forward] prepare %.1fms\n",
             std::chrono::duration<double, std::milli>(

@@ -42,7 +42,7 @@ class NormalizationMode(str, Enum):
     inside each entity context, so adding another entity to a request cannot
     change an existing prediction.  ``REFERENCE`` uses preprocessing-time
     column and task statistics, matching relational-transformer's persisted
-    dataset contract; it requires a :class:`relativedb.rt_native.ColumnStats`
+    dataset contract; it requires a :class:`relativedb.scoring.ColumnStats`
     artifact on the backend.
     """
 

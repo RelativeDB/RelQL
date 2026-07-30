@@ -47,6 +47,14 @@ struct Prepared {
   std::vector<Groups> g_col, g_feat, g_nbr;  // per batch row
   std::vector<Work> work[3];             // col, feat, nbr
   std::vector<float> x;                  // [B*S, d] block-0 input (embeddings)
+  // device_embed (prepare(host_embed=false)): the embedding stage — two
+  // 384->d projections plus per-token rmsnorm/scalar/mask — moves onto the
+  // device, so x stays empty and the SORTED channels ship instead. This was
+  // 80% of prepare's wall time on the CPU.
+  bool device_embed = false;
+  std::vector<float> colv, textv;        // [B*S, 384] sorted order
+  std::vector<float> numv, datv, boolv;  // [B*S]
+  std::vector<uint8_t> sem8, tgt8;       // [B*S] (sem fits a byte)
 };
 
 // Round fp32 to bf16 (round-to-nearest-even) and back — mirrors the Python
@@ -54,9 +62,11 @@ struct Prepared {
 float bf16_round(float f);
 
 // Sort, group, tile and embed. Fills out.sort_idxs / sorted_is_target /
-// x_embed (when debug_taps) and sizes out.yhat_number.
+// x_embed (when debug_taps) and sizes out.yhat_number. host_embed=false
+// (CUDA only; ignored when debug_taps needs x on the host) skips the CPU
+// embedding stage and ships sorted channels for the device to embed.
 Prepared prepare(const Model& m, const Batch& batch, Output& out,
-                 bool debug_taps);
+                 bool debug_taps, bool host_embed = true);
 
 // Blocks + head on each backend. Consumes prep.x as block-0 input, writes
 // out.yhat_number (+ x_block0 when debug_taps).

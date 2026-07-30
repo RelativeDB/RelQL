@@ -8,7 +8,6 @@
 
 #include "rt.hpp"
 #include "rt_train.hpp"
-#include "stdrng.hpp"
 
 namespace {
 void set_err(char* err, size_t errlen, const std::string& msg) {
@@ -31,7 +30,6 @@ rt::Batch make_batch(int32_t B,int32_t S,const int64_t*node_idxs,const int64_t*f
   b.text_v.assign(text_v,text_v+BS*rt::kDText);b.col_name_v.assign(col_name_v,col_name_v+BS*rt::kDText);return b;
 }
 
-using relrng::StdRng091;
 
 }  // namespace
 
@@ -76,35 +74,6 @@ int rt_full_finetune_available(void) {
 #else
   return 0;
 #endif
-}
-
-int rt_reference_walk_counts(int32_t node_count, const int32_t* offsets,
-                             const int32_t* neighbors, int32_t target,
-                             const uint8_t* eligible, uint64_t seed,
-                             int32_t num_walks, int32_t walk_length,
-                             uint32_t* out_counts) {
-  if (node_count <= 0 || !offsets || !neighbors || !eligible || !out_counts ||
-      target < 0 || target >= node_count || num_walks < 0 || walk_length < 0)
-    return 1;
-  std::memset(out_counts, 0, (size_t)node_count * sizeof(uint32_t));
-  StdRng091 rng(seed);
-  for (int32_t walk = 0; walk < num_walks; ++walk) {
-    int32_t current = target;
-    for (int32_t step = 0; step < walk_length; ++step) {
-      if (eligible[current]) ++out_counts[current];
-      const int32_t begin = offsets[current], end = offsets[current + 1];
-      if (begin == end) break;
-      current = neighbors[begin + rng.range((uint32_t)(end - begin))];
-    }
-  }
-  return 0;
-}
-
-int rt_stdrng_first_u64_batch(const uint64_t* seeds, int32_t count,
-                              uint64_t* out_values) {
-  if (count < 0 || (count && (!seeds || !out_values))) return 1;
-  for (int32_t i = 0; i < count; ++i) out_values[i] = StdRng091(seeds[i]).u64();
-  return 0;
 }
 
 int rt_forward_device(const rt_model* m, int32_t B, int32_t S,

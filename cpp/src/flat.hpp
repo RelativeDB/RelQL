@@ -1,24 +1,11 @@
-/* flat.hpp — can a RelQL query run as flat features, and what are they?
+/* flat.hpp — evaluate flat feature columns over assembled contexts.
  *
  * Gradient-boosted trees consume one fixed-width numeric vector per entity.
- * That representation cannot see graph structure, but for scalar targets it
- * is a strong technique — so the decision of WHICH queries qualify, the
- * derivation of the feature columns, and the evaluation of those columns
- * over an assembled context all live here, single-sourced for every binding.
- * A binding (e.g. the Python XGBoost backend) only moves matrices.
- *
- * Eligibility is deliberately narrow: scalar regression / binary targets,
- * one horizon, no RANK/CLASSIFY, no ASSUMING (a fitted tree cannot honor a
- * counterfactual), no ABLATE. Everything else stays with the sequence model.
- *
- * The feature columns are the classic tabular recipe:
- *   - the entity row's own scalar columns (dates become age-at-anchor,
- *     categoricals a stable hash),
- *   - the target aggregation mirrored into recent PAST windows (the
- *     autoregressive signal),
- *   - every windowed aggregation the WHERE clause already computes,
- *   - per linked table: COUNT over standard past windows, recency, and
- *     SUM/AVG/MAX of each numeric column.
+ * WHICH queries qualify and WHICH feature columns a schema yields is decided
+ * in Python (relativedb.flat) next to the parser and planner — no RelQL text
+ * ever reaches this layer. What stays native is the numeric evaluation: the
+ * binding sends the feature-spec JSON Python derived plus the encoded
+ * contexts, and this module fills a dense row-major float matrix.
  *
  * Aggregation semantics mirror relativedb.evaluate: window (anchor+start,
  * anchor+end], undated rows excluded from windowed frames, inline filters on
@@ -27,54 +14,36 @@
 #ifndef RELATIVEDB_FLAT_HPP
 #define RELATIVEDB_FLAT_HPP
 
+#include <cstddef>
 #include <string>
-#include <vector>
 
 #include "json.hpp"
-#include "relql.hpp"
-#include "schema.hpp"
 
 namespace relql {
 
-struct FlatFeature {
-  enum class Kind { EntityColumn, Aggregate, DaysSinceLast };
-  Kind kind = Kind::Aggregate;
-  std::string name;
+/* Feature spec (relativedb.flat.flat_spec_to_json):
+ *   {"entity_table": str, "task_type": str, "features": [
+ *      {"kind":"entity_column","name":…,"column":…,"col_type":…} |
+ *      {"kind":"aggregate","name":…,"agg":{"func":…,"table":…,"column":…,
+ *         "filter"?: <cond tree>, "window"?: {"start":…,"end":…,"unit":…}}} |
+ *      {"kind":"days_since_last","name":…,"table":…}]}
+ * Frame bounds are numbers or "inf"/"-inf"; filter trees use the same
+ * cond/logic/not shapes the RelQL AST serializes to, with literal RHS only.
+ */
 
-  // EntityColumn
-  std::string column;
-  ValueType col_type = ValueType::UNKNOWN;
+// Number of features in a parsed spec; throws JsonError-style on bad shape.
+std::size_t flat_spec_size(const JsonValue& spec);
 
-  // Aggregate: a (possibly synthesized) Agg expr evaluated over the context.
-  ExprPtr agg;
-
-  // DaysSinceLast
-  std::string table;
-};
-
-struct FlatSpec {
-  bool eligible = false;
-  std::string reason;                 // filled when ineligible
-  TaskType task = TaskType::REGRESSION;
-  std::string entity_table;
-  std::vector<FlatFeature> features;  // empty when ineligible
-};
-
-// Derive the flat plan from a BOUND query (validate + bind_params first).
-// Never throws for ineligibility — that is an answer, not an error.
-FlatSpec derive_flat_spec(const ParsedQuery& bound, const Schema& schema);
-
-// {"eligible":…,"reason":…,"task_type":…,"entity_table":…,"features":[names]}
-std::string flat_spec_to_json(const FlatSpec& spec);
-
-// One assembled context, decoded from the binding's JSON:
-//   {"entity_id":…, "anchor": <epoch seconds|null>,
-//    "rows":[{"table":…,"id":…,"ts":<epoch seconds|null>,
-//             "cells":{…},"parents":{…}}]}
-// Rows must be the FOCAL rows (the entity's own subgraph): the evaluator
-// aggregates whatever it is given, and peer rows would count into features.
-// Writes spec.features.size() floats; anything unevaluable becomes NaN.
-void flat_features(const FlatSpec& spec, const JsonValue& context, float* out);
+/* Evaluate the spec's feature columns over one assembled context:
+ *   {"entity_id":…, "anchor": <epoch seconds|null>,
+ *    "rows":[{"table":…,"id":…,"ts":<epoch seconds|null>,
+ *             "cells":{…},"parents":{…}}]}
+ * Rows must be the entity's FOCAL rows (the entity's own subgraph): the
+ * evaluator aggregates whatever it is given, and peer rows would count into
+ * features. Writes flat_spec_size(spec) floats; anything unevaluable becomes
+ * NaN (a tree model's native missing value). */
+void flat_features(const JsonValue& spec, const JsonValue& context,
+                   float* out);
 
 }  // namespace relql
 

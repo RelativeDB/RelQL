@@ -36,7 +36,7 @@ import pyarrow.parquet as pq
 from relativedb import (ContextPolicy, Engine, ExecutionInput, LinkDef,
                         RetrieverWiring, Row, RtNativeBackend, Schema,
                         TableDef, TemporalBound, ValueType)
-from relativedb.rt_native import ContextTruncationWarning
+from relativedb.scoring import ContextTruncationWarning
 
 from scale.analyze import paired_bootstrap
 from scale.resolve import accuracy, auroc, brier, logloss

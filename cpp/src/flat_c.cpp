@@ -4,11 +4,8 @@
 #include <exception>
 #include <string>
 
-#include "analyze.hpp"
 #include "flat.hpp"
 #include "json.hpp"
-#include "relql.hpp"
-#include "schema.hpp"
 
 namespace {
 
@@ -20,26 +17,9 @@ void set_str(char* dst, size_t dstlen, const std::string& msg) {
   dst[n] = '\0';
 }
 
-relql::FlatSpec analyzed_spec(const char* query, const char* schema_json,
-                              const char* params_json) {
-  if (query == nullptr) throw relql::RelqlError("null query");
-  if (schema_json == nullptr) throw relql::SchemaError("null schema");
-  relql::Schema schema = relql::schema_from_json(schema_json);
-  relql::ParsedQuery q = relql::parse(query);
-  q = relql::validate(q, schema);
-  q = relql::bind_params(q, params_json ? params_json : "");
-  return relql::derive_flat_spec(q, schema);
-}
-
-int classify(char* err, size_t errlen) {
+int fail(char* err, size_t errlen) {
   try {
     throw;
-  } catch (const relql::RelqlError& e) {
-    set_str(err, errlen, std::string("syntax: ") + e.what());
-  } catch (const relql::ValidationError& e) {
-    set_str(err, errlen, std::string("invalid: ") + e.what());
-  } catch (const relql::SchemaError& e) {
-    set_str(err, errlen, std::string("schema: ") + e.what());
   } catch (const std::exception& e) {
     set_str(err, errlen, e.what());
   } catch (...) {
@@ -52,45 +32,24 @@ int classify(char* err, size_t errlen) {
 
 extern "C" {
 
-int relql_flat_analyze(const char* query, const char* schema_json,
-                       const char* params_json, char* out, size_t outlen,
-                       char* err, size_t errlen) {
-  try {
-    std::string json =
-        relql::flat_spec_to_json(analyzed_spec(query, schema_json, params_json));
-    if (out == nullptr || outlen == 0 || json.size() + 1 > outlen) {
-      set_str(out, outlen, json);  // truncated copy
-      set_str(err, errlen, "output buffer too small for flat spec JSON");
-      return 2;
-    }
-    set_str(out, outlen, json);
-    return 0;
-  } catch (...) {
-    return classify(err, errlen);
-  }
-}
-
-int relql_flat_features(const char* query, const char* schema_json,
-                        const char* params_json, const char* contexts_json,
+int relql_flat_features(const char* spec_json, const char* contexts_json,
                         float* out, int n_contexts, int n_features,
                         char* err, size_t errlen) {
   try {
-    if (contexts_json == nullptr) throw relql::JsonError("null contexts");
-    if (out == nullptr) throw relql::JsonError("null output matrix");
-    relql::FlatSpec spec = analyzed_spec(query, schema_json, params_json);
-    if (!spec.eligible)
-      throw relql::ValidationError(
-          "query is not flat-eligible: " + spec.reason);
-    if (static_cast<int>(spec.features.size()) != n_features)
-      throw relql::ValidationError(
+    if (spec_json == nullptr) throw std::runtime_error("null spec");
+    if (contexts_json == nullptr) throw std::runtime_error("null contexts");
+    if (out == nullptr) throw std::runtime_error("null output matrix");
+    relql::JsonValue spec = relql::json_parse(spec_json);
+    if (static_cast<int>(relql::flat_spec_size(spec)) != n_features)
+      throw std::runtime_error(
           "feature count mismatch: spec has " +
-          std::to_string(spec.features.size()) + ", caller allocated " +
-          std::to_string(n_features));
+          std::to_string(relql::flat_spec_size(spec)) +
+          ", caller allocated " + std::to_string(n_features));
     relql::JsonValue contexts = relql::json_parse(contexts_json);
     if (contexts.kind != relql::JsonValue::Kind::Arr)
-      throw relql::JsonError("contexts must be a JSON array");
+      throw std::runtime_error("contexts must be a JSON array");
     if (static_cast<int>(contexts.arr.size()) != n_contexts)
-      throw relql::ValidationError(
+      throw std::runtime_error(
           "context count mismatch: JSON has " +
           std::to_string(contexts.arr.size()) + ", caller declared " +
           std::to_string(n_contexts));
@@ -99,7 +58,7 @@ int relql_flat_features(const char* query, const char* schema_json,
                            out + static_cast<size_t>(i) * n_features);
     return 0;
   } catch (...) {
-    return classify(err, errlen);
+    return fail(err, errlen);
   }
 }
 

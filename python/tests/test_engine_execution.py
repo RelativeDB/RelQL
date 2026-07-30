@@ -132,6 +132,81 @@ def test_hurdle_gate_of_zero_keeps_every_regression_value(churn_schema):
 
 
 # --------------------------------------------------------------------------
+# shared-context scoring through the Scorer protocol
+#
+# These run the REAL SequenceBackend over a stub Scorer, because the engine's
+# shared path reaches into the payload prepare_shared returns
+# (payload["batch"] / payload["model_uri"] -> scorer.forward). A stub backend
+# with its own prepare_shared would never catch the engine and the backend
+# drifting apart -- which happened: the engine kept reading the pre-split
+# payload["model"].forward_tokens(...) and only a live benchmark noticed.
+# --------------------------------------------------------------------------
+
+class ZeroScorer:
+    """Scorer whose every token score is 0 (so classification decodes to
+    probability 0.5) and whose embeddings are all-zero vectors."""
+
+    def __init__(self):
+        self.outputs_seen: list[str] = []
+
+    def forward(self, batch, *, model_uri, output):
+        import numpy as np
+        from relativedb.scoring import ForwardResult
+        self.outputs_seen.append(output)
+        if output == "token_scores":
+            return ForwardResult(
+                scores=np.zeros((batch.b, batch.s), np.float32))
+        return ForwardResult(scores=np.zeros(batch.b, np.float32))
+
+    def embed(self, texts, *, normalize=True):
+        import numpy as np
+        return np.zeros((len(texts), 384), np.float32)
+
+
+def _shared_engine(churn_schema):
+    from relativedb.scoring import SequenceBackend
+    scorer = ZeroScorer()
+    backend = SequenceBackend(scorer, schema=churn_schema)
+    return _engine(churn_schema, backend), scorer
+
+
+def test_shared_context_scores_through_the_scorer_payload(churn_schema):
+    eng, scorer = _shared_engine(churn_schema)
+    res = eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                                     params={"ids": IDS},
+                                     shared_context=True))
+    # shared predictions come back in cohort/context order, not input order
+    assert sorted(p.id for p in res.predictions) == sorted(IDS)
+    # the shared path really ran (fallback would score per-entity instead)
+    assert "token_scores" in scorer.outputs_seen
+    for p in res.predictions:
+        assert p.probability == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_execute_many_pipelines_shared_cohorts_through_the_scorer(
+        churn_schema, concurrent):
+    """execute_many's producer/consumer path has its own copy of the forward
+    call; it must consume the same payload contract as execute(). The
+    concurrent variant marks the scorer remote-like (a ``url`` attribute),
+    which turns on the in-flight forward executor."""
+    eng, scorer = _shared_engine(churn_schema)
+    if concurrent:
+        scorer.url = "stub://remote"
+    inputs = [ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                             params={"ids": IDS}, shared_context=True),
+              ExecutionInput(query=CHURN, anchor_time=ANCHOR,
+                             params={"ids": IDS[:2]}, shared_context=True)]
+    results = eng.execute_many(inputs)
+    assert sorted(p.id for p in results[0].predictions) == sorted(IDS)
+    assert sorted(p.id for p in results[1].predictions) == sorted(IDS[:2])
+    assert scorer.outputs_seen.count("token_scores") >= 2
+    for res in results:
+        for p in res.predictions:
+            assert p.probability == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------
 # shared-context guards
 #
 # The shared path needs a backend that can prepare shared state. These pin the

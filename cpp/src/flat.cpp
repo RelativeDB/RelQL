@@ -4,34 +4,39 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <limits>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
-
-#include "analyze.hpp"
-#include "plan.hpp"
 
 namespace relql {
 namespace {
 
 constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
 
-double unit_seconds(TimeUnit u) {
-  switch (u) {
-    case TimeUnit::SECONDS: return 1.0;
-    case TimeUnit::MINUTES: return 60.0;
-    case TimeUnit::HOURS: return 3600.0;
-    case TimeUnit::DAYS: return 86400.0;
-    case TimeUnit::WEEKS: return 7 * 86400.0;
-    // Calendar frames use the same 30/365-day approximation as the Python
-    // window arithmetic (relql.ast.TimeUnit.delta).
-    case TimeUnit::MONTHS: return 30 * 86400.0;
-    case TimeUnit::YEARS: return 365 * 86400.0;
-  }
+double unit_seconds(const std::string& u) {
+  if (u == "seconds") return 1.0;
+  if (u == "minutes") return 60.0;
+  if (u == "hours") return 3600.0;
+  if (u == "days") return 86400.0;
+  if (u == "weeks") return 7 * 86400.0;
+  // Calendar frames use the same 30/365-day approximation as the Python
+  // window arithmetic (relql.ast.TimeUnit.delta).
+  if (u == "months") return 30 * 86400.0;
+  if (u == "years") return 365 * 86400.0;
   return 86400.0;
+}
+
+double bound_of(const JsonValue* v) {
+  if (!v) return kNan;
+  if (v->kind == JsonValue::Kind::Num) return v->num;
+  if (v->kind == JsonValue::Kind::Str) {
+    if (v->str == "inf") return std::numeric_limits<double>::infinity();
+    if (v->str == "-inf") return -std::numeric_limits<double>::infinity();
+  }
+  return kNan;
 }
 
 // Stable across processes and runs: the categorical encoding must agree
@@ -102,7 +107,8 @@ const JsonValue* cell_of(const JsonValue& row, const std::string& col) {
 
 // ---------------------------------------------------------------------------
 // inline WHERE inside an aggregation, mirroring evaluate.eval_row_predicate.
-// A comparison this evaluator cannot decide excludes the row.
+// The filter tree arrives as spec JSON (cond/logic/not, literal RHS); a
+// comparison this evaluator cannot decide excludes the row.
 // ---------------------------------------------------------------------------
 
 bool like_match(const std::string& s, const std::string& pat, size_t si,
@@ -123,106 +129,108 @@ bool like_match(const std::string& s, const std::string& pat, size_t si,
   return si == s.size();
 }
 
-bool lit_matches(const JsonValue& cell, const Lit& lit) {
-  switch (lit.kind) {
-    case LitKind::Int:
-      return cell.kind != JsonValue::Kind::Str &&
-             cell_number(cell) == static_cast<double>(lit.ival);
-    case LitKind::Float: {
-      double d = lit.dval;
-      return cell.kind != JsonValue::Kind::Str && cell_number(cell) == d;
-    }
-    case LitKind::Bool:
-      return (cell.kind == JsonValue::Kind::Bool && cell.b == lit.bval) ||
-             (cell.kind == JsonValue::Kind::Num &&
-              cell.num == (lit.bval ? 1.0 : 0.0));
-    case LitKind::Str:
-      return cell.kind == JsonValue::Kind::Str && cell.str == lit.sval;
-    case LitKind::Date:
-      return cell_number(cell) == parse_iso_seconds(lit.sval);
-    case LitKind::Null:
-      return cell.is_null();
-    case LitKind::List:
-      return false;  // handled by IN
-  }
-  return false;
+// The literal side of a filter comparison, as spec JSON: JSON-native scalars,
+// {"date": "<iso>"} for dates, arrays for IN lists.
+bool is_date_lit(const JsonValue& lit) {
+  return lit.kind == JsonValue::Kind::Obj && lit.find("date");
 }
 
-double lit_number(const Lit& lit) {
+bool lit_matches(const JsonValue& cell, const JsonValue& lit) {
+  if (is_date_lit(lit))
+    return cell_number(cell) == parse_iso_seconds(lit.find("date")->str);
   switch (lit.kind) {
-    case LitKind::Int: return static_cast<double>(lit.ival);
-    case LitKind::Float: return lit.dval;
-    case LitKind::Bool: return lit.bval ? 1.0 : 0.0;
-    case LitKind::Date: return parse_iso_seconds(lit.sval);
+    case JsonValue::Kind::Num:
+      return cell.kind != JsonValue::Kind::Str && cell_number(cell) == lit.num;
+    case JsonValue::Kind::Bool:
+      return (cell.kind == JsonValue::Kind::Bool && cell.b == lit.b) ||
+             (cell.kind == JsonValue::Kind::Num &&
+              cell.num == (lit.b ? 1.0 : 0.0));
+    case JsonValue::Kind::Str:
+      return cell.kind == JsonValue::Kind::Str && cell.str == lit.str;
+    case JsonValue::Kind::Null:
+      return cell.is_null();
+    default:
+      return false;  // lists handled by IN
+  }
+}
+
+double lit_number(const JsonValue& lit) {
+  if (is_date_lit(lit)) return parse_iso_seconds(lit.find("date")->str);
+  switch (lit.kind) {
+    case JsonValue::Kind::Num: return lit.num;
+    case JsonValue::Kind::Bool: return lit.b ? 1.0 : 0.0;
     default: return kNan;
   }
 }
 
-bool row_condition(const Expr& cond, const JsonValue& row) {
-  if (cond.kind != ExprKind::Cond || !cond.left ||
-      cond.left->kind != ExprKind::Col)
+bool row_condition(const JsonValue& cond, const JsonValue& row) {
+  const JsonValue* col = cond.find("column");
+  const JsonValue* opv = cond.find("op");
+  if (!col || col->kind != JsonValue::Kind::Str || !opv ||
+      opv->kind != JsonValue::Kind::Str)
     return false;
-  const JsonValue* cell = cell_of(row, cond.left->column);
-  if (cond.op == Operator::IS_NULL) return cell == nullptr;
-  if (cond.op == Operator::IS_NOT_NULL) return cell != nullptr;
+  const std::string& op = opv->str;
+  const JsonValue* cell = cell_of(row, col->str);
+  if (op == "IS_NULL") return cell == nullptr;
+  if (op == "IS_NOT_NULL") return cell != nullptr;
   if (cell == nullptr) return false;
-  const Lit& r = cond.right;
-  switch (cond.op) {
-    case Operator::EQ: return lit_matches(*cell, r);
-    case Operator::NEQ: return !lit_matches(*cell, r);
-    case Operator::IN:
-    case Operator::NOT_IN: {
-      bool found = false;
-      for (const Lit& item : r.items)
+  const JsonValue* r = cond.find("right");
+  static const JsonValue kNull;
+  if (!r) r = &kNull;
+  if (op == "EQ") return lit_matches(*cell, *r);
+  if (op == "NEQ") return !lit_matches(*cell, *r);
+  if (op == "IN" || op == "NOT_IN") {
+    bool found = false;
+    if (r->kind == JsonValue::Kind::Arr)
+      for (const JsonValue& item : r->arr)
         if (lit_matches(*cell, item)) { found = true; break; }
-      return cond.op == Operator::IN ? found : !found;
-    }
-    case Operator::GT: case Operator::LT:
-    case Operator::GE: case Operator::LE: {
-      double l = cell_number(*cell), rv = lit_number(r);
-      if (std::isnan(l) || std::isnan(rv)) return false;
-      if (cond.op == Operator::GT) return l > rv;
-      if (cond.op == Operator::LT) return l < rv;
-      if (cond.op == Operator::GE) return l >= rv;
-      return l <= rv;
-    }
-    case Operator::STARTS_WITH: case Operator::ENDS_WITH:
-    case Operator::CONTAINS: case Operator::NOT_CONTAINS:
-    case Operator::LIKE: case Operator::NOT_LIKE: {
-      if (cell->kind != JsonValue::Kind::Str || r.kind != LitKind::Str)
-        return false;
-      const std::string& s = cell->str;
-      const std::string& p = r.sval;
-      switch (cond.op) {
-        case Operator::STARTS_WITH:
-          return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
-        case Operator::ENDS_WITH:
-          return s.size() >= p.size() &&
-                 s.compare(s.size() - p.size(), p.size(), p) == 0;
-        case Operator::CONTAINS: return s.find(p) != std::string::npos;
-        case Operator::NOT_CONTAINS: return s.find(p) == std::string::npos;
-        case Operator::LIKE: return like_match(s, p, 0, 0);
-        default: return !like_match(s, p, 0, 0);
-      }
-    }
-    default: return false;
+    return op == "IN" ? found : !found;
   }
+  if (op == "GT" || op == "LT" || op == "GE" || op == "LE") {
+    double l = cell_number(*cell), rv = lit_number(*r);
+    if (std::isnan(l) || std::isnan(rv)) return false;
+    if (op == "GT") return l > rv;
+    if (op == "LT") return l < rv;
+    if (op == "GE") return l >= rv;
+    return l <= rv;
+  }
+  if (op == "STARTS_WITH" || op == "ENDS_WITH" || op == "CONTAINS" ||
+      op == "NOT_CONTAINS" || op == "LIKE" || op == "NOT_LIKE") {
+    if (cell->kind != JsonValue::Kind::Str || r->kind != JsonValue::Kind::Str)
+      return false;
+    const std::string& s = cell->str;
+    const std::string& p = r->str;
+    if (op == "STARTS_WITH")
+      return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+    if (op == "ENDS_WITH")
+      return s.size() >= p.size() &&
+             s.compare(s.size() - p.size(), p.size(), p) == 0;
+    if (op == "CONTAINS") return s.find(p) != std::string::npos;
+    if (op == "NOT_CONTAINS") return s.find(p) == std::string::npos;
+    if (op == "LIKE") return like_match(s, p, 0, 0);
+    return !like_match(s, p, 0, 0);
+  }
+  return false;
 }
 
-bool row_predicate(const Expr& e, const JsonValue& row) {
-  switch (e.kind) {
-    case ExprKind::Logic: {
-      bool l = e.rleft && row_predicate(*e.rleft, row);
-      bool r = e.rright && row_predicate(*e.rright, row);
-      return e.bop == BoolOp::AND ? (l && r) : (l || r);
-    }
-    case ExprKind::Not:
-      return e.inner && !row_predicate(*e.inner, row);
-    case ExprKind::Cond:
-      return row_condition(e, row);
-    default:
-      return false;
+bool row_predicate(const JsonValue& e, const JsonValue& row) {
+  const JsonValue* kind = e.find("kind");
+  if (!kind || kind->kind != JsonValue::Kind::Str) return false;
+  if (kind->str == "logic") {
+    const JsonValue* l = e.find("left");
+    const JsonValue* r = e.find("right");
+    const JsonValue* op = e.find("op");
+    bool lb = l && row_predicate(*l, row);
+    bool rb = r && row_predicate(*r, row);
+    return (op && op->kind == JsonValue::Kind::Str && op->str == "AND")
+               ? (lb && rb) : (lb || rb);
   }
+  if (kind->str == "not") {
+    const JsonValue* inner = e.find("expr");
+    return inner && !row_predicate(*inner, row);
+  }
+  if (kind->str == "cond") return row_condition(e, row);
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,20 +249,29 @@ std::string distinct_key(const JsonValue& v) {
   }
 }
 
-double eval_agg(const Expr& agg, const RowsByTable& by_table, bool has_anchor,
-                double anchor) {
+double eval_agg(const JsonValue& agg, const RowsByTable& by_table,
+                bool has_anchor, double anchor) {
   static const std::vector<Ref> kEmpty;
-  auto it = by_table.find(agg.table);
+  const JsonValue* tablev = agg.find("table");
+  const JsonValue* funcv = agg.find("func");
+  const JsonValue* columnv = agg.find("column");
+  if (!tablev || !funcv || !columnv) return kNan;
+  const std::string& func = funcv->str;
+  const std::string& column = columnv->str;
+  auto it = by_table.find(tablev->str);
   const std::vector<Ref>& all = (it == by_table.end()) ? kEmpty : it->second;
 
   std::vector<Ref> rows;
-  if (agg.has_window) {
+  const JsonValue* window = agg.find("window");
+  if (window && window->kind == JsonValue::Kind::Obj) {
     // (anchor+start, anchor+end], start excluded, end included; undated rows
     // never enter a windowed frame.
     if (!has_anchor) return kNan;
-    double us = unit_seconds(agg.window.unit);
-    double lo = agg.window.start * us;  // may be -inf
-    double hi = agg.window.end * us;    // may be +inf
+    const JsonValue* unitv = window->find("unit");
+    double us = unit_seconds(unitv && unitv->kind == JsonValue::Kind::Str
+                                 ? unitv->str : "days");
+    double lo = bound_of(window->find("start")) * us;  // may be -inf
+    double hi = bound_of(window->find("end")) * us;    // may be +inf
     for (const Ref& r : all) {
       if (!r.has_ts) continue;
       if (std::isfinite(lo) && !(r.ts > anchor + lo)) continue;
@@ -268,29 +285,31 @@ double eval_agg(const Expr& agg, const RowsByTable& by_table, bool has_anchor,
     if (a.has_ts != b.has_ts) return !a.has_ts;  // undated first
     return a.ts < b.ts;
   });
-  if (agg.filter) {
-    std::vector<Ref> kept;
-    for (const Ref& r : rows)
-      if (row_predicate(*agg.filter, *r.row)) kept.push_back(r);
-    rows.swap(kept);
+  if (const JsonValue* filter = agg.find("filter")) {
+    if (filter->kind == JsonValue::Kind::Obj) {
+      std::vector<Ref> kept;
+      for (const Ref& r : rows)
+        if (row_predicate(*filter, *r.row)) kept.push_back(r);
+      rows.swap(kept);
+    }
   }
 
-  if (agg.func == AggFunc::EXISTS) return rows.empty() ? 0.0 : 1.0;
-  const bool star = agg.column == "*";
-  if (agg.func == AggFunc::COUNT) {
+  if (func == "EXISTS") return rows.empty() ? 0.0 : 1.0;
+  const bool star = column == "*";
+  if (func == "COUNT") {
     if (star) return static_cast<double>(rows.size());
     std::size_t n = 0;
     for (const Ref& r : rows)
-      if (cell_of(*r.row, agg.column)) ++n;
+      if (cell_of(*r.row, column)) ++n;
     return static_cast<double>(n);
   }
 
   std::vector<const JsonValue*> values;
   for (const Ref& r : rows) {
-    const JsonValue* v = star ? nullptr : cell_of(*r.row, agg.column);
+    const JsonValue* v = star ? nullptr : cell_of(*r.row, column);
     if (star || v) values.push_back(v);
   }
-  if (agg.func == AggFunc::COUNT_DISTINCT) {
+  if (func == "COUNT_DISTINCT") {
     std::set<std::string> seen;
     for (const JsonValue* v : values)
       if (v) seen.insert(distinct_key(*v));
@@ -302,9 +321,9 @@ double eval_agg(const Expr& agg, const RowsByTable& by_table, bool has_anchor,
       return hash_feature(v->str);  // categorical FIRST/LAST stays usable
     return cell_number(*v);
   };
-  if (agg.func == AggFunc::FIRST)
+  if (func == "FIRST")
     return values.empty() ? kNan : scalar(values.front());
-  if (agg.func == AggFunc::LAST)
+  if (func == "LAST")
     return values.empty() ? kNan : scalar(values.back());
 
   std::vector<double> nums;
@@ -314,292 +333,42 @@ double eval_agg(const Expr& agg, const RowsByTable& by_table, bool has_anchor,
     if (std::isnan(d)) return kNan;  // whole column of the wrong type
     nums.push_back(d);
   }
-  if (agg.func == AggFunc::SUM) {
+  if (func == "SUM") {
     double s = 0;
     for (double d : nums) s += d;
     return s;
   }
   if (nums.empty()) return kNan;
-  if (agg.func == AggFunc::AVG) {
+  if (func == "AVG") {
     double s = 0;
     for (double d : nums) s += d;
     return s / static_cast<double>(nums.size());
   }
-  if (agg.func == AggFunc::MIN) return *std::min_element(nums.begin(), nums.end());
-  if (agg.func == AggFunc::MAX) return *std::max_element(nums.begin(), nums.end());
+  if (func == "MIN") return *std::min_element(nums.begin(), nums.end());
+  if (func == "MAX") return *std::max_element(nums.begin(), nums.end());
   return kNan;  // ARRAY_AGG / LIST_DISTINCT are never flat features
 }
 
-// ---------------------------------------------------------------------------
-// spec derivation
-// ---------------------------------------------------------------------------
-
-void collect_aggs(const Expr* e, std::vector<const Expr*>& out) {
-  if (!e) return;
-  if (e->kind == ExprKind::Agg) out.push_back(e);
-  collect_aggs(e->filter.get(), out);
-  collect_aggs(e->left.get(), out);
-  collect_aggs(e->right_expr.get(), out);
-  collect_aggs(e->rleft.get(), out);
-  collect_aggs(e->rright.get(), out);
-  collect_aggs(e->inner.get(), out);
-  collect_aggs(e->a_left.get(), out);
-  collect_aggs(e->a_right.get(), out);
-  for (const ExprPtr& a : e->args) collect_aggs(a.get(), out);
-  for (const ExprPtr& c : e->when_conds) collect_aggs(c.get(), out);
-  for (const ExprPtr& t : e->when_thens) collect_aggs(t.get(), out);
-  collect_aggs(e->case_else.get(), out);
-}
-
-ExprPtr make_agg(AggFunc func, const std::string& table,
-                 const std::string& column, double start_days,
-                 double end_days) {
-  auto e = std::make_shared<Expr>();
-  e->kind = ExprKind::Agg;
-  e->func = func;
-  e->table = table;
-  e->column = column;
-  if (std::isfinite(start_days)) {
-    // Unbounded frames stay windowless: assembly already bounds the past,
-    // and a windowed frame would drop static (undated) rows entirely.
-    e->has_window = true;
-    e->window.start = start_days;
-    e->window.end = end_days;
-    e->window.unit = TimeUnit::DAYS;
-  }
-  return e;
-}
-
-const double kPastDays[] = {7, 30, 90};
-
-// Tables whose rows can appear in an entity-scoped context: within two link
-// hops of the entity table, direction-blind (children, parents, siblings).
-std::set<std::string> reachable_tables(const Schema& schema,
-                                       const std::string& entity_table) {
-  std::set<std::string> seen{entity_table};
-  std::vector<std::string> frontier{entity_table};
-  for (int hop = 0; hop < 2; ++hop) {
-    std::vector<std::string> next;
-    for (const std::string& t : frontier) {
-      for (const LinkDef& l : schema.links) {
-        std::string other;
-        if (l.from_table == t) other = l.to_table;
-        else if (l.to_table == t) other = l.from_table;
-        else continue;
-        if (seen.insert(other).second) next.push_back(other);
-      }
-    }
-    frontier.swap(next);
-  }
-  seen.erase(entity_table);
-  return seen;
-}
-
-void add_feature(FlatSpec& spec, std::set<std::string>& names, FlatFeature f) {
-  if (names.insert(f.name).second) spec.features.push_back(std::move(f));
-}
-
-std::string json_escape(const std::string& s) {
-  std::string out;
-  for (char c : s) {
-    if (c == '"' || c == '\\') { out += '\\'; out += c; }
-    else if (static_cast<unsigned char>(c) < 0x20) {
-      char buf[8];
-      std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-      out += buf;
-    } else out += c;
-  }
-  return out;
-}
-
-const char* task_name(TaskType t) {
-  switch (t) {
-    case TaskType::REGRESSION: return "regression";
-    case TaskType::BINARY_CLASSIFICATION: return "binary_classification";
-    case TaskType::MULTICLASS_CLASSIFICATION: return "multiclass_classification";
-    case TaskType::MULTILABEL_RANKING: return "multilabel_ranking";
-    case TaskType::FORECASTING: return "forecasting";
-  }
-  return "?";
+const JsonValue& spec_features(const JsonValue& spec) {
+  const JsonValue* feats = spec.find("features");
+  if (!feats || feats->kind != JsonValue::Kind::Arr)
+    throw std::runtime_error("flat spec has no 'features' array");
+  return *feats;
 }
 
 }  // namespace
 
-FlatSpec derive_flat_spec(const ParsedQuery& q, const Schema& schema) {
-  FlatSpec spec;
-  spec.entity_table = q.entity_table;
-  spec.task = task_type(q, schema);
-  auto decline = [&spec](const std::string& why) -> FlatSpec& {
-    spec.eligible = false;
-    spec.reason = why;
-    spec.features.clear();
-    return spec;
-  };
-
-  if (spec.task != TaskType::REGRESSION &&
-      spec.task != TaskType::BINARY_CLASSIFICATION)
-    return decline("flat features cover scalar regression and binary "
-                   "classification; " + std::string(task_name(spec.task)) +
-                   " needs the sequence model");
-  if (q.rank != RankKind::NONE || q.has_top_k)
-    return decline("RANK/CLASSIFY targets need the sequence model");
-  if (q.has_num_forecasts && q.num_forecasts > 1)
-    return decline("multi-horizon forecasting needs the sequence model");
-  if (q.assuming)
-    return decline("ASSUMING is a counterfactual on the context; a fitted "
-                   "tree model cannot honor it");
-  if (!q.ablations.empty())
-    return decline("ABLATE changes the context a sequence model reads; flat "
-                   "features have no equivalent");
-  if (q.ret.present && q.ret.kind != ReturnKind::EXPECTED_VALUE &&
-      q.ret.kind != ReturnKind::PROBABILITY)
-    return decline("only RETURN EXPECTED VALUE / PROBABILITY map onto a "
-                   "scalar tree prediction");
-
-  std::vector<const Expr*> target_aggs;
-  collect_aggs(q.target.get(), target_aggs);
-  for (const Expr* a : target_aggs) {
-    if (a->func == AggFunc::ARRAY_AGG || a->func == AggFunc::LIST_DISTINCT)
-      return decline("list-valued aggregations in the target need the "
-                     "sequence model");
-    if (a->has_window && a->window.horizons > 1)
-      return decline("multi-horizon windows need the sequence model");
-  }
-
-  spec.eligible = true;
-  std::set<std::string> names;
-  const TableDef* entity = schema.table(q.entity_table);
-
-  // 1. The entity row's own scalar columns.
-  if (entity) {
-    for (const ColumnDef& c : entity->columns) {
-      if (c.name == entity->primary_key) continue;
-      if (c.type == ValueType::TEXT || c.type == ValueType::UNKNOWN) continue;
-      FlatFeature f;
-      f.kind = FlatFeature::Kind::EntityColumn;
-      f.column = c.name;
-      f.col_type = c.type;
-      f.name = "entity." + c.name +
-               (c.type == ValueType::DATETIME ? "_age_days" : "");
-      add_feature(spec, names, std::move(f));
-    }
-  }
-
-  // 2. The target mirrored into the recent past — the autoregressive signal.
-  for (const Expr* a : target_aggs) {
-    bool finite = a->has_window && std::isfinite(a->window.start) &&
-                  std::isfinite(a->window.end);
-    if (finite) {
-      double w = a->window.end - a->window.start;
-      if (w <= 0) w = 1;
-      for (int i = 1; i <= 3; ++i) {
-        auto clone = std::make_shared<Expr>(*a);
-        clone->window.start = a->window.start - i * w;
-        clone->window.end = a->window.end - i * w;
-        FlatFeature f;
-        f.kind = FlatFeature::Kind::Aggregate;
-        f.agg = clone;
-        f.name = "hist" + std::to_string(i) + ":" + expr_to_string(*clone);
-        add_feature(spec, names, std::move(f));
-      }
-    } else {
-      for (double d : kPastDays) {
-        auto clone = std::make_shared<Expr>(*a);
-        clone->has_window = true;
-        clone->window = Window{};
-        clone->window.start = -d;
-        clone->window.end = 0;
-        clone->window.unit = TimeUnit::DAYS;
-        FlatFeature f;
-        f.kind = FlatFeature::Kind::Aggregate;
-        f.agg = clone;
-        f.name = "hist:" + expr_to_string(*clone);
-        add_feature(spec, names, std::move(f));
-      }
-    }
-  }
-
-  // 3. Whatever the WHERE clause already computes over the past.
-  std::vector<const Expr*> where_aggs;
-  collect_aggs(q.where.get(), where_aggs);
-  for (const Expr* a : where_aggs) {
-    if (a->func == AggFunc::ARRAY_AGG || a->func == AggFunc::LIST_DISTINCT)
-      continue;
-    if (a->has_window && a->window.horizons > 1) continue;
-    auto clone = std::make_shared<Expr>(*a);
-    FlatFeature f;
-    f.kind = FlatFeature::Kind::Aggregate;
-    f.agg = clone;
-    f.name = "where:" + expr_to_string(*clone);
-    add_feature(spec, names, std::move(f));
-  }
-
-  // 4. The standard per-table recipe over every linked table.
-  std::set<std::string> nearby = reachable_tables(schema, q.entity_table);
-  for (const TableDef& t : schema.tables) {
-    if (!nearby.count(t.name)) continue;
-    for (double d : kPastDays) {
-      FlatFeature f;
-      f.kind = FlatFeature::Kind::Aggregate;
-      f.agg = make_agg(AggFunc::COUNT, t.name, "*", -d, 0);
-      f.name = t.name + ".count_" + std::to_string(static_cast<int>(d)) + "d";
-      add_feature(spec, names, std::move(f));
-    }
-    {
-      FlatFeature f;
-      f.kind = FlatFeature::Kind::Aggregate;
-      f.agg = make_agg(AggFunc::COUNT, t.name, "*",
-                       -std::numeric_limits<double>::infinity(), 0);
-      f.name = t.name + ".count_all";
-      add_feature(spec, names, std::move(f));
-    }
-    if (!t.time_column.empty()) {
-      FlatFeature f;
-      f.kind = FlatFeature::Kind::DaysSinceLast;
-      f.table = t.name;
-      f.name = t.name + ".recency_days";
-      add_feature(spec, names, std::move(f));
-    }
-    for (const ColumnDef& c : t.columns) {
-      if (c.type != ValueType::NUMBER || c.name == t.primary_key) continue;
-      struct { AggFunc func; const char* tag; } recipes[] = {
-          {AggFunc::SUM, "sum"}, {AggFunc::AVG, "avg"}, {AggFunc::MAX, "max"}};
-      for (const auto& r : recipes) {
-        FlatFeature f30;
-        f30.kind = FlatFeature::Kind::Aggregate;
-        f30.agg = make_agg(r.func, t.name, c.name, -30, 0);
-        f30.name = t.name + "." + c.name + "_" + r.tag + "_30d";
-        add_feature(spec, names, std::move(f30));
-        FlatFeature fall;
-        fall.kind = FlatFeature::Kind::Aggregate;
-        fall.agg = make_agg(r.func, t.name, c.name,
-                            -std::numeric_limits<double>::infinity(), 0);
-        fall.name = t.name + "." + c.name + "_" + r.tag + "_all";
-        add_feature(spec, names, std::move(fall));
-      }
-    }
-  }
-  return spec;
+std::size_t flat_spec_size(const JsonValue& spec) {
+  return spec_features(spec).arr.size();
 }
 
-std::string flat_spec_to_json(const FlatSpec& spec) {
-  std::string out = "{\"eligible\":";
-  out += spec.eligible ? "true" : "false";
-  out += ",\"reason\":\"" + json_escape(spec.reason) + "\"";
-  out += ",\"task_type\":\"";
-  out += task_name(spec.task);
-  out += "\",\"entity_table\":\"" + json_escape(spec.entity_table) + "\"";
-  out += ",\"features\":[";
-  for (std::size_t i = 0; i < spec.features.size(); ++i) {
-    if (i) out += ",";
-    out += "\"" + json_escape(spec.features[i].name) + "\"";
-  }
-  out += "]}";
-  return out;
-}
-
-void flat_features(const FlatSpec& spec, const JsonValue& context,
+void flat_features(const JsonValue& spec, const JsonValue& context,
                    float* out) {
+  const JsonValue* entity_tablev = spec.find("entity_table");
+  const std::string entity_table =
+      entity_tablev && entity_tablev->kind == JsonValue::Kind::Str
+          ? entity_tablev->str : "";
+
   bool has_anchor = false;
   double anchor = 0.0;
   if (const JsonValue* a = context.find("anchor")) {
@@ -619,7 +388,7 @@ void flat_features(const FlatSpec& spec, const JsonValue& context,
         if (ts->kind == JsonValue::Kind::Num) { ref.has_ts = true; ref.ts = ts->num; }
       }
       by_table[table->str].push_back(ref);
-      if (!entity_row && table->str == spec.entity_table && entity_id) {
+      if (!entity_row && table->str == entity_table && entity_id) {
         const JsonValue* id = r.find("id");
         if (id && id->kind == entity_id->kind &&
             ((id->kind == JsonValue::Kind::Str && id->str == entity_id->str) ||
@@ -629,38 +398,48 @@ void flat_features(const FlatSpec& spec, const JsonValue& context,
     }
   }
 
-  for (std::size_t i = 0; i < spec.features.size(); ++i) {
-    const FlatFeature& f = spec.features[i];
+  const JsonValue& feats = spec_features(spec);
+  for (std::size_t i = 0; i < feats.arr.size(); ++i) {
+    const JsonValue& f = feats.arr[i];
+    const JsonValue* kindv = f.find("kind");
+    const std::string kind =
+        kindv && kindv->kind == JsonValue::Kind::Str ? kindv->str : "";
     double v = kNan;
-    switch (f.kind) {
-      case FlatFeature::Kind::EntityColumn: {
-        const JsonValue* cell =
-            entity_row ? cell_of(*entity_row, f.column) : nullptr;
-        if (!cell) break;
-        if (f.col_type == ValueType::DATETIME) {
+    if (kind == "entity_column") {
+      const JsonValue* colv = f.find("column");
+      const JsonValue* cell =
+          (entity_row && colv && colv->kind == JsonValue::Kind::Str)
+              ? cell_of(*entity_row, colv->str) : nullptr;
+      if (cell) {
+        const JsonValue* ctv = f.find("col_type");
+        const std::string col_type =
+            ctv && ctv->kind == JsonValue::Kind::Str ? ctv->str : "";
+        if (col_type == "datetime") {
           double when = cell_number(*cell);
           if (has_anchor && !std::isnan(when))
             v = (anchor - when) / 86400.0;
-        } else if (f.col_type == ValueType::CATEGORICAL &&
-                   cell->kind == JsonValue::Kind::Str) {
+        } else if (cell->kind == JsonValue::Kind::Str &&
+                   std::isnan(parse_iso_seconds(cell->str))) {
+          // categorical value in a scalar slot: the stable hash keeps it
+          // usable without carrying a vocabulary
           v = hash_feature(cell->str);
         } else {
           v = cell_number(*cell);
         }
-        break;
       }
-      case FlatFeature::Kind::Aggregate:
-        v = eval_agg(*f.agg, by_table, has_anchor, anchor);
-        break;
-      case FlatFeature::Kind::DaysSinceLast: {
-        if (!has_anchor) break;
-        auto it = by_table.find(f.table);
-        if (it == by_table.end()) break;
-        double latest = -std::numeric_limits<double>::infinity();
-        for (const Ref& r : it->second)
-          if (r.has_ts && r.ts <= anchor && r.ts > latest) latest = r.ts;
-        if (std::isfinite(latest)) v = (anchor - latest) / 86400.0;
-        break;
+    } else if (kind == "aggregate") {
+      if (const JsonValue* agg = f.find("agg"))
+        v = eval_agg(*agg, by_table, has_anchor, anchor);
+    } else if (kind == "days_since_last") {
+      const JsonValue* tablev = f.find("table");
+      if (has_anchor && tablev && tablev->kind == JsonValue::Kind::Str) {
+        auto it = by_table.find(tablev->str);
+        if (it != by_table.end()) {
+          double latest = -std::numeric_limits<double>::infinity();
+          for (const Ref& r : it->second)
+            if (r.has_ts && r.ts <= anchor && r.ts > latest) latest = r.ts;
+          if (std::isfinite(latest)) v = (anchor - latest) / 86400.0;
+        }
       }
     }
     out[i] = static_cast<float>(v);

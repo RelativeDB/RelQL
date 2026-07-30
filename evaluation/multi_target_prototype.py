@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 from relbench import load_dataset, load_task
 from evaluation.f1_relql import DATASET, TASKS, build_engine, _python_value
 from relativedb import parse, validate
-from relativedb.rt_native import RT_DEVICE_MPS, load_lib
+from relativedb_engine import RT_DEVICE_MPS, load_lib
 
 CTX = int(sys.argv[1]) if len(sys.argv) > 1 else 8192
 LIB = "cpp/build/librt_c.dylib"

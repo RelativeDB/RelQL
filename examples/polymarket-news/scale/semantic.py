@@ -47,7 +47,7 @@ def embed(texts: list[str], *, batch: int = 512, tag: str = "texts"):
             cached = {k: z[k] for k in z.files}
     todo = [t for t in dict.fromkeys(texts) if _key(t) not in cached]
     if todo:
-        from relativedb.rt_native import TextEmbedder
+        from relativedb_engine import TextEmbedder
         encoder = TextEmbedder()
         encoder._load()
         print(f"   embedding {len(todo):,} new {tag} "

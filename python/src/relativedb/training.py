@@ -54,13 +54,18 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     labels use the reference bool-as-number/Huber training contract.
     """
     from .model import NormalizationMode
-    from .rt_native import (ColumnStats, FineTunedCheckpoint,
-                            RtNativeError, load_lib,
-                            resolve_model_path)
+    from .scoring import ColumnStats
     backend = engine._require_backend()
-    if not hasattr(backend, "_build_sequences"):
+    if not hasattr(backend, "_collate_native"):
         raise ExecutionError(
             "full-backbone fine-tuning requires RtNativeBackend")
+    try:
+        from relativedb_engine import (FineTunedCheckpoint, RtNativeError,
+                                       load_lib, resolve_model_path)
+    except ImportError as e:
+        raise ExecutionError(
+            "full-backbone fine-tuning runs in the native engine; install "
+            "the optional package: pip install relativedb-engine") from e
     lib = load_lib(backend._lib_path)
     if not lib.full_finetune_available():
         raise ExecutionError(
@@ -138,7 +143,7 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     try:
         for _ in range(epochs):
             for start in range(0, len(seqs), batch_size):
-                arrays = backend._collate(seqs[start:start + batch_size])
+                arrays = backend._collate_native(seqs[start:start + batch_size])
                 result = model.finetune_step(
                     **arrays, learning_rate=learning_rate,
                     weight_decay=weight_decay,
@@ -179,9 +184,9 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
 
     The transformer is not updated; each training example is encoded once
     into its target-cell state and a small head is fitted on those. Returns
-    a :class:`~relativedb.rt_native.FineTunedHead` — inspect its losses,
+    a :class:`~relativedb_engine.FineTunedHead` — inspect its losses,
     ``save(path)`` it, and serve it by passing ``head=`` to
-    :class:`~relativedb.rt_native.RtNativeBackend`.
+    :class:`~relativedb_engine.RtNativeBackend`.
 
     ``anchors`` are past cut-off times. For each one the context is bounded
     at the anchor — exactly as at prediction time — while the **label** is
@@ -195,10 +200,9 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     an anchor and labelling only the diagonal trains each entity at its own
     cut-off instead of at a cut-off shared with rows it predates.
     """
-    from .rt_native import (FT_MULTICLASS, FT_RANKING, FineTunedHead,
-                            RtNativeError)
+    from .scoring import FT_MULTICLASS, FT_RANKING
     backend = engine._require_backend()
-    if not hasattr(backend, "candidate_seqs"):
+    if not hasattr(backend, "fit_head"):
         raise ExecutionError(
             "task-head fitting requires the native RT backend (RtNativeBackend)")
     if not anchors:
@@ -215,11 +219,17 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
             "frozen task-head fitting is limited to multiclass and "
             "multilabel-ranking adapters; scalar binary/regression tasks "
             "require full-backbone fine-tuning")
+    try:
+        from relativedb_engine import FineTunedHead, RtNativeError
+    except ImportError as e:
+        raise ExecutionError(
+            "task-head fitting runs in the native engine; install the "
+            "optional package: pip install relativedb-engine") from e
     model_uri = model_uri or engine.model_config.model_uri_for(task_type)
     model = backend._model_for(model_uri)
 
     from .model import NormalizationMode
-    from .rt_native import ColumnStats
+    from .scoring import ColumnStats
     normalization_mode = backend._mode(engine.model_config)
     if normalization_mode is NormalizationMode.REFERENCE:
         # Reference preprocessing is fitted only on rows knowable during
@@ -316,12 +326,12 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
         seqs, _, _ = backend._build_sequences(
             pq, task_type, [ctx], normalization_mode=normalization_mode,
             task_spec=task_spec)
-        feats.append(backend._encode(model, seqs))
+        feats.append(backend._encode(seqs, model_uri))
     for ctx, parent, cands, _ in ranking_examples:
         seqs = backend.candidate_seqs(
             pq, ctx, parent, cands,
             normalization_mode=normalization_mode)
-        feats.append(backend._encode(model, seqs))
+        feats.append(backend._encode(seqs, model_uri))
     features = np.concatenate(feats, axis=0).astype(np.float32)
     y = np.asarray(ys, np.float32)
     n_outputs = len(classes) if task_type is TaskType.MULTICLASS_CLASSIFICATION else 1

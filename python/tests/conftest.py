@@ -20,7 +20,7 @@ WHAT THE UNIT TIER DOES *NOT* GUARANTEE
 ---------------------------------------
 It does not run without ``librt_c``. That is by design, not an oversight:
 ``relativedb.relql.parser.parse`` delegates to ``relql_parse`` in the shared
-C++ library (see ``relql/native.py`` — "librt_c is a hard dependency"), so any
+C++ library only through the optional relativedb-engine package, so any
 test that parses a RelQL string needs the library. Measured: with ``librt_c``
 made unloadable, 186 of the 214 unit tests fail with
 ``NativeParserUnavailable``. Making the unit tier library-free would mean
@@ -74,8 +74,13 @@ def _unavailable(what: str, detail: str):
 
 
 def require_native():
-    """Return the loaded ``librt_c`` wrapper, or skip/fail per strict mode."""
-    from relativedb.rt_native import RtNativeUnavailableError, load_lib
+    """Return the loaded ``librt_c`` wrapper (from the optional
+    relativedb-engine package), or skip/fail per strict mode."""
+    try:
+        from relativedb_engine import RtNativeUnavailableError, load_lib
+    except ImportError as e:
+        _unavailable("relativedb-engine (pip install relativedb-engine)",
+                     str(e))
     try:
         return load_lib()
     except RtNativeUnavailableError as e:
@@ -83,20 +88,15 @@ def require_native():
                      "RELATIVEDB_RT_LIB)", str(e))
 
 
-def require_native_csc():
-    """``librt_c`` as reached by the CSC binding, or skip/fail per strict mode."""
-    from relativedb.csc_native import native_available
-    if not native_available():
-        _unavailable("librt_c for the native CSC binding",
-                     "csc_native.native_available() is False (run cmake in cpp/)")
-    return True
-
-
 def require_checkpoint(variant: str) -> str:
     """Resolve ``hf://stanford-star/rt-j/<variant>``, or skip/fail per strict
     mode. Cache-first; on CI the HF cache is pre-warmed, so a miss here means
     the cache key is wrong or the download failed."""
-    from relativedb.rt_native import resolve_model_path
+    try:
+        from relativedb_engine import resolve_model_path
+    except ImportError as e:
+        _unavailable("relativedb-engine (pip install relativedb-engine)",
+                     str(e))
     uri = f"hf://stanford-star/rt-j/{variant}"
     try:
         return resolve_model_path(uri)
@@ -105,13 +105,13 @@ def require_checkpoint(variant: str) -> str:
 
 
 def require_text_embedder():
-    """The pinned MiniLM encoder (sentence-transformers/all-MiniLM-L12-v2)
-    used for text and schema cells. Skips/fails like the other prerequisites —
-    it is a network-backed model, so it never belongs in the unit tier."""
-    try:
-        import sentence_transformers                      # noqa: F401
-    except ImportError as e:
-        _unavailable("sentence-transformers (MiniLM text encoder)", str(e))
+    """The pinned MiniLM encoder — now the NATIVE encoder inside librt_c
+    (the engine package). Skips/fails like the other prerequisites — it needs
+    a model snapshot, so it never belongs in the unit tier."""
+    lib = require_native()
+    if not hasattr(lib._lib, "minilm_load"):
+        _unavailable("native MiniLM encoder",
+                     "this librt_c was built without minilm_* (rebuild cpp/)")
 
 
 def pytest_configure(config):
@@ -141,6 +141,38 @@ def pytest_collection_modifyitems(config, items):
 
 def dt(s: str) -> datetime:
     return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+
+class StubScorer:
+    """Scorer double for assembly-only tests: sequence building, validation
+    and error paths never reach the model, so forward/embed must not be hit
+    unless a test explicitly wants deterministic outputs."""
+
+    def __init__(self, score_value: float = 0.0):
+        self.score_value = score_value
+        self.forwards = 0
+
+    def forward(self, batch, *, model_uri, output="target_scores"):
+        import numpy as np
+
+        from relativedb.scoring import D_MODEL, D_TEXT, ForwardResult
+        self.forwards += 1
+        B, S = batch.b, batch.s
+        if output == "token_scores":
+            return ForwardResult(scores=np.full((B, S), self.score_value,
+                                                np.float32))
+        if output == "target_features":
+            return ForwardResult(features=np.zeros((B, D_MODEL), np.float32))
+        if output == "target_scores_and_text":
+            return ForwardResult(scores=np.full(B, self.score_value, np.float32),
+                                 target_text=np.zeros((B, D_TEXT), np.float32))
+        return ForwardResult(scores=np.full(B, self.score_value, np.float32))
+
+    def embed(self, texts, *, normalize=False):
+        import numpy as np
+
+        from relativedb.scoring import D_TEXT
+        return np.zeros((len(list(texts)), D_TEXT), np.float32)
 
 
 class StubBackend:

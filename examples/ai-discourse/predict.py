@@ -39,7 +39,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from relativedb import ContextPolicy, Engine, ExecutionInput, RtNativeBackend
-from relativedb.rt_native import ContextTruncationWarning
+from relativedb.scoring import ContextTruncationWarning
 
 import db
 import topics

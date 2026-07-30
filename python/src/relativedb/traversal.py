@@ -105,6 +105,63 @@ class _StdRng:
                 return high
 
 
+def _reference_walk_counts(node_count: int, offsets, neighbors, target: int,
+                           eligible, seed: int, num_walks: int,
+                           walk_length: int):
+    """The peer-ranking graph walk, vectorized across walks.
+
+    CSR graph with deterministic neighbor order; ``eligible`` marks nodes
+    whose visits are counted. All walks advance one step per RNG call — a
+    single ``num_walks``-wide draw from a raw PCG64 stream — instead of the
+    former one-draw-per-step-per-walk rand-0.9.1 stream, which forced a
+    Python-level loop over 10k x 20 steps. Sampling is deterministic per seed
+    (``PCG64.random_raw`` is a fixed stream; the modulo bias at context-sized
+    degrees is < 2^-50) but intentionally NOT the reference byte stream; the
+    committed fingerprints pin THIS sampler.
+
+    The draw protocol — per step, one vector over walks still alive, in walk
+    order — is shared with :meth:`relativedb.graph.ContextGraph.assemble`, so
+    the row path and the columnar path sample identical contexts.
+    """
+    counts = np.zeros(node_count, dtype=np.int64)
+    off = np.asarray(offsets, dtype=np.int64)
+    nbr = np.asarray(neighbors, dtype=np.int64)
+    elig = np.asarray(eligible, dtype=bool)
+    if num_walks <= 0 or walk_length <= 0:
+        return counts.astype(np.uint32)
+    bg = np.random.PCG64(seed & _U64)
+    cur = np.full(num_walks, target, dtype=np.int64)
+    alive = np.ones(num_walks, dtype=bool)
+    for _ in range(walk_length):
+        live = cur[alive]
+        visited = live[elig[live]]
+        if visited.size:
+            np.add.at(counts, visited, 1)
+        degree = off[live + 1] - off[live]
+        stepping = degree > 0
+        if not stepping.any():
+            break
+        raw = bg.random_raw(int(stepping.sum()))
+        step_from = live[stepping]
+        r = (raw % degree[stepping].astype(np.uint64)).astype(np.int64)
+        moved = nbr[off[step_from] + r]
+        nxt = live.copy()
+        nxt[stepping] = moved
+        idx = np.flatnonzero(alive)
+        cur[idx] = nxt
+        alive[idx[~stepping]] = False
+        if not alive.any():
+            break
+    return counts.astype(np.uint32)
+
+
+def _stdrng_first_u64_batch(seeds) -> "np.ndarray":
+    """First u64 from independently seeded rand-0.9.1 StdRng streams."""
+    return np.asarray([_StdRng(int(s) & _U64).u64() for s in seeds],
+                      dtype=np.uint64)
+
+
+
 def _rand_sample(rng: _StdRng, length: int, amount: int) -> list[int]:
     """rand::seq::index::sample for the u32-sized cases used by contexts."""
     if not 0 <= amount <= length:
@@ -583,12 +640,9 @@ class ReferenceTraversal:
             walk_neighbor_cache[row.key] = result
             return result
 
-        # ReferenceTraversal has one execution contract: the exact native
-        # rand-0.9.1 graph walk. Missing/old native libraries are hard errors;
-        # never switch algorithms or performance regimes implicitly.
-        from .rt_native import load_lib
-        native_lib = load_lib()._lib
-
+        # ReferenceTraversal has one execution contract: the vectorized
+        # PCG64 walk in _reference_walk_counts — deterministic per seed and
+        # shared with the columnar path, with no native dependency.
         graph_identity = getattr(graph, "index", graph)
         # bound.as_of is part of the graph identity: with an undated target
         # the cutoff falls back to it, so two AS OF anchors must not share
@@ -631,14 +685,11 @@ class ReferenceTraversal:
         target_position = position[target.key]
         eligible = eligible_base.copy()
         eligible[target_position] = 0
-        counts = np.zeros(len(discovered), dtype=np.uint32)
-        rc = native_lib.rt_reference_walk_counts(
-            len(discovered), offsets, neighbors_array, target_position, eligible,
-            (step_seed + target_node_idx
-             + 0xD0D0_D0D0_D0D0_D0D0) & _U64,
-            policy.num_walks, policy.walk_length, counts)
-        if rc:
-            raise RuntimeError("native reference walk rejected its graph")
+        counts = _reference_walk_counts(
+            len(discovered), offsets, neighbors_array, target_position,
+            eligible,
+            (step_seed + target_node_idx + 0xD0D0_D0D0_D0D0_D0D0) & _U64,
+            policy.num_walks, policy.walk_length)
         visits = {row.key: int(count)
                   for row, count in zip(discovered, counts) if count}
 
@@ -648,11 +699,7 @@ class ReferenceTraversal:
                 (step_seed + task_node_ids.get(
                     key, physical_node_ids.get(key))) & _U64
                 for key in visit_keys], dtype=np.uint64)
-            tie_values = np.empty(len(seeds), dtype=np.uint64)
-            rc = native_lib.rt_stdrng_first_u64_batch(
-                seeds, len(seeds), tie_values)
-            if rc:
-                raise RuntimeError("native tie RNG rejected its seeds")
+            tie_values = _stdrng_first_u64_batch(seeds)
             tie = dict(zip(visit_keys, map(int, tie_values)))
         else:
             tie = {}
@@ -842,12 +889,16 @@ class ReferenceTraversal:
             if set(focal_keys) != wanted:
                 return None
             # Every focal row in the group must share the state's cutoff —
-            # they get one temporal overlay.
+            # they get one temporal overlay. Timestamp-less focal rows
+            # (isolated task tables) are admitted at the state's as-of bound,
+            # exactly as ``traverse`` computes its effective cutoff; the
+            # caller already groups ids whose anchors compare equal.
             cutoff = state.get("cutoff")
+            as_of = state.get("bound_as_of")
             targets, inject = [], []
             for eid in entity_ids:
                 row = by_key[focal_keys[eid]]
-                if row.timestamp != cutoff:
+                if (row.timestamp or as_of) != cutoff:
                     return None
                 targets.append((eid, row.key))
                 inject.append(row)
@@ -1258,16 +1309,10 @@ class ReferenceTraversal:
         fallback_rng = _StdRng((step_seed + target_node_idx
                                 + 0xA5A5_A5A5_A5A5_A5A5) & _U64)
 
-        from .rt_native import load_lib
-        native_lib = load_lib()._lib
-        counts = np.zeros(len(node_keys), dtype=np.uint32)
-        rc = native_lib.rt_reference_walk_counts(
-            len(node_keys), offsets, neighbors,
-            target_position, eligible,
+        counts = _reference_walk_counts(
+            len(node_keys), offsets, neighbors, target_position, eligible,
             (step_seed + target_node_idx + 0xD0D0_D0D0_D0D0_D0D0) & _U64,
-            policy.num_walks, policy.walk_length, counts)
-        if rc:
-            raise RuntimeError("native reference walk rejected its graph")
+            policy.num_walks, policy.walk_length)
         visits = {node_keys[i]: int(count)
                   for i, count in enumerate(counts) if count}
 
@@ -1276,11 +1321,7 @@ class ReferenceTraversal:
             seeds = np.asarray([
                 (step_seed + node_id_of(key)) & _U64
                 for key in visit_keys], dtype=np.uint64)
-            tie_values = np.empty(len(seeds), dtype=np.uint64)
-            rc = native_lib.rt_stdrng_first_u64_batch(
-                seeds, len(seeds), tie_values)
-            if rc:
-                raise RuntimeError("native tie RNG rejected its seeds")
+            tie_values = _stdrng_first_u64_batch(seeds)
             tie = dict(zip(visit_keys, map(int, tie_values)))
         else:
             tie = {}

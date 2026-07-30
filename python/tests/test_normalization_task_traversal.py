@@ -7,7 +7,8 @@ from relativedb import (ContextPolicy, Engine, NormalizationMode,
                         ReferenceTraversal, TaskSpec, ValueType)
 from relativedb.relql.ast import TaskType
 from relativedb.relql.parser import parse, validate
-from relativedb.rt_native import ColumnStats, RtNativeBackend
+from conftest import StubScorer
+from relativedb.scoring import ColumnStats, SequenceBackend
 from relativedb.traversal import TraversalResult, _StdRng, _rand_sample
 
 from conftest import dt, in_memory_wiring, churn_rows, require_native
@@ -23,7 +24,7 @@ def _query(schema, text=QUERY):
 
 def test_zero_shot_normalization_is_batch_invariant(churn_schema):
     wiring = in_memory_wiring(churn_rows())
-    backend = RtNativeBackend(schema=churn_schema, wiring=wiring)
+    backend = SequenceBackend(StubScorer(), schema=churn_schema, wiring=wiring)
     engine = Engine(churn_schema, wiring,
                     context_policy=ContextPolicy(cohort_size=0))
     pq = _query(churn_schema)
@@ -44,7 +45,7 @@ def test_reference_normalization_uses_persisted_column_and_task_stats(
     spec = TaskSpec.from_query(pq, TaskType.BINARY_CLASSIFICATION)
     stats = ColumnStats.fit(churn_schema, wiring).with_task_values(
         spec, [0.0, 1.0, 1.0])
-    backend = RtNativeBackend(
+    backend = SequenceBackend(StubScorer(), 
         schema=churn_schema, wiring=wiring, column_stats=stats,
         normalization_mode=NormalizationMode.REFERENCE)
     engine = Engine(churn_schema, wiring,
@@ -189,7 +190,7 @@ def test_materialized_task_target_is_first_and_node_ids_are_global(churn_schema)
     wiring = in_memory_wiring(churn_rows())
     policy = ContextPolicy(num_walks=8, walk_length=4, num_history_windows=2)
     engine = Engine(churn_schema, wiring, context_policy=policy)
-    backend = RtNativeBackend(schema=churn_schema, wiring=wiring)
+    backend = SequenceBackend(StubScorer(), schema=churn_schema, wiring=wiring)
     pq = _query(churn_schema)
     c1 = engine.assemble_context("customers", "C1", dt("2026-07-01"), query=pq)
     c7 = engine.assemble_context("customers", "C7", dt("2026-07-01"), query=pq)
@@ -215,7 +216,7 @@ def test_fk_feature_is_opt_in_while_pk_never_emits(churn_schema):
     rows["customers"][0].cells["customer_id"] = "C1"
     wiring = in_memory_wiring(rows)
     engine = Engine(opted, wiring, context_policy=ContextPolicy(num_walks=0))
-    backend = RtNativeBackend(schema=opted, wiring=wiring)
+    backend = SequenceBackend(StubScorer(), schema=opted, wiring=wiring)
     pq = _query(opted)
     ctx = engine.assemble_context("customers", "C1", dt("2026-07-01"), query=pq)
     seq = backend._build_sequences(pq, TaskType.BINARY_CLASSIFICATION, [ctx])[0][0]

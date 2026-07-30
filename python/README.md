@@ -42,15 +42,28 @@ FROM customers
 ## Install
 
 ```bash
-pip install relativedb
+pip install relativedb                 # pure Python: parse, plan, assemble
+pip install relativedb[engine]         # + the local native engine (librt_c)
 ```
 
-Python 3.10 or newer. Wheels bundle the native inference engine for macOS
+Python 3.10 or newer. The base package is pure Python (numpy only): RelQL
+parsing, planning, and context creation all run client-side, and the model is
+reached through a **scoring backend** — either a cloud backend URL or the
+optional in-process engine:
+
+```python
+engine = Engine(schema, wiring, model_backend="https://scoring.example.com")
+# or, with relativedb-engine installed:
+from relativedb_engine import RtNativeBackend
+engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))  # relativedb-engine
+```
+
+`relativedb-engine` wheels bundle `librt_c` (the C++ RT-J engine with its
+native MiniLM text encoder — no torch, no Python embedding) for macOS
 (universal2, 13.0+; Accelerate and Metal) and manylinux x86_64 / aarch64.
-Windows is not supported. On any other platform `pip` falls back to the
-source distribution, which contains no engine: build it from
-[the repository](https://github.com/RelativeDB/RelQL) (`cpp/` with CMake) and
-point `RELATIVEDB_RT_LIB` at the built `librt_c`.
+Windows is not supported. On any other platform build `cpp/` with CMake and
+point `RELATIVEDB_RT_LIB` at the built `librt_c`. The cloud backend is the
+same engine behind HTTP: `cpp/build/rt_serve --port 8500`.
 
 ## Quickstart: 90-day churn from your own DataFrames
 
@@ -81,7 +94,7 @@ wiring = (RetrieverWiring.new_wiring()
                    order_dao.recent_by_customer(parent_id, bound.as_of, limit))
     .build())
 
-engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
+engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))  # relativedb-engine
 result = engine.execute(ExecutionInput(
     query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
           "WHERE customers.customer_id IN :ids",
@@ -119,12 +132,11 @@ pytest -m integration         # native kernels + the real rt-j checkpoint
 pytest                        # everything
 ```
 
-Both tiers run from this directory or from the repository root. The unit tier
-still needs `librt_c` — the RelQL grammar lives once in C++ and is shared by
-the Python, Java, and Rust bindings — but it never downloads a checkpoint or
-opens a socket. The integration tier resolves `hf://stanford-star/rt-j/…`
-through the Hugging Face cache (~326 MB fp32, plus ~128 MB for the pinned
-MiniLM text encoder).
+Both tiers run from this directory or from the repository root. The unit
+tier is pure Python — no native library, no checkpoint, no network. The
+integration tier lives with the engine package (`python-engine/tests`) and
+resolves `hf://stanford-star/rt-j/…` through the Hugging Face cache (~326 MB
+fp32, plus ~128 MB for the pinned MiniLM text encoder).
 
 Set `RELATIVEDB_REQUIRE_NATIVE=1` to make a missing library or an
 unresolvable checkpoint a hard failure instead of a skip. CI sets it on the

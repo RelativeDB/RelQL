@@ -111,7 +111,7 @@ def _auc(labels: np.ndarray, scores: np.ndarray) -> float:
 
 def _evaluate(model, sampler, task_type: str, *, ctx_size: int,
               batch_size: int, max_items: int) -> dict[str, float | int]:
-    from relativedb.rt_native import RT_DEVICE_MPS
+    from relativedb_engine import RT_DEVICE_MPS
 
     labels, predictions = [], []
     n_items = min(int(sampler.num_items), max_items)
@@ -227,7 +227,7 @@ def main() -> None:
         parser.error("lr-backoff-factor must be between zero and one")
 
     from rt.checkpoints import resolve_checkpoint
-    from relativedb.rt_native import load_lib
+    from relativedb_engine import load_lib
 
     out = Path(args.output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)

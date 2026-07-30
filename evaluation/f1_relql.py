@@ -24,7 +24,8 @@ from relativedb import (ColumnDef, ContextPolicy, Engine, ExecutionInput,
                         LinkDef, ModelConfig, ReferenceTraversal,
                         RetrieverWiring, Row, Schema, TableDef, TemporalBound,
                         TaskSpec, ValueType, NormalizationMode, parse, validate)
-from relativedb.rt_native import (RT_DEVICE_MPS, ColumnStats,
+from relativedb.scoring import ColumnStats
+from relativedb_engine import (RT_DEVICE_MPS,
                                   RtNativeBackend)
 
 

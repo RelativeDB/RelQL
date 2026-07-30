@@ -15,7 +15,7 @@ class NativeReferenceAdapter:
 
     def __init__(self, checkpoint: str, library: str | None, native_device: str,
                  heads: dict[str, str] | None = None, collect: bool = False):
-        from relativedb.rt_native import (FineTunedHead, RT_DEVICE_CPU,
+        from relativedb_engine import (FineTunedHead, RT_DEVICE_CPU,
                                           RT_DEVICE_MPS, load_lib,
                                           resolve_model_path)
 

@@ -151,7 +151,8 @@ def test_context_truncation_is_an_error():
     import numpy as np
     from conftest import require_native
     require_native()
-    from relativedb.graph_native import ContextTruncated, NativeGraph
+    from relativedb.graph import ContextGraph as NativeGraph
+    from relativedb.graph import ContextTruncated
 
     n = 64
     ts = np.full(n, np.nan)

@@ -278,11 +278,13 @@ def test_ranking_over_non_fk_column_rejected(churn_schema, churn_wiring):
     foreign-key column that names a parent table; ``orders.qty`` is an ordinary
     feature column, so ranking over it is a clear error. (Raised before the
     checkpoint is loaded, so this runs offline.)"""
-    from relativedb.rt_native import RtNativeBackend, RtNativeError
+    from conftest import StubScorer
+    from relativedb.scoring import ScoringError, SequenceBackend
     eng = Engine(churn_schema, churn_wiring,
-                 model_backend=RtNativeBackend(schema=churn_schema,
+                 model_backend=SequenceBackend(StubScorer(),
+                                               schema=churn_schema,
                                                wiring=churn_wiring))
-    with pytest.raises(RtNativeError, match="foreign-key"):
+    with pytest.raises(ScoringError, match="foreign-key"):
         eng.execute(ExecutionInput(
             query="PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING RANK TOP 5) FROM customers WHERE customers.customer_id IN :ids",
             params={"ids": ['C7']}, anchor_time=T0))

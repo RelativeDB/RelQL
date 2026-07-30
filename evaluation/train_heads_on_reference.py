@@ -32,7 +32,7 @@ def main() -> None:
     args = parser.parse_args()
 
     from relativedb import TaskType
-    from relativedb.rt_native import RtNativeBackend
+    from relativedb_engine import RtNativeBackend
     from rt.eval_utils import build_evaluator
     from rt.tasks import eval_tasks
 

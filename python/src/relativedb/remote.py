@@ -1,15 +1,33 @@
-"""Remote scoring: a :class:`~relativedb.engine.ModelBackend` over HTTP.
+"""Remote scoring: a :class:`~relativedb.scoring.Scorer` over HTTP.
 
-The engine assembles contexts locally — retrievers stay next to the data — and
-ships only the assembled context to a service that holds the checkpoint. That
-keeps model weights, the native library, and the GPU in one process while any
-number of query processes stay light.
-
-The wire format is the same JSON shape :meth:`relativedb.retrieve.Row.to_json_dict`
-already defines for the C ABI, so a row costs nothing extra to serialize.
+Context creation — retrieval, assembly, token sequence building,
+normalization — happens entirely in this (pure Python) package, next to the
+data. What crosses the wire is the prepared token batch with text cells still
+as RAW STRINGS, plus the query text and scoring metadata; the service (the
+C++ ``rt_serve`` backend, or anything speaking the same protocol) embeds the
+strings with the pinned MiniLM encoder it carries and runs the transformer
+forward. Model weights, the text encoder, and the GPU live in one process
+while any number of query processes stay light — and no embedding model ever
+runs client-side.
 
     backend = RemoteBackend("http://localhost:8500", schema=schema)
     engine = Engine(schema, wiring, model_backend=backend)
+
+Endpoints (JSON over HTTP):
+
+``POST /v1/forward``
+    ``{"model_uri", "output", "query", "task_type", "batch": {...}}`` ->
+    ``{"scores": [...]}"`` / ``{"scores": [[...]]}`` (token_scores) /
+    ``+ "target_text": [[384]]`` / ``{"features": [[512]]}``.
+    ``batch`` is the :class:`~relativedb.scoring.TokenBatch` encoding below;
+    ``query``/``task_type`` ride along for validation and logging only — the
+    service never parses RelQL.
+
+``POST /v1/embed``
+    ``{"texts": [...], "normalize": bool}`` -> ``{"embeddings": [[384]...]}``
+    (used for multiclass class-label embeddings).
+
+``GET /health`` -> ``{"status": "ok", ...}``
 
 Errors from the service are raised as :class:`RemoteScoringError`; the caller
 sees the same failure surface as a local backend that could not score.
@@ -17,20 +35,22 @@ sees the same failure surface as a local backend that could not score.
 from __future__ import annotations
 
 import json
+import os
+import struct
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional, Sequence
 
-from .engine import EntityContext, EntityPrediction
-from .model import ModelConfig
+import numpy as np
+
 from .relql import ParsedQuery, TaskType
+from .retrieve import RetrieverWiring
 from .schema import Schema
+from .scoring import (MAX_F2P, D_MODEL, D_TEXT, ForwardResult,
+                      SequenceBackend, TokenBatch)
 
-if TYPE_CHECKING:  # pragma: no cover
-    pass
-
-__all__ = ["RemoteBackend", "RemoteScoringError", "encode_contexts",
-           "decode_contexts", "encode_schema", "decode_schema"]
+__all__ = ["RemoteBackend", "RemoteScorer", "RemoteScoringError",
+           "encode_batch", "decode_batch"]
 
 
 class RemoteScoringError(RuntimeError):
@@ -41,204 +61,212 @@ class RemoteScoringError(RuntimeError):
 # wire encoding
 # ---------------------------------------------------------------------------
 
-def encode_schema(schema: Schema) -> dict:
+def encode_batch(batch: TokenBatch) -> dict:
+    """:class:`TokenBatch` -> JSON-able dict.
+
+    Integer channels ship as nested lists; the two float channels are already
+    bfloat16-rounded, so the JSON float round-trip is exact (every bf16 value
+    is a short decimal). Text is the deduplicated string tables plus per-token
+    indices — never embeddings.
+    """
     return {
-        "tables": [{
-            "name": t.name,
-            "primary_key": t.primary_key,
-            "time_column": t.time_column,
-            "columns": [{"name": c.name, "type": c.type.value} for c in t.columns],
-        } for t in schema.tables],
-        "links": [{
-            "from_table": l.from_table, "fk_column": l.fk_column,
-            "to_table": l.to_table,
-            "feature_type": l.feature_type.value if l.feature_type else None,
-        } for l in schema.links],
+        "b": batch.b, "s": batch.s,
+        "node_idxs": batch.node_idxs.tolist(),
+        "f2p": batch.f2p.tolist(),
+        "col_idxs": batch.col_idxs.tolist(),
+        "table_idxs": batch.table_idxs.tolist(),
+        "is_padding": batch.is_padding.tolist(),
+        "sem_types": batch.sem_types.tolist(),
+        "is_target": batch.is_target.tolist(),
+        "number_v": batch.number_v.tolist(),
+        "datetime_v": batch.datetime_v.tolist(),
+        "col_phrases": list(batch.col_phrases),
+        "texts": list(batch.texts),
+        "text_idx": (batch.text_idx.tolist()
+                     if batch.text_idx is not None else None),
     }
 
 
-def decode_schema(d: dict) -> Schema:
-    from .schema import ColumnDef, LinkDef, TableDef, ValueType
-    tables = []
-    for t in d.get("tables", []):
-        b = TableDef.new_table(t["name"])
-        for c in t.get("columns", []):
-            b = b.column(ColumnDef(c["name"], ValueType(c["type"])))
-        if t.get("primary_key"):
-            b = b.primary_key(t["primary_key"])
-        if t.get("time_column"):
-            b = b.time_column(t["time_column"])
-        tables.append(b.build())
-    links = [LinkDef(l["from_table"], l["fk_column"], l["to_table"],
-                     ValueType(l["feature_type"]) if l.get("feature_type") else None)
-             for l in d.get("links", [])]
-    return Schema(tables=tuple(tables), links=tuple(links))
+def encode_batch_bin(batch: TokenBatch, header_extra: dict) -> bytes:
+    """:class:`TokenBatch` -> the ``/v2/forward`` binary wire.
 
-
-def _encode_row(row) -> dict:
-    """``Row.to_json_dict`` plus the cell keys that were datetimes.
-
-    ``to_json_dict`` renders datetime cells as ISO strings and
-    ``from_json_dict`` leaves them as strings, so a naive round trip silently
-    retypes temporal features as text. The C ABI never round-trips, so it does
-    not notice; this transport does. Carrying the key list keeps the decode
-    exact without guessing which strings look like timestamps.
+    Layout: ``u32le header_len | header JSON | raw little-endian arrays`` in
+    the fixed order serve.cpp's ``decode_forward_bin`` documents. Index
+    channels ride as int32 (their values are context-local node ids and tiny
+    vocabularies); floats are the already-bf16-rounded fp32 channels, so the
+    raw bytes are bit-exact — no text float round-trip at all.
     """
-    from datetime import date, datetime
-    d = row.to_json_dict()
-    dt_cells = [k for k, v in row.cells.items() if isinstance(v, (datetime, date))]
-    if dt_cells:
-        d["dt_cells"] = dt_cells
-    return d
+    header = dict(header_extra)
+    header.update({"b": batch.b, "s": batch.s,
+                   "col_phrases": list(batch.col_phrases),
+                   "texts": list(batch.texts),
+                   "has_text_idx": batch.text_idx is not None})
+    hb = json.dumps(header, default=_json_default).encode()
+    arrays = [
+        batch.node_idxs.astype("<i4", copy=False),
+        batch.f2p.astype("<i4", copy=False),
+        batch.col_idxs.astype("<i4", copy=False),
+        batch.table_idxs.astype("<i4", copy=False),
+        batch.is_padding.astype(np.uint8, copy=False),
+        batch.sem_types.astype(np.uint8, copy=False),
+        batch.is_target.astype(np.uint8, copy=False),
+        batch.number_v.astype("<f4", copy=False),
+        batch.datetime_v.astype("<f4", copy=False),
+    ]
+    if batch.text_idx is not None:
+        arrays.append(batch.text_idx.astype("<i4", copy=False))
+    return b"".join([struct.pack("<I", len(hb)), hb,
+                     *(a.tobytes() for a in arrays)])
 
 
-def _decode_row(d: dict):
-    from datetime import datetime
-
-    from .retrieve import Row
-    row = Row.from_json_dict(d)
-    keys = d.get("dt_cells")
-    if not keys:
-        return row
-    cells = dict(row.cells)
-    for k in keys:
-        v = cells.get(k)
-        if isinstance(v, str):
-            try:
-                cells[k] = datetime.fromisoformat(v)
-            except ValueError:
-                pass
-    return Row(table=row.table, id=row.id, cells=cells,
-               timestamp=row.timestamp, parents=dict(row.parents))
+def decode_forward_bin(payload: bytes) -> tuple[dict, np.ndarray,
+                                                Optional[np.ndarray]]:
+    """``/v2/forward`` response -> (header, scores, target_text_or_None)."""
+    if len(payload) < 4:
+        raise RemoteScoringError("binary response too short")
+    (hlen,) = struct.unpack_from("<I", payload)
+    header = json.loads(payload[4:4 + hlen].decode())
+    raw = np.frombuffer(payload, np.float32, offset=4 + hlen)
+    b = int(header["b"])
+    output = header.get("output", "target_scores")
+    if output == "target_scores_and_text":
+        scores, text = raw[:b], raw[b:].reshape(b, D_TEXT)
+        return header, scores, text
+    return header, raw, None
 
 
-def encode_contexts(contexts: list[EntityContext]) -> list[dict]:
-    out = []
-    for c in contexts:
-        out.append({
-            "entity_id": c.entity_id,
-            "anchor": c.anchor.isoformat() if c.anchor else None,
-            "rows": [_encode_row(r) for r in c.rows],
-            "truncated_children": c.truncated_children,
-            "hit_cell_budget": c.hit_cell_budget,
-            "focal_row_keys": [[t, i] for (t, i) in c.focal_row_keys],
-            "node_ids": [[[t, i], n] for (t, i), n in c.node_ids.items()],
-        })
-    return out
-
-
-def decode_contexts(payload: list[dict]) -> list[EntityContext]:
-    from datetime import datetime
-    out = []
-    for d in payload:
-        anchor = d.get("anchor")
-        ctx = EntityContext(
-            entity_id=d["entity_id"],
-            anchor=datetime.fromisoformat(anchor) if anchor else None,
-            rows=[_decode_row(r) for r in d.get("rows", [])],
-            truncated_children=int(d.get("truncated_children") or 0),
-            hit_cell_budget=bool(d.get("hit_cell_budget")),
-            focal_row_keys=frozenset((t, i) for t, i in d.get("focal_row_keys", [])),
-            node_ids={(t, i): n for (t, i), n in
-                      ((tuple(k), v) for k, v in d.get("node_ids", []))},
-        )
-        out.append(ctx)
-    return out
-
-
-def encode_predictions(preds: list[EntityPrediction]) -> list[dict]:
-    return [{
-        "id": p.id, "value": p.value, "probability": p.probability,
-        "class_probs": dict(p.class_probs), "ranked": list(p.ranked),
-        "forecast": list(p.forecast), "predicted_class": p.predicted_class,
-    } for p in preds]
-
-
-def decode_predictions(payload: list[dict]) -> list[EntityPrediction]:
-    return [EntityPrediction(
-        id=p["id"], value=p.get("value"), probability=p.get("probability"),
-        class_probs=dict(p.get("class_probs") or {}),
-        ranked=tuple(tuple(x) if isinstance(x, list) else x
-                     for x in (p.get("ranked") or ())),
-        forecast=tuple(p.get("forecast") or ()),
-        predicted_class=p.get("predicted_class"),
-    ) for p in payload]
-
-
-def encode_config(config: ModelConfig) -> dict:
-    mode = config.normalization_mode
-    return {
-        "classification_model_uri": config.classification_model_uri,
-        "regression_model_uri": config.regression_model_uri,
-        "embedding_model": config.embedding_model,
-        "allow_embedding_mismatch": config.allow_embedding_mismatch,
-        "normalization_mode": getattr(mode, "value", str(mode)),
-    }
-
-
-def decode_config(d: dict) -> ModelConfig:
-    return ModelConfig(
-        classification_model_uri=d.get(
-            "classification_model_uri", ModelConfig.defaults().classification_model_uri),
-        regression_model_uri=d.get(
-            "regression_model_uri", ModelConfig.defaults().regression_model_uri),
-        embedding_model=d.get("embedding_model",
-                              ModelConfig.defaults().embedding_model),
-        allow_embedding_mismatch=bool(d.get("allow_embedding_mismatch", False)),
-        normalization_mode=d.get("normalization_mode", "zero_shot"),
-    )
+def decode_batch(d: dict) -> TokenBatch:
+    b, s = int(d["b"]), int(d["s"])
+    def arr(key, dtype, shape):
+        return np.asarray(d[key], dtype=dtype).reshape(shape)
+    text_idx = d.get("text_idx")
+    return TokenBatch(
+        node_idxs=arr("node_idxs", np.int64, (b, s)),
+        f2p=arr("f2p", np.int64, (b, s, MAX_F2P)),
+        col_idxs=arr("col_idxs", np.int64, (b, s)),
+        table_idxs=arr("table_idxs", np.int64, (b, s)),
+        is_padding=arr("is_padding", np.uint8, (b, s)),
+        sem_types=arr("sem_types", np.int64, (b, s)),
+        is_target=arr("is_target", np.uint8, (b, s)),
+        number_v=arr("number_v", np.float32, (b, s)),
+        datetime_v=arr("datetime_v", np.float32, (b, s)),
+        col_phrases=list(d.get("col_phrases") or []),
+        texts=list(d.get("texts") or []),
+        text_idx=(None if text_idx is None
+                  else np.asarray(text_idx, np.int32).reshape(b, s)))
 
 
 # ---------------------------------------------------------------------------
-# the backend
+# the scorer + backend
 # ---------------------------------------------------------------------------
 
-class RemoteBackend:
-    """Scores assembled contexts through an HTTP inference service.
+class RemoteScorer:
+    """Ships token batches to an inference service and text to its embedder.
 
-    ``schema`` is sent with each request so the service can validate the query
-    the same way the local engine did; pass the schema the engine was built
-    with. ``session`` lets a service cache its loaded checkpoint and any
-    schema-derived state across calls for one project.
+    ``session`` lets a service cache its loaded checkpoint and any derived
+    state across calls for one project. ``context`` metadata (the query text
+    and task type) is attached per forward by :class:`RemoteBackend` for
+    validation/observability on the service side.
     """
 
-    def __init__(self, url: str, *, schema: Optional[Schema] = None,
-                 session: Optional[str] = None, timeout: float = 120.0,
+    def __init__(self, url: str, *, session: Optional[str] = None,
+                 timeout: float = 120.0,
                  headers: Optional[dict[str, str]] = None):
         self.url = url.rstrip("/")
-        self.schema = schema
         self.session = session
         self.timeout = timeout
         self.headers = dict(headers or {})
+        # "binary" ships /v2/forward's raw-array wire (bit-exact floats, no
+        # tolist/parse cost); RELATIVEDB_WIRE=json forces the JSON wire, and
+        # a 404 from an older service downgrades automatically.
+        self._wire = os.environ.get("RELATIVEDB_WIRE", "binary")
         self.last_stats: dict[str, Any] = {}
+        # Attached by RemoteBackend around each score() call; None outside.
+        self._query_meta: Optional[dict] = None
+        # Class-label embeddings are tiny and stable; cache per (text, norm).
+        self._embed_cache: dict[tuple[str, bool], np.ndarray] = {}
 
     def health(self) -> dict:
         return self._get("/health")
 
-    def score(self, query: ParsedQuery, task_type: TaskType,
-              contexts: list[EntityContext], model_uri: str,
-              config: ModelConfig) -> list[EntityPrediction]:
-        if not contexts:
-            return []
-        body = {
-            "query": query.text,
-            "task_type": task_type.value if hasattr(task_type, "value") else str(task_type),
-            "model_uri": model_uri,
-            "config": encode_config(config),
-            "contexts": encode_contexts(contexts),
-        }
-        if self.schema is not None:
-            body["schema"] = encode_schema(self.schema)
+    # -- Scorer protocol ----------------------------------------------------
+    def forward(self, batch: TokenBatch, *, model_uri: str,
+                output: str = "target_scores") -> ForwardResult:
+        meta: dict[str, Any] = {"model_uri": model_uri, "output": output}
+        if self._query_meta:
+            meta.update(self._query_meta)
         if self.session:
-            body["session"] = self.session
-        out = self._post("/score", body)
-        preds = decode_predictions(out.get("predictions") or [])
-        self.last_stats = {k: v for k, v in out.items() if k != "predictions"}
-        if len(preds) != len(contexts):
-            raise RemoteScoringError(
-                f"scoring service returned {len(preds)} predictions for "
-                f"{len(contexts)} contexts")
-        return preds
+            meta["session"] = self.session
+        if self._wire == "binary":
+            try:
+                payload = self._post_raw("/v2/forward",
+                                         encode_batch_bin(batch, meta))
+            except RemoteScoringError as e:
+                if "404" not in str(e):
+                    raise
+                # older service without /v2: fall back to JSON for good
+                self._wire = "json"
+            else:
+                header, scores, target_text = decode_forward_bin(payload)
+                self.last_stats = {k: v for k, v in header.items()
+                                   if k not in ("b", "s", "output")}
+                if output == "target_features":
+                    return ForwardResult(
+                        features=scores.reshape(batch.b, D_MODEL).copy())
+                if output == "token_scores":
+                    scores = scores.reshape(batch.b, batch.s)
+                else:
+                    scores = scores.reshape(batch.b)
+                return ForwardResult(
+                    scores=scores.copy(),
+                    target_text=(None if target_text is None
+                                 else target_text.copy()))
+        body = dict(meta)
+        body["batch"] = encode_batch(batch)
+        out = self._post("/v1/forward", body)
+        self.last_stats = {k: v for k, v in out.items()
+                           if k not in ("scores", "target_text", "features")}
+        if output == "target_features":
+            feats = out.get("features")
+            if feats is None:
+                raise RemoteScoringError(
+                    "service returned no 'features' for target_features")
+            return ForwardResult(features=np.asarray(feats, np.float32))
+        scores = out.get("scores")
+        if scores is None:
+            raise RemoteScoringError("service returned no 'scores'")
+        scores = np.asarray(scores, np.float32)
+        if output == "token_scores":
+            scores = scores.reshape(batch.b, batch.s)
+        else:
+            scores = scores.reshape(batch.b)
+        target_text = None
+        if output == "target_scores_and_text":
+            tt = out.get("target_text")
+            if tt is None:
+                raise RemoteScoringError(
+                    "service returned no 'target_text' for "
+                    "target_scores_and_text")
+            target_text = np.asarray(tt, np.float32).reshape(batch.b, D_TEXT)
+        return ForwardResult(scores=scores, target_text=target_text)
+
+    def embed(self, texts: Sequence[str], *,
+              normalize: bool = False) -> np.ndarray:
+        texts = list(texts)
+        missing = [t for t in dict.fromkeys(texts)
+                   if (t, normalize) not in self._embed_cache]
+        if missing:
+            out = self._post("/v1/embed",
+                             {"texts": missing, "normalize": bool(normalize)})
+            embs = out.get("embeddings")
+            if embs is None or len(embs) != len(missing):
+                raise RemoteScoringError(
+                    f"service returned {0 if embs is None else len(embs)} "
+                    f"embeddings for {len(missing)} texts")
+            for t, e in zip(missing, embs):
+                self._embed_cache[(t, normalize)] = np.asarray(e, np.float32)
+        return np.stack([self._embed_cache[(t, normalize)] for t in texts]) \
+            if texts else np.zeros((0, D_TEXT), np.float32)
 
     # -- transport --------------------------------------------------------
     def _post(self, path: str, body: dict) -> dict:
@@ -247,6 +275,23 @@ class RemoteBackend:
             self.url + path, data=data, method="POST",
             headers={"Content-Type": "application/json", **self.headers})
         return self._send(req)
+
+    def _post_raw(self, path: str, data: bytes) -> bytes:
+        req = urllib.request.Request(
+            self.url + path, data=data, method="POST",
+            headers={"Content-Type": "application/octet-stream",
+                     **self.headers})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:2000]
+            raise RemoteScoringError(
+                f"inference service {e.code}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RemoteScoringError(
+                f"inference service unreachable at {self.url}: "
+                f"{e.reason}") from e
 
     def _get(self, path: str) -> dict:
         req = urllib.request.Request(self.url + path, method="GET",
@@ -267,6 +312,49 @@ class RemoteBackend:
         except json.JSONDecodeError as e:
             raise RemoteScoringError(
                 f"inference service returned a non-JSON body: {e}") from e
+
+
+class RemoteBackend(SequenceBackend):
+    """The cloud-backend :class:`~relativedb.engine.ModelBackend`: sequence
+    assembly here, embeddings and the transformer forward on the service.
+
+    Accepts the same assembly options as any :class:`SequenceBackend`; the
+    query text and task type are attached to each forward so the service can
+    validate and log without ever parsing RelQL itself.
+    """
+
+    def __init__(self, url: str, *, schema: Optional[Schema] = None,
+                 wiring: Optional[RetrieverWiring] = None,
+                 session: Optional[str] = None, timeout: float = 120.0,
+                 headers: Optional[dict[str, str]] = None,
+                 **assembly_options):
+        scorer = RemoteScorer(url, session=session, timeout=timeout,
+                              headers=headers)
+        super().__init__(scorer, schema=schema, wiring=wiring,
+                         **assembly_options)
+
+    @property
+    def url(self) -> str:
+        return self.scorer.url
+
+    @property
+    def last_stats(self) -> dict:
+        return self.scorer.last_stats
+
+    def health(self) -> dict:
+        return self.scorer.health()
+
+    def score(self, query: ParsedQuery, task_type: TaskType, contexts,
+              model_uri: str, config) -> list:
+        self.scorer._query_meta = {
+            "query": query.text,
+            "task_type": (task_type.value if hasattr(task_type, "value")
+                          else str(task_type)),
+        }
+        try:
+            return super().score(query, task_type, contexts, model_uri, config)
+        finally:
+            self.scorer._query_meta = None
 
 
 def _json_default(o):

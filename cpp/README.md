@@ -1,23 +1,34 @@
-# rt.cpp — shared native layer (inference + parser + CSC)
+# rt.cpp — the native model layer (inference + embedding + serving)
 
 A dependency-light C++20 implementation of **RT-J** (the Stanford Relational
 Transformer successor, `stanford-star/rt-j`), verified bit-for-practical
 against the PyTorch reference. ~700 lines, no torch, no Python at inference.
 
-`librt_c` is the single shared backend for every language binding. Beyond
-inference it now also hosts two components that were previously reimplemented
-per language, so the bindings can delegate instead of diverging:
+The native layer is **model-serving only**: query parsing, planning, CSC
+adjacency and context assembly all live in the pure-Python `relativedb`
+package now (ported and pinned by the same corpus/fingerprint tests that used
+to prove cross-language equivalence). What ships here:
 
-- **RelQL parser** (`src/relql.{hpp,cpp}`, C ABI `relql_parse` in `src/relql_c.h`) —
-  hand-written lexer + recursive-descent parser producing a JSON AST. Implements
-  the v2 grammar (`OVER (...)`/`WINDOW` frames, `HORIZONS`, `AS OF`, `RETURN`,
-  `EXPLAIN`, `EXISTS`; see `RelQL_EVOLUTION.md`). Test: `./build/relql_test`. Python
-  binding: `relativedb.relql.native`; cross-language equivalence:
-  `python/tests/test_native_parser.py`.
-- **CSC index** (`src/csc.{hpp,cpp}`, C ABI `csc_build`/`csc_children`/`csc_free`
-  in `src/csc_c.h`) — lex-sorted adjacency + binary-searched "latest ≤ anchor"
-  children. Test: `./build/csc_test`. Python binding: `relativedb.csc_native`;
-  equivalence: `python/tests/test_native_csc.py`.
+- **RT-J inference + training** (`src/rt.*`, `src/rt_train.*`, C ABI
+  `src/rt_c.h`) — the transformer forward on CPU/Metal/CUDA, task-head
+  fitting, and full-checkpoint fine-tuning.
+- **Native MiniLM text encoder** (`src/minilm.*`, C ABI `src/minilm_c.h`,
+  compiled into `librt_c`) — the pinned `all-MiniLM-L12-v2` pipeline
+  (WordPiece + BERT-12 + mean pooling + L2 norm), golden-verified against
+  sentence-transformers (40-text corpus: exact token ids, max |Δ| 3e-7).
+  Text embedding runs HERE, never in Python: the encoder belongs with the
+  checkpoint. Test: `./build/minilm_test` (self-skips without a snapshot;
+  regenerate goldens with `tools/dump_minilm_golden.py`).
+- **Flat-feature evaluator** (`src/flat.*`, C ABI `src/flat_c.h`) — fills the
+  XGBoost feature matrix from the spec JSON `relativedb.flat` derives; no
+  RelQL text reaches this layer. Test: `./build/flat_test`.
+- **`rt_serve`** (`src/serve.cpp`) — the model-serving web backend: plain
+  HTTP/1.1 over POSIX sockets. `GET /health`, `POST /v1/embed`,
+  `POST /v1/forward` (prepared token batches with raw text; this process
+  embeds and runs the forward), `POST /v1/flat_features`.
+  `rt_serve --port 8500 --device auto [--preload hf://stanford-star/rt-j/classification]`;
+  `relativedb.remote.RemoteBackend` is the reference client, and its
+  predictions match the in-process backend bit-for-bit.
 
 Build all: `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4`.
 
@@ -259,8 +270,8 @@ a second:
 
 | test | what it covers |
 | --- | --- |
-| `csc` | randomized CSC adjacency batteries, fixed seeds (~22.5k assertions) |
-| `relql` | parses the 67-query corpus in `python/tests/data/examples.relql` and rejects 22 malformed queries |
+| `flat` | the flat-feature evaluator over a hand-written spec: windows, filters, categorical hashing, recency, the C ABI's error surface |
+| `minilm` | native MiniLM conformance: exact HF token ids + embedding parity vs sentence-transformers goldens (self-skips without a snapshot) |
 | `train` | head fine-tuning: zero-shot reparameterization everywhere, plus multiclass/ranking/checkpoint round-trip on Metal. Self-skips the Metal sections with exit 0 when no MPS device is present. |
 
 `rt_golden` (the PyTorch-parity forward-pass test) is registered but **DISABLED

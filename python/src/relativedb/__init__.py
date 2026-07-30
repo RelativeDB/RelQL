@@ -24,20 +24,32 @@ from .engine import (AssumptionNotAppliedWarning,
                      ExplainResult, InvisibleTableWarning, ModelBackend,
                      PredictionResult, SamplerMode)
 from .csc import CscIndex
-from .remote import RemoteBackend, RemoteScoringError
+from .scoring import (ColumnStats, ContextConnectivityWarning, ForwardResult,
+                      Scorer, ScoringError, SequenceBackend, TokenBatch)
+from .remote import RemoteBackend, RemoteScorer, RemoteScoringError
+
+# The native engine moved to the optional relativedb-engine package. These
+# names keep resolving from `relativedb` so existing imports fail with an
+# actionable message instead of an AttributeError.
+_ENGINE_EXPORTS = ("RtNativeBackend", "RtNativeUnavailableError",
+                   "TextEmbedder", "FineTunedHead", "FineTunedCheckpoint",
+                   "XgboostBackend", "XgboostUnavailableError", "fit_xgboost")
 
 
 def __getattr__(name):
-    """Lazy exports with optional runtime deps (librt_c, MiniLM encoder)."""
-    if name in ("RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
-                "ContextConnectivityWarning", "FineTunedHead",
-                "FineTunedCheckpoint", "ColumnStats"):
-        from . import rt_native
-        return getattr(rt_native, name)
-    if name in ("XgboostBackend", "XgboostUnavailableError", "FlatAnalysis",
-                "analyze_flat", "fit_xgboost"):
-        from . import xgb
-        return getattr(xgb, name)
+    """Lazy exports that live in the optional native engine package."""
+    if name in _ENGINE_EXPORTS:
+        try:
+            import relativedb_engine
+        except ImportError as e:
+            raise ImportError(
+                f"relativedb.{name} requires the optional native engine: "
+                f"pip install relativedb-engine — or score through a cloud "
+                f"backend with Engine(model_backend=\"https://...\")") from e
+        return getattr(relativedb_engine, name)
+    if name in ("FlatAnalysis", "analyze_flat"):
+        from . import flat
+        return getattr(flat, name)
     raise AttributeError(f"module 'relativedb' has no attribute {name!r}")
 
 
@@ -62,10 +74,11 @@ __all__ = [
     "SamplerMode", "PredictionResult", "ExplainResult",
     "EntityPrediction", "EntityContext",
     "ModelBackend", "CscIndex",
-    "RemoteBackend", "RemoteScoringError",
+    "RemoteBackend", "RemoteScorer", "RemoteScoringError",
+    "SequenceBackend", "Scorer", "TokenBatch", "ForwardResult",
+    "ScoringError", "ContextConnectivityWarning", "ColumnStats",
     "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
-    "ContextConnectivityWarning", "ColumnStats", "FineTunedHead",
-    "FineTunedCheckpoint",
+    "FineTunedHead", "FineTunedCheckpoint",
     "XgboostBackend", "XgboostUnavailableError", "FlatAnalysis",
     "analyze_flat", "fit_xgboost",
 ]

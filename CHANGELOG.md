@@ -9,7 +9,40 @@ between minor versions.
 
 ## [Unreleased]
 
+### Changed
+- **The engine is optional; the Python package is pure.** The distribution
+  split in two: `relativedb` (pure Python + numpy — RelQL parsing,
+  validation, planning, CSC adjacency, the reference walk sampler, the
+  array-backed context assembler, token-batch building, and the remote
+  scoring client) and `relativedb-engine` (librt_c behind the same scorer
+  protocol, plus task-head fitting, full fine-tuning, and the XGBoost
+  backend as its `[xgboost]` extra). Install `relativedb[engine]` for the
+  old all-local behavior, or point the engine at a cloud backend instead:
+  `Engine(schema, wiring, model_backend="https://scoring.example.com")`.
+- **All query parsing and context creation moved out of C++.** The RelQL
+  parser, semantic pass, CSC index, walk primitives and graph assembler were
+  ported to Python (67/67 corpus ASTs identical to the removed parser;
+  randomized CSC/assembler batteries agreed with the removed native
+  implementations before deletion) and their C++ sources deleted. The
+  peer-ranking walk was then vectorized over walks on a raw PCG64 stream —
+  still deterministic per seed, no longer the reference rand-0.9.1 byte
+  stream — so context sampling changed once; the committed fingerprints pin
+  the new sampler, and the row and columnar paths share one draw protocol. The native
+  layer is model-serving only. The flat-feature evaluator stays native but
+  now consumes a feature-spec JSON derived by the new pure-Python
+  `relativedb.flat` — RelQL text never reaches C++.
+- **Text embedding is native-only.** `librt_c` gains a golden-verified
+  MiniLM-L12-v2 encoder (`cpp/src/minilm.*`; exact HF token ids, max |Δ|
+  3e-7 vs sentence-transformers over a 40-text corpus). The Python packages
+  no longer depend on sentence-transformers or torch; the engine package and
+  the serving backend embed through the same native encoder.
+
 ### Added
+- **`rt_serve`, the model-serving web backend** (`cpp/src/serve.cpp`): plain
+  HTTP/1.1 over the prepared-token-batch protocol (`/health`, `/v1/embed`,
+  `/v1/forward`, `/v1/flat_features`). Context creation stays client-side;
+  the service embeds raw text and runs the forward. `RemoteBackend`
+  predictions match the in-process backend bit-for-bit.
 - **XGBoost flat-feature backend.** The C++ layer gains a flat-feature
   planner/evaluator (`cpp/src/flat.*`, exposed as `relql_flat_analyze` /
   `relql_flat_features` in `librt_c`): it decides whether a RelQL query can

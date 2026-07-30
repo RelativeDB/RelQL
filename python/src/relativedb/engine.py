@@ -757,7 +757,7 @@ class ExplainResult:
 
 class ModelBackend(Protocol):
     """Anything that can score assembled contexts. The real backend
-    (:class:`~relativedb.rt_native.RtNativeBackend`) loads the checkpoint at
+    (:class:`~relativedb_engine.RtNativeBackend`) loads the checkpoint at
     ``model_uri`` (routed by task type); engine tests use a tiny deterministic
     test double. There is no built-in model-free scorer."""
 
@@ -852,12 +852,18 @@ def _newest_first_key(r: Row):
 class Engine:
     def __init__(self, schema: Schema, wiring: RetrieverWiring, *,
                  model_config: Optional[ModelConfig] = None,
-                 model_backend: Optional[ModelBackend] = None,
+                 model_backend: Optional[Union[ModelBackend, str]] = None,
                  context_policy: Optional[ContextPolicy] = None,
                  sampler_mode: SamplerMode = SamplerMode.RETRIEVER,
                  traversal: Optional[GraphTraversal] = None):
         self.schema = schema
         self.wiring = wiring
+        if isinstance(model_backend, str):
+            # A URL is the cloud backend: sequence assembly stays here,
+            # embeddings + the forward run on the service (see .remote).
+            from .remote import RemoteBackend
+            model_backend = RemoteBackend(model_backend, schema=schema,
+                                          wiring=wiring)
         _warn_invisible_tables(schema)
         self.model_config = model_config or ModelConfig.defaults()
         self.model_backend: Optional[ModelBackend] = model_backend
@@ -1060,7 +1066,15 @@ class Engine:
                 "native RT backend")
         seed = ids[0]
         anchor = self._anchor_for(entity_table, seed, input)
-        ctx = self.assemble_context(entity_table, seed, anchor, query=pq)
+        # Chunk sizing just assembled this exact context (the first chunk's
+        # seed is the group's seed); consume it instead of assembling twice.
+        memo = getattr(self, "_seed_ctx_memo", None)
+        if memo is not None and memo[0] == (entity_table, seed, anchor,
+                                            id(pq)):
+            ctx = memo[1]
+            self._seed_ctx_memo = None
+        else:
+            ctx = self.assemble_context(entity_table, seed, anchor, query=pq)
         task_spec = backend.task_spec(pq, task_type)
         got = self.traversal.cohort_targets(
             entity_table, list(ids), anchor, task_spec,
@@ -1105,9 +1119,15 @@ class Engine:
 
     def _shared_anchor_groups(self, pq: ParsedQuery, input: ExecutionInput,
                               entity_table: str, ids: list[Any],
-                              backend) -> list[list[Any]]:
-        """Split a cohort into groups whose anchors are exactly equal, then
-        into chunks whose injected block fits the context.
+                              backend):
+        """Yield cohort chunks: ids grouped by exactly-equal anchor, then
+        split so each chunk's injected block fits the context.
+
+        This is a GENERATOR on purpose: chunk sizing assembles the group
+        seed's context and parks it in ``_seed_ctx_memo`` for the first
+        chunk's ``_prepare_shared`` to pop, so sizing must interleave with
+        preparation — a materialized list would run every sizing first and
+        the memo would only survive for the last group.
 
         With a shared anchor there is one anchor group. With per-entity
         anchors, entities whose anchors compare equal — e.g. every row of
@@ -1130,13 +1150,11 @@ class Engine:
                 by_anchor.setdefault(
                     self._anchor_for(entity_table, eid, input), []).append(eid)
             groups = list(by_anchor.values())
-        out: list[list[Any]] = []
         for group in groups:
             limit = self._cohort_chunk_limit(pq, input, entity_table, group,
                                              backend)
-            out.extend(group[i:i + limit]
-                       for i in range(0, len(group), limit))
-        return out
+            for i in range(0, len(group), limit):
+                yield group[i:i + limit]
 
     def _cohort_chunk_limit(self, pq: ParsedQuery, input: ExecutionInput,
                             entity_table: str, group: list[Any],
@@ -1152,9 +1170,13 @@ class Engine:
         try:
             seed = group[0]
             anchor = self._anchor_for(entity_table, seed, input)
-            # Warms the traversal's shared state for this anchor; chunk 1
-            # reuses the same cached build.
-            self.assemble_context(entity_table, seed, anchor, query=pq)
+            # Warms the traversal's shared state for this anchor. The first
+            # chunk's seed is this same entity, so park the assembled context
+            # for _prepare_shared to pop — assembly was measured at half the
+            # client-side cost of a cohort, and this halves it back.
+            ctx = self.assemble_context(entity_table, seed, anchor, query=pq)
+            self._seed_ctx_memo = (
+                (entity_table, seed, anchor, id(pq)), ctx)
             task_spec = backend.task_spec(pq, pq.task_type(self.schema))
             got = self.traversal.cohort_targets(
                 entity_table, list(group), anchor, task_spec,
@@ -1193,8 +1215,9 @@ class Engine:
                 continue
             if tag == "fallback":
                 return None
-            yhat = payload["model"].forward_tokens(
-                device=backend._resolve_device(), **payload["kw"])[0]
+            yhat = backend.scorer.forward(
+                payload["batch"], model_uri=payload["model_uri"],
+                output="token_scores").scores[0]
             group_preds = backend.finish_shared(payload, yhat)
             preds.extend(group_preds)
             for key, value in group_stats.items():
@@ -1271,6 +1294,35 @@ class Engine:
             except BaseException as error:
                 feed.put(("error", error, None, None, None))
 
+        # Forwards for different cohorts are independent, so they may run
+        # concurrently: the service coalesces simultaneous requests into one
+        # GPU batch, and overlapping them hides each request's CPU phases.
+        # Serial scorers keep concurrency 1 (in-process forwards already own
+        # the whole machine); remote scorers default to 4 in flight. The
+        # semaphore bounds how many prepared payloads wait in the executor so
+        # a fast producer cannot buffer every cohort in memory.
+        conc = int(os.environ.get("RELATIVEDB_FORWARD_CONCURRENCY", "0") or 0)
+        if conc <= 0:
+            conc = 4 if hasattr(getattr(backend, "scorer", None), "url") else 1
+
+        import concurrent.futures as _futures
+        executor = (_futures.ThreadPoolExecutor(max_workers=conc)
+                    if conc > 1 else None)
+        inflight = threading.Semaphore(conc * 2)
+
+        def score_group(group_payload):
+            try:
+                yhat = backend.scorer.forward(
+                    group_payload["batch"],
+                    model_uri=group_payload["model_uri"],
+                    output="token_scores").scores[0]
+                return backend.finish_shared(group_payload, yhat)
+            finally:
+                if executor is not None:
+                    inflight.release()
+
+        # (idx, task_type, model_uri, [(future-or-preds, group_stats), ...])
+        scored: list[tuple] = []
         results: list[Optional[PredictionResult]] = [None] * len(inputs)
         serial: list[int] = []
         producer = threading.Thread(target=produce, daemon=True)
@@ -1291,14 +1343,23 @@ class Engine:
                         task_type=task_type, predictions=(),
                         model_uri=model_uri, stats={"entities_scored": 0})
                     continue
+                groups = []
+                for group_payload, group_stats in payload:
+                    if executor is not None:
+                        inflight.acquire()
+                        groups.append((executor.submit(
+                            score_group, group_payload), group_stats))
+                    else:
+                        groups.append((score_group(group_payload),
+                                       group_stats))
+                scored.append((idx, task_type, model_uri, groups))
+            for idx, task_type, model_uri, groups in scored:
                 preds: list[EntityPrediction] = []
                 merged: dict = {"entities_scored": 0,
                                 "shared_context_forwards": 0}
-                for group_payload, group_stats in payload:
-                    yhat = group_payload["model"].forward_tokens(
-                        device=backend._resolve_device(),
-                        **group_payload["kw"])[0]
-                    group_preds = backend.finish_shared(group_payload, yhat)
+                for got, group_stats in groups:
+                    group_preds = (got.result() if executor is not None
+                                   else got)
                     preds.extend(group_preds)
                     for key, value in group_stats.items():
                         if isinstance(value, (int, float)):
@@ -1309,6 +1370,8 @@ class Engine:
                     model_uri=model_uri, stats=merged)
         finally:
             stop.set()
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
             while producer.is_alive():
                 try:
                     feed.get_nowait()
@@ -1592,8 +1655,14 @@ class Engine:
         path next to :meth:`fit_head` and :meth:`finetune`, for queries the
         flat-feature planner accepts. Returns the fitted
         :class:`~relativedb.xgb.XgboostBackend`; assign it to
-        ``model_backend`` to serve. See :func:`relativedb.xgb.fit_xgboost`."""
-        from . import xgb as _xgb                 # optional dependency
+        ``model_backend`` to serve. See
+        :func:`relativedb_engine.xgb.fit_xgboost`."""
+        try:                                      # optional dependency
+            from relativedb_engine import xgb as _xgb
+        except ImportError as e:
+            raise ExecutionError(
+                "fit_xgboost runs in the native engine; install the optional "
+                "packages: pip install 'relativedb-engine[xgboost]'") from e
         return _xgb.fit_xgboost(self, *args, **kwargs)
 
     def _scalar_label(self, *args, **kwargs):

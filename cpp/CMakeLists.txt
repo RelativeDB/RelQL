@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# rt_c is a SHARED library that links the rt/relql/csc STATIC libraries. On ELF
+# rt_c is a SHARED library that links the rt STATIC library. On ELF
 # targets (Linux) every object pulled into a .so must be position independent or
 # the link dies with "relocation R_X86_64_PC32 against symbol ... can not be
 # used when making a shared object". macOS is PIC by default, which is why this
@@ -102,29 +102,31 @@ if(RT_CUDA)
   set_target_properties(rt PROPERTIES CUDA_STANDARD 17)
 endif()
 
-# Shared RelQL front end: lexer + recursive-descent parser, plus the
-# schema-aware semantic pass (validation, task-type inference) that each
-# binding used to reimplement in its own language.
-add_library(relql STATIC src/relql.cpp src/schema.cpp src/analyze.cpp
-                        src/plan.cpp src/json.cpp src/flat.cpp)
-target_include_directories(relql PUBLIC src)
-target_link_libraries(relql PUBLIC rt_flags)
+# Flat-feature evaluator: fills the tree-model feature matrix from the spec
+# JSON Python derives. Query parsing, planning and context creation live in
+# the Python package now — the native layer is model-serving only.
+add_library(flat STATIC src/flat.cpp src/json.cpp)
+target_include_directories(flat PUBLIC src)
+target_link_libraries(flat PUBLIC rt_flags)
 
-# Shared CSC adjacency (time-bounded "latest <= anchor" children query).
-add_library(csc STATIC src/csc.cpp)
+# Native MiniLM-L12-v2 text encoder: the pinned embedding model ships with
+# whoever runs the transformer (this library / the serving backend), never
+# with context creation.
+# minilm reuses rt's safetensors loader (and its Accelerate link on Apple).
+add_library(minilm STATIC src/minilm.cpp)
+if(RT_CUDA)
+  target_sources(minilm PRIVATE src/minilm_cuda.cu)
+  set_target_properties(minilm PROPERTIES CUDA_STANDARD 17)
+endif()
+target_include_directories(minilm PUBLIC src)
+target_link_libraries(minilm PUBLIC rt)
+if(APPLE)
+  target_compile_definitions(minilm PRIVATE ACCELERATE_NEW_LAPACK)
+endif()
 
-# Array-backed context assembly: returns the ordered node ids a
-# context emits, so a binding materializes only those rows.
-add_library(relgraph STATIC src/graph.cpp)
-target_include_directories(relgraph PUBLIC src)
-target_include_directories(csc PUBLIC src)
-target_link_libraries(csc PUBLIC rt_flags)
-
-add_library(rt_c SHARED src/rt_c.cpp src/relql_c.cpp src/relql.cpp
-                        src/schema.cpp src/analyze.cpp src/plan.cpp src/json.cpp
+add_library(rt_c SHARED src/rt_c.cpp src/json.cpp
                         src/flat.cpp src/flat_c.cpp
-                        src/csc_c.cpp src/csc.cpp
-                        src/graph.cpp src/graph_c.cpp)
+                        src/minilm.cpp src/minilm_c.cpp)
 target_link_libraries(rt_c PRIVATE rt)
 target_include_directories(rt_c PUBLIC src)
 set_target_properties(rt_c PROPERTIES PUBLIC_HEADER src/rt_c.h)
@@ -147,27 +149,46 @@ target_link_libraries(rt_train_test rt)
 add_executable(rt_quantize src/quantize.cpp)
 target_link_libraries(rt_quantize rt)
 
-add_executable(relql_test src/test_relql.cpp)
-target_link_libraries(relql_test relql)
-
-# The semantic pass: validation + schema-aware task typing, shared by every
-# binding, so its behaviour is pinned here rather than per language.
-add_executable(analyze_test src/test_analyze.cpp)
-target_link_libraries(analyze_test relql)
-
-# Flat-feature planner/evaluator behind the XGBoost binding. flat_c.cpp is
-# compiled in directly (like csc_test) so the C ABI is exercised without the
-# engine shared library.
+# Flat-feature evaluator behind the XGBoost binding. flat_c.cpp is compiled
+# in directly so the C ABI is exercised without the engine shared library.
 add_executable(flat_test src/test_flat.cpp src/flat_c.cpp)
-target_link_libraries(flat_test relql)
+target_link_libraries(flat_test flat)
 
-# csc_c.cpp is compiled in directly (rather than linking rt_c) so the test
-# exercises the C ABI without dragging in the whole engine shared library.
-add_executable(graph_test src/test_graph.cpp)
-target_link_libraries(graph_test relgraph)
+# Native MiniLM encoder conformance (tokenizer + goldens when present).
+add_executable(minilm_test src/test_minilm.cpp src/minilm_c.cpp src/json.cpp)
+target_link_libraries(minilm_test minilm)
 
-add_executable(csc_test src/test_csc.cpp src/csc_c.cpp)
-target_link_libraries(csc_test csc)
+# The model-serving web backend: HTTP over rt + minilm + flat.
+# HTTP is libh2o (evloop flavor), fetched and built from the v2.2.6 tag —
+# the last tagged release; needs OpenSSL + zlib on the build machine
+# (brew openssl@3 on macOS, libssl-dev/zlib1g-dev on Debian).
+if(APPLE AND NOT DEFINED OPENSSL_ROOT_DIR
+   AND EXISTS /opt/homebrew/opt/openssl@3)
+  set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
+endif()
+# Frameworks last: GStreamer.framework bundles zlib + OpenSSL 1.1 headers
+# that would otherwise shadow the real OpenSSL 3 and break the h2o link.
+set(CMAKE_FIND_FRAMEWORK LAST)
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+include(FetchContent)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)   # h2o's CMakeLists predates 3.5
+FetchContent_Declare(h2o
+  GIT_REPOSITORY https://github.com/h2o/h2o.git
+  GIT_TAG v2.2.6
+  GIT_SHALLOW TRUE
+  EXCLUDE_FROM_ALL)
+FetchContent_MakeAvailable(h2o)
+
+add_executable(rt_serve src/serve.cpp src/json.cpp src/minilm_c.cpp
+                        src/flat.cpp src/flat_c.cpp)
+target_include_directories(rt_serve PRIVATE
+  ${h2o_SOURCE_DIR}/include
+  ${h2o_SOURCE_DIR}/deps/picohttpparser
+  ${h2o_SOURCE_DIR}/deps/klib)
+target_compile_definitions(rt_serve PRIVATE H2O_USE_LIBUV=0)
+target_link_libraries(rt_serve rt minilm libh2o-evloop
+                      OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
 
 # --- tests ------------------------------------------------------------------
 # Contract: `ctest --test-dir <builddir> --output-on-failure` runs the fast,
@@ -175,23 +196,18 @@ target_link_libraries(csc_test csc)
 include(CTest)
 
 if(BUILD_TESTING)
-  # Self-contained: randomized CSC adjacency batteries with fixed seeds.
-  add_test(NAME csc COMMAND csc_test)
-  add_test(NAME analyze COMMAND analyze_test)
   add_test(NAME flat COMMAND flat_test)
-  add_test(NAME graph COMMAND graph_test)
 
-  # Needs the RelQL corpus, which lives in the python package. Pass it as an
-  # absolute path so the test is independent of the working directory.
-  add_test(NAME relql COMMAND relql_test
-           "${CMAKE_CURRENT_SOURCE_DIR}/../python/tests/data/examples.relql")
+  # Tokenizer self-checks always run; the encoder golden section self-skips
+  # when no MiniLM snapshot / goldens are present.
+  add_test(NAME minilm COMMAND minilm_test)
 
   # Head fine-tuning. The zero-shot reparameterization check runs everywhere;
   # the Metal sections self-skip (exit 0, "SKIP: Metal unavailable") when no MPS
   # device is present, so this is safe on Linux CI.
   add_test(NAME train COMMAND rt_train_test)
 
-  set_tests_properties(csc relql train PROPERTIES
+  set_tests_properties(flat train PROPERTIES
                        TIMEOUT 300
                        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 

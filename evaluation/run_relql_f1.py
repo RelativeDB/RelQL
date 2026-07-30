@@ -56,9 +56,9 @@ def _gate(engine, spec, frame, context_size: int) -> dict:
         "no_future_child_or_outcome_rows": not unsafe_future_rows,
     }
     # Loading the model is lazy, while the traversal ABI is bound by
-    # relativedb.rt_native.load_lib(). Assert it directly instead of relying on
+    # relativedb_engine.load_lib(). Assert it directly instead of relying on
     # the backend's model handle.
-    from relativedb.rt_native import load_lib
+    from relativedb_engine import load_lib
     checks["native_sampler_bound"] = hasattr(
         load_lib()._lib, "rt_reference_walk_counts")
     if not all(checks.values()):

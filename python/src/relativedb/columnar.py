@@ -354,12 +354,12 @@ class ColumnarStore:
         and they seed the walk and BFS streams, so the numbering here decides
         the sampling."""
         if self._native_graph is None:
-            from .graph_native import NativeGraph
+            from .graph import ContextGraph
             is_task = np.zeros(self.n_nodes, dtype=np.uint8)
             for name in self.task_tables:
                 base = self.base[name]
                 is_task[base:base + self._table(name).n] = 1
-            self._native_graph = NativeGraph(
+            self._native_graph = ContextGraph(
                 self.node_ts, self.node_cells, self.node_table_idx, is_task,
                 self.edge_parent, self.edge_child)
         return self._native_graph
