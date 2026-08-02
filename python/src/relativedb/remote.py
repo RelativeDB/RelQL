@@ -87,54 +87,6 @@ def encode_batch(batch: TokenBatch) -> dict:
     }
 
 
-def encode_batch_bin(batch: TokenBatch, header_extra: dict) -> bytes:
-    """:class:`TokenBatch` -> the ``/v2/forward`` binary wire.
-
-    Layout: ``u32le header_len | header JSON | raw little-endian arrays`` in
-    the fixed order serve.cpp's ``decode_forward_bin`` documents. Index
-    channels ride as int32 (their values are context-local node ids and tiny
-    vocabularies); floats are the already-bf16-rounded fp32 channels, so the
-    raw bytes are bit-exact — no text float round-trip at all.
-    """
-    header = dict(header_extra)
-    header.update({"b": batch.b, "s": batch.s,
-                   "col_phrases": list(batch.col_phrases),
-                   "texts": list(batch.texts),
-                   "has_text_idx": batch.text_idx is not None})
-    hb = json.dumps(header, default=_json_default).encode()
-    arrays = [
-        batch.node_idxs.astype("<i4", copy=False),
-        batch.f2p.astype("<i4", copy=False),
-        batch.col_idxs.astype("<i4", copy=False),
-        batch.table_idxs.astype("<i4", copy=False),
-        batch.is_padding.astype(np.uint8, copy=False),
-        batch.sem_types.astype(np.uint8, copy=False),
-        batch.is_target.astype(np.uint8, copy=False),
-        batch.number_v.astype("<f4", copy=False),
-        batch.datetime_v.astype("<f4", copy=False),
-    ]
-    if batch.text_idx is not None:
-        arrays.append(batch.text_idx.astype("<i4", copy=False))
-    return b"".join([struct.pack("<I", len(hb)), hb,
-                     *(a.tobytes() for a in arrays)])
-
-
-def decode_forward_bin(payload: bytes) -> tuple[dict, np.ndarray,
-                                                Optional[np.ndarray]]:
-    """``/v2/forward`` response -> (header, scores, target_text_or_None)."""
-    if len(payload) < 4:
-        raise RemoteScoringError("binary response too short")
-    (hlen,) = struct.unpack_from("<I", payload)
-    header = json.loads(payload[4:4 + hlen].decode())
-    raw = np.frombuffer(payload, np.float32, offset=4 + hlen)
-    b = int(header["b"])
-    output = header.get("output", "target_scores")
-    if output == "target_scores_and_text":
-        scores, text = raw[:b], raw[b:].reshape(b, D_TEXT)
-        return header, scores, text
-    return header, raw, None
-
-
 def decode_batch(d: dict) -> TokenBatch:
     b, s = int(d["b"]), int(d["s"])
     def arr(key, dtype, shape):
@@ -176,10 +128,6 @@ class RemoteScorer:
         self.session = session
         self.timeout = timeout
         self.headers = dict(headers or {})
-        # "binary" ships /v2/forward's raw-array wire (bit-exact floats, no
-        # tolist/parse cost); RELATIVEDB_WIRE=json forces the JSON wire, and
-        # a 404 from an older service downgrades automatically.
-        self._wire = os.environ.get("RELATIVEDB_WIRE", "binary")
         self.last_stats: dict[str, Any] = {}
         # Attached by RemoteBackend around each score() call; None outside.
         self._query_meta: Optional[dict] = None
@@ -197,30 +145,6 @@ class RemoteScorer:
             meta.update(self._query_meta)
         if self.session:
             meta["session"] = self.session
-        if self._wire == "binary":
-            try:
-                payload = self._post_raw("/v2/forward",
-                                         encode_batch_bin(batch, meta))
-            except RemoteScoringError as e:
-                if "404" not in str(e):
-                    raise
-                # older service without /v2: fall back to JSON for good
-                self._wire = "json"
-            else:
-                header, scores, target_text = decode_forward_bin(payload)
-                self.last_stats = {k: v for k, v in header.items()
-                                   if k not in ("b", "s", "output")}
-                if output == "target_features":
-                    return ForwardResult(
-                        features=scores.reshape(batch.b, D_MODEL).copy())
-                if output == "token_scores":
-                    scores = scores.reshape(batch.b, batch.s)
-                else:
-                    scores = scores.reshape(batch.b)
-                return ForwardResult(
-                    scores=scores.copy(),
-                    target_text=(None if target_text is None
-                                 else target_text.copy()))
         body = dict(meta)
         body["batch"] = encode_batch(batch)
         out = self._post("/v1/forward", body)

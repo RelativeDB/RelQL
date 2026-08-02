@@ -11,7 +11,6 @@
  * Protocol (JSON over HTTP/1.1; relativedb.remote.RemoteScorer is the
  * reference client):
  *   GET  /health                -> {"status":"ok","device":…}
- *   POST /v1/embed              {"texts":[…],"normalize":bool}
  *                               -> {"embeddings":[[384]…]}
  *   POST /v1/forward            {"model_uri":…, "output":…, "batch":{…},
  *                                "query"?:…, "task_type"?:…, "session"?:…}
@@ -610,70 +609,6 @@ DecodedFwd decode_forward_json(const relql::JsonValue& req) {
 //   dt  f32[B,S] | tidx i32[B,S] (only when has_text_idx)
 // Index channels ride as i32: node/f2p values are context-local node ids and
 // col/tab/sem are tiny vocabularies — they widen to the Batch's i64 here.
-DecodedFwd decode_forward_bin(const std::string& body) {
-  if (body.size() < 4) throw std::runtime_error("binary body too short");
-  uint32_t hlen;
-  std::memcpy(&hlen, body.data(), 4);
-  if (4ull + hlen > body.size())
-    throw std::runtime_error("binary header overruns body");
-  const relql::JsonValue hdr = relql::json_parse(body.substr(4, hlen));
-  DecodedFwd d;
-  d.uri = need(hdr, "model_uri").str;
-  const relql::JsonValue* outv = hdr.find("output");
-  d.output = outv && outv->kind == relql::JsonValue::Kind::Str
-                 ? outv->str
-                 : "target_scores";
-  rt::Batch& b = d.b;
-  b.B = (int)need(hdr, "b").num;
-  b.S = (int)need(hdr, "s").num;
-  if (b.B <= 0 || b.S <= 0) throw std::runtime_error("batch b/s must be positive");
-  const size_t BS = (size_t)b.B * b.S;
-  const relql::JsonValue* ht = hdr.find("has_text_idx");
-  const bool has_tidx =
-      ht && ht->kind == relql::JsonValue::Kind::Bool && ht->b;
-  const size_t expect = BS * (4 + 4 * rt::kMaxF2p + 4 + 4 + 1 + 1 + 1 + 4 + 4)
-                        + (has_tidx ? BS * 4 : 0);
-  if (4ull + hlen + expect != body.size())
-    throw std::runtime_error("binary payload size mismatch");
-  const char* p = body.data() + 4 + hlen;
-  auto take_i32_as_i64 = [&](std::vector<int64_t>& out, size_t n) {
-    out.resize(n);
-    const int32_t* src = reinterpret_cast<const int32_t*>(p);
-    for (size_t i = 0; i < n; ++i) out[i] = src[i];
-    p += n * 4;
-  };
-  auto take_u8 = [&](std::vector<uint8_t>& out, size_t n) {
-    out.assign(p, p + n);
-    p += n;
-  };
-  auto take_u8_as_i64 = [&](std::vector<int64_t>& out, size_t n) {
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)p[i];
-    p += n;
-  };
-  auto take_f32 = [&](std::vector<float>& out, size_t n) {
-    out.resize(n);
-    std::memcpy(out.data(), p, n * 4);
-    p += n * 4;
-  };
-  take_i32_as_i64(b.node_idxs, BS);
-  take_i32_as_i64(b.f2p, BS * rt::kMaxF2p);
-  take_i32_as_i64(b.col_idxs, BS);
-  take_i32_as_i64(b.table_idxs, BS);
-  take_u8(b.is_padding, BS);
-  take_u8_as_i64(b.sem_types, BS);
-  take_u8(b.is_target, BS);
-  take_f32(b.number_v, BS);
-  take_f32(b.datetime_v, BS);
-  if (has_tidx) take_i32_as_i64(d.tidx, BS);
-  const relql::JsonValue& phrases = need(hdr, "col_phrases");
-  const relql::JsonValue& texts = need(hdr, "texts");
-  d.to_embed.reserve(phrases.arr.size() + texts.arr.size());
-  for (const relql::JsonValue& q : phrases.arr) d.to_embed.push_back(q.str);
-  for (const relql::JsonValue& t : texts.arr) d.to_embed.push_back(t.str);
-  d.n_phrases = phrases.arr.size();
-  return d;
-}
 
 std::string handle_forward(Service& svc, DecodedFwd&& dec, bool binary) {
   const std::string& uri = dec.uri;
@@ -915,21 +850,11 @@ std::deque<Job*> g_jobs;
 void run_job(Job* job) {
   const auto t0 = std::chrono::steady_clock::now();
   try {
-    auto t1 = t0;
-    if (job->path == "/v2/forward") {
-      DecodedFwd dec = decode_forward_bin(job->body);
-      t1 = std::chrono::steady_clock::now();
-      job->response = handle_forward(*g_svc, std::move(dec), /*binary=*/true);
-      job->content_type = "application/octet-stream";
-    } else {
-      const relql::JsonValue req = relql::json_parse(job->body);
-      t1 = std::chrono::steady_clock::now();
-      job->response =
-          job->path == "/v1/forward"
-              ? handle_forward(*g_svc, decode_forward_json(req), false)
-          : job->path == "/v1/embed" ? handle_embed(*g_svc, req)
-                                     : handle_flat(req);
-    }
+    const relql::JsonValue req = relql::json_parse(job->body);
+    const auto t1 = std::chrono::steady_clock::now();
+    job->response = job->path == "/v1/forward"
+                        ? handle_forward(*g_svc, decode_forward_json(req), false)
+                        : handle_flat(req);
     const auto t2 = std::chrono::steady_clock::now();
     auto ms = [](auto a, auto b) {
       return std::chrono::duration<double, std::milli>(b - a).count();
@@ -1002,8 +927,7 @@ int on_req(h2o_handler_t*, h2o_req_t* req) {
     send_json(req, 200, health_json(*g_svc));
     return 0;
   }
-  if (method == "POST" && (path == "/v1/forward" || path == "/v2/forward" ||
-                           path == "/v1/embed" ||
+  if (method == "POST" && (path == "/v1/forward" ||
                            path == "/v1/flat_features")) {
     Job* job = new Job;
     job->req = req;

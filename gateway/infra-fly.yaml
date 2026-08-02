@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS backing services and Fly OIDC role for RelativeDB gateway
+
+Resources:
+  FlyOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://oidc.fly.io/daniel-henneberger
+      ClientIdList:
+        - sts.amazonaws.com
+
+  Namespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: workers.relativedb.local
+
+  WorkerService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: inference
+      NamespaceId: !GetAtt Namespace.Id
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  ApiKeys:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: relativedb-gateway-api-keys
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: key_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: key_hash
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  Usage:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: relativedb-gateway-usage
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  FlyGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: relativedb-fly-gateway
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref FlyOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                oidc.fly.io/daniel-henneberger:aud: sts.amazonaws.com
+              StringLike:
+                oidc.fly.io/daniel-henneberger:sub: daniel-henneberger:relativedb-gateway:*
+      Policies:
+        - PolicyName: GatewayDiscoveryAndMetering
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: servicediscovery:DiscoverInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt ApiKeys.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt Usage.Arn
+
+Outputs:
+  WorkerServiceId:
+    Value: !GetAtt WorkerService.Id
+  NamespaceId:
+    Value: !GetAtt Namespace.Id
+  ApiKeysTable:
+    Value: !Ref ApiKeys
+  UsageTable:
+    Value: !Ref Usage
+  FlyRoleArn:
+    Value: !GetAtt FlyGatewayRole.Arn
