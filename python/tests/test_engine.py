@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import pytest
 
-from relativedb import (BreadthFirstTraversal, ContextPolicy, Engine, ExecutionInput, ModelConfig,
+from relativedb import (BreadthFirstTraversal, ContextPolicy, ReferenceTraversal, Engine, ExecutionInput, ModelConfig,
                       Row, SamplerMode, TaskType, TemporalBound)
 from relativedb.csc import CscIndex
 from relativedb.schema import LinkDef
@@ -200,9 +200,13 @@ def test_for_each_without_scanner_raises():
         eng.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
                   "FROM customers", anchor_time=T0))
-    # Reference traversal is snapshot-defined even for a pinned id.
+    # Reference traversal is snapshot-defined even for a pinned id — and it
+    # is now asked for rather than inherited, since the engine defaults to
+    # the pull-per-hop traversal this wiring can actually serve.
+    ref = Engine(_make_schema(), wiring, model_backend=StubBackend(),
+                 traversal=ReferenceTraversal())
     with pytest.raises(ExecutionError, match="immutable graph snapshot"):
-        eng.execute(ExecutionInput(
+        ref.execute(ExecutionInput(
             query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
                   "FROM customers WHERE customers.customer_id IN :ids",
             params={"ids": ['C7']}, anchor_time=T0))

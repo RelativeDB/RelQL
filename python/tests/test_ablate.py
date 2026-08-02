@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from relativedb import Engine, ExecutionInput
+from relativedb import ReferenceTraversal, Engine, ExecutionInput
 from relativedb.engine import EntityPrediction, ExecutionError
 from relativedb.relql.parser import parse
 
@@ -43,8 +43,12 @@ class _CellCountBackend:
 
 
 def _engine(churn_schema):
+    # These assertions count cells in the assembled context, so the traversal
+    # that assembles it is part of the fixture rather than an incidental
+    # default. Pinned here now that the engine defaults to pull-per-hop.
     return Engine(churn_schema, in_memory_wiring(churn_rows()),
-                  model_backend=_CellCountBackend())
+                  model_backend=_CellCountBackend(),
+                  traversal=ReferenceTraversal())
 
 
 def _value(engine, query):

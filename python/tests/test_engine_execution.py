@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from relativedb import Engine, ExecutionInput, TaskType
+from relativedb import ReferenceTraversal, Engine, ExecutionInput, TaskType
 from relativedb.engine import EntityPrediction, ExecutionError
 
 from conftest import churn_rows, dt, in_memory_wiring
@@ -51,8 +51,10 @@ class BatchedStub:
 
 
 def _engine(churn_schema, backend):
+    # The shared-context path is defined over the reference graph, so these
+    # engines ask for it rather than relying on it being the default.
     return Engine(churn_schema, in_memory_wiring(churn_rows()),
-                  model_backend=backend)
+                  model_backend=backend, traversal=ReferenceTraversal())
 
 
 # --------------------------------------------------------------------------

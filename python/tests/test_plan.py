@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from relativedb import (BreadthFirstTraversal, Engine, ExecutionInput,
+from relativedb import (BreadthFirstTraversal, ReferenceTraversal, Engine, ExecutionInput,
                         TaskType, parse, validate)
 from relativedb.engine import SamplerMode
 from relativedb.plan import QueryPlan, build_plan, pinned_ids, pure_pin
@@ -105,19 +105,19 @@ def test_strategy_mirrors_the_dispatch_in_execute(engine, kwargs, expected):
 
 def test_plan_names_the_sampler_and_traversal(engine, churn_schema,
                                               stub_backend):
-    """The default Engine uses ReferenceTraversal, which always samples from
-    the CSC snapshot regardless of sampler_mode; an explicit BFS traversal in
-    RETRIEVER mode is the pull-per-hop path."""
+    """The default Engine walks pull-per-hop through the retrievers; asking
+    for ReferenceTraversal is what opts into sampling from the CSC snapshot,
+    regardless of sampler_mode."""
     default = _plan_for(engine, CHURN, params={"ids": ["C1"]})
-    assert default.sampler == "csc"
-    assert default.traversal == "ReferenceTraversal"
+    assert default.sampler == "retriever"
+    assert default.traversal == "BreadthFirstTraversal"
 
-    bfs = Engine(churn_schema, in_memory_wiring(churn_rows()),
+    ref = Engine(churn_schema, in_memory_wiring(churn_rows()),
                  model_backend=stub_backend,
-                 traversal=BreadthFirstTraversal())
-    plan = _plan_for(bfs, CHURN, params={"ids": ["C1"]})
-    assert plan.sampler == "retriever"
-    assert plan.traversal == "BreadthFirstTraversal"
+                 traversal=ReferenceTraversal())
+    plan = _plan_for(ref, CHURN, params={"ids": ["C1"]})
+    assert plan.sampler == "csc"
+    assert plan.traversal == "ReferenceTraversal"
 
 
 def test_pipelining_needs_a_cohort_larger_than_the_scoring_batch(engine):
@@ -149,8 +149,8 @@ def test_explain_surfaces_the_execution_section(engine):
         params={"ids": ["C1", "C7"]}))
     ex = result.plan["execution"]
     assert ex["strategy"] == "per-entity"
-    assert ex["sampler"] == "csc"
-    assert ex["traversal"] == "ReferenceTraversal"
+    assert ex["sampler"] == "retriever"
+    assert ex["traversal"] == "BreadthFirstTraversal"
     assert ex["cohort_size"] == 2
 
 

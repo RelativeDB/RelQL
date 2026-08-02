@@ -547,6 +547,11 @@ class ExecutionInput:
     # `:name` bindings for the query text — the anchor (`AS OF :t`), the
     # cohort (`WHERE t.pk IN :ids`), and any other parameterized literal.
     params: Optional[dict[str, Any]] = None
+    # The cohort as data: score exactly these entities of the FROM table,
+    # leaving the query text untouched. Takes precedence over a WHERE-derived
+    # cohort. This is how a caller evaluates one query over many batches
+    # without rewriting it per batch.
+    entity_ids: Optional[Sequence[Any]] = None
     # Score the whole cohort inside ONE shared context: every entity's target
     # is masked in the same sequence and read from its own token, so cohort
     # members never see each other's outcomes (strictly less exposure than
@@ -869,22 +874,19 @@ class Engine:
         self.model_backend: Optional[ModelBackend] = model_backend
         self.context_policy = context_policy or ContextPolicy()
         self.sampler_mode = sampler_mode
-        self.traversal = traversal or ReferenceTraversal()
-        # The CSC snapshot is built once, here. It is immutable for the life of
-        # the engine: to pick up changed data, construct a new Engine.
+        # Pull-per-hop by default. The retrievers turn a walk into bounded
+        # queries — `WHERE pk IN (...)`, `WHERE fk = ? ORDER BY ts DESC LIMIT
+        # n` — which a warehouse answers with an index or a row-group skip.
+        # The alternative, a materialized snapshot, reads *every row of every
+        # table* into memory before the first query is even parsed; on a
+        # 146k-row database that was ten seconds and 169 MB to predict for
+        # three entities. Reference tiering still needs the whole graph, so it
+        # remains available — and is now built on demand rather than for
+        # everyone who never asked for it.
+        self.traversal = traversal or BreadthFirstTraversal()
+        # Built on first use and immutable thereafter: to pick up changed
+        # data, construct a new Engine.
         self._csc_index: Optional[CscIndex] = None
-        # Reference sampling is defined over one immutable bidirectional graph
-        # snapshot. Build it even in RETRIEVER mode; explicit legacy BFS keeps
-        # the pull-per-hop retriever semantics.
-        if sampler_mode is SamplerMode.CSC:
-            self._csc_index = CscIndex.build(self.schema, self.wiring)
-        elif (isinstance(self.traversal, ReferenceTraversal)
-              and self.wiring.scanners):
-            # A schema-only table with no scanner is an empty table in the
-            # snapshot. At least one scanner is required to distinguish this
-            # from legacy pull-only wiring.
-            self._csc_index = CscIndex.build(
-                self.schema, self.wiring, allow_missing_scanners=True)
 
     def _check_ablations(self, pq: ParsedQuery) -> None:
         """ABLATE TABLE names must be real and must not be the entity table:
@@ -910,22 +912,33 @@ class Engine:
                 "there is no built-in model-free scorer.")
         return self.model_backend
 
-    def _sampler(self):
-        if isinstance(self.traversal, ReferenceTraversal):
-            if self._csc_index is None:
+    def csc_index(self) -> CscIndex:
+        """The materialized graph snapshot, built on first use.
+
+        Every row of every table, as one immutable bidirectional index. That
+        is what reference tiering is defined over — peers and the random-table
+        fallback are statements about the whole graph, not about one walk — so
+        it cannot be assembled a hop at a time. Paying for it lazily at least
+        confines the cost to the queries that actually need it.
+        """
+        if self._csc_index is None:
+            if not self.wiring.scanners:
+                # A schema-only table with no scanner is an empty table in the
+                # snapshot. At least one scanner is required to distinguish
+                # this from pull-only wiring, which cannot be snapshotted.
                 raise ExecutionError(
                     "reference traversal requires a TableScanner for every "
-                    "schema table so it can build one immutable graph snapshot")
-            return _CscSampler(self._csc_index)
-        if self.sampler_mode is SamplerMode.CSC:
-            if self._csc_index is None:
-                # Only reachable by flipping sampler_mode after construction.
-                # Say so rather than silently draining every scanner mid-query.
-                raise ExecutionError(
-                    "CSC mode has no index: the snapshot is built once, in the "
-                    "Engine constructor. Construct the engine with "
-                    "sampler_mode=SamplerMode.CSC instead of setting it later.")
-            return _CscSampler(self._csc_index)
+                    "schema table so it can build one immutable graph "
+                    "snapshot; this wiring has none, so only pull-per-hop "
+                    "traversal (BreadthFirstTraversal) can run against it")
+            self._csc_index = CscIndex.build(
+                self.schema, self.wiring, allow_missing_scanners=True)
+        return self._csc_index
+
+    def _sampler(self):
+        if (isinstance(self.traversal, ReferenceTraversal)
+                or self.sampler_mode is SamplerMode.CSC):
+            return _CscSampler(self.csc_index())
         return _RetrieverSampler(self.schema, self.wiring)
 
     # -- context assembly ---------------------------------------------------
@@ -1580,6 +1593,8 @@ class Engine:
         and no enumeration happens. Anything else needs the table enumerated
         and filtered, which requires a TableScanner.
         """
+        if input.entity_ids is not None:
+            return list(input.entity_ids)
         pinned = pinned_ids(pq.where, pq.entity_key)
         if pinned is not None:
             return pinned

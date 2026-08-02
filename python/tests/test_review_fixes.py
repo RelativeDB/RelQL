@@ -216,7 +216,7 @@ def test_per_entity_anchor_without_any_anchor_is_an_error():
             params={"ids": ["C7"]}, per_entity_anchor=True))
 
 
-def test_fully_dangling_link_warns_at_index_build():
+def test_fully_dangling_link_warns_when_the_index_is_built():
     # int primary keys, string FK values: every edge of the link severed
     schema = (Schema.new_schema()
               .table(TableDef.new_table("customers")
@@ -235,8 +235,11 @@ def test_fully_dangling_link_warns_at_index_build():
                                         "order_date": dt("2026-06-01")},
                        dt("2026-06-01"), {"customer_id": "1"})],
     }
+    # The index is built on first use now, not in the constructor, so the
+    # warning arrives when the snapshot is actually assembled.
+    eng = Engine(schema, in_memory_wiring(rows), model_backend=_Stub())
     with pytest.warns(UserWarning, match="dangling"):
-        Engine(schema, in_memory_wiring(rows), model_backend=_Stub())
+        eng.csc_index()
 
 
 # ---------------------------------------------------------------------------

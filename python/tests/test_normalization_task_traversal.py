@@ -26,7 +26,8 @@ def test_zero_shot_normalization_is_batch_invariant(churn_schema):
     wiring = in_memory_wiring(churn_rows())
     backend = SequenceBackend(StubScorer(), schema=churn_schema, wiring=wiring)
     engine = Engine(churn_schema, wiring,
-                    context_policy=ContextPolicy(cohort_size=0))
+                    context_policy=ContextPolicy(cohort_size=0),
+                    traversal=ReferenceTraversal())
     pq = _query(churn_schema)
     one = engine.assemble_context("customers", "C1", dt("2026-07-01"))
     other = engine.assemble_context("customers", "C7", dt("2026-07-01"))
@@ -49,7 +50,8 @@ def test_reference_normalization_uses_persisted_column_and_task_stats(
         schema=churn_schema, wiring=wiring, column_stats=stats,
         normalization_mode=NormalizationMode.REFERENCE)
     engine = Engine(churn_schema, wiring,
-                    context_policy=ContextPolicy(cohort_size=0))
+                    context_policy=ContextPolicy(cohort_size=0),
+                    traversal=ReferenceTraversal())
     ctx = engine.assemble_context("customers", "C1", dt("2026-07-01"))
     seq = backend._build_sequences(
         pq, TaskType.BINARY_CLASSIFICATION, [ctx],
@@ -173,7 +175,11 @@ def test_reference_defaults_match_evaluator_geometry():
 def test_reference_graph_is_an_immutable_engine_snapshot(churn_schema):
     rows = churn_rows()
     wiring = in_memory_wiring(rows)
-    engine = Engine(churn_schema, wiring,
+    # The claim under test is that the reference graph is a snapshot, so the
+    # traversal that defines it is named rather than assumed. It is now taken
+    # on first use rather than at construction — before the mutation below,
+    # which is what the test actually turns on.
+    engine = Engine(churn_schema, wiring, traversal=ReferenceTraversal(),
                     context_policy=ContextPolicy(num_walks=0))
     before = engine.assemble_context("customers", "C7", dt("2026-07-01"))
     original_age = before.entity_cells("customers")["age"]
@@ -189,7 +195,9 @@ def test_reference_graph_is_an_immutable_engine_snapshot(churn_schema):
 def test_materialized_task_target_is_first_and_node_ids_are_global(churn_schema):
     wiring = in_memory_wiring(churn_rows())
     policy = ContextPolicy(num_walks=8, walk_length=4, num_history_windows=2)
-    engine = Engine(churn_schema, wiring, context_policy=policy)
+    # Graph-walk peers and global node ids are reference-tiering concepts.
+    engine = Engine(churn_schema, wiring, context_policy=policy,
+                    traversal=ReferenceTraversal())
     backend = SequenceBackend(StubScorer(), schema=churn_schema, wiring=wiring)
     pq = _query(churn_schema)
     c1 = engine.assemble_context("customers", "C1", dt("2026-07-01"), query=pq)
