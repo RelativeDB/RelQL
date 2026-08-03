@@ -77,11 +77,8 @@ def _context_builder(engine: "Engine", req: ExecutionRequest):
 # ---------------------------------------------------------------------------
 
 def _score_serial(engine: "Engine", req: ExecutionRequest, build):
-    contexts: list = []
-    for eid in req.ids:
-        ctx = build(eid)
-        if ctx is not None:
-            contexts.append(ctx)
+    contexts = [ctx for ctx in engine._map_context_builds(req.ids, build)
+                if ctx is not None]
     preds = req.backend.score(req.pq, req.plan.task_type, contexts,
                               req.plan.model_uri, engine.model_config)
     return contexts, list(preds)

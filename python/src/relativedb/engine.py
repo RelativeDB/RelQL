@@ -970,6 +970,28 @@ class Engine:
             focal_row_keys=result.focal_row_keys,
             node_ids=dict(result.node_ids))
 
+    def _map_context_builds(self, ids, build):
+        """Build independent BFS contexts concurrently when explicitly enabled.
+
+        Retriever-backed breadth-first traversal keeps all walk state local to
+        one context. Reference/native traversal caches graph snapshots on the
+        traversal object and therefore remains serial. ContextVars carry the
+        caller's retrieval deadline into every worker.
+        """
+        ids = list(ids)
+        workers = int(os.environ.get("RELATIVEDB_CONTEXT_WORKERS", "1") or 1)
+        if (workers <= 1 or len(ids) <= 1
+                or not isinstance(self.traversal, BreadthFirstTraversal)):
+            return [build(eid) for eid in ids]
+        import contextvars
+        import concurrent.futures as _futures
+        workers = min(workers, len(ids))
+        parent = contextvars.copy_context()
+        with _futures.ThreadPoolExecutor(max_workers=workers,
+                                         thread_name_prefix="rt-context") as pool:
+            futures = [pool.submit(parent.copy().run, build, eid) for eid in ids]
+            return [future.result() for future in futures]
+
     # -- execution ----------------------------------------------------------
     def execute(self, input: Union[ExecutionInput, str], **kwargs) -> PredictionResult:
         if isinstance(input, str):
@@ -1775,19 +1797,19 @@ class Engine:
         agg_assumed = aggregate_assumptions(pq.assuming)
         where_anchor = (eff_input.anchor_time
                         if eff_input.context_anchor_time is not None else None)
-        contexts: list[EntityContext] = []
-        for eid in ids:
+        def build(eid):
             anchor = self._anchor_for(entity_table, eid, eff_input)
             ctx = self.assemble_context(entity_table, eid, anchor, query=pq)
             if pq.where is not None and not self._where_ok(
                     pq, ctx, entity_table, where_anchor):
-                continue
+                return None
             ctx = _apply_ablations(pq.ablations, ctx)
             ctx = _apply_aggregate_assumptions(
                 agg_assumed, ctx, entity_table, self.schema,
                 self._assumption_template_fetch(ctx, entity_table))
-            contexts.append(_apply_assumptions(assumed, ctx, entity_table))
-        return contexts
+            return _apply_assumptions(assumed, ctx, entity_table)
+        return [ctx for ctx in self._map_context_builds(ids, build)
+                if ctx is not None]
 
     def _ablation_report(self, pq: ParsedQuery, input: ExecutionInput,
                          effective: Optional[datetime]):
@@ -1849,29 +1871,37 @@ class Engine:
                 if r.table == table else r for r in c.rows])
                 for c in contexts]
 
-        entries: list[dict] = []
-        forwards = 1
-
         def measure(kind, name, ctxs):
-            nonlocal forwards
             _, vals = score(ctxs)
-            forwards += 1
             deltas = [v - b for v, b in zip(vals, base)
                       if v is not None and b is not None]
             n = len(deltas)
-            entries.append({
+            return {
                 "kind": kind, "name": name, "n": n,
                 "mean_delta": sum(deltas) / n if n else 0.0,
                 "mean_abs_delta": sum(abs(d) for d in deltas) / n if n else 0.0,
                 "max_abs_delta": max((abs(d) for d in deltas), default=0.0),
-            })
+            }
 
-        for t in sorted(tables):
-            measure("table", t,
-                    [_apply_ablations([Ablation("table", t)], c)
-                     for c in contexts])
-        for t, col in sorted(columns):
-            measure("column", f"{t}.{col}", drop_column(t, col))
+        work = [("table", t,
+                 [_apply_ablations([Ablation("table", t)], c)
+                  for c in contexts]) for t in sorted(tables)]
+        work += [("column", f"{t}.{col}", drop_column(t, col))
+                 for t, col in sorted(columns)]
+        concurrency = int(os.environ.get(
+            "RELATIVEDB_ABLATE_CONCURRENCY", "0") or 0)
+        if concurrency <= 0:
+            concurrency = (4 if hasattr(getattr(backend, "scorer", None), "url")
+                           else 1)
+        concurrency = min(concurrency, len(work)) if work else 1
+        if concurrency > 1:
+            import concurrent.futures as _futures
+            with _futures.ThreadPoolExecutor(
+                    max_workers=concurrency,
+                    thread_name_prefix="rt-ablate") as pool:
+                entries = list(pool.map(lambda args: measure(*args), work))
+        else:
+            entries = [measure(*args) for args in work]
         entries.sort(key=lambda e: -e["mean_abs_delta"])
         known = [b for b in base if b is not None]
         report = {
@@ -1879,7 +1909,7 @@ class Engine:
             "baseline": {"n": len(known),
                          "mean": sum(known) / len(known) if known else None},
             "candidates": entries,
-            "model_forwards": forwards,
+            "model_forwards": 1 + len(work),
             "note": ("mean_abs_delta: how far the prediction moves when this "
                      "is dropped. Near zero = the model is not using it — a "
                      "good ablation; large = load-bearing, keep it."),

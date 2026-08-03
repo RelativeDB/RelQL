@@ -37,6 +37,8 @@ from __future__ import annotations
 import json
 import os
 import struct
+import contextvars
+import threading
 import urllib.error
 import urllib.request
 from typing import Any, Optional, Sequence
@@ -129,10 +131,14 @@ class RemoteScorer:
         self.timeout = timeout
         self.headers = dict(headers or {})
         self.last_stats: dict[str, Any] = {}
-        # Attached by RemoteBackend around each score() call; None outside.
-        self._query_meta: Optional[dict] = None
+        # A remote backend can issue several independent forwards at once
+        # (notably EXPLAIN ABLATE). Query metadata must follow the calling
+        # thread/task rather than live in one shared mutable slot.
+        self._query_meta = contextvars.ContextVar(
+            f"remote_query_meta_{id(self)}", default=None)
         # Class-label embeddings are tiny and stable; cache per (text, norm).
         self._embed_cache: dict[tuple[str, bool], np.ndarray] = {}
+        self._embed_lock = threading.RLock()
 
     def health(self) -> dict:
         return self._get("/health")
@@ -141,8 +147,9 @@ class RemoteScorer:
     def forward(self, batch: TokenBatch, *, model_uri: str,
                 output: str = "target_scores") -> ForwardResult:
         meta: dict[str, Any] = {"model_uri": model_uri, "output": output}
-        if self._query_meta:
-            meta.update(self._query_meta)
+        query_meta = self._query_meta.get()
+        if query_meta:
+            meta.update(query_meta)
         if self.session:
             meta["session"] = self.session
         body = dict(meta)
@@ -177,20 +184,21 @@ class RemoteScorer:
     def embed(self, texts: Sequence[str], *,
               normalize: bool = False) -> np.ndarray:
         texts = list(texts)
-        missing = [t for t in dict.fromkeys(texts)
-                   if (t, normalize) not in self._embed_cache]
-        if missing:
-            out = self._post("/v1/embed",
-                             {"texts": missing, "normalize": bool(normalize)})
-            embs = out.get("embeddings")
-            if embs is None or len(embs) != len(missing):
-                raise RemoteScoringError(
-                    f"service returned {0 if embs is None else len(embs)} "
-                    f"embeddings for {len(missing)} texts")
-            for t, e in zip(missing, embs):
-                self._embed_cache[(t, normalize)] = np.asarray(e, np.float32)
-        return np.stack([self._embed_cache[(t, normalize)] for t in texts]) \
-            if texts else np.zeros((0, D_TEXT), np.float32)
+        with self._embed_lock:
+            missing = [t for t in dict.fromkeys(texts)
+                       if (t, normalize) not in self._embed_cache]
+            if missing:
+                out = self._post("/v1/embed",
+                                 {"texts": missing, "normalize": bool(normalize)})
+                embs = out.get("embeddings")
+                if embs is None or len(embs) != len(missing):
+                    raise RemoteScoringError(
+                        f"service returned {0 if embs is None else len(embs)} "
+                        f"embeddings for {len(missing)} texts")
+                for t, e in zip(missing, embs):
+                    self._embed_cache[(t, normalize)] = np.asarray(e, np.float32)
+            return np.stack([self._embed_cache[(t, normalize)] for t in texts]) \
+                if texts else np.zeros((0, D_TEXT), np.float32)
 
     # -- transport --------------------------------------------------------
     def _post(self, path: str, body: dict) -> dict:
@@ -270,15 +278,15 @@ class RemoteBackend(SequenceBackend):
 
     def score(self, query: ParsedQuery, task_type: TaskType, contexts,
               model_uri: str, config) -> list:
-        self.scorer._query_meta = {
+        token = self.scorer._query_meta.set({
             "query": query.text,
             "task_type": (task_type.value if hasattr(task_type, "value")
-                          else str(task_type)),
-        }
+                           else str(task_type)),
+        })
         try:
             return super().score(query, task_type, contexts, model_uri, config)
         finally:
-            self.scorer._query_meta = None
+            self.scorer._query_meta.reset(token)
 
 
 def _json_default(o):

@@ -14,6 +14,9 @@ an exactly predictable effect on the prediction.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from relativedb import ReferenceTraversal, Engine, ExecutionInput
@@ -146,3 +149,36 @@ def test_render_includes_the_ranking(churn_schema):
     text = _report(churn_schema).render()
     assert "ABLATION" in text
     assert "mean_abs_delta" in text
+
+
+def test_remote_candidate_forwards_run_concurrently(churn_schema, monkeypatch):
+    class ConcurrentBackend(_CellCountBackend):
+        scorer = type("Remote", (), {"url": "http://inference"})()
+
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def score(self, *args, **kwargs):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.01)
+                return super().score(*args, **kwargs)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    backend = ConcurrentBackend()
+    engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                    model_backend=backend, traversal=ReferenceTraversal())
+    monkeypatch.setenv("RELATIVEDB_ABLATE_CONCURRENCY", "4")
+
+    result = engine.execute(ExecutionInput(
+        query="EXPLAIN ABLATE " + Q, anchor_time=ANCHOR, params=IDS))
+
+    assert backend.max_active > 1
+    assert result.ablation["model_forwards"] == 1 + len(
+        result.ablation["candidates"])

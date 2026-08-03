@@ -6,9 +6,13 @@ selected by flags on ExecutionInput and were never exercised by a test.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
-from relativedb import ReferenceTraversal, Engine, ExecutionInput, TaskType
+from relativedb import (BreadthFirstTraversal, ReferenceTraversal, Engine,
+                        ExecutionInput, TaskType)
 from relativedb.engine import EntityPrediction, ExecutionError
 
 from conftest import churn_rows, dt, in_memory_wiring
@@ -99,6 +103,45 @@ def test_producer_thread_errors_surface_to_the_caller(churn_schema):
     with pytest.raises(RuntimeError, match="assembly exploded"):
         eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
                                    params={"ids": IDS}))
+
+
+def test_breadth_first_context_builds_use_configured_workers(
+        churn_schema, monkeypatch):
+    eng = Engine(churn_schema, in_memory_wiring(churn_rows()),
+                 model_backend=BatchedStub(batch_size=99),
+                 traversal=BreadthFirstTraversal())
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def build(eid):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.01)
+            return eid
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setenv("RELATIVEDB_CONTEXT_WORKERS", "3")
+    result = eng._map_context_builds(["a", "b", "c"], build)
+
+    assert result == ["a", "b", "c"]
+    assert max_active == 3
+
+
+def test_reference_context_builds_remain_serial(churn_schema, monkeypatch):
+    eng = _engine(churn_schema, BatchedStub(batch_size=99))
+    owner = threading.get_ident()
+    seen = []
+    monkeypatch.setenv("RELATIVEDB_CONTEXT_WORKERS", "3")
+
+    assert eng._map_context_builds(IDS, lambda eid: seen.append(
+        threading.get_ident()) or eid) == IDS
+    assert seen == [owner] * len(IDS)
 
 
 # --------------------------------------------------------------------------
