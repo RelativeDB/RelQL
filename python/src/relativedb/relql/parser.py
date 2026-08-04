@@ -187,7 +187,24 @@ def _validate_bound(pq: ParsedQuery, schema) -> tuple[ParsedQuery, TaskType]:
 
     bound = pq.bind_entity_key(schema)
 
-    _walk_columns(bound.target, schema)
+    # A bare direct target may be virtual: the target name is the task the
+    # foundation model is being asked to predict, and need not be a stored
+    # feature column. Expressions and aggregations still validate every
+    # referenced column because they require physical values to evaluate.
+    virtual_target = False
+    if isinstance(bound.target, ColumnRef):
+        target_table = schema.table(bound.target.table)
+        if target_table is not None:
+            real_names = {c.name for c in target_table.columns}
+            real_names.update(l.fk_column
+                              for l in schema.links_from(target_table.name))
+            if target_table.primary_key:
+                real_names.add(target_table.primary_key)
+            virtual_target = (
+                bound.target.table == bound.entity_key.table
+                and bound.target.column not in real_names)
+    if not virtual_target:
+        _walk_columns(bound.target, schema)
     for agg in bound.target_aggregations:
         if agg.window is not None and agg.window.start < 0:
             raise RelqlValidationError(

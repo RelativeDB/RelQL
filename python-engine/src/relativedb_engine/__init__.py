@@ -1,9 +1,9 @@
-"""relativedb-engine — the optional in-process native engine for relativedb.
+"""relativedb-engine — local Triton CUDA and native MPS/CPU inference.
 
 The base ``relativedb`` package is pure Python: it parses RelQL, assembles
 contexts and token batches, and can score through a remote backend URL. This
-package adds the local alternative: librt_c (the golden-verified C++ RT-J
-engine with its native MiniLM text encoder) behind the same
+package adds the local alternative: Triton RT-J inference on CUDA plus librt_c
+on MPS/CPU and for native MiniLM text encoding, behind the same
 :class:`relativedb.scoring.Scorer` protocol, plus the adaptation paths that
 are native by design — task-head fitting, full fine-tuning, and the optional
 XGBoost flat-feature backend (``pip install relativedb-engine[xgboost]``).
@@ -17,7 +17,7 @@ XGBoost flat-feature backend (``pip install relativedb-engine[xgboost]``).
 from .native import (FineTunedCheckpoint, RtLib, RtModel, RtNativeError,
                      RtNativeUnavailableError, load_lib, resolve_model_path,
                      RT_DEVICE_CPU, RT_DEVICE_CUDA, RT_DEVICE_MPS)
-from .backend import FineTunedHead, RtNativeBackend
+from .backend import FineTunedHead, RtBackend, RtNativeBackend
 from .scorer import NativeScorer, NativeTextEncoder, resolve_minilm_snapshot
 
 # The historical name: TextEmbedder embedded through sentence-transformers in
@@ -37,7 +37,7 @@ def __getattr__(name):
 __version__ = "0.1.3"
 
 __all__ = [
-    "RtNativeBackend", "NativeScorer", "NativeTextEncoder", "TextEmbedder",
+    "RtBackend", "RtNativeBackend", "NativeScorer", "NativeTextEncoder", "TextEmbedder",
     "FineTunedHead", "FineTunedCheckpoint",
     "RtLib", "RtModel", "RtNativeError", "RtNativeUnavailableError",
     "load_lib", "resolve_model_path", "resolve_minilm_snapshot",

@@ -1,0 +1,2 @@
+[console_scripts]
+rt_triton_serve = relativedb_engine.triton_server:main

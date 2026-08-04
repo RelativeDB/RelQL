@@ -909,9 +909,11 @@ class ReferenceTraversal:
                               key=lambda r: r.timestamp, reverse=True)
                 inject.extend(hist[:history])
             return targets, inject, {}
-        state = getattr(self, "_inline_state", None)
-        if (state is not None and state.get("anchor") == anchor
-                and state.get("sampling_table") == table):
+        states = getattr(self, "_inline_states", None) or {}
+        state = next((s for s in reversed(list(states.values()))
+                      if s.get("anchor") == anchor
+                      and s.get("sampling_table") == table), None)
+        if state is not None:
             by_key = state["by_key"]
             meta = state["entity_meta"]
             targets, inject = [], []
@@ -1675,18 +1677,28 @@ class ReferenceTraversal:
                                 task_spec) -> TraversalResult:
         import bisect
         anchor = bound.as_of
-        state = getattr(self, "_inline_state", None)
-        if (state is None
-                or state["graph_id"] != id(getattr(graph, "index", graph))
-                or state["anchor"] != anchor
-                or state["query_text"] != getattr(query, "text", None)
-                or state["task_spec_id"] != (
-                    task_spec.id, task_spec.table_name,
-                    task_spec.target_column)
-                or state["num_history_windows"] != policy.num_history_windows):
+        # Keyed LRU rather than a single entry: several tasks over one dataset
+        # (a benchmark suite, a dashboard) alternate queries at fixed anchors,
+        # and a one-entry cache made every alternation pay the full
+        # dataset-sized rebuild. States mostly hold references to the graph's
+        # own Row objects, so a handful of entries is cheap.
+        cache = getattr(self, "_inline_states", None)
+        if cache is None:
+            cache = self._inline_states = {}
+        state_key = (id(getattr(graph, "index", graph)), anchor,
+                     getattr(query, "text", None),
+                     (task_spec.id, task_spec.table_name,
+                      task_spec.target_column),
+                     policy.num_history_windows)
+        state = cache.get(state_key)
+        if state is None:
             state = self._inline_shared_build(
                 schema, graph, entity_table, bound, policy, query, task_spec)
-            self._inline_state = state
+            cache[state_key] = state
+            while len(cache) > 8:
+                cache.pop(next(iter(cache)))
+        else:                       # refresh recency
+            cache[state_key] = cache.pop(state_key)
 
         meta = state["entity_meta"].get(entity_id)
         if meta is None:

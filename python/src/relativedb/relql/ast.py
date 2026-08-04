@@ -540,8 +540,11 @@ class ParsedQuery:
                                                    default=TaskType.MULTICLASS_CLASSIFICATION)
             return TaskType.REGRESSION
         # bare static column
+        # An undeclared bare target is a virtual yes/no outcome. Its name is
+        # part of the task token (for example ``customers.likes_pickles``),
+        # not a request to read a missing feature column.
         return self._static_or_categorical(t, schema,
-                                           default=TaskType.MULTICLASS_CLASSIFICATION)
+                                           default=TaskType.BINARY_CLASSIFICATION)
 
     @staticmethod
     def _static_or_categorical(col: ColumnRef, schema, default: TaskType) -> TaskType:

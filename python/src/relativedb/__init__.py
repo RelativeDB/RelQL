@@ -31,7 +31,7 @@ from .remote import RemoteBackend, RemoteScorer, RemoteScoringError
 # The native engine moved to the optional relativedb-engine package. These
 # names keep resolving from `relativedb` so existing imports fail with an
 # actionable message instead of an AttributeError.
-_ENGINE_EXPORTS = ("RtNativeBackend", "RtNativeUnavailableError",
+_ENGINE_EXPORTS = ("RtBackend", "RtNativeBackend", "RtNativeUnavailableError",
                    "TextEmbedder", "FineTunedHead", "FineTunedCheckpoint",
                    "XgboostBackend", "XgboostUnavailableError", "fit_xgboost")
 
@@ -77,7 +77,7 @@ __all__ = [
     "RemoteBackend", "RemoteScorer", "RemoteScoringError",
     "SequenceBackend", "Scorer", "TokenBatch", "ForwardResult",
     "ScoringError", "ContextConnectivityWarning", "ColumnStats",
-    "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
+    "RtBackend", "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
     "FineTunedHead", "FineTunedCheckpoint",
     "XgboostBackend", "XgboostUnavailableError", "FlatAnalysis",
     "analyze_flat", "fit_xgboost",

@@ -1,10 +1,12 @@
-"""In-process :class:`relativedb.scoring.Scorer` over librt_c.
+"""In-process scorer: Triton on CUDA, native engine on MPS/CPU and for legacy.
 
 This is the "optional engine dependency" half of the scoring split: the base
 ``relativedb`` package assembles token batches (text still as raw strings);
 this scorer embeds the strings with the NATIVE MiniLM encoder compiled into
 librt_c (``cpp/src/minilm_c.h``) — text embedding never runs in Python — and
-runs the golden-verified C++ transformer forward.
+runs the transformer through Triton by default on CUDA. The golden-verified
+C++ transformer remains the MPS/CPU implementation, the training backend, and
+an explicitly selected CUDA compatibility path.
 """
 from __future__ import annotations
 
@@ -155,12 +157,17 @@ class NativeScorer:
     def __init__(self, *, lib_path: Optional[str] = None,
                  embedder: Optional[NativeTextEncoder] = None,
                  n_threads: int = 0,
-                 device: Optional[int] = None):
+                 device: Optional[int] = None,
+                 cuda_backend: str = "triton"):
+        if cuda_backend not in ("triton", "native"):
+            raise ValueError("cuda_backend must be 'triton' or 'native'")
         self._lib_path = lib_path
         self.embedder = embedder or NativeTextEncoder(lib_path=lib_path)
         self.n_threads = n_threads
         self.device = device
+        self.cuda_backend = cuda_backend
         self._models: dict[str, RtModel] = {}
+        self._triton_models: dict[str, object] = {}
 
     # -- Scorer protocol ----------------------------------------------------
     def embed(self, texts: Sequence[str], *,
@@ -170,12 +177,32 @@ class NativeScorer:
 
     def forward(self, batch: TokenBatch, *, model_uri: str,
                 output: str = "target_scores") -> ForwardResult:
-        model = self._model_for(model_uri)
         kw = self._materialize(batch)
+        device = self._resolve_device()
+        if (output == "target_scores" and device == RT_DEVICE_CUDA
+                and self.cuda_backend == "triton"):
+            model = self._triton_model_for(model_uri)
+            raw = {
+                "node_idxs": kw["node_idxs"],
+                "f2p_nbr_idxs": kw["f2p"],
+                "col_name_idxs": kw["col_idxs"],
+                "table_name_idxs": kw["table_idxs"],
+                "is_padding": kw["is_padding"],
+                "sem_types": kw["sem_types"],
+                "is_targets": kw["is_target"],
+                "number_values": kw["number_v"],
+                "datetime_values": kw["datetime_v"],
+                "boolean_values": kw["boolean_v"],
+                "text_values": kw["text_v"],
+                "col_name_values": kw["col_name_v"],
+            }
+            return ForwardResult(scores=model.predict(raw))
+
+        # Compatibility/training outputs remain behind the native engine.
+        model = self._model_for(model_uri)
         kw["n_threads"] = self.n_threads
         if output == "target_scores":
-            return ForwardResult(scores=model.forward(
-                device=self._resolve_device(), **kw))
+            return ForwardResult(scores=model.forward(device=device, **kw))
         if output == "token_scores":
             return ForwardResult(scores=model.forward_tokens(
                 device=self._resolve_device(), **kw))
@@ -193,6 +220,21 @@ class NativeScorer:
         if path not in self._models:
             self._models[path] = load_lib(self._lib_path).load_model(path)
         return self._models[path]
+
+    def _triton_model_for(self, model_uri: str):
+        path = resolve_model_path(model_uri)
+        if path not in self._triton_models:
+            try:
+                from .triton_model import RTJTriton
+            except ImportError as exc:
+                raise ScoringError(
+                    "CUDA scoring uses Triton by default; install "
+                    "'relativedb-engine[triton]' or explicitly construct "
+                    "RtNativeBackend(cuda_backend='native') for the legacy "
+                    "CUDA implementation"
+                ) from exc
+            self._triton_models[path] = RTJTriton(path)
+        return self._triton_models[path]
 
     def _resolve_device(self) -> int:
         if self.device is None:

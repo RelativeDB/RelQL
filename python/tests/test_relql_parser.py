@@ -474,6 +474,14 @@ def test_validate_static_column_types(churn_schema):
     assert vq.task_type is TaskType.MULTICLASS_CLASSIFICATION
 
 
+def test_validate_virtual_target_is_binary_classification(churn_schema):
+    for query in ("PREDICT customers.likes_pickles",
+                  "PREDICT customers.likes_pickles FROM customers"):
+        vq = validate(query, churn_schema)
+        assert vq.query.target == ColumnRef("customers", "likes_pickles")
+        assert vq.task_type is TaskType.BINARY_CLASSIFICATION
+
+
 def test_validate_rejects_unknowns(churn_schema):
     with pytest.raises(RelqlValidationError):
         validate("PREDICT COUNT(nope.*) OVER (90 DAYS FOLLOWING) = 0 "
@@ -482,7 +490,8 @@ def test_validate_rejects_unknowns(churn_schema):
         validate("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 "
                  "FROM nope", churn_schema)          # unknown population
     with pytest.raises(RelqlValidationError):
-        validate("PREDICT orders.nope FROM orders", churn_schema)
+        validate("PREDICT customers.age FROM customers "
+                 "WHERE customers.nope = 1", churn_schema)
 
 
 def test_validate_rejects_past_facing_target_window(churn_schema):

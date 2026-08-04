@@ -25,7 +25,7 @@ from .native import (RT_DEVICE_CUDA, RT_DEVICE_MPS, RtLib, RtModel,
                      RtNativeError, load_lib, resolve_model_path)
 from .scorer import NativeScorer, NativeTextEncoder
 
-__all__ = ["RtNativeBackend", "FineTunedHead"]
+__all__ = ["RtBackend", "RtNativeBackend", "FineTunedHead"]
 
 
 class FineTunedHead:
@@ -175,12 +175,15 @@ class FineTunedHead:
 class RtNativeBackend(SequenceBackend):
     """The in-process :class:`~relativedb.engine.ModelBackend`: sequence
     assembly from the base package, MiniLM text embedding and the RT-J
-    forward in native code (librt_c).
+    forward through Triton on CUDA and through native code on MPS/CPU.
 
     Beyond scoring it carries the adaptation surface that is native-only by
     design: :meth:`fit_head` (frozen-backbone task heads, trained on the GPU)
     and the full fine-tuning plumbing used by
     :func:`relativedb.training.finetune`.
+
+    ``cuda_backend="native"`` selects the retired bespoke CUDA inference path
+    for parity investigations. Production CUDA scoring defaults to Triton.
     """
 
     def __init__(self, *, schema: Optional[Schema] = None,
@@ -194,13 +197,15 @@ class RtNativeBackend(SequenceBackend):
                  normalization_mode: Optional[NormalizationMode | str] = None,
                  task_spec_factory: Optional[TaskSpecFactory] = None,
                  device: Optional[int] = None,
+                 cuda_backend: str = "triton",
                  head: Optional[Any] = None,
                  batch_size: Optional[int] = None):
         self._lib_path = lib_path
         if isinstance(head, (str, os.PathLike)):
             head = FineTunedHead.load(str(head))
         scorer = NativeScorer(lib_path=lib_path, embedder=embedder,
-                              n_threads=n_threads, device=device)
+                              n_threads=n_threads, device=device,
+                              cuda_backend=cuda_backend)
         super().__init__(scorer, schema=schema, wiring=wiring,
                          n_threads=n_threads,
                          num_history_windows=num_history_windows,
@@ -331,3 +336,8 @@ class RtNativeBackend(SequenceBackend):
                                            if mode is NormalizationMode.REFERENCE
                                            else None),
                              normalization_mode=mode)
+
+
+# Primary public name. The historical name remains source-compatible, but no
+# longer describes CUDA inference now that Triton owns that path.
+RtBackend = RtNativeBackend
