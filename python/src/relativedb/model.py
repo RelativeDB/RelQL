@@ -24,8 +24,8 @@ __all__ = ["ModelConfig", "NormalizationMode", "EmbeddingMismatchError",
            "DEFAULT_CLASSIFICATION_MODEL_URI", "DEFAULT_REGRESSION_MODEL_URI",
            "DEFAULT_EMBEDDING_MODEL"]
 
-DEFAULT_CLASSIFICATION_MODEL_URI = "hf://stanford-star/rt-j/classification"
-DEFAULT_REGRESSION_MODEL_URI = "hf://stanford-star/rt-j/regression"
+DEFAULT_CLASSIFICATION_MODEL_URI = "hf://RelativeDB/rt-j-fp16/classification"
+DEFAULT_REGRESSION_MODEL_URI = "hf://RelativeDB/rt-j-fp16/regression"
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L12-v2"
 
 _EMBEDDING_DIMS = {"all-MiniLM-L12-v2": 384, "all-MiniLM-L6-v2": 384}

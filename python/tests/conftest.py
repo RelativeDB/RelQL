@@ -89,7 +89,7 @@ def require_native():
 
 
 def require_checkpoint(variant: str) -> str:
-    """Resolve ``hf://stanford-star/rt-j/<variant>``, or skip/fail per strict
+    """Resolve ``hf://RelativeDB/rt-j-fp16/<variant>``, or skip/fail per strict
     mode. Cache-first; on CI the HF cache is pre-warmed, so a miss here means
     the cache key is wrong or the download failed."""
     try:
@@ -97,7 +97,7 @@ def require_checkpoint(variant: str) -> str:
     except ImportError as e:
         _unavailable("relativedb-engine (pip install relativedb-engine)",
                      str(e))
-    uri = f"hf://stanford-star/rt-j/{variant}"
+    uri = f"hf://RelativeDB/rt-j-fp16/{variant}"
     try:
         return resolve_model_path(uri)
     except Exception as e:                       # noqa: BLE001 - report anything

@@ -302,6 +302,29 @@ def test_resolve_model_path_local_and_hf(tmp_path):
         resolve_model_path("gs://nope")
 
 
+def test_resolve_model_path_honors_hub_checkpoint_config(tmp_path, monkeypatch):
+    config = tmp_path / "config.json"
+    weights = tmp_path / "model.f16.safetensors"
+    config.write_text('{"checkpoint_file": "model.f16.safetensors"}')
+    weights.write_bytes(b"f16")
+    requested = []
+
+    def download(repo_id, filename, local_files_only=False):
+        requested.append((repo_id, filename, local_files_only))
+        return str(config if filename.endswith("config.json") else weights)
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    resolved = resolve_model_path("hf://RelativeDB/rt-j-fp16/classification")
+
+    assert resolved == str(weights)
+    assert requested == [
+        ("RelativeDB/rt-j-fp16", "classification/config.json", True),
+        ("RelativeDB/rt-j-fp16", "classification/model.f16.safetensors", True),
+    ]
+
+
 def test_resolve_model_path_prefers_quantized_only_when_opted_in(
         tmp_path, monkeypatch):
     f = tmp_path / "model.safetensors"
@@ -488,7 +511,7 @@ def test_multiclass_classification_end_to_end(churn_schema):
         query="PREDICT FIRST(products.name) FROM customers",
         anchor_time=dt("2026-07-01")))
     assert res.task_type.name == "MULTICLASS_CLASSIFICATION"
-    assert res.model_uri == "hf://stanford-star/rt-j/classification"
+    assert res.model_uri == "hf://RelativeDB/rt-j-fp16/classification"
     labels = {"espresso machine", "running shoes", "yoga mat"}
     assert {p.id for p in res.predictions} == {"C1", "C7", "C9"}
     for p in res.predictions:
@@ -819,7 +842,7 @@ def test_readme_quickstart_not_exists_with_params(churn_schema):
         anchor_time=dt("2026-07-01")))
 
     assert res.task_type.name == "BINARY_CLASSIFICATION"
-    assert res.model_uri == "hf://stanford-star/rt-j/classification"
+    assert res.model_uri == "hf://RelativeDB/rt-j-fp16/classification"
     probs = {p.id: p.probability for p in res.predictions}
     assert set(probs) == {"C1", "C7"}            # :ids narrows the cohort
     for p in probs.values():
@@ -850,7 +873,7 @@ def test_regression_checkpoint_end_to_end(churn_schema):
         anchor_time=dt("2026-07-01")))
 
     assert res.task_type.name == "REGRESSION"
-    assert res.model_uri == "hf://stanford-star/rt-j/regression"
+    assert res.model_uri == "hf://RelativeDB/rt-j-fp16/regression"
     values = {p.id: p.value for p in res.predictions}
     assert set(values) == {"C1", "C7", "C9"}
     for v in values.values():

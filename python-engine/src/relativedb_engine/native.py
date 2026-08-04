@@ -8,6 +8,7 @@ copy, or the sibling ``cpp/build`` tree of a monorepo checkout; a clear
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -622,17 +623,30 @@ def resolve_model_path(uri: str) -> str:
             raise RtNativeUnavailableError(f"malformed hf:// URI: {uri!r}")
         repo_id = "/".join(parts[:2])
         sub = "/".join(parts[2:])
-        filename = (sub + "/" if sub else "") + "model.safetensors"
+        prefix = (sub + "/" if sub else "")
         try:
             from huggingface_hub import hf_hub_download
         except ImportError as e:
             raise RtNativeUnavailableError(
                 f"resolving {uri!r} requires huggingface_hub: "
                 f"pip install huggingface_hub") from e
-        try:  # cache-first: never hit the network when already downloaded
-            path = hf_hub_download(repo_id, filename, local_files_only=True)
+        def download(filename: str) -> str:
+            try:  # cache-first: never hit the network when already downloaded
+                return hf_hub_download(repo_id, filename, local_files_only=True)
+            except Exception:
+                return hf_hub_download(repo_id, filename)
+
+        checkpoint_file = "model.safetensors"
+        try:
+            config_path = download(prefix + "config.json")
+            with open(config_path) as config_file:
+                checkpoint_file = json.load(config_file).get(
+                    "checkpoint_file", checkpoint_file)
         except Exception:
-            path = hf_hub_download(repo_id, filename)
+            # Older repositories did not publish a config; retain the legacy
+            # model.safetensors convention for them.
+            pass
+        path = download(prefix + checkpoint_file)
         # a quantized sibling lives beside the snapshot file, not in the repo
         picked = _pick_model(os.path.dirname(path))
         return picked if os.path.isfile(picked) else path

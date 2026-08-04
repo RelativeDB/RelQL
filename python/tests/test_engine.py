@@ -155,15 +155,15 @@ def test_engine_routes_model_uri_by_task_type(churn_schema, churn_wiring):
     eng = Engine(churn_schema, churn_wiring, model_backend=backend)
     cases = [
         ("PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FROM customers",
-         TaskType.REGRESSION, "hf://stanford-star/rt-j/regression"),
+         TaskType.REGRESSION, "hf://RelativeDB/rt-j-fp16/regression"),
         ("PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FROM customers",
-         TaskType.BINARY_CLASSIFICATION, "hf://stanford-star/rt-j/classification"),
+         TaskType.BINARY_CLASSIFICATION, "hf://RelativeDB/rt-j-fp16/classification"),
         ("PREDICT SUM(orders.qty) OVER (7 DAYS FOLLOWING HORIZONS 4) "
          "FROM customers",
-         TaskType.FORECASTING, "hf://stanford-star/rt-j/regression"),
+         TaskType.FORECASTING, "hf://RelativeDB/rt-j-fp16/regression"),
         ("PREDICT LIST_DISTINCT(orders.qty) OVER (30 DAYS FOLLOWING RANK TOP 5) "
          "FROM customers",
-         TaskType.MULTILABEL_RANKING, "hf://stanford-star/rt-j/classification"),
+         TaskType.MULTILABEL_RANKING, "hf://RelativeDB/rt-j-fp16/classification"),
     ]
     for relql, expect_task, expect_uri in cases:
         res = eng.execute(ExecutionInput(query=relql, anchor_time=T0))
@@ -310,8 +310,8 @@ def test_return_probability_on_regression_target_rejected(churn_schema, churn_wi
 
 def test_model_config_defaults_and_routing():
     cfg = ModelConfig.defaults()
-    assert cfg.classification_model_uri == "hf://stanford-star/rt-j/classification"
-    assert cfg.regression_model_uri == "hf://stanford-star/rt-j/regression"
+    assert cfg.classification_model_uri == "hf://RelativeDB/rt-j-fp16/classification"
+    assert cfg.regression_model_uri == "hf://RelativeDB/rt-j-fp16/regression"
     assert cfg.embedding_model == "all-MiniLM-L12-v2"
     assert cfg.d_text == 384
     assert cfg.model_uri_for(TaskType.REGRESSION) == cfg.regression_model_uri

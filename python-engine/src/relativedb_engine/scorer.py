@@ -175,7 +175,6 @@ class NativeScorer:
         self.inference_backend = inference_backend
         self.onnx_model_path = onnx_model_path
         self._models: dict[str, RtModel] = {}
-        self._triton_models: dict[str, object] = {}
         self._relational_models: dict[tuple[str, str, str], object] = {}
 
     # -- Scorer protocol ----------------------------------------------------
@@ -189,10 +188,11 @@ class NativeScorer:
         kw = self._materialize(batch)
         device = self._resolve_device()
         selected = self._selected_backend(device)
-        if selected in ("torch", "onnx"):
-            raw = self._relational_raw(kw)
+        if selected in ("torch", "onnx") or (
+                selected == "triton" and output == "target_scores"):
+            relational_batch = self._relational_batch(kw)
             model = self._relational_model_for(model_uri, selected, device)
-            result = model.forward(raw, output=output)
+            result = model.forward(relational_batch, output=output)
             if output == "target_scores":
                 return ForwardResult(scores=result.scores.detach().cpu().numpy())
             if output == "token_scores":
@@ -204,11 +204,6 @@ class NativeScorer:
                     scores=result.scores.detach().cpu().numpy(),
                     target_text=result.target_text.detach().cpu().numpy(),
                 )
-        if output == "target_scores" and selected == "triton":
-            model = self._triton_model_for(model_uri)
-            raw = self._relational_raw(kw)
-            return ForwardResult(scores=model.predict(raw))
-
         # Compatibility/training outputs remain behind the native engine.
         model = self._model_for(model_uri)
         kw["n_threads"] = self.n_threads
@@ -232,24 +227,15 @@ class NativeScorer:
             self._models[path] = load_lib(self._lib_path).load_model(path)
         return self._models[path]
 
-    def _triton_model_for(self, model_uri: str):
-        path = resolve_model_path(model_uri)
-        if path not in self._triton_models:
-            try:
-                from relational_transformers.backends.triton_model import RTJTriton
-            except ImportError as exc:
-                raise ScoringError(
-                    "CUDA scoring uses Triton by default; install "
-                    "'relativedb-engine[triton]' or explicitly construct "
-                    "RtNativeBackend(cuda_backend='native') for the legacy "
-                    "CUDA implementation"
-                ) from exc
-            self._triton_models[path] = RTJTriton(path)
-        return self._triton_models[path]
-
     @staticmethod
-    def _relational_raw(kw):
-        return {
+    def _relational_batch(kw):
+        try:
+            from relational_transformers import RelationalBatch
+        except ImportError as exc:
+            raise ScoringError(
+                "install relational-transformers to use the shared model runtime"
+            ) from exc
+        return RelationalBatch.from_mapping({
             "node_idxs": kw["node_idxs"],
             "f2p_nbr_idxs": kw["f2p"],
             "col_name_idxs": kw["col_idxs"],
@@ -262,7 +248,7 @@ class NativeScorer:
             "boolean_values": kw["boolean_v"],
             "text_values": kw["text_v"],
             "col_name_values": kw["col_name_v"],
-        }
+        })
 
     def _selected_backend(self, device: int) -> str:
         inference_backend = getattr(self, "inference_backend", "auto")

@@ -68,7 +68,7 @@ wiring = (RetrieverWiring.new_wiring()
     .build())
 
 # Scoring requires a model backend. RtNativeBackend runs the RT-J relational
-# model; it needs librt_c and a cached stanford-star/rt-j checkpoint.
+# model; it needs librt_c and a cached RelativeDB/rt-j-fp16 checkpoint.
 engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
 result = engine.execute(ExecutionInput(
     query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers",

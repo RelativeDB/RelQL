@@ -135,7 +135,7 @@ pytest                        # everything
 Both tiers run from this directory or from the repository root. The unit
 tier is pure Python — no native library, no checkpoint, no network. The
 integration tier lives with the engine package (`python-engine/tests`) and
-resolves `hf://stanford-star/rt-j/…` through the Hugging Face cache (~326 MB
+resolves `hf://RelativeDB/rt-j-fp16/…` through the Hugging Face cache (~326 MB
 fp32, plus ~128 MB for the pinned MiniLM text encoder).
 
 Set `RELATIVEDB_REQUIRE_NATIVE=1` to make a missing library or an
