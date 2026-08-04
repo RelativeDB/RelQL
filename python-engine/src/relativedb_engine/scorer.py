@@ -158,16 +158,25 @@ class NativeScorer:
                  embedder: Optional[NativeTextEncoder] = None,
                  n_threads: int = 0,
                  device: Optional[int] = None,
-                 cuda_backend: str = "triton"):
+                 cuda_backend: str = "triton",
+                 inference_backend: str = "auto",
+                 onnx_model_path: Optional[str] = None):
         if cuda_backend not in ("triton", "native"):
             raise ValueError("cuda_backend must be 'triton' or 'native'")
+        if inference_backend not in ("auto", "native", "torch", "triton", "onnx"):
+            raise ValueError(
+                "inference_backend must be 'auto', 'native', 'torch', 'triton', or 'onnx'"
+            )
         self._lib_path = lib_path
         self.embedder = embedder or NativeTextEncoder(lib_path=lib_path)
         self.n_threads = n_threads
         self.device = device
         self.cuda_backend = cuda_backend
+        self.inference_backend = inference_backend
+        self.onnx_model_path = onnx_model_path
         self._models: dict[str, RtModel] = {}
         self._triton_models: dict[str, object] = {}
+        self._relational_models: dict[tuple[str, str, str], object] = {}
 
     # -- Scorer protocol ----------------------------------------------------
     def embed(self, texts: Sequence[str], *,
@@ -179,23 +188,25 @@ class NativeScorer:
                 output: str = "target_scores") -> ForwardResult:
         kw = self._materialize(batch)
         device = self._resolve_device()
-        if (output == "target_scores" and device == RT_DEVICE_CUDA
-                and self.cuda_backend == "triton"):
+        selected = self._selected_backend(device)
+        if selected in ("torch", "onnx"):
+            raw = self._relational_raw(kw)
+            model = self._relational_model_for(model_uri, selected, device)
+            result = model.forward(raw, output=output)
+            if output == "target_scores":
+                return ForwardResult(scores=result.scores.detach().cpu().numpy())
+            if output == "token_scores":
+                return ForwardResult(scores=result.token_scores.detach().cpu().numpy())
+            if output == "target_features":
+                return ForwardResult(features=result.features.detach().cpu().numpy())
+            if output == "target_scores_and_text":
+                return ForwardResult(
+                    scores=result.scores.detach().cpu().numpy(),
+                    target_text=result.target_text.detach().cpu().numpy(),
+                )
+        if output == "target_scores" and selected == "triton":
             model = self._triton_model_for(model_uri)
-            raw = {
-                "node_idxs": kw["node_idxs"],
-                "f2p_nbr_idxs": kw["f2p"],
-                "col_name_idxs": kw["col_idxs"],
-                "table_name_idxs": kw["table_idxs"],
-                "is_padding": kw["is_padding"],
-                "sem_types": kw["sem_types"],
-                "is_targets": kw["is_target"],
-                "number_values": kw["number_v"],
-                "datetime_values": kw["datetime_v"],
-                "boolean_values": kw["boolean_v"],
-                "text_values": kw["text_v"],
-                "col_name_values": kw["col_name_v"],
-            }
+            raw = self._relational_raw(kw)
             return ForwardResult(scores=model.predict(raw))
 
         # Compatibility/training outputs remain behind the native engine.
@@ -225,7 +236,7 @@ class NativeScorer:
         path = resolve_model_path(model_uri)
         if path not in self._triton_models:
             try:
-                from .triton_model import RTJTriton
+                from relational_transformers.backends.triton_model import RTJTriton
             except ImportError as exc:
                 raise ScoringError(
                     "CUDA scoring uses Triton by default; install "
@@ -235,6 +246,57 @@ class NativeScorer:
                 ) from exc
             self._triton_models[path] = RTJTriton(path)
         return self._triton_models[path]
+
+    @staticmethod
+    def _relational_raw(kw):
+        return {
+            "node_idxs": kw["node_idxs"],
+            "f2p_nbr_idxs": kw["f2p"],
+            "col_name_idxs": kw["col_idxs"],
+            "table_name_idxs": kw["table_idxs"],
+            "is_padding": kw["is_padding"],
+            "sem_types": kw["sem_types"],
+            "is_targets": kw["is_target"],
+            "number_values": kw["number_v"],
+            "datetime_values": kw["datetime_v"],
+            "boolean_values": kw["boolean_v"],
+            "text_values": kw["text_v"],
+            "col_name_values": kw["col_name_v"],
+        }
+
+    def _selected_backend(self, device: int) -> str:
+        inference_backend = getattr(self, "inference_backend", "auto")
+        if inference_backend != "auto":
+            return inference_backend
+        if device == RT_DEVICE_CUDA:
+            return self.cuda_backend
+        return "native"
+
+    def _relational_model_for(self, model_uri: str, backend: str, device: int):
+        path = resolve_model_path(model_uri)
+        if backend == "onnx":
+            if not self.onnx_model_path:
+                raise ScoringError(
+                    "inference_backend='onnx' requires onnx_model_path pointing "
+                    "to an exported RT-J ONNX model"
+                )
+            path = os.fspath(self.onnx_model_path)
+        torch_device = (
+            "cuda" if device == RT_DEVICE_CUDA else
+            "mps" if device == RT_DEVICE_MPS else "cpu"
+        )
+        key = (path, backend, torch_device)
+        if key not in self._relational_models:
+            try:
+                from relational_transformers import RelationalTransformer
+            except ImportError as exc:
+                raise ScoringError(
+                    "install relational-transformers to use the shared model runtime"
+                ) from exc
+            self._relational_models[key] = RelationalTransformer(
+                path, backend=backend, device=torch_device
+            )
+        return self._relational_models[key]
 
     def _resolve_device(self) -> int:
         if self.device is None:

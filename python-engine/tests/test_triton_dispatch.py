@@ -1,6 +1,7 @@
 """CUDA inference dispatch: Triton is primary, native CUDA is explicit legacy."""
 
 import numpy as np
+import torch
 
 from relativedb_engine.native import RT_DEVICE_CUDA
 from relativedb_engine.scorer import NativeScorer
@@ -70,3 +71,27 @@ def test_native_cuda_requires_explicit_legacy_selection():
     result = scorer.forward(object(), model_uri="/checkpoint")
 
     assert result.scores.tolist() == [-0.5]
+
+
+def test_explicit_torch_backend_uses_shared_relational_runtime():
+    scorer = bare_scorer("native")
+    scorer.inference_backend = "torch"
+    captured = {}
+
+    class Result:
+        scores = torch.tensor([0.75])
+
+    class Model:
+        def forward(self, raw, output):
+            captured.update(raw)
+            assert output == "target_scores"
+            return Result()
+
+    scorer._relational_model_for = lambda uri, backend, device: Model()
+    scorer._model_for = lambda uri: (_ for _ in ()).throw(
+        AssertionError("native backend must stay cold"))
+
+    result = scorer.forward(object(), model_uri="/checkpoint")
+
+    assert result.scores.tolist() == [0.75]
+    assert captured["text_values"].shape == (1, 2, 384)

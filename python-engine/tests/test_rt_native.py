@@ -380,6 +380,41 @@ def test_churn_end_to_end_with_native_backend(churn_schema):
     assert len(set(probs.values())) > 1
 
 
+@pytest.mark.integration
+@pytest.mark.native
+@pytest.mark.checkpoint
+def test_churn_end_to_end_with_shared_torch_backend(churn_schema):
+    """RelativeDB materializes context; relational-transformers scores it."""
+    require_text_embedder()
+    _lib_or_skip()
+    _checkpoint_or_skip("classification")
+    from relativedb import ContextPolicy, Engine, ExecutionInput
+    from relativedb_engine import RT_DEVICE_CPU
+
+    backend = RtNativeBackend(
+        schema=churn_schema,
+        device=RT_DEVICE_CPU,
+        inference_backend="torch",
+    )
+    engine = Engine(
+        churn_schema,
+        in_memory_wiring(churn_rows()),
+        context_policy=ContextPolicy(cohort_size=0),
+        model_backend=backend,
+    )
+    result = engine.execute(
+        ExecutionInput(
+            query="PREDICT COUNT(orders.*) OVER (90 DAYS FOLLOWING) = 0 FROM customers",
+            anchor_time=dt("2026-07-01"),
+        )
+    )
+
+    probabilities = {prediction.id: prediction.probability for prediction in result.predictions}
+    assert set(probabilities) == {"C1", "C7", "C9"}
+    assert all(0.0 < value < 1.0 and math.isfinite(value) for value in probabilities.values())
+    assert len(set(probabilities.values())) > 1
+
+
 # --------------------------------------------------------------------------
 # RETURN output-shaping — moved from the deleted history baseline onto the
 # native backend's model probability.

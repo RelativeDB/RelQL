@@ -198,6 +198,8 @@ class RtNativeBackend(SequenceBackend):
                  task_spec_factory: Optional[TaskSpecFactory] = None,
                  device: Optional[int] = None,
                  cuda_backend: str = "triton",
+                 inference_backend: str = "auto",
+                 onnx_model_path: Optional[str] = None,
                  head: Optional[Any] = None,
                  batch_size: Optional[int] = None):
         self._lib_path = lib_path
@@ -205,7 +207,9 @@ class RtNativeBackend(SequenceBackend):
             head = FineTunedHead.load(str(head))
         scorer = NativeScorer(lib_path=lib_path, embedder=embedder,
                               n_threads=n_threads, device=device,
-                              cuda_backend=cuda_backend)
+                              cuda_backend=cuda_backend,
+                              inference_backend=inference_backend,
+                              onnx_model_path=onnx_model_path)
         super().__init__(scorer, schema=schema, wiring=wiring,
                          n_threads=n_threads,
                          num_history_windows=num_history_windows,
