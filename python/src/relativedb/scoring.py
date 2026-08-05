@@ -40,7 +40,7 @@ from .evaluate import eval_bool, eval_value
 from relational_transformers_utils.normalize import ColumnStats as _ColumnStats
 from relational_transformers_utils.normalize import NormalizationError
 from relational_transformers_utils.normalize import bf16_as_f32  # noqa: F401 (re-export)
-from relational_transformers_utils.normalize import days_since_epoch as _days
+from relational_transformers_utils.normalize import normalize_sequence
 from relational_transformers_utils.normalize import mean_std as _mean_std
 
 from .model import ModelConfig, NormalizationMode
@@ -985,48 +985,26 @@ class SequenceBackend:
     def _normalize_one(self, seq: _Seq, task_spec: TaskSpec,
                        label_stats: tuple[float, float],
                        mode: NormalizationMode) -> None:
-        """Normalize one entity independently or from persisted reference stats."""
-        num_vals: dict[tuple[str, str], list[float]] = {}
-        dt_vals: list[float] = []
-        for ck, sem, v, tgt in zip(seq.col, seq.sem, seq.value, seq.is_tgt):
-            if tgt or v is None:
-                continue
-            if sem == SEM_DATETIME:
-                dt_vals.append(_days(v))
-            elif sem in (SEM_NUMBER, SEM_BOOLEAN):
-                num_vals.setdefault(ck, []).append(
-                    float(v) if not isinstance(v, bool)
-                    else (1.0 if v else 0.0))
+        """Normalize one entity independently or from persisted reference stats.
 
-        task_key = (task_spec.target_column, task_spec.table_name)
-        stats: dict[tuple[str, str], tuple[float, float]] = {}
-        for ck, vals in num_vals.items():
-            if ck == task_key:
-                stats[ck] = label_stats
-            elif mode is NormalizationMode.REFERENCE:
-                if self.column_stats is None or not self.column_stats.has(ck[1], ck[0]):
-                    raise ScoringError(
-                        f"reference normalization has no statistics for "
-                        f"{ck[1]}.{ck[0]}")
-                stats[ck] = self.column_stats.stats[(ck[1], ck[0])]
-            else:
-                stats[ck] = _mean_std(vals)
-
-        dt_stats = (self.column_stats.dt
-                    if mode is NormalizationMode.REFERENCE
-                    and self.column_stats is not None else _mean_std(dt_vals))
-        for i, (ck, sem, v, tgt) in enumerate(
-                zip(seq.col, seq.sem, seq.value, seq.is_tgt)):
-            if tgt or v is None:
-                seq.value[i] = 0.0
-                continue
-            if sem == SEM_DATETIME:
-                mu, sd = dt_stats
-                seq.value[i] = (_days(v) - mu) / sd
-            elif sem in (SEM_NUMBER, SEM_BOOLEAN):
-                x = float(v) if not isinstance(v, bool) else (1.0 if v else 0.0)
-                mu, sd = stats[ck]
-                seq.value[i] = (x - mu) / sd
+        The arithmetic lives in
+        :func:`relational_transformers_utils.normalize.normalize_sequence`;
+        this wrapper flips the sequence's ``(column, table)`` keys into the
+        shared ``(table, column)`` order and leaves text cells as raw
+        strings for the scorer to embed.
+        """
+        keys = [(ck[1], ck[0]) for ck in seq.col]
+        try:
+            normalized = normalize_sequence(
+                keys, seq.sem, seq.value, seq.is_tgt, mode=mode,
+                column_stats=self.column_stats, label_stats=label_stats,
+                target_key=(task_spec.table_name, task_spec.target_column))
+        except NormalizationError as e:
+            raise ScoringError(str(e)) from e
+        for i, (sem, v, tgt) in enumerate(zip(seq.sem, seq.value, seq.is_tgt)):
+            if tgt or v is None or sem in (SEM_NUMBER, SEM_BOOLEAN,
+                                           SEM_DATETIME):
+                seq.value[i] = normalized[i]
             # text values stay as raw strings; embedded by the scorer
 
     def _collate(self, seqs: list[_Seq]) -> TokenBatch:

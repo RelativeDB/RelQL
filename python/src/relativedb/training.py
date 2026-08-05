@@ -126,49 +126,54 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
 
     import time
 
-    import torch
-    from relational_transformers import RelationalTransformer
+    from relational_transformers import (RelationalExample as _Example,
+                                         RelationalTrainer,
+                                         RelationalTrainingArguments,
+                                         RelationalTransformer)
+
     from .rt.scorer import RelationalScorer
 
     source_path = resolve_model_path(model_uri)
     # An independent mutable instance: the backend's serving cache must not
     # receive gradient updates.
     transformer = RelationalTransformer(source_path)
-    model = transformer.model
-    device = transformer.device
-    model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
-                                  weight_decay=weight_decay)
-    losses: list[float] = []
-    grad_norms: list[float] = []
-    total_seconds = 0.0
-    try:
-        for _ in range(epochs):
-            for start in range(0, len(seqs), batch_size):
-                started = time.perf_counter()
-                arrays = backend._collate_native(seqs[start:start + batch_size])
-                batch = RelationalScorer._relational_batch(arrays).to(device)
-                # The normalized label was written into the target cell's
-                # number channel; the model never reads it there (target
-                # values are masked), so it doubles as the training label.
-                targets = (batch.number_values.squeeze(-1)
-                           * batch.is_targets).sum(1)
-                scores = model(batch, output="target_scores").scores
-                loss = torch.nn.functional.huber_loss(
-                    scores.float(), targets.float())
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), grad_clip_norm)
-                optimizer.step()
-                losses.append(float(loss.detach()))
-                grad_norms.append(float(grad_norm))
-                total_seconds += time.perf_counter() - started
-    except RuntimeError as exc:
-        raise ExecutionError(str(exc)) from exc
-    model.eval()
+
+    # One RelationalBatch per example. The normalized label was written into
+    # the target cell's number channel; the model never reads it there
+    # (target values are masked), so it doubles as the training label.
+    train_examples = []
+    for seq in seqs:
+        batch = RelationalScorer._relational_batch(backend._collate_native([seq]))
+        label = float((batch.number_values.squeeze(-1)
+                       * batch.is_targets).sum())
+        train_examples.append(_Example(batch, label))
 
     out = Path(output_dir).expanduser().resolve()
+    # problem_type="regression" keeps the reference bool-as-number/Huber
+    # training contract for binary tasks as well; labels are already
+    # normalized scalars.
+    trainer = RelationalTrainer(
+        model=transformer,
+        args=RelationalTrainingArguments(
+            output_dir=str(out),
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            max_grad_norm=grad_clip_norm,
+            save_strategy="none",
+        ),
+        train_dataset=train_examples,
+        problem_type="regression",
+    )
+    started = time.perf_counter()
+    try:
+        trainer.train()
+    except RuntimeError as exc:
+        raise ExecutionError(str(exc)) from exc
+    total_seconds = time.perf_counter() - started
+    losses = list(trainer.losses)
+
     out.mkdir(parents=True, exist_ok=True)
     transformer.save_pretrained(out)
     source_config = Path(source_path).with_name("config.json")
@@ -183,7 +188,7 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     }
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     return FineTunedCheckpoint(
-        out, tuple(losses), tuple(grad_norms), total_seconds,
+        out, tuple(losses), (), total_seconds,
         len(examples), len(losses), backend.column_stats,
         normalization_mode)
 

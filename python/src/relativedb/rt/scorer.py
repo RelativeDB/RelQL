@@ -18,8 +18,10 @@ import numpy as np
 from relativedb.scoring import (D_TEXT, ForwardResult, ScoringError,
                                 TokenBatch, bf16_as_f32)
 
+from relational_transformers_utils.text import CachedEncoder
+
 from .models import (RT_DEVICE_CPU, RT_DEVICE_CUDA, RT_DEVICE_MPS,
-                     EngineError, resolve_model_path, torch_device_name)
+                     resolve_model_path, torch_device_name)
 
 __all__ = ["RelationalScorer", "NativeScorer", "TextEncoder",
            "NativeTextEncoder", "resolve_minilm_snapshot"]
@@ -42,35 +44,24 @@ def resolve_minilm_snapshot() -> Optional[str]:
         return snapshot_download(_MINILM_REPO)
 
 
-class TextEncoder:
-    """MiniLM embedding with a per-process cache and precomputed-table support.
+class TextEncoder(CachedEncoder):
+    """MiniLM embedding behind the shared per-process cache.
 
-    Wraps :class:`~relativedb.rt.torch_minilm.TorchTextEncoder`, which
-    mean-pools over the attention mask and rounds through bfloat16, matching
-    the reference preprocessor. ``normalize=True`` returns L2-normalized
-    vectors (a separate cache) — used for multiclass class-label embeddings;
-    the default (un-normalized) matches training for text CELL values.
+    The cache, deduplication, and precomputed-table behavior live in
+    :class:`relational_transformers_utils.text.CachedEncoder`; this class
+    adds the lazily loaded torch MiniLM encoder, which mean-pools over the
+    attention mask and rounds through bfloat16, matching the reference
+    preprocessor. ``normalize=True`` returns L2-normalized vectors (a
+    separate cache) — used for multiclass class-label embeddings; the
+    default (un-normalized) matches training for text CELL values.
     """
 
     def __init__(self, *, snapshot_dir: Optional[str] = None,
                  device: Optional[str] = None):
+        super().__init__()
         self._snapshot_dir = snapshot_dir
         self._device = device
         self._encoder = None
-        self._cache: dict[str, np.ndarray] = {}
-        self._cache_norm: dict[str, np.ndarray] = {}
-        self._strict_precomputed = False
-
-    def install_precomputed(self, values: dict[str, np.ndarray], *,
-                            strict: bool = True) -> None:
-        """Install preprocessing-time embeddings.
-
-        With ``strict=True`` an unknown string is an error, never an implicit
-        switch to a newly computed embedding distribution.
-        """
-        self._cache.update({str(key): np.asarray(value, np.float32)
-                            for key, value in values.items()})
-        self._strict_precomputed = strict
 
     def _load(self):
         if self._encoder is None:
@@ -92,22 +83,8 @@ class TextEncoder:
             self._encoder = TorchTextEncoder(model_dir=snapshot, device=device)
         return self._encoder
 
-    def encode(self, texts: Sequence[str], *,
-               normalize: bool = False) -> list[np.ndarray]:
-        cache = self._cache_norm if normalize else self._cache
-        missing = [t for t in dict.fromkeys(texts) if t not in cache]
-        if missing:
-            if self._strict_precomputed:
-                raise EngineError(
-                    "precomputed embedding table has no value for "
-                    + ", ".join(repr(value) for value in missing[:3]))
-            encoded = self._load().encode(missing, normalize=normalize)
-            for t, e in zip(missing, encoded):
-                cache[t] = np.asarray(e, np.float32)
-        return [cache[t] for t in texts]
-
-    def encode_one(self, text: str) -> np.ndarray:
-        return self.encode([text])[0]
+    def _encode_missing(self, texts, normalize):
+        return self._load().encode(list(texts), normalize=normalize)
 
 
 # Historical name: text embedding used to bind to librt_c's MiniLM.

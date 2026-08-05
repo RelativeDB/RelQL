@@ -53,7 +53,6 @@ dependencies = [
 ]
 
 [project.scripts]
-rt_triton_serve = "relativedb.rt.triton_server:main"
 
 [project.urls]
 Homepage = "https://relql.com"

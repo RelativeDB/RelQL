@@ -59,10 +59,12 @@ engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))
 ```
 
 `relativedb.rt` runs RT-J through the shared relational-transformers
-runtime (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX for exported
+runtime (torch on CPU/MPS/CUDA, Triton CUDA kernels, ONNX for exported
 graphs) and embeds text with MiniLM in torch, imported lazily so query
-planning never pays the torch import. The cloud backend is the same engine
-behind HTTP: `rt_triton_serve --port 8500`.
+planning never pays the torch import. relativedb never serves HTTP: remote
+scoring goes through `RemoteBackend`, which calls the model gateway
+(relational-transformers-gateway); the gateway imports this package to run
+the model.
 
 ## Quickstart: 90-day churn from your own DataFrames
 

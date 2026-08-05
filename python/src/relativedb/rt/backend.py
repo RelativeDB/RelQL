@@ -154,25 +154,25 @@ class FineTunedHead:
         return f"<FineTunedHead {self.task_name}{n}{loss}>"
 
 
-def _head_loss(torch, logits, labels, task: int, group_offsets, n_groups):
-    F = torch.nn.functional
-    if task == FT_MULTICLASS:
-        return F.cross_entropy(logits, labels.long())
-    if task == FT_BINARY:
-        return F.binary_cross_entropy_with_logits(logits.reshape(-1), labels)
-    if task == FT_REGRESSION:
-        return F.huber_loss(logits.reshape(-1), labels)
-    # FT_RANKING: listwise cross entropy per candidate group. Relevance is
-    # normalized into a target distribution; every group carries at least one
-    # positive (enforced upstream in relativedb.training.fit_head).
-    scores = logits.reshape(-1)
-    total = logits.new_zeros(())
-    for g in range(n_groups):
-        s, e = int(group_offsets[g]), int(group_offsets[g + 1])
-        log_p = F.log_softmax(scores[s:e], dim=0)
-        target = labels[s:e] / labels[s:e].sum()
-        total = total - (target * log_p).sum()
-    return total / max(n_groups, 1)
+_PROBLEM_TYPE_OF = {FT_BINARY: "binary", FT_REGRESSION: "regression",
+                    FT_MULTICLASS: "multiclass", FT_RANKING: "ranking"}
+
+
+def _head_loss_fn(task: int, group_offsets, n_groups):
+    """The shared loss modules from relational-transformers, bound per task."""
+    from relational_transformers import ListwiseRankingLoss, losses
+
+    if task == FT_RANKING:
+        # Relevance is normalized into a target distribution per group; every
+        # group carries at least one positive (enforced upstream in
+        # relativedb.training.fit_head).
+        ranking = ListwiseRankingLoss()
+        offsets = group_offsets[:n_groups + 1]
+        return lambda logits, labels: ranking(logits, labels, offsets)
+    loss = losses.loss_for(_PROBLEM_TYPE_OF[task])
+    if task in (FT_BINARY, FT_REGRESSION):
+        return lambda logits, labels: loss(logits.reshape(-1), labels)
+    return loss
 
 
 class RtNativeBackend(SequenceBackend):
@@ -268,7 +268,11 @@ class RtNativeBackend(SequenceBackend):
         feat_sd = np.ascontiguousarray(feats.std(0) + 1e-6, np.float32)
         feats = (feats - feat_mu) / feat_sd
 
-        head = torch.nn.Linear(D_MODEL, n_outputs)
+        from relational_transformers import TaskHead
+
+        head = TaskHead(D_MODEL, n_outputs,
+                        problem_type=_PROBLEM_TYPE_OF[ft_task])
+        projection = head.projection
         if ft_task == FT_MULTICLASS and classes:
             # Seed the head in the checkpoint's own class-embedding basis so it
             # starts from the zero-shot ordering rather than from nothing:
@@ -283,12 +287,13 @@ class RtNativeBackend(SequenceBackend):
             mu = torch.as_tensor(feat_mu)
             sd = torch.as_tensor(feat_sd)
             with torch.no_grad():
-                head.weight.copy_(weight_raw * sd)
-                head.bias.copy_(bias_raw + weight_raw @ mu)
+                projection.weight.copy_(weight_raw * sd)
+                projection.bias.copy_(bias_raw + weight_raw @ mu)
 
         x = torch.as_tensor(feats)
         y = torch.as_tensor(np.ascontiguousarray(labels, np.float32))
         go = np.ascontiguousarray(group_offsets, np.int64)
+        loss_fn = _head_loss_fn(ft_task, go, n_groups)
         optimizer = torch.optim.AdamW(head.parameters(), lr=learning_rate,
                                       weight_decay=weight_decay)
         started = time.perf_counter()
@@ -297,7 +302,7 @@ class RtNativeBackend(SequenceBackend):
         head.train()
         for _ in range(max(int(epochs), 1)):
             optimizer.zero_grad(set_to_none=True)
-            loss = _head_loss(torch, head(x), y, ft_task, go, n_groups)
+            loss = loss_fn(head(x), y)
             if initial_loss is None:
                 initial_loss = float(loss.detach())
             loss.backward()
@@ -308,7 +313,8 @@ class RtNativeBackend(SequenceBackend):
 
         mode = NormalizationMode.coerce(normalization_mode)
         return FineTunedHead(
-            head.weight.detach().numpy(), head.bias.detach().numpy(),
+            projection.weight.detach().numpy(),
+            projection.bias.detach().numpy(),
             task=ft_task,
             initial_loss=initial_loss,
             final_loss=loss_value,

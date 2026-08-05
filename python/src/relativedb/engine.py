@@ -34,8 +34,8 @@ from .relql.ast import (Ablation, AggFunc, Explain, Operator, ParsedQuery,
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
 from .schema import Schema, TableDef, ValueType
-from .traversal import (BreadthFirstTraversal, GraphTraversal,
-                        ReferenceTraversal)
+from .traversal import (BreadthFirstTraversal, ContextPolicy,
+                        GraphTraversal, ReferenceTraversal)
 
 __all__ = [
     "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
@@ -476,66 +476,6 @@ class ContextTruncationWarning(UserWarning):
 class SamplerMode(Enum):
     RETRIEVER = "retriever"   # pull-per-hop through retrievers (default)
     CSC = "csc"               # materialized in-memory CSC index (scanners)
-
-
-@dataclass(frozen=True)
-class ContextPolicy:
-    """Context assembly knobs (storage-agnostic).
-
-    ``fanouts`` are per-hop child caps; when unset, a
-    uniform ``bfs_width`` per hop is used (RT geometry). ``max_context_cells``
-    is the global cell budget.
-    """
-
-    # Geometry follows the reference evaluator (eval_utils.build_evaluator);
-    # the default cell budget is 2048 — pass max_context_cells=8192 to match
-    # the reference evaluation context size.
-    max_context_cells: int = 2048
-    bfs_width: int = 32
-    fanouts: Optional[tuple[int, ...]] = None
-    max_hops: int = 2
-    cohort_size: int = 256
-    prefer_latest: bool = True
-    local_context_cells: int = 256
-    num_walks: int = 10_000
-    walk_length: int = 20
-    seed: int = 0
-    # Number of prior task windows materialized when a RelQL aggregate defines
-    # a derived target table. The reference consumes pre-materialized task
-    # rows; this is the query-runtime equivalent.
-    num_history_windows: int = 3
-    # Members per shared-context chunk. None sizes it from the measured cost of
-    # injecting the cohort's rows; 0 puts the whole cohort in one forward; a
-    # positive value fixes the split. Chunking has no counterpart in the
-    # reference implementation -- it scores each item in its own context -- so
-    # this is a relativedb protocol knob, and how a cohort is split changes
-    # every member's context and therefore its prediction.
-    cohort_chunk: Optional[int] = None
-
-    def __post_init__(self) -> None:
-        if self.fanouts is not None:
-            object.__setattr__(self, "fanouts", tuple(self.fanouts))
-        if self.max_context_cells <= 0:
-            raise ValueError("max_context_cells must be positive")
-        if self.local_context_cells <= 0:
-            raise ValueError("local_context_cells must be positive")
-        if self.num_walks < 0 or self.walk_length < 0:
-            raise ValueError("num_walks and walk_length cannot be negative")
-        if self.num_history_windows < 0:
-            raise ValueError("num_history_windows cannot be negative")
-        if self.cohort_chunk is not None and self.cohort_chunk < 0:
-            raise ValueError("cohort_chunk cannot be negative (0 = one chunk)")
-
-    def fanout_at(self, hop: int) -> int:
-        if self.fanouts:
-            return self.fanouts[min(hop, len(self.fanouts) - 1)]
-        return self.bfs_width
-
-    @property
-    def effective_hops(self) -> int:
-        if self.fanouts:
-            return min(self.max_hops, len(self.fanouts))
-        return self.max_hops
 
 
 @dataclass(frozen=True)
