@@ -40,7 +40,6 @@ dependencies = [
 
 [project.scripts]
 rt_triton_serve = "relativedb_engine.triton_server:main"
-relativedb-quantize-fp8 = "relativedb_engine.quantization:main"
 
 [project.urls]
 Homepage = "https://relql.com"

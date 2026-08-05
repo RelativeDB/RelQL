@@ -1,3 +1,2 @@
 [console_scripts]
-relativedb-quantize-fp8 = relativedb_engine.quantization:main
 rt_triton_serve = relativedb_engine.triton_server:main
