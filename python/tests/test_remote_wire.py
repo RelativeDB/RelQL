@@ -14,7 +14,7 @@ import pytest
 from conftest import StubScorer, churn_rows, in_memory_wiring
 
 from relativedb import Engine, ExecutionInput
-from relativedb.remote import decode_batch, encode_batch
+from relativedb.remote import RemoteScorer, decode_batch, encode_batch
 from relativedb.scoring import SequenceBackend
 
 
@@ -83,3 +83,22 @@ def test_engine_accepts_backend_url(churn_schema):
             query="PREDICT COUNT(orders.*) OVER (30 DAYS FOLLOWING) = 0 "
                   "FROM customers WHERE customers.customer_id IN :ids",
             params={"ids": ["C7"]}, anchor_time=dt("2026-07-01")))
+
+
+def test_remote_text_embeddings_use_the_forward_endpoint(monkeypatch):
+    scorer = RemoteScorer("http://worker")
+    calls = []
+
+    def post(path, body):
+        calls.append((path, body))
+        return {"embeddings": [[1.0, 0.0], [0.0, 1.0]]}
+
+    monkeypatch.setattr(scorer, "_post", post)
+    got = scorer.embed(["owned", "rented"], normalize=True)
+
+    assert got.tolist() == [[1.0, 0.0], [0.0, 1.0]]
+    assert calls == [("/v1/forward", {
+        "output": "text_embeddings",
+        "texts": ["owned", "rented"],
+        "normalize": True,
+    })]

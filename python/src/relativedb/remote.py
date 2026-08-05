@@ -19,13 +19,11 @@ Endpoints (JSON over HTTP):
     ``{"model_uri", "output", "query", "task_type", "batch": {...}}`` ->
     ``{"scores": [...]}"`` / ``{"scores": [[...]]}`` (token_scores) /
     ``+ "target_text": [[384]]`` / ``{"features": [[512]]}``.
+    ``output="text_embeddings"`` carries ``texts`` instead of ``batch`` and
+    returns ``{"embeddings": [[384]...]}`` for multiclass label decoding.
     ``batch`` is the :class:`~relativedb.scoring.TokenBatch` encoding below;
     ``query``/``task_type`` ride along for validation and logging only — the
     service never parses RelQL.
-
-``POST /v1/embed``
-    ``{"texts": [...], "normalize": bool}`` -> ``{"embeddings": [[384]...]}``
-    (used for multiclass class-label embeddings).
 
 ``GET /health`` -> ``{"status": "ok", ...}``
 
@@ -186,8 +184,14 @@ class RemoteScorer:
             missing = [t for t in dict.fromkeys(texts)
                        if (t, normalize) not in self._embed_cache]
             if missing:
-                out = self._post("/v1/embed",
-                                 {"texts": missing, "normalize": bool(normalize)})
+                # Text encoding is part of the model forward contract.  Keep
+                # one authenticated/metered worker endpoint rather than a
+                # second embedding API that can drift from model execution.
+                out = self._post("/v1/forward", {
+                    "output": "text_embeddings",
+                    "texts": missing,
+                    "normalize": bool(normalize),
+                })
                 embs = out.get("embeddings")
                 if embs is None or len(embs) != len(missing):
                     raise RemoteScoringError(
