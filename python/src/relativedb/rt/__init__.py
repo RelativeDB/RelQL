@@ -1,4 +1,4 @@
-"""relativedb-engine — local model execution over relational-transformers.
+"""relativedb.rt — local model execution over relational-transformers.
 
 The base ``relativedb`` package is pure Python: it parses RelQL, assembles
 contexts and token batches, and can score through a remote backend URL. This
@@ -8,7 +8,7 @@ for exported graphs), MiniLM text encoding in torch, and the adaptation paths
 — frozen task-head fitting and full fine-tuning.
 
     from relativedb import Engine
-    from relativedb_engine import RtBackend
+    from relativedb.rt import RtBackend
 
     engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))
 """

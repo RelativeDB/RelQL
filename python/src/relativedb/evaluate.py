@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional
 
 from .relql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,

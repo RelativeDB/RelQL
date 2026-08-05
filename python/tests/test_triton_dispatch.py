@@ -3,8 +3,8 @@
 import numpy as np
 import torch
 
-from relativedb_engine.models import RT_DEVICE_CUDA
-from relativedb_engine.scorer import RelationalScorer
+from relativedb.rt.models import RT_DEVICE_CUDA
+from relativedb.rt.scorer import RelationalScorer
 
 
 def materialized():

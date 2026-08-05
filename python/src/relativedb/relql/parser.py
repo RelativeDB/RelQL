@@ -10,7 +10,7 @@ assert on their wording.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from .ast import (AggFunc, Aggregation, Arith, Case, ColumnRef, Condition,
                   Func, LogicalOp, Not, ParsedQuery, TaskType,

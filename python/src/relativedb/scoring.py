@@ -12,7 +12,7 @@ What does NOT live here is the model itself. A :class:`Scorer` supplies two
 primitives — ``forward`` over a collated :class:`TokenBatch` and ``embed``
 for text — and this module never imports a native library or an ML runtime:
 
-* ``relativedb_engine.NativeScorer`` (the optional ``relativedb-engine``
+* ``relativedb.rt.RelationalScorer`` (the torch-backed ``relativedb.rt``
   package) runs both in-process: librt_c for the transformer, the pinned
   MiniLM encoder for text.
 * :class:`relativedb.remote.RemoteScorer` ships the same token batch to a
@@ -30,13 +30,19 @@ import json
 import math
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional, Protocol, Sequence
 
 import numpy as np
 
 from .engine import EntityContext, EntityPrediction
 from .evaluate import eval_bool, eval_value
+from relational_transformers_utils.normalize import ColumnStats as _ColumnStats
+from relational_transformers_utils.normalize import NormalizationError
+from relational_transformers_utils.normalize import bf16_as_f32  # noqa: F401 (re-export)
+from relational_transformers_utils.normalize import days_since_epoch as _days
+from relational_transformers_utils.normalize import mean_std as _mean_std
+
 from .model import ModelConfig, NormalizationMode
 from .relql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef,
                         Condition, Func, LogicalOp, Not, ParsedQuery, TaskType)
@@ -103,190 +109,36 @@ class ContextTruncationWarning(UserWarning):
     comparison rather than merely shrinking it."""
 
 
-def bf16_as_f32(values: np.ndarray) -> np.ndarray:
-    """Round-to-nearest-even bfloat16, widened back to float32.
+class ColumnStats(_ColumnStats):
+    """Per-column ``(mean, std)`` statistics, shared with
+    relational-transformers-utils; this subclass adds the wiring-facing
+    ``fit`` and reports missing task statistics as :class:`ScoringError`."""
 
-    rustler persists every model-valued channel as bfloat16; the native ABI
-    accepts float32, so this reproduces that storage boundary deterministically
-    without a runtime dtype dependency. Scorers must apply the same rounding
-    to the text channels they materialize."""
-    values = np.ascontiguousarray(values, dtype=np.float32)
-    bits = values.view(np.uint32)
-    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
-    return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
-
-
-class ColumnStats:
-    """Per-column ``(mean, std)`` for numeric cells, plus one global normalizer
-    for datetimes. Fitted from the data, exactly as the reference does it.
-
-    The reference computes these once at preprocessing (``rustler/src/pre.rs``):
-    each numeric column gets the mean and sample standard deviation of its
-    whole column with nulls and NaNs excluded, a zero standard deviation is
-    replaced by 1.0, and every value is stored as ``(v - mean) / std``. Every
-    datetime cell in the dataset shares a single mean/std accumulated across
-    all tables.
-
-    This engine previously normalized against the values present in the
-    context window instead. That is undefined when a column appears once —
-    which is every column on the entity's own row when entities are scored one
-    at a time — and it made a value depend on which other rows shared the call.
-
-    Fit under the training temporal bound: statistics drawn from rows after the
-    anchor leak the future into every scaled value.
-    """
-
-    __slots__ = ("stats", "task_stats", "dt", "bound")
-
-    def __init__(self, stats: dict[tuple[str, str], tuple[float, float]],
-                 dt: tuple[float, float] = (0.0, 1.0),
-                 bound: str = "unbounded",
-                 task_stats: Optional[dict[str, tuple[float, float]]] = None):
-        self.stats = dict(stats)
-        self.task_stats = dict(task_stats or {})
-        self.dt = dt
-        self.bound = bound
+    __slots__ = ()
 
     @classmethod
     def fit(cls, schema: Schema, wiring: RetrieverWiring,
             bound: Optional[TemporalBound] = None) -> "ColumnStats":
         bound = TemporalBound.unbounded() if bound is None else bound
-        out: dict[tuple[str, str], tuple[float, float]] = {}
-        dt_vals: list[float] = []
+        scalar = (ValueType.NUMBER, ValueType.BOOLEAN, ValueType.DATETIME)
+        tables = {}
         for table in schema.tables:
-            wanted = {c.name: c.type for c in table.columns
-                      if c.type in (ValueType.NUMBER, ValueType.BOOLEAN,
-                                    ValueType.DATETIME)}
-            wanted.update({l.fk_column: l.feature_type
-                           for l in schema.links_from(table.name)
-                           if l.feature_type in (ValueType.NUMBER,
-                                                 ValueType.BOOLEAN,
-                                                 ValueType.DATETIME)})
+            wanted = (any(c.type in scalar for c in table.columns)
+                      or any(link.feature_type in scalar
+                             for link in schema.links_from(table.name)))
             if not wanted:
                 continue
-            acc: dict[str, list[float]] = {c: [] for c in wanted}
-            scanner = wiring.scanner(table.name)
-            for r in scanner(table.name, bound):
-                for c, vt in wanted.items():
-                    v = (r.parents.get(c) if c in r.parents else r.cells.get(c))
-                    if v is None:
-                        continue
-                    if vt is ValueType.DATETIME:
-                        dt_vals.append(_days(v))
-                        continue
-                    if isinstance(v, bool):
-                        v = 1.0 if v else 0.0
-                    if isinstance(v, (int, float)) and not math.isnan(float(v)):
-                        acc[c].append(float(v))
-            for c, vals in acc.items():
-                if not vals:
-                    continue
-                a = np.asarray(vals, float)
-                # ddof=1 to match polars' std(1) in the reference
-                sd = float(a.std(ddof=1)) if len(a) > 1 else 0.0
-                out[(table.name, c)] = (float(a.mean()),
-                                        sd if sd != 0.0 else 1.0)
-        if len(dt_vals) > 1:
-            a = np.asarray(dt_vals, float)
-            # rustler's global datetime Welford accumulator divides M2 by N,
-            # unlike numeric Polars columns which use sample std (N-1).
-            sd = float(a.std(ddof=0))
-            dt = (float(a.mean()), sd if sd != 0.0 else 1.0)
-        else:
-            dt = (0.0, 1.0)
-        return cls(out, dt=dt, bound=repr(bound))
+            scanner = wiring.scanner(table.name)  # raises a precise error
+            tables[table.name] = scanner(table.name, bound)
+        base = _ColumnStats.fit(schema, tables, bound)
+        return cls(base.stats, dt=base.dt, bound=base.bound,
+                   task_stats=base.task_stats)
 
-    def has(self, table: str, column: str) -> bool:
-        return (table, column) in self.stats
-
-    def transform(self, table: str, column: str, x: float) -> float:
-        mu, sd = self.stats[(table, column)]
-        return (x - mu) / sd
-
-    def transform_datetime(self, x: float) -> float:
-        mu, sd = self.dt
-        return (x - mu) / sd
-
-    def with_task_values(self, task: "TaskSpec | str",
-                         values: Sequence[float]) -> "ColumnStats":
-        """Return a copy carrying preprocessing-time stats for one task.
-
-        The task target is a real column in the reference pipeline, so its
-        transform must be persisted just like every physical numeric column.
-        """
-        vals = np.asarray(list(values), dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            raise ValueError("task statistics need at least one finite value")
-        sd = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
-        key = task.id if isinstance(task, TaskSpec) else str(task)
-        task_stats = dict(self.task_stats)
-        task_stats[key] = (float(vals.mean()), sd if sd != 0.0 else 1.0)
-        return ColumnStats(self.stats, dt=self.dt, bound=self.bound,
-                           task_stats=task_stats)
-
-    def with_column_values(self, table: str, column: str,
-                           values: Sequence[float]) -> "ColumnStats":
-        """Return a copy with reference-style numeric statistics for a
-        materialized table column that is not part of the product schema."""
-        vals = np.asarray(list(values), dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            raise ValueError("column statistics need at least one finite value")
-        sd = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
-        stats = dict(self.stats)
-        stats[(table, column)] = (float(vals.mean()),
-                                  sd if sd != 0.0 else 1.0)
-        return ColumnStats(stats, dt=self.dt, bound=self.bound,
-                           task_stats=self.task_stats)
-
-    def with_datetime_values(self, values: Sequence[float]) -> "ColumnStats":
-        """Return a copy with the reference's global datetime normalizer.
-
-        Values use the same day units as the runtime ``_days`` conversion.
-        """
-        vals = np.asarray(list(values), dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            raise ValueError("datetime statistics need at least one finite value")
-        sd = float(vals.std(ddof=0)) if vals.size > 1 else 0.0
-        return ColumnStats(self.stats,
-                           dt=(float(vals.mean()), sd if sd != 0.0 else 1.0),
-                           bound=self.bound, task_stats=self.task_stats)
-
-    def task(self, task: "TaskSpec | str") -> tuple[float, float]:
-        key = task.id if isinstance(task, TaskSpec) else str(task)
+    def task(self, task) -> tuple[float, float]:
         try:
-            return self.task_stats[key]
-        except KeyError as e:
-            raise ScoringError(
-                f"reference normalization has no target statistics for task "
-                f"{key!r}; fit them with ColumnStats.with_task_values()") from e
-
-    def to_dict(self) -> dict:
-        return {"bound": self.bound, "datetime": list(self.dt),
-                "tasks": {k: list(v) for k, v in self.task_stats.items()},
-                "stats": {f"{t}.{c}": list(v) for (t, c), v in self.stats.items()}}
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "ColumnStats":
-        stats = {}
-        for k, v in (d.get("stats") or {}).items():
-            t, _, c = k.partition(".")
-            stats[(t, c)] = (float(v[0]), float(v[1]))
-        dt = tuple(d.get("datetime") or (0.0, 1.0))
-        tasks = {str(k): (float(v[0]), float(v[1]))
-                 for k, v in (d.get("tasks") or {}).items()}
-        return cls(stats, dt=(float(dt[0]), float(dt[1])),
-                   bound=d.get("bound", "unbounded"), task_stats=tasks)
-
-    def __len__(self) -> int:
-        return len(self.stats)
-
-    def __repr__(self) -> str:
-        return (f"<ColumnStats {len(self.stats)} columns "
-                f"{len(self.task_stats)} tasks "
-                f"datetime={self.dt[0]:.1f}/{self.dt[1]:.1f} bound={self.bound}>")
+            return super().task(task)
+        except NormalizationError as e:
+            raise ScoringError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -382,22 +234,6 @@ def _sem_of_python_value(v: Any) -> Optional[int]:
     return None  # lists/None/unsupported -> no token
 
 
-def _days(t: datetime) -> float:
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    return t.timestamp() / 86400.0
-
-
-def _mean_std(values: Sequence[float], *, ddof: int = 0) -> tuple[float, float]:
-    """Finite mean/std with the reference's safe zero-variance convention."""
-    a = np.asarray(list(values), dtype=float)
-    a = a[np.isfinite(a)]
-    if a.size == 0:
-        return 0.0, 1.0
-    sd = float(a.std(ddof=ddof)) if a.size > ddof else 0.0
-    return float(a.mean()), sd if math.isfinite(sd) and sd != 0.0 else 1.0
-
-
 class _Seq:
     """Token accumulator for one entity's context window (pre-sort order)."""
 
@@ -475,7 +311,7 @@ class SequenceBackend:
     class/candidate domain.
 
     ``head`` is an optional trained task head over the frozen backbone's
-    target-cell features (``relativedb_engine.FineTunedHead``): any object
+    target-cell features (``relativedb.rt.FineTunedHead``): any object
     with ``predict(features [N,512]) -> logits [N,K]``, ``task`` (FT_* code),
     ``classes`` and ``column_stats``/``normalization_mode`` attributes.
     """

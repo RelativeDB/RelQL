@@ -10,7 +10,7 @@ import numpy as np
 from .retrieve import Row, TemporalBound
 from .schema import Schema
 from .evaluate import eval_bool, eval_value
-from .relql.ast import ColumnRef, TaskType
+from .relql.ast import TaskType
 from .task import TaskSpec
 
 __all__ = ["GraphAccess", "GraphTraversal", "TraversalResult",

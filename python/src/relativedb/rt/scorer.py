@@ -45,7 +45,7 @@ def resolve_minilm_snapshot() -> Optional[str]:
 class TextEncoder:
     """MiniLM embedding with a per-process cache and precomputed-table support.
 
-    Wraps :class:`~relativedb_engine.torch_minilm.TorchTextEncoder`, which
+    Wraps :class:`~relativedb.rt.torch_minilm.TorchTextEncoder`, which
     mean-pools over the attention mask and rounds through bfloat16, matching
     the reference preprocessor. ``normalize=True`` returns L2-normalized
     vectors (a separate cache) — used for multiclass class-label embeddings;

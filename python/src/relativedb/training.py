@@ -59,12 +59,7 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     if not hasattr(backend, "_collate_native"):
         raise ExecutionError(
             "full-backbone fine-tuning requires RtBackend")
-    try:
-        from relativedb_engine import FineTunedCheckpoint, resolve_model_path
-    except ImportError as e:
-        raise ExecutionError(
-            "full-backbone fine-tuning runs in the local engine; install "
-            "the optional package: pip install relativedb-engine") from e
+    from .rt import FineTunedCheckpoint, resolve_model_path
     if not anchors:
         raise ExecutionError("full-model fine-tuning needs at least one anchor")
     if epochs <= 0 or batch_size <= 0:
@@ -133,7 +128,7 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
 
     import torch
     from relational_transformers import RelationalTransformer
-    from relativedb_engine.scorer import RelationalScorer
+    from .rt.scorer import RelationalScorer
 
     source_path = resolve_model_path(model_uri)
     # An independent mutable instance: the backend's serving cache must not
@@ -203,9 +198,9 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
 
     The transformer is not updated; each training example is encoded once
     into its target-cell state and a small head is fitted on those. Returns
-    a :class:`~relativedb_engine.FineTunedHead` — inspect its losses,
+    a :class:`~relativedb.rt.FineTunedHead` — inspect its losses,
     ``save(path)`` it, and serve it by passing ``head=`` to
-    :class:`~relativedb_engine.RtNativeBackend`.
+    :class:`~relativedb.rt.RtBackend`.
 
     ``anchors`` are past cut-off times. For each one the context is bounded
     at the anchor — exactly as at prediction time — while the **label** is
@@ -219,7 +214,6 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     an anchor and labelling only the diagonal trains each entity at its own
     cut-off instead of at a cut-off shared with rows it predates.
     """
-    from .scoring import FT_MULTICLASS, FT_RANKING
     backend = engine._require_backend()
     if not hasattr(backend, "fit_head"):
         raise ExecutionError(
@@ -238,12 +232,7 @@ def fit_head(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
             "frozen task-head fitting is limited to multiclass and "
             "multilabel-ranking adapters; scalar binary/regression tasks "
             "require full-backbone fine-tuning")
-    try:
-        from relativedb_engine import FineTunedHead, RtNativeError
-    except ImportError as e:
-        raise ExecutionError(
-            "task-head fitting runs in the native engine; install the "
-            "optional package: pip install relativedb-engine") from e
+    from .rt import FineTunedHead, RtNativeError  # noqa: F401
     model_uri = model_uri or engine.model_config.model_uri_for(task_type)
     model = backend._model_for(model_uri)
 

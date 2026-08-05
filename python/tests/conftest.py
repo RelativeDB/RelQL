@@ -77,11 +77,7 @@ def require_checkpoint(variant: str) -> str:
     """Resolve ``hf://RelativeDB/rt-j-fp16/<variant>``, or skip/fail per strict
     mode. Cache-first; on CI the HF cache is pre-warmed, so a miss here means
     the cache key is wrong or the download failed."""
-    try:
-        from relativedb_engine import resolve_model_path
-    except ImportError as e:
-        _unavailable("relativedb-engine (pip install relativedb-engine)",
-                     str(e))
+    from relativedb.rt import resolve_model_path
     uri = f"hf://RelativeDB/rt-j-fp16/{variant}"
     try:
         return resolve_model_path(uri)
@@ -96,8 +92,8 @@ def require_text_embedder():
     try:
         import transformers  # noqa: F401
     except ImportError as e:
-        _unavailable("transformers (pip install relativedb-engine)", str(e))
-    from relativedb_engine import resolve_minilm_snapshot
+        _unavailable("transformers (pip install relativedb)", str(e))
+    from relativedb.rt import resolve_minilm_snapshot
     try:
         if resolve_minilm_snapshot() is None:
             _unavailable("MiniLM snapshot", "huggingface_hub is unavailable")

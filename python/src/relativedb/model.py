@@ -16,7 +16,8 @@ verify it against this setting and fail fast unless
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from enum import Enum
+
+from relational_transformers_utils.normalize import NormalizationMode
 
 from .relql.ast import TaskType
 
@@ -33,35 +34,6 @@ _EMBEDDING_DIMS = {"all-MiniLM-L12-v2": 384, "all-MiniLM-L6-v2": 384}
 
 class EmbeddingMismatchError(ValueError):
     """A checkpoint pins a different text encoder than the config."""
-
-
-class NormalizationMode(str, Enum):
-    """How raw relational values are mapped to the checkpoint's scale.
-
-    ``ZERO_SHOT`` needs no dataset scan.  It derives statistics independently
-    inside each entity context, so adding another entity to a request cannot
-    change an existing prediction.  ``REFERENCE`` uses preprocessing-time
-    column and task statistics, matching relational-transformer's persisted
-    dataset contract; it requires a :class:`relativedb.scoring.ColumnStats`
-    artifact on the backend.
-    """
-
-    ZERO_SHOT = "zero_shot"
-    REFERENCE = "reference"
-    # A readable alias for callers that think of the second mode by how its
-    # values are obtained rather than by the implementation it conforms to.
-    STATISTICS = "reference"
-
-    @classmethod
-    def coerce(cls, value: "NormalizationMode | str") -> "NormalizationMode":
-        if isinstance(value, cls):
-            return value
-        try:
-            return cls(str(value).lower())
-        except ValueError as e:
-            choices = ", ".join(sorted({m.value for m in cls}))
-            raise ValueError(
-                f"unknown normalization mode {value!r}; expected {choices}") from e
 
 
 @dataclass(frozen=True)

@@ -35,8 +35,6 @@ sees the same failure surface as a local backend that could not score.
 from __future__ import annotations
 
 import json
-import os
-import struct
 import contextvars
 import threading
 import urllib.error
@@ -48,7 +46,7 @@ import numpy as np
 from .relql import ParsedQuery, TaskType
 from .retrieve import RetrieverWiring
 from .schema import Schema
-from .scoring import (MAX_F2P, D_MODEL, D_TEXT, ForwardResult,
+from .scoring import (MAX_F2P, D_TEXT, ForwardResult,
                       SequenceBackend, TokenBatch)
 
 __all__ = ["RemoteBackend", "RemoteScorer", "RemoteScoringError",

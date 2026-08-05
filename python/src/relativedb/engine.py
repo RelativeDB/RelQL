@@ -762,7 +762,7 @@ class ExplainResult:
 
 class ModelBackend(Protocol):
     """Anything that can score assembled contexts. The real backend
-    (:class:`~relativedb_engine.RtNativeBackend`) loads the checkpoint at
+    (:class:`~relativedb.rt.RtBackend`) loads the checkpoint at
     ``model_uri`` (routed by task type); engine tests use a tiny deterministic
     test double. There is no built-in model-free scorer."""
 
@@ -1686,21 +1686,6 @@ class Engine:
         """Fit a task head on labelled anchors. See
         :func:`relativedb.training.fit_head`."""
         return _training.fit_head(self, *args, **kwargs)
-
-    def fit_xgboost(self, *args, **kwargs):
-        """Fit an XGBoost model on labelled anchors — the third adaptation
-        path next to :meth:`fit_head` and :meth:`finetune`, for queries the
-        flat-feature planner accepts. Returns the fitted
-        :class:`~relativedb.xgb.XgboostBackend`; assign it to
-        ``model_backend`` to serve. See
-        :func:`relativedb_engine.xgb.fit_xgboost`."""
-        try:                                      # optional dependency
-            from relativedb_engine import xgb as _xgb
-        except ImportError as e:
-            raise ExecutionError(
-                "fit_xgboost runs in the native engine; install the optional "
-                "packages: pip install 'relativedb-engine[xgboost]'") from e
-        return _xgb.fit_xgboost(self, *args, **kwargs)
 
     def _scalar_label(self, *args, **kwargs):
         return _training._scalar_label(self, *args, **kwargs)

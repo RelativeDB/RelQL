@@ -10,8 +10,9 @@ Mirrors ``dev.rql.retrieve`` from the Java API design.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Protocol, Sequence, runtime_checkable
+
+from relational_transformers_utils.rows import Row, TemporalBound
 
 from .schema import LinkDef
 
@@ -19,96 +20,6 @@ __all__ = [
     "TemporalBound", "Row", "EntityRetriever", "LinkRetriever",
     "CohortRetriever", "TableScanner", "RetrieverWiring", "WiringError",
 ]
-
-
-def _to_utc(t: datetime) -> datetime:
-    if t.tzinfo is None:
-        return t.replace(tzinfo=timezone.utc)
-    return t.astimezone(timezone.utc)
-
-
-@dataclass(frozen=True)
-class TemporalBound:
-    """"Nothing newer than this" — the temporal-leakage guard (F24).
-
-    ``as_of is None`` means unbounded (static tables without time).
-    """
-
-    as_of: Optional[datetime] = None
-
-    @staticmethod
-    def at_or_before(t: datetime) -> "TemporalBound":
-        return TemporalBound(_to_utc(t))
-
-    @staticmethod
-    def unbounded() -> "TemporalBound":
-        return TemporalBound(None)
-
-    @property
-    def is_unbounded(self) -> bool:
-        return self.as_of is None
-
-    def admits(self, timestamp: Optional[datetime]) -> bool:
-        """A row with no timestamp is static and always admitted."""
-        if self.as_of is None or timestamp is None:
-            return True
-        return _to_utc(timestamp) <= self.as_of
-
-    def admits_row(self, row: "Row") -> bool:
-        return self.admits(row.timestamp)
-
-
-@dataclass(frozen=True)
-class Row:
-    """One row's typed feature cells.
-
-    FK values are reported via ``parents``. A schema link may opt into also
-    emitting that value as a non-targetable feature. Primary keys are identity
-    only and never emit feature tokens.
-    Missing/null values: simply omit the cell — nulls emit no token.
-    """
-
-    table: str
-    id: Any
-    cells: dict[str, Any] = field(default_factory=dict)
-    timestamp: Optional[datetime] = None
-    parents: dict[str, Any] = field(default_factory=dict)  # fk column -> parent id
-
-    def __post_init__(self) -> None:
-        if self.timestamp is not None:
-            object.__setattr__(self, "timestamp", _to_utc(self.timestamp))
-        # `key` is read hundreds of millions of times during reference
-        # traversal; precompute it instead of building a tuple per access.
-        object.__setattr__(self, "key", (self.table, self.id))
-
-    key: tuple[str, Any] = field(init=False, repr=False, compare=False)
-
-    def to_json_dict(self) -> dict:
-        """The Row JSON shape shared with the ``relativedb-ffi`` C ABI."""
-        cells = {}
-        for k, v in self.cells.items():
-            if isinstance(v, datetime):
-                cells[k] = v.isoformat()
-            else:
-                cells[k] = v
-        return {
-            "table": self.table,
-            "id": self.id,
-            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
-            "cells": cells,
-            "parents": dict(self.parents),
-        }
-
-    @staticmethod
-    def from_json_dict(d: dict) -> "Row":
-        ts = d.get("timestamp")
-        return Row(
-            table=d["table"],
-            id=d["id"],
-            cells=dict(d.get("cells") or {}),
-            timestamp=datetime.fromisoformat(ts) if ts else None,
-            parents=dict(d.get("parents") or {}),
-        )
 
 
 @runtime_checkable

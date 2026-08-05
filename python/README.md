@@ -43,7 +43,7 @@ FROM customers
 
 ```bash
 pip install relativedb                 # pure Python: parse, plan, assemble
-pip install relativedb[engine]         # + the local model engine
+pip install relativedb                 # includes the local model engine
 ```
 
 Python 3.10 or newer. The base package is pure Python (numpy only): RelQL
@@ -53,15 +53,16 @@ optional in-process engine:
 
 ```python
 engine = Engine(schema, wiring, model_backend="https://scoring.example.com")
-# or, with relativedb-engine installed:
-from relativedb_engine import RtBackend
-engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))  # relativedb-engine
+# or, in process through relativedb.rt:
+from relativedb.rt import RtBackend
+engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))
 ```
 
-`relativedb-engine` runs RT-J through the shared relational-transformers
+`relativedb.rt` runs RT-J through the shared relational-transformers
 runtime (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX for exported
-graphs) and embeds text with MiniLM in torch. The cloud backend is the same
-engine behind HTTP: `rt_triton_serve --port 8500`.
+graphs) and embeds text with MiniLM in torch, imported lazily so query
+planning never pays the torch import. The cloud backend is the same engine
+behind HTTP: `rt_triton_serve --port 8500`.
 
 ## Quickstart: 90-day churn from your own DataFrames
 
@@ -92,7 +93,7 @@ wiring = (RetrieverWiring.new_wiring()
                    order_dao.recent_by_customer(parent_id, bound.as_of, limit))
     .build())
 
-engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))  # relativedb-engine
+engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))
 result = engine.execute(ExecutionInput(
     query="PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers "
           "WHERE customers.customer_id IN :ids",
@@ -132,7 +133,7 @@ pytest                        # everything
 
 Both tiers run from this directory or from the repository root. The unit
 tier is pure Python — no native library, no checkpoint, no network. The
-integration tier lives with the engine package (`python-engine/tests`) and
+integration tier lives in `python/tests` and
 resolves `hf://RelativeDB/rt-j-fp16/…` through the Hugging Face cache (~326 MB
 fp32, plus ~128 MB for the pinned MiniLM text encoder).
 

@@ -1,17 +1,16 @@
 name: Wheels
 
-# Builds the release distributions for the `relativedb` and `relativedb-engine`
-# PyPI packages: a pure sdist plus a pure py3-none-any wheel for each. Both
-# packages are pure Python; model execution lives in the separately released
-# relational-transformers package.
+# Builds the release distributions for the `relativedb` PyPI package: a pure
+# sdist plus a pure py3-none-any wheel. Model execution lives in the
+# separately released relational-transformers package; relativedb.rt wires
+# it in.
 #
 # This workflow only PRODUCES and VERIFIES artifacts. Publishing to PyPI is
-# release-libraries.yml's job; it consumes the artifacts named below:
+# release-libraries.yml's job; it consumes the artifact named below:
 #
 #   relativedb-dist
-#   relativedb-engine-dist
 #
-# Both match the glob `relativedb-*` and each holds a flat set of files for
+# It matches the glob `relativedb-*` and holds a flat set of files for
 # dist/, so downstream can download-artifact with `pattern: relativedb-*` +
 # `merge-multiple: true`.
 
@@ -49,8 +48,6 @@ jobs:
         include:
           - package: relativedb
             path: python
-          - package: relativedb-engine
-            path: python-engine
     steps:
       - uses: actions/checkout@v7
 

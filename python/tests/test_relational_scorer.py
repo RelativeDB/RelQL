@@ -8,9 +8,9 @@ from relational_transformers.checkpoints import save_checkpoint
 
 from relativedb.model import NormalizationMode
 from relativedb.relql.ast import TaskType
-from relativedb_engine.backend import FineTunedHead, RtNativeBackend
-from relativedb_engine.models import RT_DEVICE_CPU
-from relativedb_engine.scorer import RelationalScorer, TextEncoder
+from relativedb.rt.backend import FineTunedHead, RtNativeBackend
+from relativedb.rt.models import RT_DEVICE_CPU
+from relativedb.rt.scorer import RelationalScorer, TextEncoder
 
 D_TEXT = 384
 D_MODEL = 512

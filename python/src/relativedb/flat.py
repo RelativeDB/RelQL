@@ -8,7 +8,7 @@ derivation of the feature columns live here, in pure Python next to the
 parser and planner. The numeric EVALUATION of those columns over assembled
 contexts stays in C++ (``cpp/src/flat.*``): it receives this module's
 feature-spec JSON — never RelQL text — plus the encoded contexts, and fills a
-dense float matrix (see ``relativedb_engine.xgb``).
+dense float matrix (see an external tree backend).
 
 Eligibility is deliberately narrow: scalar regression / binary targets, one
 horizon, no RANK/CLASSIFY, no ASSUMING (a fitted tree cannot honor a
@@ -27,13 +27,13 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Optional, Union
 
 from .plan import _expr_str
 from .relql.ast import (AggFunc, Aggregation, ColumnRef, Condition,
-                        LogicalOp, Not, Operator, ParsedQuery, TaskType,
+                        LogicalOp, Not, ParsedQuery, TaskType,
                         TimeUnit, Window, _find_aggregations)
 from .schema import Schema, ValueType
 

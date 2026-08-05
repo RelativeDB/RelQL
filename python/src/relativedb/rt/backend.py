@@ -1,5 +1,5 @@
 """The in-process model backend: :class:`relativedb.scoring.SequenceBackend`
-over a :class:`~relativedb_engine.scorer.RelationalScorer`, plus frozen
+over a :class:`~relativedb.rt.scorer.RelationalScorer`, plus frozen
 task-head fitting on torch. Sequence assembly stays in the base package; the
 model runtime is the shared ``relational-transformers`` package.
 """
@@ -12,8 +12,8 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from relativedb.model import ModelConfig, NormalizationMode
-from relativedb.relql.ast import ParsedQuery, TaskType
+from relativedb.model import NormalizationMode
+from relativedb.relql.ast import TaskType
 from relativedb.retrieve import RetrieverWiring
 from relativedb.schema import Schema
 from relativedb.scoring import (D_MODEL, _FT_TASK_OF, FT_BINARY,

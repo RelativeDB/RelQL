@@ -1,13 +1,14 @@
 # Contributing
 
-The repository ships two Python packages:
+The repository ships one Python package:
 
 - `python/` — the `relativedb` package: RelQL planning, retriever wiring,
-  context assembly, and model routing. Pure Python, numpy only.
-- `python-engine/` — the `relativedb-engine` package: local model execution
-  over the shared [relational-transformers](https://relationaltransformers.com)
-  runtime (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX), MiniLM text
-  encoding in torch, task-head fitting, and full fine-tuning.
+  context assembly, and model routing.
+- `python/src/relativedb/rt/` — local model execution over the shared
+  [relational-transformers](https://relationaltransformers.com) runtime
+  (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX), MiniLM text encoding
+  in torch, task-head fitting, and full fine-tuning. Imported lazily, so the
+  query-planning side of the package never pays the torch import.
 
 `evaluation/` and `website/` are not part of the published packages.
 
@@ -20,7 +21,7 @@ Windows is out of scope. Python 3.10 or newer.
 git clone https://github.com/RelativeDB/RelQL.git
 cd RelQL
 python3 -m venv python/.venv
-python/.venv/bin/pip install -e "./python[dev]" -e "./python-engine"
+python/.venv/bin/pip install -e "./python[dev]"
 ```
 
 ## Tests
@@ -106,10 +107,9 @@ and never block a merge.
 
 ```bash
 python -m build python
-python -m build python-engine
 ```
 
-Both packages are pure Python and produce `py3-none-any` wheels.
+The package is pure Python and produces a `py3-none-any` wheel.
 
 See `RELEASING.md` for the full release procedure.
 

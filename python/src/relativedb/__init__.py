@@ -28,24 +28,18 @@ from .scoring import (ColumnStats, ContextConnectivityWarning, ForwardResult,
                       Scorer, ScoringError, SequenceBackend, TokenBatch)
 from .remote import RemoteBackend, RemoteScorer, RemoteScoringError
 
-# The local model engine lives in the optional relativedb-engine package.
-# These names keep resolving from `relativedb` so existing imports fail with
-# an actionable message instead of an AttributeError.
+# The local model engine lives in relativedb.rt, which imports torch. These
+# names resolve lazily so `import relativedb` stays light for clients that
+# score through a cloud backend URL.
 _ENGINE_EXPORTS = ("RtBackend", "RtNativeBackend", "RtNativeUnavailableError",
                    "TextEmbedder", "FineTunedHead", "FineTunedCheckpoint")
 
 
 def __getattr__(name):
-    """Lazy exports that live in the optional engine package."""
+    """Lazy exports that live in the torch-backed relativedb.rt subpackage."""
     if name in _ENGINE_EXPORTS:
-        try:
-            import relativedb_engine
-        except ImportError as e:
-            raise ImportError(
-                f"relativedb.{name} requires the optional local engine: "
-                f"pip install relativedb-engine — or score through a cloud "
-                f"backend with Engine(model_backend=\"https://...\")") from e
-        return getattr(relativedb_engine, name)
+        from . import rt
+        return getattr(rt, name)
     if name in ("FlatAnalysis", "analyze_flat"):
         from . import flat
         return getattr(flat, name)

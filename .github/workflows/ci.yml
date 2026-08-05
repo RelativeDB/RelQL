@@ -125,8 +125,7 @@ jobs:
 
       - name: Install the Python packages
         run: >-
-          python -m pip install --upgrade "./python[dev]" "./python-engine"
-          pytest-cov
+          python -m pip install --upgrade "./python[dev]" pytest-cov
 
       # Fetch explicitly rather than letting the first test that needs a
       # checkpoint pull it: a failure here reads as "download broke", not as
