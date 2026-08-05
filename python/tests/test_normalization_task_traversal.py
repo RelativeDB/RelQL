@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from relativedb import (ContextPolicy, Engine, NormalizationMode,
-                        ReferenceTraversal, TaskSpec, ValueType)
+                        EntityContext, ExecutionInput, ReferenceTraversal, Row,
+                        TaskSpec, ValueType)
 from relativedb.relql.ast import TaskType
 from relativedb.relql.parser import parse, validate
 from conftest import StubScorer
@@ -36,6 +37,110 @@ def test_zero_shot_normalization_is_batch_invariant(churn_schema):
                                          [one, other])[0][0]
     assert seq_one.col == seq_batch.col
     assert seq_one.value == pytest.approx(seq_batch.value)
+
+
+def test_derived_sum_labels_use_complete_history_not_sampled_context(
+        churn_schema):
+    """A context fanout cap must not change the units of a regression."""
+    rows = churn_rows()
+    wiring = in_memory_wiring(rows)
+    backend = SequenceBackend(StubScorer(), schema=churn_schema, wiring=wiring,
+                              num_history_windows=3)
+    pq = _query(
+        churn_schema,
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) FROM customers")
+    customer = next(row for row in rows["customers"] if row.id == "C1")
+    # Deliberately omit C1's June order, as a sampled/truncated context may.
+    ctx = EntityContext("C1", dt("2026-07-01"), rows=[customer],
+                        truncated_children=1,
+                        focal_row_keys=frozenset({customer.key}))
+
+    labels = backend._self_labels(pq, TaskType.REGRESSION, ctx)
+
+    assert [value for _, value in labels] == [1.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize(("aggregation", "expected"), [
+    ("SUM(orders.qty)", 181.0),
+    ("COUNT(orders.*)", 4.0),
+    ("AVG(orders.qty)", 37.0),
+])
+def test_full_execution_keeps_aggregate_regression_in_complete_data_units(
+        churn_schema, aggregation, expected):
+    """Integration guard: sampled evidence must not become sampled labels.
+
+    A zero normalized model score decodes to the mean of the three historical
+    task labels.  The context admits one order, while the factual windows hold
+    five, four, and three rows; the assertion therefore spans parsing,
+    traversal, exact label derivation, normalization, scoring, and decoding.
+    """
+    rows = churn_rows()
+    rows["orders"] = [
+        Row("orders", f"J{i}", {"qty": qty, "order_date": dt(date)},
+            timestamp=dt(date),
+            parents={"customer_id": "C1", "product_id": "P1"})
+        for i, (date, qty) in enumerate(
+            [("2026-06-10", 100.0)] * 5
+            + [("2026-05-10", 10.0)] * 4
+            + [("2026-04-10", 1.0)] * 3)
+    ]
+    wiring = in_memory_wiring(rows)
+    backend = SequenceBackend(StubScorer(score_value=0.0),
+                              schema=churn_schema, wiring=wiring,
+                              num_history_windows=3)
+    engine = Engine(
+        churn_schema, wiring, model_backend=backend,
+        context_policy=ContextPolicy(bfs_width=1, cohort_size=0,
+                                     max_context_cells=64))
+    query = (f"PREDICT {aggregation} OVER (30 DAYS FOLLOWING) "
+             "FROM customers WHERE customers.customer_id IN :ids ")
+
+    result = engine.execute(ExecutionInput(
+        query=query, params={"ids": ["C1"]},
+        anchor_time=dt("2026-07-01")))
+
+    assert result.stats["contexts_truncated"] == 1
+    assert result.predictions[0].value == pytest.approx(expected)
+
+
+def test_threshold_labels_and_forecasts_use_complete_aggregate_history(
+        churn_schema):
+    """The exact-data rule also covers classification and forecast paths."""
+    rows = churn_rows()
+    rows["orders"] = [
+        Row("orders", f"J{i}", {"qty": qty, "order_date": dt(date)},
+            timestamp=dt(date),
+            parents={"customer_id": "C1", "product_id": "P1"})
+        for i, (date, qty) in enumerate(
+            [("2026-06-10", 100.0)] * 5
+            + [("2026-05-10", 10.0)] * 4
+            + [("2026-04-10", 1.0)] * 3)
+    ]
+    wiring = in_memory_wiring(rows)
+    backend = SequenceBackend(StubScorer(score_value=0.0),
+                              schema=churn_schema, wiring=wiring,
+                              num_history_windows=3)
+    customer = next(row for row in rows["customers"] if row.id == "C1")
+    ctx = EntityContext("C1", dt("2026-07-01"), rows=[customer],
+                        truncated_children=1,
+                        focal_row_keys=frozenset({customer.key}))
+    binary = _query(
+        churn_schema,
+        "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING) >= 100 "
+        "FROM customers")
+    assert [v for _, v in backend._self_labels(
+        binary, TaskType.BINARY_CLASSIFICATION, ctx)] == [1.0, 0.0, 0.0]
+
+    engine = Engine(
+        churn_schema, wiring, model_backend=backend,
+        context_policy=ContextPolicy(bfs_width=1, cohort_size=0,
+                                     max_context_cells=64))
+    result = engine.execute(ExecutionInput(
+        query=("PREDICT SUM(orders.qty) OVER "
+               "(30 DAYS FOLLOWING HORIZONS 2) FROM customers "
+               "WHERE customers.customer_id IN :ids"),
+        params={"ids": ["C1"]}, anchor_time=dt("2026-07-01")))
+    assert result.predictions[0].forecast == pytest.approx((181.0, 181.0))
 
 
 def test_reference_normalization_uses_persisted_column_and_task_stats(

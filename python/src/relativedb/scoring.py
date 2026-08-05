@@ -720,7 +720,7 @@ class SequenceBackend:
         span = window.span() if window is not None else None
         if ctx.anchor is None or span is None:
             return []
-        rows_by_table = ctx.focal_rows_by_table()
+        rows_by_table = self._self_label_rows(query, ctx)
         cells = ctx.entity_cells(query.entity_key.table)
         out = []
         for k in range(1, self.num_history_windows + 1):
@@ -737,6 +737,52 @@ class SequenceBackend:
                 v = float(ev)
             out.append((pa, v))
         return out
+
+    _SELF_LABEL_FETCH_LIMIT = 1_000_000
+
+    def _self_label_rows(self, query: ParsedQuery,
+                         ctx: EntityContext) -> dict[str, list[Row]]:
+        """Use complete direct-child history when deriving task labels.
+
+        The model context is intentionally sampled and fanout-capped.  It is
+        valid evidence for the transformer, but it is not a factual dataset
+        over which to calculate COUNT/SUM/AVG labels: doing that made a
+        300-transaction monthly spend look like a 16-transaction spend and
+        then denormalized regression output into the wrong units.  Fetch only
+        the tables read by the target, and only through an unambiguous direct
+        relationship to the focal entity; the sequence itself remains
+        bounded.
+        """
+        rows_by_table = ctx.focal_rows_by_table()
+        if self.schema is None or self.wiring is None or ctx.anchor is None:
+            return rows_by_table
+        entity_table = query.entity_key.table
+        target_tables = {a.column.table for a in query.target_aggregations}
+        bound = TemporalBound.at_or_before(ctx.anchor)
+        for table in target_tables:
+            if table == entity_table:
+                continue
+            links = [link for link in self.schema.links_from(table)
+                     if link.to_table == entity_table]
+            if len(links) != 1:
+                if ctx.truncated_children or ctx.hit_cell_budget:
+                    raise ScoringError(
+                        f"cannot derive exact historical labels for "
+                        f"{table!r}: it is not connected to entity table "
+                        f"{entity_table!r} by one direct relationship and "
+                        "the assembled context is truncated. Refusing to "
+                        "normalize from sampled aggregate rows")
+                continue
+            retriever = self.wiring.link_retriever(table)
+            rows = list(retriever(links[0], ctx.entity_id, bound,
+                                  self._SELF_LABEL_FETCH_LIMIT))
+            if len(rows) >= self._SELF_LABEL_FETCH_LIMIT:
+                raise ScoringError(
+                    f"historical labels for {table!r} hit the "
+                    f"{self._SELF_LABEL_FETCH_LIMIT}-row safety limit; "
+                    "refusing to normalize a prediction from a partial SUM")
+            rows_by_table[table] = rows
+        return rows_by_table
 
     @staticmethod
     def _target_columns(expr: Any) -> set[tuple[str, str]]:
