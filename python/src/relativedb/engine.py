@@ -76,9 +76,9 @@ __all__ = [
     "SamplerMode",
 ]
 
-# Aggregations whose value grows with the number of rows in the window, and so
-# are biased low when the fanout cap drops children. (FIRST/LAST/MIN/MAX and
-# the DISTINCT/LIST variants are far less sensitive to a dropped tail.)
+# Aggregations whose model evidence is especially sensitive to dropped rows.
+# Historical labels are evaluated separately from complete direct-child data;
+# this set controls the context-quality warning, not label computation.
 _COUNTING_AGGS = frozenset({AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG})
 
 
@@ -1408,9 +1408,7 @@ class Engine:
 
     def _collect_stats(self, pq: ParsedQuery, task_type: TaskType,
                        contexts: list[EntityContext]) -> dict:
-        """Surface silent context truncation. A windowed COUNT/SUM whose
-        window can hold more rows than the fanout cap is biased low when
-        ``truncated_children`` is nonzero — previously invisible to callers."""
+        """Surface incomplete model evidence caused by context truncation."""
         # truncated_children counts *truncation events* (child-expansions that
         # hit the cap); the true number of dropped rows is unknown and larger,
         # since detection only requests one past the cap. So we report affected
@@ -1423,18 +1421,20 @@ class Engine:
             "contexts_hit_cell_budget": sum(1 for c in contexts if c.hit_cell_budget),
             "fanout_per_hop": self.context_policy.fanout_at(0),
         }
-        # Truncation only distorts *count-like* aggregates (COUNT/SUM/AVG over
-        # a window) in the TARGET. WHERE aggregations are evaluated against
-        # the database (`_where_agg_rows`), so truncation cannot bias the
-        # cohort. Warn once per execute when it actually bites.
+        # WHERE aggregates and direct-child historical labels are evaluated
+        # against complete data, but the transformer still sees a bounded
+        # context. Warn when a count-like target is missing some of that model
+        # evidence without falsely claiming its normalization is partial.
         windowed = any(a.window is not None and a.func in _COUNTING_AGGS
                        for a in pq.target_aggregations)
         if n_trunc and windowed:
             warnings.warn(
                 f"context truncation: {n_trunc}/{len(contexts)} entities hit "
                 f"the fanout cap ({stats['fanout_per_hop']}); windowed "
-                f"COUNT/SUM/AVG in this query are biased low for them. Raise "
-                f"ContextPolicy.bfs_width/fanouts or max_context_cells.",
+                f"COUNT/SUM/AVG model evidence is incomplete for them "
+                f"(historical label normalization remains exact for direct "
+                f"relationships). Raise ContextPolicy.bfs_width/fanouts or "
+                f"max_context_cells to expose more evidence to the model.",
                 ContextTruncationWarning, stacklevel=2)
         return stats
 
