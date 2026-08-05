@@ -207,3 +207,204 @@ def test_shared_context_scores_the_whole_cohort():
     assert {p.id for p in result.predictions} == {"C1", "C7", "C9"}
     for prediction in result.predictions:
         assert 0.0 <= prediction.probability <= 1.0
+
+
+# -- windows and horizons ------------------------------------------------------
+
+def test_forecast_horizons_return_one_value_per_step(regressor):
+    result = _run(regressor,
+                  "PREDICT SUM(orders.qty) OVER (30 DAYS FOLLOWING HORIZONS 3) "
+                  "FROM customers WHERE customers.customer_id IN :ids "
+                  "RETURN EXPECTED VALUE")
+    forecast = result.predictions[0].forecast
+    assert len(forecast) == 3
+    assert all(math.isfinite(v) for v in forecast)
+
+
+def test_preceding_target_windows_are_rejected(classifier):
+    # PRECEDING belongs in WHERE; a backward-facing PREDICT target would
+    # score the past as though it were the outcome.
+    from relativedb import RelqlValidationError
+
+    with pytest.raises(RelqlValidationError, match="future-facing"):
+        _run(classifier,
+             "PREDICT COUNT(orders.*) OVER (90 DAYS PRECEDING) > 0 "
+             "FROM customers WHERE customers.customer_id IN :ids")
+
+
+# -- WHERE and cohorts ---------------------------------------------------------
+
+def test_where_combines_aggregates_and_scalar_predicates(classifier):
+    result = classifier.execute(ExecutionInput(
+        query=("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
+               "FROM customers "
+               "WHERE EXISTS(orders.*) OVER (365 DAYS PRECEDING) "
+               "AND customers.age > :min_age"),
+        params={"min_age": 40}, anchor_time=dt(T0)))
+    # C7 (52, has orders) qualifies; C1 (34) fails the age bound and C9 has
+    # no orders at all.
+    assert {p.id for p in result.predictions} == {"C7"}
+
+
+def test_entity_with_no_history_still_scores(classifier):
+    result = _run(classifier, CHURN, params={"ids": ["C9"]})
+    assert 0.0 <= result.predictions[0].probability <= 1.0
+
+
+def test_entity_ids_as_data_match_the_where_cohort(classifier):
+    by_where = _run(classifier, CHURN, params={"ids": ["C1", "C7"]})
+    by_data = classifier.execute(ExecutionInput(
+        query=("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
+               "FROM customers"),
+        entity_ids=["C1", "C7"], anchor_time=dt(T0)))
+    assert ({p.id: p.probability for p in by_where.predictions}
+            == {p.id: p.probability for p in by_data.predictions})
+
+
+def test_per_entity_anchor_scores_rows_at_their_own_time(regressor):
+    result = regressor.execute(ExecutionInput(
+        query=("PREDICT orders.qty FROM orders "
+               "WHERE orders.order_id IN :ids RETURN EXPECTED VALUE"),
+        params={"ids": ["O1", "O3"]}, anchor_time=dt(T0),
+        per_entity_anchor=True))
+    assert {p.id for p in result.predictions} == {"O1", "O3"}
+    assert all(math.isfinite(p.value) for p in result.predictions)
+
+
+# -- samplers and explain --------------------------------------------------------
+
+def test_csc_sampler_matches_the_retriever_sampler(classifier):
+    from relativedb import SamplerMode
+
+    uri = require_checkpoint("classification")
+    schema = _schema()
+    wiring = in_memory_wiring(churn_rows())
+    from relativedb.rt import RtBackend
+
+    csc = Engine(schema, wiring,
+                 model_backend=RtBackend(schema=schema, wiring=wiring,
+                                         inference_backend="torch"),
+                 sampler_mode=SamplerMode.CSC,
+                 context_policy=ContextPolicy(max_context_cells=256, seed=11),
+                 model_config=ModelConfig(classification_model_uri=uri))
+    over_csc = csc.execute(ExecutionInput(
+        query=CHURN, params={"ids": ["C1", "C7", "C9"]}, anchor_time=dt(T0)))
+    over_retriever = classifier.execute(ExecutionInput(
+        query=CHURN, params={"ids": ["C1", "C7", "C9"]}, anchor_time=dt(T0)))
+    assert ({p.id: p.probability for p in over_csc.predictions}
+            == {p.id: p.probability for p in over_retriever.predictions})
+
+
+def test_explain_analyze_runs_the_real_model(classifier):
+    plan = classifier.explain(ExecutionInput(
+        query="EXPLAIN PLAN " + CHURN, params={"ids": ["C7"]},
+        anchor_time=dt(T0)))
+    assert plan.plan
+    context = classifier.explain(ExecutionInput(
+        query="EXPLAIN CONTEXT " + CHURN, params={"ids": ["C7"]},
+        anchor_time=dt(T0)))
+    assert context.context["total_rows"] > 0
+    analyze = classifier.explain(ExecutionInput(
+        query="EXPLAIN ANALYZE " + CHURN, params={"ids": ["C7"]},
+        anchor_time=dt(T0)))
+    assert analyze.mode == "ANALYZE"
+    assert analyze.predictions            # scored with the real model
+    assert analyze.context["total_rows"] > 0
+
+
+# -- normalization modes ---------------------------------------------------------
+
+def test_reference_normalization_serves_with_fitted_stats():
+    require_text_embedder()
+    uri = require_checkpoint("classification")
+    from relativedb.rt import RtBackend
+    from relativedb.scoring import ColumnStats
+
+    schema = _schema()
+    wiring = in_memory_wiring(churn_rows())
+    from relativedb import TaskSpec, parse, validate
+
+    pq = validate(parse(CHURN), schema).query
+    task_spec = TaskSpec.from_query(pq, pq.task_type(schema))
+    stats = ColumnStats.fit(schema, wiring).with_task_values(
+        task_spec, [0.0, 1.0])
+    engine = Engine(
+        schema, wiring,
+        model_backend=RtBackend(schema=schema, wiring=wiring,
+                                inference_backend="torch",
+                                column_stats=stats,
+                                normalization_mode="reference"),
+        context_policy=ContextPolicy(max_context_cells=256, seed=11),
+        model_config=ModelConfig(classification_model_uri=uri,
+                                 normalization_mode="reference"))
+    result = engine.execute(ExecutionInput(
+        query=CHURN, params={"ids": ["C7"]}, anchor_time=dt(T0)))
+    p = result.predictions[0].probability
+    assert 0.0 <= p <= 1.0
+    again = engine.execute(ExecutionInput(
+        query=CHURN, params={"ids": ["C7"]}, anchor_time=dt(T0)))
+    assert again.predictions[0].probability == p
+
+
+# -- the columnar serving shape ------------------------------------------------
+
+def test_columnar_store_serves_a_shared_cohort():
+    """rel-studio's serving shape: frames -> ColumnarStore -> shared context."""
+    import numpy as np
+
+    require_text_embedder()
+    uri = require_checkpoint("classification")
+    from relativedb import TaskSpec, parse, validate
+    from relativedb.rt import RtBackend
+    from relativedb.traversal import ColumnarStore, ColumnarTraversal
+
+    schema = _schema()
+    pq = validate(parse(CHURN), schema).query
+    task_spec = TaskSpec.from_query(pq, pq.task_type(schema))
+    anchor = dt(T0)
+
+    frames = {
+        "customers": {"customer_id": np.asarray(["C1", "C7", "C9"]),
+                      "age": np.asarray([34.0, 52.0, 27.0])},
+        "products": {"product_id": np.asarray(["P1", "P2", "P3"]),
+                     "price": np.asarray([25.0, 90.0, 35.0]),
+                     "name": np.asarray(["running shoes", "espresso machine",
+                                         "yoga mat"], dtype=object)},
+        "orders": {"order_id": np.asarray(["O1", "O2", "O3"]),
+                   "qty": np.asarray([1.0, 2.0, 1.0]),
+                   "order_date": np.asarray([np.datetime64("2026-03-10", "us"),
+                                             np.datetime64("2026-05-02", "us"),
+                                             np.datetime64("2026-06-20", "us")]),
+                   "customer_id": np.asarray(["C7", "C7", "C1"], dtype=object),
+                   "product_id": np.asarray(["P2", "P1", "P3"], dtype=object)},
+    }
+    # One focal task row per entity at the anchor (label unknown), plus one
+    # labeled history window per entity below it.
+    entities = ["C1", "C7", "C9"]
+    anchors = [np.datetime64(anchor.replace(tzinfo=None), "us")] * 3
+    history_ts = [np.datetime64("2026-04-01", "us")] * 3
+    task_frame = {
+        "customer": np.asarray(entities * 2, dtype=object),
+        "at": np.asarray(anchors + history_ts),
+        task_spec.target_column: np.asarray(
+            [np.nan, np.nan, np.nan, 0.0, 0.0, 1.0]),
+    }
+    store = ColumnarStore(
+        schema, frames,
+        task_frames={task_spec.table_name: task_frame},
+        task_links={task_spec.table_name: ("customers", "customer", "at")})
+
+    wiring = store.wiring()
+    engine = Engine(
+        schema, wiring,
+        model_backend=RtBackend(schema=schema, wiring=wiring,
+                                inference_backend="torch"),
+        traversal=ColumnarTraversal(store),
+        context_policy=ContextPolicy(max_context_cells=256, seed=11),
+        model_config=ModelConfig(classification_model_uri=uri))
+    result = engine.execute(ExecutionInput(
+        query=CHURN, params={"ids": entities}, anchor_time=anchor,
+        shared_context=True))
+    assert {p.id for p in result.predictions} == set(entities)
+    for prediction in result.predictions:
+        assert 0.0 <= prediction.probability <= 1.0
