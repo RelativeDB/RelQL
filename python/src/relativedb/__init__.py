@@ -40,9 +40,6 @@ def __getattr__(name):
     if name in _ENGINE_EXPORTS:
         from . import rt
         return getattr(rt, name)
-    if name in ("FlatAnalysis", "analyze_flat"):
-        from . import flat
-        return getattr(flat, name)
     raise AttributeError(f"module 'relativedb' has no attribute {name!r}")
 
 
@@ -72,5 +69,4 @@ __all__ = [
     "ScoringError", "ContextConnectivityWarning", "ColumnStats",
     "RtBackend", "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
     "FineTunedHead", "FineTunedCheckpoint",
-    "FlatAnalysis", "analyze_flat",
 ]
