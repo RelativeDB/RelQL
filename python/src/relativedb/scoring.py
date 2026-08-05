@@ -317,6 +317,28 @@ class _Seq:
         return s
 
 
+def _physical_batches(seqs, *, max_items: int,
+                      max_cells: int | None) -> list[list]:
+    """Bound batches by padded cells, not only by entity count."""
+    batches = []
+    current = []
+    longest = 0
+    for seq in seqs:
+        candidate_longest = max(longest, len(seq))
+        candidate_cells = candidate_longest * (len(current) + 1)
+        if current and (len(current) >= max_items
+                        or (max_cells is not None
+                            and candidate_cells > max_cells)):
+            batches.append(current)
+            current = []
+            longest = 0
+        current.append(seq)
+        longest = max(longest, len(seq))
+    if current:
+        batches.append(current)
+    return batches
+
+
 class SequenceBackend:
     """A :class:`~relativedb.engine.ModelBackend` over any :class:`Scorer`.
 
@@ -365,7 +387,8 @@ class SequenceBackend:
                  normalization_mode: NormalizationMode | str | None = None,
                  task_spec_factory: TaskSpecFactory | None = None,
                  head: Any | None = None,
-                 batch_size: int | None = None):
+                 batch_size: int | None = None,
+                 max_batch_cells: int | None = None):
         self.scorer = scorer
         self.schema = schema
         self.wiring = wiring
@@ -377,12 +400,15 @@ class SequenceBackend:
         self.task_spec_factory = task_spec_factory or TaskSpec.from_query
         if batch_size is not None and batch_size <= 0:
             raise ValueError("batch_size must be positive when provided")
+        if max_batch_cells is not None and max_batch_cells <= 0:
+            raise ValueError("max_batch_cells must be positive when provided")
         # Bound the physical forward without changing the query cohort or the
         # context length. Engine.execute() may resolve thousands of entities
         # at once; passing that whole cohort through one forward makes the
         # public product path unusable and can OOM the scorer even when a
         # small physical batch would fit comfortably.
         self.batch_size = batch_size
+        self.max_batch_cells = max_batch_cells
         self.column_stats = column_stats
         # A head fitted under fitted-statistics normalization must be served
         # the same way, so the head's own stats win over anything passed here.
@@ -567,11 +593,15 @@ class SequenceBackend:
     def _forward_batched(self, seqs: list[_Seq], model_uri: str, *,
                          output: str = "target_scores"):
         """Run bounded physical forwards while preserving logical ordering."""
-        bs = self.batch_size or self.DEFAULT_PHYSICAL_BATCH
-        if not seqs or len(seqs) <= bs:
+        chunks = _physical_batches(
+            seqs,
+            max_items=self.batch_size or self.DEFAULT_PHYSICAL_BATCH,
+            max_cells=self.max_batch_cells,
+        )
+        if len(chunks) <= 1:
             return self._forward(seqs, model_uri, output=output)
-        chunks = [self._forward(seqs[i:i + bs], model_uri, output=output)
-                  for i in range(0, len(seqs), bs)]
+        chunks = [self._forward(chunk, model_uri, output=output)
+                  for chunk in chunks]
         if output == "target_scores_and_text":
             scores = np.concatenate([c[0] for c in chunks], axis=0)
             text = np.concatenate([c[1] for c in chunks], axis=0)
