@@ -19,7 +19,7 @@ body:
       description: >-
         The smallest thing that shows it. If it needs the native engine, say
         which backend (CPU / Metal / CUDA) and which checkpoint variant
-        (fp32 / f16 / q8 / q4, i.e. RELATIVEDB_RT_QUANTIZED).
+        (fp16 / fp8 / int8 / int4).
       render: python
     validations:
       required: true
@@ -48,4 +48,3 @@ body:
       label: Engine
       options:
         - label: The library loaded (the second command above printed a path)
-        - label: I built `cpp/` myself rather than using a released wheel

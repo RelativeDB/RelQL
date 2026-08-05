@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from relativedb import (Engine, ExecutionInput, LinkDef, RetrieverWiring,
                         Row, Schema, TableDef, TemporalBound, ValueType)
-from relativedb.rt_native import RtNativeBackend, load_lib
+from relativedb_engine import RtBackend
 
 
 def dt(s):
@@ -99,12 +99,7 @@ for t in ROWS:
 wiring = wiring.build()
 
 # ---- the actual check -----------------------------------------------------
-lib = load_lib()
-assert "site-packages" in lib.path, (
-    f"expected the wheel's bundled librt_c, got {lib.path}")
-print(f"native engine: ...{lib.path.split('site-packages/')[-1]}")
-
-engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))
+engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))
 result = engine.execute(ExecutionInput(
     query=("PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) "
            "FROM customers WHERE customers.customer_id IN :ids"),

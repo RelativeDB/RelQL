@@ -1,10 +1,10 @@
-"""CUDA inference dispatch: Triton is primary, native CUDA is explicit legacy."""
+"""Backend dispatch: Triton serves CUDA target scores, torch serves the rest."""
 
 import numpy as np
 import torch
 
-from relativedb_engine.native import RT_DEVICE_CUDA
-from relativedb_engine.scorer import NativeScorer
+from relativedb_engine.models import RT_DEVICE_CUDA
+from relativedb_engine.scorer import RelationalScorer
 
 
 def materialized():
@@ -26,12 +26,12 @@ def materialized():
     }
 
 
-def bare_scorer(cuda_backend):
-    scorer = object.__new__(NativeScorer)
-    scorer.cuda_backend = cuda_backend
+def bare_scorer(inference_backend="auto"):
+    scorer = object.__new__(RelationalScorer)
+    scorer.cuda_backend = "triton"
     scorer.n_threads = 0
     scorer.device = RT_DEVICE_CUDA
-    scorer.inference_backend = "auto"
+    scorer.inference_backend = inference_backend
     scorer.onnx_model_path = None
     scorer._resolve_device = lambda: RT_DEVICE_CUDA
     scorer._materialize = lambda batch: materialized()
@@ -39,8 +39,9 @@ def bare_scorer(cuda_backend):
 
 
 def test_cuda_target_scores_use_triton_by_default():
-    scorer = bare_scorer("triton")
+    scorer = bare_scorer()
     captured = {}
+    backends = []
 
     class Model:
         def forward(self, batch, output):
@@ -48,53 +49,59 @@ def test_cuda_target_scores_use_triton_by_default():
             assert output == "target_scores"
             return type("Result", (), {"scores": torch.tensor([0.25])})()
 
-    scorer._relational_model_for = lambda uri, backend, device: Model()
-    scorer._model_for = lambda uri: (_ for _ in ()).throw(
-        AssertionError("native CUDA path must stay cold"))
+    def model_for(uri, backend, device):
+        backends.append(backend)
+        return Model()
+
+    scorer._relational_model_for = model_for
 
     result = scorer.forward(object(), model_uri="/checkpoint")
 
+    assert backends == ["triton"]
     assert result.scores.tolist() == [0.25]
     assert captured["f2p_nbr_idxs"].shape == (1, 2, 5)
     assert captured["is_targets"].tolist() == [[True, False]]
-
-
-def test_native_cuda_requires_explicit_legacy_selection():
-    scorer = bare_scorer("native")
-
-    class Model:
-        def forward(self, **kwargs):
-            assert kwargs["device"] == RT_DEVICE_CUDA
-            return np.asarray([-0.5], np.float32)
-
-    scorer._model_for = lambda uri: Model()
-    scorer._relational_model_for = lambda uri, backend, device: (_ for _ in ()).throw(
-        AssertionError("shared runtime must not run under explicit legacy selection"))
-
-    result = scorer.forward(object(), model_uri="/checkpoint")
-
-    assert result.scores.tolist() == [-0.5]
+    assert captured["text_values"].shape == (1, 2, 384)
 
 
 def test_explicit_torch_backend_uses_shared_relational_runtime():
-    scorer = bare_scorer("native")
-    scorer.inference_backend = "torch"
-    captured = {}
-
-    class Result:
-        scores = torch.tensor([0.75])
+    scorer = bare_scorer(inference_backend="torch")
+    backends = []
 
     class Model:
         def forward(self, batch, output):
-            captured.update(batch.as_dict())
             assert output == "target_scores"
-            return Result()
+            return type("Result", (), {"scores": torch.tensor([0.75])})()
 
-    scorer._relational_model_for = lambda uri, backend, device: Model()
-    scorer._model_for = lambda uri: (_ for _ in ()).throw(
-        AssertionError("native backend must stay cold"))
+    def model_for(uri, backend, device):
+        backends.append(backend)
+        return Model()
+
+    scorer._relational_model_for = model_for
 
     result = scorer.forward(object(), model_uri="/checkpoint")
 
+    assert backends == ["torch"]
     assert result.scores.tolist() == [0.75]
-    assert captured["text_values"].shape == (1, 2, 384)
+
+
+def test_rich_outputs_fall_back_to_torch_on_cuda():
+    scorer = bare_scorer()
+    backends = []
+
+    class Model:
+        def forward(self, batch, output):
+            assert output == "target_features"
+            return type("Result", (), {"features": torch.zeros((1, 512))})()
+
+    def model_for(uri, backend, device):
+        backends.append(backend)
+        return Model()
+
+    scorer._relational_model_for = model_for
+
+    result = scorer.forward(object(), model_uri="/checkpoint",
+                            output="target_features")
+
+    assert backends == ["torch"]
+    assert result.features.shape == (1, 512)

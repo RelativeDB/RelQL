@@ -22,15 +22,16 @@ Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: relativedb==0.1.3
+Requires-Dist: relational-transformers>=0.1.0
 Requires-Dist: numpy>=1.24
 Requires-Dist: huggingface_hub>=0.23
 Provides-Extra: dev
 Requires-Dist: pytest>=7; extra == "dev"
 Requires-Dist: pytest-cov>=5; extra == "dev"
 Provides-Extra: triton
-Requires-Dist: torch>=2.13; extra == "triton"
 Requires-Dist: triton>=3.7; extra == "triton"
-Requires-Dist: safetensors>=0.8; extra == "triton"
+Provides-Extra: onnx
+Requires-Dist: relational-transformers[onnx]>=0.1.0; extra == "onnx"
 Provides-Extra: xgboost
 Requires-Dist: xgboost>=3.3.0; extra == "xgboost"
 Dynamic: license-file

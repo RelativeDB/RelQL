@@ -1,16 +1,15 @@
-"""In-process scorer: Triton on CUDA, native engine on MPS/CPU and for legacy.
+"""In-process scorer over the shared relational-transformers runtime.
 
-This is the "optional engine dependency" half of the scoring split: the base
-``relativedb`` package assembles token batches (text still as raw strings);
-this scorer embeds the strings with the NATIVE MiniLM encoder compiled into
-librt_c (``cpp/src/minilm_c.h``) — text embedding never runs in Python — and
-runs the transformer through Triton by default on CUDA. The golden-verified
-C++ transformer remains the MPS/CPU implementation, the training backend, and
-an explicitly selected CUDA compatibility path.
+The base ``relativedb`` package assembles token batches with text still as raw
+strings; this scorer embeds the strings with MiniLM
+(``sentence-transformers/all-MiniLM-L12-v2``, mean-pooled and un-normalized,
+exactly the space RT-J is frozen against) and forwards through
+:class:`relational_transformers.RelationalTransformer`. Backend selection:
+Triton serves classification target scores on CUDA, torch serves everything
+else everywhere, and ONNX is available for exported graphs.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 from typing import Optional, Sequence
 
@@ -19,10 +18,11 @@ import numpy as np
 from relativedb.scoring import (D_TEXT, ForwardResult, ScoringError,
                                 TokenBatch, bf16_as_f32)
 
-from .native import (RT_DEVICE_CPU, RT_DEVICE_CUDA, RT_DEVICE_MPS,
-                     RtNativeError, RtModel, load_lib, resolve_model_path)
+from .models import (RT_DEVICE_CPU, RT_DEVICE_CUDA, RT_DEVICE_MPS,
+                     EngineError, resolve_model_path, torch_device_name)
 
-__all__ = ["NativeScorer", "NativeTextEncoder", "resolve_minilm_snapshot"]
+__all__ = ["RelationalScorer", "NativeScorer", "TextEncoder",
+           "NativeTextEncoder", "resolve_minilm_snapshot"]
 
 _MINILM_REPO = "sentence-transformers/all-MiniLM-L12-v2"
 
@@ -30,10 +30,8 @@ _MINILM_REPO = "sentence-transformers/all-MiniLM-L12-v2"
 def resolve_minilm_snapshot() -> Optional[str]:
     """Resolve (and if needed download) the pinned MiniLM snapshot directory.
 
-    The C++ encoder can auto-locate an existing HF-cache snapshot itself; this
-    helper exists for the cold-cache case, where only huggingface_hub knows how
-    to fetch one. Returns None when huggingface_hub is unavailable — the native
-    loader then reports precisely what is missing."""
+    Returns None when huggingface_hub is unavailable; the encoder then reports
+    precisely what is missing when it loads."""
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -44,22 +42,21 @@ def resolve_minilm_snapshot() -> Optional[str]:
         return snapshot_download(_MINILM_REPO)
 
 
-class NativeTextEncoder:
-    """ctypes binding to the native MiniLM encoder in librt_c
-    (``cpp/src/minilm_c.h``), with a per-process embedding cache.
+class TextEncoder:
+    """MiniLM embedding with a per-process cache and precomputed-table support.
 
-    Embedding is deliberately NOT implemented in Python: RT-J is frozen
-    against vectors this exact encoder produced, and the encoder ships with
-    the engine (this package's librt_c) or with the serving backend — never
-    with context creation.
+    Wraps :class:`~relativedb_engine.torch_minilm.TorchTextEncoder`, which
+    mean-pools over the attention mask and rounds through bfloat16, matching
+    the reference preprocessor. ``normalize=True`` returns L2-normalized
+    vectors (a separate cache) — used for multiclass class-label embeddings;
+    the default (un-normalized) matches training for text CELL values.
     """
 
-    def __init__(self, *, lib_path: Optional[str] = None,
-                 snapshot_dir: Optional[str] = None):
-        self._lib_path = lib_path
+    def __init__(self, *, snapshot_dir: Optional[str] = None,
+                 device: Optional[str] = None):
         self._snapshot_dir = snapshot_dir
-        self._handle: Optional[int] = None
-        self._lib = None
+        self._device = device
+        self._encoder = None
         self._cache: dict[str, np.ndarray] = {}
         self._cache_norm: dict[str, np.ndarray] = {}
         self._strict_precomputed = False
@@ -76,105 +73,75 @@ class NativeTextEncoder:
         self._strict_precomputed = strict
 
     def _load(self):
-        if self._handle is None:
-            lib = load_lib(self._lib_path)._lib
-            if not hasattr(lib, "minilm_load"):
-                raise RtNativeError(
-                    "this librt_c was built without the native MiniLM text "
-                    "encoder (minilm_load missing); rebuild cpp/ or point "
-                    "RELATIVEDB_RT_LIB at a full build")
-            lib.minilm_load.restype = ctypes.c_void_p
-            lib.minilm_load.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
-                                        ctypes.c_size_t]
-            lib.minilm_free.restype = None
-            lib.minilm_free.argtypes = [ctypes.c_void_p]
-            lib.minilm_encode.restype = ctypes.c_int
-            lib.minilm_encode.argtypes = [
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
-                ctypes.c_int32, ctypes.c_int32,
-                np.ctypeslib.ndpointer(np.float32, flags="C_CONTIGUOUS"),
-                ctypes.c_char_p, ctypes.c_size_t]
-            snap = self._snapshot_dir or os.environ.get(
-                "RELATIVEDB_MINILM_DIR") or resolve_minilm_snapshot() or ""
-            err = ctypes.create_string_buffer(512)
-            handle = lib.minilm_load(snap.encode("utf-8"), err, len(err))
-            if not handle:
-                raise RtNativeError(
-                    f"minilm_load({snap!r}) failed: "
-                    f"{err.value.decode('utf-8', 'replace')}")
-            self._lib = lib
-            self._handle = handle
-        return self._lib
+        if self._encoder is None:
+            import torch
+
+            from .torch_minilm import TorchTextEncoder
+
+            device = self._device
+            if device is None:
+                if torch.backends.mps.is_available():
+                    device = "mps"
+                elif torch.cuda.is_available():
+                    device = "cuda"
+                else:
+                    device = "cpu"
+            snapshot = (self._snapshot_dir
+                        or os.environ.get("RELATIVEDB_MINILM_DIR")
+                        or resolve_minilm_snapshot())
+            self._encoder = TorchTextEncoder(model_dir=snapshot, device=device)
+        return self._encoder
 
     def encode(self, texts: Sequence[str], *,
                normalize: bool = False) -> list[np.ndarray]:
-        """Mean-pooled MiniLM embeddings, cached. ``normalize=True`` returns
-        L2-normalized (unit) vectors (a separate cache) — used for multiclass
-        class-label embeddings; the default (un-normalized) matches training
-        for text CELL values."""
         cache = self._cache_norm if normalize else self._cache
         missing = [t for t in dict.fromkeys(texts) if t not in cache]
         if missing:
             if self._strict_precomputed:
-                raise RtNativeError(
+                raise EngineError(
                     "precomputed embedding table has no value for "
                     + ", ".join(repr(value) for value in missing[:3]))
-            lib = self._load()
-            arr = (ctypes.c_char_p * len(missing))(
-                *[t.encode("utf-8") for t in missing])
-            out = np.zeros((len(missing), D_TEXT), np.float32)
-            err = ctypes.create_string_buffer(512)
-            rc = lib.minilm_encode(self._handle, arr, len(missing),
-                                   1 if normalize else 0, out, err, len(err))
-            if rc != 0:
-                raise RtNativeError(
-                    f"minilm_encode failed ({rc}): "
-                    f"{err.value.decode('utf-8', 'replace')}")
-            for t, e in zip(missing, out):
-                cache[t] = e.copy()
+            encoded = self._load().encode(missing, normalize=normalize)
+            for t, e in zip(missing, encoded):
+                cache[t] = np.asarray(e, np.float32)
         return [cache[t] for t in texts]
 
     def encode_one(self, text: str) -> np.ndarray:
         return self.encode([text])[0]
 
-    def __del__(self):  # pragma: no cover
-        try:
-            if self._handle and self._lib is not None:
-                self._lib.minilm_free(self._handle)
-                self._handle = None
-        except Exception:
-            pass
+
+# Historical name: text embedding used to bind to librt_c's MiniLM.
+NativeTextEncoder = TextEncoder
 
 
-class NativeScorer:
-    """Embeds text and forwards through librt_c, all in native code.
+class RelationalScorer:
+    """Embeds text and forwards through relational-transformers backends.
 
-    ``device=None`` resolves once to the best available backend (MPS, then
+    ``device=None`` resolves once to the best available device (MPS, then
     CUDA, then CPU). Loaded checkpoints are cached per resolved path so cohort
     chunks and multi-task queries do not reload 342 MB of weights.
     """
 
     def __init__(self, *, lib_path: Optional[str] = None,
-                 embedder: Optional[NativeTextEncoder] = None,
+                 embedder: Optional[TextEncoder] = None,
                  n_threads: int = 0,
                  device: Optional[int] = None,
                  cuda_backend: str = "triton",
                  inference_backend: str = "auto",
                  onnx_model_path: Optional[str] = None):
-        if cuda_backend not in ("triton", "native"):
-            raise ValueError("cuda_backend must be 'triton' or 'native'")
-        if inference_backend not in ("auto", "native", "torch", "triton", "onnx"):
+        if cuda_backend not in ("triton", "torch"):
+            raise ValueError("cuda_backend must be 'triton' or 'torch'")
+        if inference_backend not in ("auto", "torch", "triton", "onnx"):
             raise ValueError(
-                "inference_backend must be 'auto', 'native', 'torch', 'triton', or 'onnx'"
+                "inference_backend must be 'auto', 'torch', 'triton', or 'onnx'"
             )
-        self._lib_path = lib_path
-        self.embedder = embedder or NativeTextEncoder(lib_path=lib_path)
+        del lib_path  # retained in the signature for source compatibility
+        self.embedder = embedder or TextEncoder()
         self.n_threads = n_threads
         self.device = device
         self.cuda_backend = cuda_backend
         self.inference_backend = inference_backend
         self.onnx_model_path = onnx_model_path
-        self._models: dict[str, RtModel] = {}
         self._relational_models: dict[tuple[str, str, str], object] = {}
 
     # -- Scorer protocol ----------------------------------------------------
@@ -185,48 +152,30 @@ class NativeScorer:
 
     def forward(self, batch: TokenBatch, *, model_uri: str,
                 output: str = "target_scores") -> ForwardResult:
+        if output not in ("target_scores", "token_scores", "target_features",
+                          "target_scores_and_text"):
+            raise ScoringError(f"unknown forward output kind {output!r}")
         kw = self._materialize(batch)
         device = self._resolve_device()
         selected = self._selected_backend(device)
-        if selected in ("torch", "onnx") or (
-                selected == "triton" and output == "target_scores"):
-            relational_batch = self._relational_batch(kw)
-            model = self._relational_model_for(model_uri, selected, device)
-            result = model.forward(relational_batch, output=output)
-            if output == "target_scores":
-                return ForwardResult(scores=result.scores.detach().cpu().numpy())
-            if output == "token_scores":
-                return ForwardResult(scores=result.token_scores.detach().cpu().numpy())
-            if output == "target_features":
-                return ForwardResult(features=result.features.detach().cpu().numpy())
-            if output == "target_scores_and_text":
-                return ForwardResult(
-                    scores=result.scores.detach().cpu().numpy(),
-                    target_text=result.target_text.detach().cpu().numpy(),
-                )
-        # Compatibility/training outputs remain behind the native engine.
-        model = self._model_for(model_uri)
-        kw["n_threads"] = self.n_threads
+        if selected in ("triton", "onnx") and output != "target_scores":
+            # Those backends serve target scores; richer outputs run torch.
+            selected = "torch"
+        relational_batch = self._relational_batch(kw)
+        model = self._relational_model_for(model_uri, selected, device)
+        result = model.forward(relational_batch, output=output)
         if output == "target_scores":
-            return ForwardResult(scores=model.forward(device=device, **kw))
+            return ForwardResult(scores=result.scores.detach().cpu().numpy())
         if output == "token_scores":
-            return ForwardResult(scores=model.forward_tokens(
-                device=self._resolve_device(), **kw))
-        if output == "target_scores_and_text":
-            scores, text = model.forward_ex(**kw)   # CPU path (rt_forward_ex)
-            return ForwardResult(scores=scores, target_text=text)
+            return ForwardResult(scores=result.token_scores.detach().cpu().numpy())
         if output == "target_features":
-            return ForwardResult(features=model.encode_targets(
-                device=self._resolve_device(), **kw))
-        raise ScoringError(f"unknown forward output kind {output!r}")
+            return ForwardResult(features=result.features.detach().cpu().numpy())
+        return ForwardResult(
+            scores=result.scores.detach().cpu().numpy(),
+            target_text=result.target_text.detach().cpu().numpy(),
+        )
 
     # -- internals ------------------------------------------------------------
-    def _model_for(self, model_uri: str) -> RtModel:
-        path = resolve_model_path(model_uri)
-        if path not in self._models:
-            self._models[path] = load_lib(self._lib_path).load_model(path)
-        return self._models[path]
-
     @staticmethod
     def _relational_batch(kw):
         try:
@@ -256,7 +205,7 @@ class NativeScorer:
             return inference_backend
         if device == RT_DEVICE_CUDA:
             return self.cuda_backend
-        return "native"
+        return "torch"
 
     def _relational_model_for(self, model_uri: str, backend: str, device: int):
         path = resolve_model_path(model_uri)
@@ -267,10 +216,7 @@ class NativeScorer:
                     "to an exported RT-J ONNX model"
                 )
             path = os.fspath(self.onnx_model_path)
-        torch_device = (
-            "cuda" if device == RT_DEVICE_CUDA else
-            "mps" if device == RT_DEVICE_MPS else "cpu"
-        )
+        torch_device = torch_device_name(device)
         key = (path, backend, torch_device)
         if key not in self._relational_models:
             try:
@@ -284,12 +230,18 @@ class NativeScorer:
             )
         return self._relational_models[key]
 
+    def torch_model(self, model_uri: str):
+        """The loaded torch :class:`relational_transformers.RTJModel` for
+        ``model_uri`` — the handle training paths differentiate through."""
+        device = self._resolve_device()
+        return self._relational_model_for(model_uri, "torch", device)
+
     def _resolve_device(self) -> int:
         if self.device is None:
-            lib = load_lib(self._lib_path)
-            if lib.device_available(RT_DEVICE_MPS):
+            import torch
+            if torch.backends.mps.is_available():
                 self.device = RT_DEVICE_MPS
-            elif lib.device_available(RT_DEVICE_CUDA):
+            elif torch.cuda.is_available():
                 self.device = RT_DEVICE_CUDA
             else:
                 self.device = RT_DEVICE_CPU
@@ -298,10 +250,10 @@ class NativeScorer:
     def _materialize(self, batch: TokenBatch) -> dict:
         """Fill the two 384-d channels from the batch's raw strings.
 
-        Schema phrases and text cells embed in one native call: the batch
-        already carries each set deduplicated, so this is one encoder
-        invocation per collate, then pure scatters. The bf16 rounding mirrors
-        the numeric channels (rustler persists every model-valued channel as
+        Schema phrases and text cells embed in one call: the batch already
+        carries each set deduplicated, so this is one encoder invocation per
+        collate, then pure scatters. The bf16 rounding mirrors the numeric
+        channels (the reference persists every model-valued channel as
         bfloat16)."""
         B, S = batch.b, batch.s
         n_phrases = len(batch.col_phrases)
@@ -328,3 +280,7 @@ class NativeScorer:
             boolean_v=np.zeros((B, S), np.float32),
             text_v=bf16_as_f32(text_v),
             col_name_v=bf16_as_f32(col_name_v))
+
+
+# Historical name from the librt_c era.
+NativeScorer = RelationalScorer

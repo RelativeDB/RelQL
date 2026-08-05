@@ -46,7 +46,7 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
              weight_decay: float = 1e-2,
              grad_clip_norm: float = 1.0,
              model_uri: Optional[str] = None):
-    """Fine-tune the complete RT-J checkpoint with native C++ (Metal or CUDA).
+    """Fine-tune the complete RT-J checkpoint with torch.
 
     Unlike :meth:`fit_head`, this differentiates through all transformer
     blocks, encoders, learned masks, normalization scales, and the number
@@ -58,19 +58,13 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
     backend = engine._require_backend()
     if not hasattr(backend, "_collate_native"):
         raise ExecutionError(
-            "full-backbone fine-tuning requires RtNativeBackend")
+            "full-backbone fine-tuning requires RtBackend")
     try:
-        from relativedb_engine import (FineTunedCheckpoint, RtNativeError,
-                                       load_lib, resolve_model_path)
+        from relativedb_engine import FineTunedCheckpoint, resolve_model_path
     except ImportError as e:
         raise ExecutionError(
-            "full-backbone fine-tuning runs in the native engine; install "
+            "full-backbone fine-tuning runs in the local engine; install "
             "the optional package: pip install relativedb-engine") from e
-    lib = load_lib(backend._lib_path)
-    if not lib.full_finetune_available():
-        raise ExecutionError(
-            "full-model fine-tuning requires a GPU training backend "
-            "(Apple Metal 3 or CUDA)")
     if not anchors:
         raise ExecutionError("full-model fine-tuning needs at least one anchor")
     if epochs <= 0 or batch_size <= 0:
@@ -135,34 +129,59 @@ def finetune(engine, query: Union[str, ParsedQuery], anchors: Sequence[datetime]
                 seq.value[i] = target
         seqs.append(seq)
 
+    import time
+
+    import torch
+    from relational_transformers import RelationalTransformer
+    from relativedb_engine.scorer import RelationalScorer
+
     source_path = resolve_model_path(model_uri)
-    model = lib.load_model(source_path)  # independent mutable checkpoint
+    # An independent mutable instance: the backend's serving cache must not
+    # receive gradient updates.
+    transformer = RelationalTransformer(source_path)
+    model = transformer.model
+    device = transformer.device
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
+                                  weight_decay=weight_decay)
     losses: list[float] = []
     grad_norms: list[float] = []
     total_seconds = 0.0
     try:
         for _ in range(epochs):
             for start in range(0, len(seqs), batch_size):
+                started = time.perf_counter()
                 arrays = backend._collate_native(seqs[start:start + batch_size])
-                result = model.finetune_step(
-                    **arrays, learning_rate=learning_rate,
-                    weight_decay=weight_decay,
-                    grad_clip_norm=grad_clip_norm)
-                losses.append(result["loss"])
-                grad_norms.append(result["grad_norm"])
-                total_seconds += result["seconds"]
-    except RtNativeError as exc:
+                batch = RelationalScorer._relational_batch(arrays).to(device)
+                # The normalized label was written into the target cell's
+                # number channel; the model never reads it there (target
+                # values are masked), so it doubles as the training label.
+                targets = (batch.number_values.squeeze(-1)
+                           * batch.is_targets).sum(1)
+                scores = model(batch, output="target_scores").scores
+                loss = torch.nn.functional.huber_loss(
+                    scores.float(), targets.float())
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), grad_clip_norm)
+                optimizer.step()
+                losses.append(float(loss.detach()))
+                grad_norms.append(float(grad_norm))
+                total_seconds += time.perf_counter() - started
+    except RuntimeError as exc:
         raise ExecutionError(str(exc)) from exc
+    model.eval()
 
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-    model.save(str(out / "model.safetensors"))
+    transformer.save_pretrained(out)
     source_config = Path(source_path).with_name("config.json")
     config = (json.loads(source_config.read_text())
               if source_config.exists() else {})
     config["checkpoint_file"] = "model.safetensors"
     config["finetune"] = {
-        "backend": "native-mps", "full_model": True,
+        "backend": "torch", "full_model": True,
         "source_model": model_uri, "steps": len(losses),
         "examples": len(examples), "final_loss": losses[-1],
         "normalization_mode": normalization_mode.value,

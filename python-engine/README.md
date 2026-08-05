@@ -5,9 +5,11 @@ The optional in-process inference engine for
 
 The base `relativedb` package is pure Python: it parses RelQL, plans, and
 assembles contexts and token batches next to your data, and can score through
-a cloud backend URL. This package adds the local alternative: Triton FP16
-inference by default on CUDA, and `librt_c` on MPS/CPU plus its **native
-MiniLM text encoder**. Both sit behind the same scorer protocol:
+a cloud backend URL. This package adds the local alternative over the shared
+[relational-transformers](https://relationaltransformers.com) runtime: Triton
+FP16 inference by default on CUDA, torch on MPS and CPU, ONNX for exported
+graphs, and MiniLM text encoding in torch. Everything sits behind the same
+scorer protocol:
 
 ```python
 from relativedb import Engine
@@ -16,29 +18,21 @@ from relativedb_engine import RtBackend
 engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))
 ```
 
-It also carries the adaptation paths that are native by design:
+It also carries the adaptation paths:
 
-- `Engine.fit_head` — frozen-backbone task heads, trained on the GPU
-  (Metal or CUDA);
-- `Engine.finetune` — full-checkpoint fine-tuning;
-- `Engine.fit_xgboost` — the flat-feature tree backend
-  (`pip install relativedb-engine[xgboost]`). Feature *derivation* happens in
-  `relativedb.flat` (pure Python); this package evaluates the derived spec
-  natively and drives XGBoost.
+- `Engine.fit_head` — frozen-backbone task heads, trained with torch AdamW;
+- `Engine.finetune` — full-checkpoint fine-tuning through torch.
 
 ## Install
 
 ```bash
 pip install relativedb-engine              # or: pip install relativedb[engine]
 pip install "relativedb-engine[triton]"    # primary CUDA inference
-pip install relativedb-engine[xgboost]     # + the tree backend
 ```
 
-Wheels bundle `librt_c` for macOS (universal2, 13.0+) and manylinux
-x86_64/aarch64. From source, build `cpp/` with CMake and set
-`RELATIVEDB_RT_LIB`. Checkpoints and the MiniLM snapshot resolve through the
-Hugging Face cache on first use (`huggingface_hub` downloads them; the native
-loaders are cache-first and never open a socket themselves).
+Checkpoints and the MiniLM snapshot resolve through the Hugging Face cache on
+first use (`huggingface_hub` downloads them; the loaders are cache-first and
+never open a socket themselves).
 
 ## Serving
 
@@ -46,20 +40,20 @@ The primary CUDA worker speaks the existing remote scorer protocol:
 
 ```bash
 pip install "relativedb-engine[triton]"
-rt_triton_serve --checkpoint /models/model.f16.safetensors --port 8500
+rt_triton_serve --checkpoint /models/model.safetensors --port 8500
 ```
 
 Point any number of light client processes at it with
 `Engine(schema, wiring, model_backend="https://worker.example")`. The wire
 carries prepared token batches with text as raw strings; the worker embeds
 them next to the model and serializes concurrent forwards over its reusable
-Triton buffers. The legacy native server remains available as `rt_serve`.
+Triton buffers.
 
 ## Development
 
 ```bash
-pip install -e ../python -e ".[dev,xgboost]"
-pytest -m "not integration"   # unit tier (needs librt_c, no checkpoint)
+pip install -e ../python -e ".[dev]"
+pytest -m "not integration"   # unit tier (no checkpoint download)
 pytest -m integration         # + the real rt-j checkpoint and MiniLM snapshot
 ```
 

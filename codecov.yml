@@ -40,18 +40,10 @@ flag_management:
     - name: python
       paths:
         - python/src/
-    - name: cpp
-      paths:
-        - cpp/src/
 
 ignore:
   - "website/**"          # Docusaurus site, no unit tests
   - "evaluation/**"       # research/benchmark scripts, not shipped
-  - "cpp/build*/**"       # build trees, including build-coverage
-  - "cpp/testdata/**"
-  - "cpp/tools/**"
-  - "cpp/src/test_*.cpp"
-  - "cpp/src/bench.cpp"
   - "python/tests/**"
   - "python/build/**"
   - "python/dist/**"

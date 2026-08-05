@@ -142,15 +142,12 @@ def test_chunk_sizing_failure_raises_under_strict(churn_schema, monkeypatch):
 # --------------------------------------------------------------------------
 
 @pytest.mark.integration
-@pytest.mark.native
 def test_context_truncation_is_an_error():
     """Nodes and cells are different quantities: a row whose feature columns
     are all null costs zero cells but still occupies a node slot. A buffer
     sized from the cell budget therefore binds on a real graph, and used to
     drop the tail of the context before the model saw it."""
     import numpy as np
-    from conftest import require_native
-    require_native()
     from relativedb.graph import ContextGraph as NativeGraph
     from relativedb.graph import ContextTruncated
 

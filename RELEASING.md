@@ -14,22 +14,13 @@ Do not run it without a sign-off from whoever owns the release.
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `ci.yml` | every push to `main`, every PR | `cpp/` build + `ctest`, Python unit tier on Linux x86_64/aarch64 and macOS arm64; integration tier + coverage on Linux x86_64 and macOS arm64 |
-| `wheels.yml` | `workflow_dispatch`, `v*` tag push, weekly cron, or a PR labelled `build-wheels` | builds and verifies the sdist and the three platform wheels; uploads them as run artifacts. Never publishes |
+| `ci.yml` | every push to `main`, every PR | Python unit tier on Linux x86_64/aarch64 and macOS arm64; integration tier + coverage on Linux x86_64 and macOS arm64 |
+| `wheels.yml` | `workflow_dispatch`, `v*` tag push, weekly cron, or a PR labelled `build-wheels` | builds and verifies pure sdists and wheels for both packages; uploads them as run artifacts. Never publishes |
 | `release-libraries.yml` | `workflow_dispatch` only | downloads a `wheels.yml` run's artifacts, re-verifies, and (optionally) uploads to TestPyPI and PyPI |
 
-`wheels.yml` builds by calling `python/build_wheel.sh` — the same script a
-developer runs locally — inside the manylinux_2_28 container and on the macOS
-runner, so the released binary comes off the same code path as a local one.
-Wheel tags are `py3-none-<platform>`: `librt_c` is loaded through `ctypes`, so
-one wheel per platform covers every CPython 3.
-
-Targets are manylinux_2_28 x86_64, manylinux_2_28 aarch64, and macOS
-`universal2` at deployment target 13.0. Windows is out of scope. The sdist
-carries no native library at all; installing it gives a pure `py3-none-any`
-wheel that falls back to `RELATIVEDB_RT_LIB` or a monorepo `cpp/build` tree at
-runtime. That is by design — `cpp/` is not in the sdist and a source install
-can never build the engine on its own.
+`wheels.yml` builds with `python -m build` — the same command a developer
+runs locally. Both packages are pure Python, so every artifact is a
+`py3-none-any` wheel plus its sdist.
 
 ## Checklist
 
@@ -97,11 +88,6 @@ python3 -m venv "$work/venv"
 (cd "$work" && ./venv/bin/python release_smoke.py)
 ```
 
-`build_wheel.sh` deletes any stray `librt_c` from `python/src/relativedb/`
-before building the sdist. Do not substitute a bare `python -m build python`
-for it: that builds the sdist from whatever is in your working tree, and a
-leftover development `librt_c` ends up inside the source distribution.
-
 ### 5. Rehearse on TestPyPI (optional, recommended for a first release of a new
 platform target)
 
@@ -145,8 +131,7 @@ python3 -m venv "$work/venv"
 (cd "$work" && ./venv/bin/python release_smoke.py)
 ```
 
-From a directory outside the repository, so the `cpp/build` fallback cannot
-hide a broken bundle. Confirm `pip` chose a platform wheel and not the sdist.
+Run from a directory outside the repository.
 
 ### 9. GitHub release
 

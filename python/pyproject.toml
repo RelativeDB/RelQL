@@ -74,8 +74,7 @@ pythonpath = ["..", "src"]
 # nothing. Paired with the empty-selection guard in tests/conftest.py.
 addopts = "--strict-markers --strict-config"
 markers = [
-    "integration: needs librt_c and/or a real model checkpoint; excluded from the unit tier",
-    "native: needs librt_c (no checkpoint download)",
+    "integration: needs a real model checkpoint; excluded from the unit tier",
     "checkpoint: needs an HF model checkpoint (rt-j and/or MiniLM)",
 ]
 

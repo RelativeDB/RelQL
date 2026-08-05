@@ -57,7 +57,7 @@ STRICT_ENV = "RELATIVEDB_REQUIRE_NATIVE"
 
 
 def strict_native() -> bool:
-    """True when missing native/checkpoint prerequisites must FAIL, not skip."""
+    """True when missing checkpoint prerequisites must FAIL, not skip."""
     return os.environ.get(STRICT_ENV, "").strip().lower() in (
         "1", "true", "yes", "on")
 
@@ -71,21 +71,6 @@ def _unavailable(what: str, detail: str):
             "broken build/cache, not a test that may be skipped.",
             pytrace=False)
     pytest.skip(f"{what} unavailable: {detail}")
-
-
-def require_native():
-    """Return the loaded ``librt_c`` wrapper (from the optional
-    relativedb-engine package), or skip/fail per strict mode."""
-    try:
-        from relativedb_engine import RtNativeUnavailableError, load_lib
-    except ImportError as e:
-        _unavailable("relativedb-engine (pip install relativedb-engine)",
-                     str(e))
-    try:
-        return load_lib()
-    except RtNativeUnavailableError as e:
-        _unavailable("librt_c (build cpp/ with cmake, or set "
-                     "RELATIVEDB_RT_LIB)", str(e))
 
 
 def require_checkpoint(variant: str) -> str:
@@ -105,22 +90,26 @@ def require_checkpoint(variant: str) -> str:
 
 
 def require_text_embedder():
-    """The pinned MiniLM encoder — now the NATIVE encoder inside librt_c
-    (the engine package). Skips/fails like the other prerequisites — it needs
-    a model snapshot, so it never belongs in the unit tier."""
-    lib = require_native()
-    if not hasattr(lib._lib, "minilm_load"):
-        _unavailable("native MiniLM encoder",
-                     "this librt_c was built without minilm_* (rebuild cpp/)")
+    """The pinned MiniLM encoder, served by transformers in torch. Skips/fails
+    like the other prerequisites — it needs a model snapshot, so it never
+    belongs in the unit tier."""
+    try:
+        import transformers  # noqa: F401
+    except ImportError as e:
+        _unavailable("transformers (pip install relativedb-engine)", str(e))
+    from relativedb_engine import resolve_minilm_snapshot
+    try:
+        if resolve_minilm_snapshot() is None:
+            _unavailable("MiniLM snapshot", "huggingface_hub is unavailable")
+    except Exception as e:                       # noqa: BLE001
+        _unavailable("MiniLM snapshot", f"{type(e).__name__}: {e}")
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "integration: needs librt_c and/or a real model checkpoint; excluded "
-        "from the unit tier")
-    config.addinivalue_line(
-        "markers", "native: needs librt_c (no checkpoint download)")
+        "integration: needs a real model checkpoint; excluded from the unit "
+        "tier")
     config.addinivalue_line(
         "markers", "checkpoint: needs an HF model checkpoint (rt-j / MiniLM)")
 

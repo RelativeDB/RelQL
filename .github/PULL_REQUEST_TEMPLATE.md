@@ -7,16 +7,15 @@
 
 ## Numerical impact
 
-<!-- Anything touching cpp/src or the samplers: does golden parity still hold,
+<!-- Anything touching the samplers: does traversal parity still hold,
      and did any score move? "None" is a fine answer; silence is not. -->
 
 ## Checklist
 
-- [ ] `ctest --test-dir cpp/build --output-on-failure --no-tests=error` passes
 - [ ] `pytest python/tests -m "not integration"` passes
 - [ ] Ran the integration tier with `RELATIVEDB_REQUIRE_NATIVE=1`, or this
       change cannot reach it
 - [ ] New behaviour has a test in a tier that actually reaches it
 - [ ] `CHANGELOG.md` updated under `Unreleased`, or this is not user-visible
-- [ ] Added the `build-wheels` label if this touches `cpp/`, `build_wheel.sh`,
+- [ ] Added the `build-wheels` label if this touches packaging,
       `setup.py`, or packaging metadata

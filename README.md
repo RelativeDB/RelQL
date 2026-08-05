@@ -172,18 +172,17 @@ for p in result.predictions:
 
 </details>
 
-Wheels bundle the native engine for macOS (universal2, 13.0+) and manylinux
-x86_64/aarch64. Elsewhere `pip` falls back to the source distribution, which
-carries no engine: build `cpp/` yourself and point `RELATIVEDB_RT_LIB` at the
-result. See [CONTRIBUTING.md](CONTRIBUTING.md).
+The engine runs on the shared [relational-transformers](https://relationaltransformers.com)
+runtime: torch on CPU, Apple MPS, and CUDA, with Triton CUDA serving and ONNX
+export one flag away. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 # Notes
 - The multi-label head requires tuning (e.g. RANK TOP 10)
 
 # Development
 
-[CONTRIBUTING.md](CONTRIBUTING.md) — building `cpp/`, wiring Python at the
-built library, and the unit vs integration test tiers.
+[CONTRIBUTING.md](CONTRIBUTING.md) — development setup and the unit vs
+integration test tiers.
 [RELEASING.md](RELEASING.md) — cutting a release.
 [CHANGELOG.md](CHANGELOG.md) — what changed.
 

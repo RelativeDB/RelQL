@@ -43,7 +43,7 @@ FROM customers
 
 ```bash
 pip install relativedb                 # pure Python: parse, plan, assemble
-pip install relativedb[engine]         # + the local native engine (librt_c)
+pip install relativedb[engine]         # + the local model engine
 ```
 
 Python 3.10 or newer. The base package is pure Python (numpy only): RelQL
@@ -54,16 +54,14 @@ optional in-process engine:
 ```python
 engine = Engine(schema, wiring, model_backend="https://scoring.example.com")
 # or, with relativedb-engine installed:
-from relativedb_engine import RtNativeBackend
-engine = Engine(schema, wiring, model_backend=RtNativeBackend(schema=schema))  # relativedb-engine
+from relativedb_engine import RtBackend
+engine = Engine(schema, wiring, model_backend=RtBackend(schema=schema))  # relativedb-engine
 ```
 
-`relativedb-engine` wheels bundle `librt_c` (the C++ RT-J engine with its
-native MiniLM text encoder — no torch, no Python embedding) for macOS
-(universal2, 13.0+; Accelerate and Metal) and manylinux x86_64 / aarch64.
-Windows is not supported. On any other platform build `cpp/` with CMake and
-point `RELATIVEDB_RT_LIB` at the built `librt_c`. The cloud backend is the
-same engine behind HTTP: `cpp/build/rt_serve --port 8500`.
+`relativedb-engine` runs RT-J through the shared relational-transformers
+runtime (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX for exported
+graphs) and embeds text with MiniLM in torch. The cloud backend is the same
+engine behind HTTP: `rt_triton_serve --port 8500`.
 
 ## Quickstart: 90-day churn from your own DataFrames
 
@@ -104,9 +102,9 @@ result = engine.execute(ExecutionInput(
 
 ## Checkpoints
 
-Model checkpoints resolve through the Hugging Face cache on first use. Set
-`RELATIVEDB_RT_QUANTIZED` to `f16`, `q8`, or `q4` to trade footprint for
-precision:
+Model checkpoints resolve through the Hugging Face cache on first use.
+Quantized checkpoints (`RelativeDB/rt-j-fp8`, `-int8`, `-int4`) trade
+footprint for precision:
 
 | Checkpoint | On-disk | Accuracy | Download |
 | --- | --- | --- | --- |

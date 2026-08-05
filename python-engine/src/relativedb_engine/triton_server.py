@@ -18,7 +18,7 @@ from typing import Any
 from relativedb.remote import decode_batch
 from relativedb.scoring import TokenBatch
 
-from .native import RT_DEVICE_CUDA
+from .models import RT_DEVICE_CUDA
 from .scorer import NativeScorer
 from .torch_minilm import TorchTextEncoder
 
