@@ -1720,8 +1720,9 @@ class Engine:
         contexts, and every declared non-key column carrying values — and
         rank candidates by how far dropping them moves the predictions.
         Large movement means the model leans on it; near zero means it is
-        not earning its context budget and is a good ablation. One cohort
-        forward per candidate, so cost scales with schema width, not data."""
+        not earning its context budget and is a good ablation. Candidate
+        variants are flattened into one scoring call so the scorer can form
+        GPU-sized batches instead of issuing one tiny request per candidate."""
         entity_table = pq.entity_key.table
         contexts = self._score_ready_contexts(pq, input, effective)
         task_type = pq.task_type(self.schema)
@@ -1773,8 +1774,7 @@ class Engine:
                 if r.table == table else r for r in c.rows])
                 for c in contexts]
 
-        def measure(kind, name, ctxs):
-            _, vals = score(ctxs)
+        def measure(kind, name, vals):
             deltas = [v - b for v, b in zip(vals, base)
                       if v is not None and b is not None]
             n = len(deltas)
@@ -1790,20 +1790,16 @@ class Engine:
                   for c in contexts]) for t in sorted(tables)]
         work += [("column", f"{t}.{col}", drop_column(t, col))
                  for t, col in sorted(columns)]
-        concurrency = int(os.environ.get(
-            "RELATIVEDB_ABLATE_CONCURRENCY", "0") or 0)
-        if concurrency <= 0:
-            concurrency = (4 if hasattr(getattr(backend, "scorer", None), "url")
-                           else 1)
-        concurrency = min(concurrency, len(work)) if work else 1
-        if concurrency > 1:
-            import concurrent.futures as _futures
-            with _futures.ThreadPoolExecutor(
-                    max_workers=concurrency,
-                    thread_name_prefix="rt-ablate") as pool:
-                entries = list(pool.map(lambda args: measure(*args), work))
-        else:
-            entries = [measure(*args) for args in work]
+        entries = []
+        if work:
+            width = len(contexts)
+            variant_contexts = [ctx for _, _, ctxs in work for ctx in ctxs]
+            _, variant_values = score(variant_contexts)
+            entries = [
+                measure(kind, name,
+                        variant_values[index * width:(index + 1) * width])
+                for index, (kind, name, _) in enumerate(work)
+            ]
         entries.sort(key=lambda e: -e["mean_abs_delta"])
         known = [b for b in base if b is not None]
         report = {
@@ -1811,7 +1807,8 @@ class Engine:
             "baseline": {"n": len(known),
                          "mean": sum(known) / len(known) if known else None},
             "candidates": entries,
-            "model_forwards": 1 + len(work),
+            "model_forwards": 1 + int(bool(work)),
+            "ablation_variants": len(work),
             "note": ("mean_abs_delta: how far the prediction moves when this "
                      "is dropped. Near zero = the model is not using it — a "
                      "good ablation; large = load-bearing, keep it."),

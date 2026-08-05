@@ -14,16 +14,11 @@ an exactly predictable effect on the prediction.
 """
 from __future__ import annotations
 
-import threading
-import time
-
 import pytest
-
-from relativedb import ReferenceTraversal, Engine, ExecutionInput
+from conftest import churn_rows, dt, in_memory_wiring
+from relativedb import Engine, ExecutionInput, ReferenceTraversal
 from relativedb.engine import EntityPrediction, ExecutionError
 from relativedb.relql.parser import parse
-
-from conftest import churn_rows, dt, in_memory_wiring
 
 ANCHOR = dt("2026-07-01")
 # A dated entity: the reference walk expands children only under a dated
@@ -132,7 +127,8 @@ def test_deltas_are_exact_and_ranked(churn_schema):
     assert by_name[("column", "customers.age")]["mean_abs_delta"] == 1.0
     ranks = [e["mean_abs_delta"] for e in rep["candidates"]]
     assert ranks == sorted(ranks, reverse=True)
-    assert rep["model_forwards"] == 1 + len(rep["candidates"])
+    assert rep["model_forwards"] == 2
+    assert rep["ablation_variants"] == len(rep["candidates"])
 
 
 def test_declared_ablation_shapes_the_baseline(churn_schema):
@@ -151,34 +147,25 @@ def test_render_includes_the_ranking(churn_schema):
     assert "mean_abs_delta" in text
 
 
-def test_remote_candidate_forwards_run_concurrently(churn_schema, monkeypatch):
-    class ConcurrentBackend(_CellCountBackend):
+def test_candidate_variants_are_batched_into_one_scoring_call(churn_schema):
+    class RecordingBackend(_CellCountBackend):
         scorer = type("Remote", (), {"url": "http://inference"})()
 
         def __init__(self):
-            self.lock = threading.Lock()
-            self.active = 0
-            self.max_active = 0
+            self.batch_sizes = []
 
         def score(self, *args, **kwargs):
-            with self.lock:
-                self.active += 1
-                self.max_active = max(self.max_active, self.active)
-            try:
-                time.sleep(0.01)
-                return super().score(*args, **kwargs)
-            finally:
-                with self.lock:
-                    self.active -= 1
+            self.batch_sizes.append(len(args[2]))
+            return super().score(*args, **kwargs)
 
-    backend = ConcurrentBackend()
+    backend = RecordingBackend()
     engine = Engine(churn_schema, in_memory_wiring(churn_rows()),
                     model_backend=backend, traversal=ReferenceTraversal())
-    monkeypatch.setenv("RELATIVEDB_ABLATE_CONCURRENCY", "4")
 
     result = engine.execute(ExecutionInput(
         query="EXPLAIN ABLATE " + Q, anchor_time=ANCHOR, params=IDS))
 
-    assert backend.max_active > 1
-    assert result.ablation["model_forwards"] == 1 + len(
-        result.ablation["candidates"])
+    assert len(backend.batch_sizes) == 2
+    assert backend.batch_sizes[0] == 1
+    assert backend.batch_sizes[1] == len(result.ablation["candidates"])
+    assert result.ablation["model_forwards"] == 2
