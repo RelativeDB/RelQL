@@ -18,7 +18,7 @@ import warnings
 
 import pytest
 
-from relativedb import ContextTruncationWarning, Engine, ExecutionInput
+from relativedb import Engine, ExecutionInput
 from relativedb.engine import EntityPrediction
 from relativedb.evaluate import EvalError, eval_value
 from relativedb.relql.ast import (Aggregation, AggFunc, ColumnRef, Condition,

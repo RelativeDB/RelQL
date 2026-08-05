@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 from conftest import StubScorer, churn_rows, in_memory_wiring
 
-from relativedb import Engine, ExecutionInput, TaskType, parse
+from relativedb import Engine, ExecutionInput
 from relativedb.remote import decode_batch, encode_batch
-from relativedb.scoring import SequenceBackend, TokenBatch
+from relativedb.scoring import SequenceBackend
 
 
 class RecordingScorer(StubScorer):

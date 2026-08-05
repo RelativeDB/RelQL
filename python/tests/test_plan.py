@@ -11,13 +11,11 @@ explain() and execute() see the same plan.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 
 import pytest
 
-from relativedb import (BreadthFirstTraversal, ReferenceTraversal, Engine, ExecutionInput,
+from relativedb import (ReferenceTraversal, Engine, ExecutionInput,
                         TaskType, parse, validate)
-from relativedb.engine import SamplerMode
 from relativedb.plan import QueryPlan, build_plan, pinned_ids, pure_pin
 
 from conftest import churn_rows, dt, in_memory_wiring

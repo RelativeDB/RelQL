@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from relativedb.rt.models import RT_DEVICE_CUDA
+from relativedb.rt.scorer import RT_DEVICE_CUDA
 from relativedb.rt.scorer import RelationalScorer
 
 

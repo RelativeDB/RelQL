@@ -278,53 +278,24 @@ large populations and the data fits in memory.
 
 ## Fit a multiclass/ranking adapter
 
-The released checkpoint is zero-shot. For multiclass or multilabel ranking,
-you can fit a small task head over the **frozen** transformer. Nothing in the transformer
-changes, so the engine encodes each example once into its target-cell state and
-fits a ~2 KB adapter quickly.
-
-This is not full-model fine-tuning. `fit_head` covers **multiclass and
-ranking** only; scalar binary/regression tasks reject the frozen adapter and go
-through `Engine.finetune()` instead, which trains the complete backbone
-natively (requires Apple MPS).
+The released checkpoint is zero-shot. Training moved out of relativedb: fit
+adapters with the [relational-transformers](https://relationaltransformers.com)
+package (`fit_feature_head` over frozen target features, `RelationalTrainer`
+for full fine-tuning) and serve the resulting head here by passing it to the
+backend:
 
 ```python
-head = engine.fit_head(
-    query=Q,
-    anchors=[t - timedelta(days=d) for d in (150, 120, 90, 60)],  # past cut-offs
-    params={"ids": cohort},
-    epochs=300, learning_rate=1e-2)
+from relational_transformers import fit_feature_head
 
-head          # <FineTunedHead ranking on 2760 examples loss 4.10->3.65>
+head = fit_feature_head(features, labels, "ranking",
+                        group_offsets=offsets, n_groups=n_groups)
 head.save("head.safetensors")
 
 tuned = Engine(schema, wiring, model_backend=RtNativeBackend(
     schema=schema, wiring=wiring, head="head.safetensors"))
 ```
 
-### Labels come from the query
-
-At each anchor the context is bounded exactly as it would be at prediction
-time, while the **label** is read from the target's own window *after* it. The
-query therefore defines its own supervision and nothing needs labelling by hand.
-
-Pass `labels={(entity_id, anchor): value}` to override. For ranking, that is a
-`{candidate_id: relevance}` mapping.
-
-:::caution
-Choose training anchors strictly **before** the anchor you evaluate at, or the
-head learns from the future it is meant to predict.
-:::
-
-### What to expect
-
-- The head replaces the checkpoint's zero-shot head only for the task it was
-  trained on.
-- Fitting requires **Metal**. Inference on a trained head is plain CPU, so an
-  adapter trained on a Mac serves anywhere.
-- Ranking groups with no relevant candidate in the window carry no signal and
-  are skipped, and the count is reported, since listwise loss needs a positive
-  per group.
-- Judge the result on **held-out** anchors, never on training loss. A falling
-  loss with flat held-out quality means the head is data-limited. Adding epochs
-  will not help. Add anchors or entities.
+The head replaces the checkpoint's zero-shot head only for the task it was
+trained on, and inference on a trained head is plain CPU, so an adapter
+trained anywhere serves anywhere. Judge the result on **held-out** anchors,
+never on training loss.

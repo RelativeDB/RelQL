@@ -227,7 +227,7 @@ def test_explain_context_counts_fk_feature_cells(churn_schema, stub_backend):
     It once counted only r.cells, so feature-bearing links — and tables whose
     rows carry nothing but FKs — reported zero cells while the model saw their
     tokens, which made the knob look inert to anyone measuring it."""
-    from relativedb import LinkDef, Schema, TableDef, ValueType
+    from relativedb import LinkDef, Schema, ValueType
     from conftest import churn_rows, in_memory_wiring
 
     def build(feature_type):

@@ -7,7 +7,7 @@ from datetime import timedelta
 import pytest
 
 from relativedb import (BreadthFirstTraversal, ContextPolicy, ReferenceTraversal, Engine, ExecutionInput, ModelConfig,
-                      Row, SamplerMode, TaskType, TemporalBound)
+                      SamplerMode, TaskType, TemporalBound)
 from relativedb.retrieve import CscIndex
 from relational_transformers_utils.schema import LinkDef
 

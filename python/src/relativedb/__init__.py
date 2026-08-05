@@ -32,7 +32,7 @@ from .remote import RemoteBackend, RemoteScorer, RemoteScoringError
 # names resolve lazily so `import relativedb` stays light for clients that
 # score through a cloud backend URL.
 _ENGINE_EXPORTS = ("RtBackend", "RtNativeBackend", "RtNativeUnavailableError",
-                   "TextEmbedder", "FineTunedHead", "FineTunedCheckpoint")
+                   "TextEmbedder", "FineTunedHead")
 
 
 def __getattr__(name):
@@ -68,5 +68,5 @@ __all__ = [
     "SequenceBackend", "Scorer", "TokenBatch", "ForwardResult",
     "ScoringError", "ContextConnectivityWarning", "ColumnStats",
     "RtBackend", "RtNativeBackend", "RtNativeUnavailableError", "TextEmbedder",
-    "FineTunedHead", "FineTunedCheckpoint",
+    "FineTunedHead",
 ]

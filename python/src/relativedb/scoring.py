@@ -85,6 +85,16 @@ _FT_TASK_OF = {
     TaskType.MULTILABEL_RANKING: FT_RANKING,
 }
 
+# Heads fitted by relational_transformers_utils.heads carry problem-type
+# strings; serving matches the query's task type against them.
+_HEAD_TASK_OF = {
+    TaskType.BINARY_CLASSIFICATION: "binary",
+    TaskType.REGRESSION: "regression",
+    TaskType.FORECASTING: "regression",
+    TaskType.MULTICLASS_CLASSIFICATION: "multiclass",
+    TaskType.MULTILABEL_RANKING: "ranking",
+}
+
 _SEM_OF_VALUE_TYPE = {
     ValueType.NUMBER: SEM_NUMBER,
     ValueType.TEXT: SEM_TEXT,
@@ -370,7 +380,8 @@ class SequenceBackend:
         """The fine-tuned head, when it was trained for this task type."""
         if self.head is None:
             return None
-        return self.head if _FT_TASK_OF.get(task_type) == self.head.task else None
+        return (self.head if _HEAD_TASK_OF.get(task_type) == self.head.task
+                else None)
 
     def _encode(self, seqs: list["_Seq"], model_uri: str) -> np.ndarray:
         """Frozen-backbone features ``[len(seqs), 512]`` for these sequences."""

@@ -6,10 +6,7 @@ import torch
 from relational_transformers import RTJModel
 from relational_transformers.checkpoints import save_checkpoint
 
-from relativedb.model import NormalizationMode
-from relativedb.relql.ast import TaskType
-from relativedb.rt.backend import FineTunedHead, RtNativeBackend
-from relativedb.rt.models import RT_DEVICE_CPU
+from relativedb.rt.scorer import RT_DEVICE_CPU
 from relativedb.rt.scorer import RelationalScorer, TextEncoder
 
 D_TEXT = 384
@@ -87,86 +84,3 @@ def test_precomputed_embeddings_are_strict():
     assert encoder.encode_one("known").shape == (D_TEXT,)
     with pytest.raises(Exception, match="precomputed embedding table"):
         encoder.encode(["unknown"])
-
-
-def _backend_with_stub_embeddings(classes):
-    backend = object.__new__(RtNativeBackend)
-    scorer = RelationalScorer(device=RT_DEVICE_CPU, inference_backend="torch")
-    rng = np.random.default_rng(1)
-    table = {str(c): rng.normal(size=D_TEXT).astype(np.float32) for c in classes}
-    scorer.embedder.install_precomputed(table, strict=True)
-    scorer.embedder._cache_norm.update(
-        {k: v / np.linalg.norm(v) for k, v in table.items()})
-    backend.scorer = scorer
-    backend.column_stats = None
-    return backend
-
-
-def test_multiclass_head_fits_saves_and_reloads(checkpoint, tmp_path):
-    classes = ["yes", "no", "maybe"]
-    backend = _backend_with_stub_embeddings(classes)
-
-    rng = np.random.default_rng(3)
-    labels = np.asarray([0, 1, 2] * 15, np.float32)
-    features = rng.normal(size=(45, D_MODEL)).astype(np.float32)
-    for k in range(3):
-        features[labels == k, k] += 1.5
-
-    model = backend.scorer._relational_model_for(
-        str(checkpoint), "torch", RT_DEVICE_CPU)
-    head = RtNativeBackend.fit_head(
-        backend, model, TaskType.MULTICLASS_CLASSIFICATION,
-        features, labels, np.zeros(1, np.int32), 0,
-        epochs=120, classes=classes,
-        normalization_mode=NormalizationMode.ZERO_SHOT)
-    assert head.n_outputs == 3
-    assert head.initial_loss >= head.final_loss
-
-    path = tmp_path / "head.safetensors"
-    head.save(str(path))
-    reloaded = FineTunedHead.load(str(path))
-    assert reloaded.classes == ("yes", "no", "maybe")
-    logits = reloaded.predict(features)
-    assert logits.shape == (45, 3)
-    assert (logits.argmax(1) == labels).mean() > 0.8
-
-
-def test_head_load_requires_sidecar(checkpoint, tmp_path):
-    classes = ["a", "b"]
-    backend = _backend_with_stub_embeddings(classes)
-    rng = np.random.default_rng(7)
-    labels = np.asarray([0, 1] * 10, np.float32)
-    features = rng.normal(size=(20, D_MODEL)).astype(np.float32)
-    model = backend.scorer._relational_model_for(
-        str(checkpoint), "torch", RT_DEVICE_CPU)
-    head = RtNativeBackend.fit_head(
-        backend, model, TaskType.MULTICLASS_CLASSIFICATION,
-        features, labels, np.zeros(1, np.int32), 0, epochs=5, classes=classes)
-    path = tmp_path / "head.safetensors"
-    head.save(str(path))
-    (tmp_path / "head.safetensors.preproc.json").unlink()
-    with pytest.raises(Exception, match="preproc"):
-        FineTunedHead.load(str(path))
-
-
-def test_ranking_head_learns_group_ordering(checkpoint):
-    backend = _backend_with_stub_embeddings([])
-    rng = np.random.default_rng(11)
-    groups = 12
-    per_group = 4
-    features = rng.normal(size=(groups * per_group, D_MODEL)).astype(np.float32)
-    labels = np.zeros(groups * per_group, np.float32)
-    for g in range(groups):
-        labels[g * per_group] = 1.0            # first candidate is relevant
-        features[g * per_group] += 0.6
-    offsets = np.arange(0, groups * per_group + 1, per_group, dtype=np.int32)
-
-    model = backend.scorer._relational_model_for(
-        str(checkpoint), "torch", RT_DEVICE_CPU)
-    head = RtNativeBackend.fit_head(
-        backend, model, TaskType.MULTILABEL_RANKING,
-        features, labels, offsets, groups, epochs=80)
-    logits = head.predict(features)[:, 0]
-    winners = [int(np.argmax(logits[s:s + per_group])) == 0
-               for s in range(0, groups * per_group, per_group)]
-    assert sum(winners) >= groups - 2

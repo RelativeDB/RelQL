@@ -14,8 +14,8 @@ from typing import Any, Iterable, Optional, Protocol, Sequence, runtime_checkabl
 
 from relational_transformers_utils.csc import CscAdjacency  # noqa: F401
 from relational_transformers_utils.csc import CscIndex as _CscIndex
-from relational_transformers_utils.rows import Row, TemporalBound
-from relational_transformers_utils.schema import LinkDef, Schema
+from relational_transformers_utils.schema import (LinkDef, Row, Schema,
+                                                  TemporalBound)
 
 
 __all__ = [

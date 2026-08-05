@@ -9,21 +9,18 @@ warn) — never quietly wrong.
 """
 from __future__ import annotations
 
-import warnings
 from datetime import datetime, timezone
 
 import pytest
 
-from relativedb import (Engine, ExecutionInput, LinkDef, RetrieverWiring, Row,
-                        Schema, TableDef, TemporalBound, ValueType)
+from relativedb import (Engine, ExecutionInput, LinkDef, Row,
+                        Schema, TableDef, ValueType)
 from relativedb.engine import (EntityPrediction, ExecutionError,
                                ProtocolFallbackWarning)
-from relativedb.errors import ExecutionError as ExecError
 from relativedb.evaluate import EvalError, eval_bool, eval_value
 from relativedb.relql.ast import (Aggregation, AggFunc, ColumnRef, Condition,
-                                  Operator, TaskType)
+                                  Operator)
 from relativedb.relql.parser import parse, validate
-from relativedb.training import _scalar_label
 
 from conftest import churn_rows, dt, in_memory_wiring
 
@@ -57,60 +54,6 @@ class _Stub:
 def _engine():
     return Engine(_churn_schema(), in_memory_wiring(churn_rows()),
                   model_backend=_Stub())
-
-
-# ---------------------------------------------------------------------------
-# training labels are facts: database-exact, entity-scoped
-# ---------------------------------------------------------------------------
-
-def _posts_engagements_engine():
-    """Dated entity table: the shape where peer children DO expand into the
-    context, which used to contaminate derived labels."""
-    T = lambda d: datetime(2026, 7, d, tzinfo=timezone.utc)
-    tables = [
-        TableDef.new_table("posts").column("created_at", ValueType.DATETIME)
-        .column("length", ValueType.NUMBER)
-        .primary_key("post_id").time_column("created_at").build(),
-        TableDef.new_table("engagements").column("at", ValueType.DATETIME)
-        .primary_key("eng_id").time_column("at").build(),
-    ]
-    links = [LinkDef("engagements", "post_id", "posts")]
-    rows = {
-        "posts": [Row("posts", "p1", {"created_at": T(1), "length": 100.0},
-                      T(1)),
-                  Row("posts", "p2", {"created_at": T(2), "length": 80.0},
-                      T(2))],
-        "engagements": [
-            Row("engagements", "e1", {"at": T(3)}, T(3), {"post_id": "p1"}),
-            Row("engagements", "e2", {"at": T(4)}, T(4), {"post_id": "p1"}),
-            Row("engagements", "e3", {"at": T(5)}, T(5), {"post_id": "p2"}),
-        ],
-    }
-    return Engine(Schema(tuple(tables), tuple(links)),
-                  in_memory_wiring(rows), model_backend=_Stub()), T
-
-
-def test_derived_training_label_is_entity_scoped_and_exact():
-    engine, T = _posts_engagements_engine()
-    q = ("PREDICT COUNT(engagements.*) OVER (10 DAYS FOLLOWING) FROM posts "
-         "WHERE posts.post_id IN :ids RETURN EXPECTED VALUE")
-    pq = validate(parse(q), engine.schema,
-                  {"ids": ["p1"]}).query.bind_params({"ids": ["p1"]})
-    # p1's truth is 2 (e1, e2); the context sample also holds p2's e3, which
-    # used to be counted into p1's label (previously derived 3.0)
-    y = _scalar_label(engine, pq, TaskType.REGRESSION,
-                      T(2).replace(hour=12), None, "p1", [])
-    assert y == 2.0
-
-
-def test_derived_label_on_unlinked_table_is_an_error():
-    engine = _engine()
-    q = ("PREDICT COUNT(products.*) FROM customers "
-         "WHERE customers.customer_id IN :ids RETURN EXPECTED VALUE")
-    pq = validate(parse(q), engine.schema,
-                  {"ids": ["C7"]}).query.bind_params({"ids": ["C7"]})
-    with pytest.raises(ExecError, match="no direct link"):
-        _scalar_label(engine, pq, TaskType.REGRESSION, ANCHOR, None, "C7", [])
 
 
 # ---------------------------------------------------------------------------

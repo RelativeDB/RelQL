@@ -6,9 +6,10 @@ The repository ships one Python package:
   context assembly, and model routing.
 - `python/src/relativedb/rt/` — local model execution over the shared
   [relational-transformers](https://relationaltransformers.com) runtime
-  (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX), MiniLM text encoding
-  in torch, task-head fitting, and full fine-tuning. Imported lazily, so the
-  query-planning side of the package never pays the torch import.
+  (torch on CPU/MPS/CUDA, Triton CUDA serving, ONNX) and MiniLM text
+  encoding in torch. Imported lazily, so the query-planning side of the
+  package never pays the torch import. Training lives in the
+  relational-transformers package; relativedb only serves fitted heads.
 
 `evaluation/` and `website/` are not part of the published packages.
 

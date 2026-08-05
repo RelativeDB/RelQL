@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from relativedb import (ColumnDef, EntityPrediction, LinkDef, RetrieverWiring,
+from relativedb import (EntityPrediction, LinkDef, RetrieverWiring,
                       Row, Schema, TableDef, TaskType, TemporalBound, ValueType)
 
 # ---------------------------------------------------------------------------

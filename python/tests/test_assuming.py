@@ -18,7 +18,6 @@ column, missing entity row) now warn instead of degrading silently.
 """
 from __future__ import annotations
 
-import warnings
 
 import pytest
 

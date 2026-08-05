@@ -21,7 +21,6 @@ from enum import Enum
 from typing import Any, Optional, Protocol, Sequence, Union
 
 from . import strategies as _strategies
-from . import training as _training
 from .plan import coerce_anchor, effective_anchor, parse_anchor_date
 from .retrieve import CscIndex
 from .errors import ExecutionError
@@ -1419,60 +1418,6 @@ class Engine:
     # pathological fan-out fails loudly instead of silently saturating.
     _WHERE_FETCH_LIMIT = 1_000_000
 
-    def _label_rows(self, pq: ParsedQuery, entity_table: str, eid: Any,
-                    anchor: Optional[datetime]
-                    ) -> tuple[dict[str, list[Row]], dict[str, Any]]:
-        """Database-exact rows and entity cells for evaluating the target as
-        GROUND TRUTH (training labels, ranking relevance).
-
-        Labels used to be derived from an assembled context — a sample built
-        for the model that carries peer entities' rows (a peer's event
-        counted into this entity's label) and is fanout/budget truncated (a
-        heavy entity's own events under-counted). A label is a fact: fetch
-        the entity's rows through the wiring, bounded at each window's far
-        edge (``end_delta``, not span — an offset window's tail was being
-        cut off).
-        """
-        aggs = _find_aggregations(pq.target)
-        ent = self._sampler().entities(entity_table, [eid],
-                                       TemporalBound.unbounded())
-        cells = dict(ent[0].cells) if ent else {}
-        horizon: dict[str, Optional[datetime]] = {}
-        for a in aggs:
-            table = a.column.table
-            if table == entity_table:
-                continue
-            if a.window is None or anchor is None:
-                horizon[table] = None            # unbounded fetch
-                continue
-            end = a.window.end_delta()
-            hi = None if end == timedelta.max else anchor + max(
-                end, timedelta(0))
-            prev = horizon.get(table, anchor)
-            horizon[table] = (None if prev is None or hi is None
-                              else max(prev, hi))
-        out: dict[str, list[Row]] = {entity_table: list(ent)}
-        sampler = self._sampler()
-        for table, hi in horizon.items():
-            link = next((l for l in self.schema.links_from(table)
-                         if l.to_table == entity_table), None)
-            if link is None:
-                raise ExecutionError(
-                    f"the target aggregates {table!r}, which has no direct "
-                    f"link to {entity_table!r}; a derived label cannot "
-                    f"attribute its rows to one entity. Supply labels "
-                    f"explicitly.")
-            bound = (TemporalBound.at_or_before(hi) if hi is not None
-                     else TemporalBound.unbounded())
-            rows = list(sampler.children(link, eid, bound,
-                                         self._WHERE_FETCH_LIMIT))
-            if len(rows) >= self._WHERE_FETCH_LIMIT:
-                raise ExecutionError(
-                    f"label fetch for {table!r} hit the row cap for entity "
-                    f"{eid!r}; the derived label would be silently wrong")
-            out[table] = rows
-        return out, cells
-
     def _where_ok(self, pq: ParsedQuery, ctx: EntityContext,
                   entity_table: str,
                   anchor_override: Optional[datetime] = None) -> bool:
@@ -1616,22 +1561,6 @@ class Engine:
     # -- task-head adaptation ----------------------------------------------
     # -- task-head adaptation ----------------------------------------------
     # Implemented in relativedb.training; these stay methods so the public
-    # API (engine.fit_head(...), engine.finetune(...)) is unchanged.
-    def finetune(self, *args, **kwargs):
-        """Finetune the full model on labelled anchors. See
-        :func:`relativedb.training.finetune`."""
-        return _training.finetune(self, *args, **kwargs)
-
-    def fit_head(self, *args, **kwargs):
-        """Fit a task head on labelled anchors. See
-        :func:`relativedb.training.fit_head`."""
-        return _training.fit_head(self, *args, **kwargs)
-
-    def _scalar_label(self, *args, **kwargs):
-        return _training._scalar_label(self, *args, **kwargs)
-
-    def _ranking_relevance(self, *args, **kwargs):
-        return _training._ranking_relevance(self, *args, **kwargs)
 
     def _sampler_kind(self) -> str:
         """Which sampler _sampler() will hand back, as a plan-facing name."""

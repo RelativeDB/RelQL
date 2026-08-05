@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from relativedb import (ContextPolicy, Engine, NormalizationMode,
@@ -211,7 +210,7 @@ def test_history_window_labels_are_scoped_to_the_owning_entity(churn_schema):
     examples. C9 has never ordered (every window must be 1.0); C7 ordered in
     Mar and May 2026 (windows covering those months must be 0.0).
     """
-    from relativedb import parse, validate
+    from relativedb import validate
 
     wiring = in_memory_wiring(churn_rows())
     engine = Engine(churn_schema, wiring,
