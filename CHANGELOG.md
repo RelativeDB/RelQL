@@ -1,68 +1,73 @@
 # Changelog
 
-Notable changes to the `relativedb` Python package and the `librt_c` engine
-behind it. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Notable changes to the `relativedb` Python package. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The engine is pre-1.0: the Python API and the RelQL grammar may still change
 between minor versions.
 
-## [Unreleased]
+## [0.1.4] — 2026-08-05
+
+The big one: relativedb is now the query engine and nothing else. Model
+execution, training, and every shared numeric surface moved out to the
+`relational-transformers` and `relational-transformers-utils` packages.
 
 ### Changed
-- **The engine is optional; the Python package is pure.** The distribution
-  split in two: `relativedb` (pure Python + numpy — RelQL parsing,
-  validation, planning, CSC adjacency, the reference walk sampler, the
-  array-backed context assembler, token-batch building, and the remote
-  scoring client) and `relativedb-engine` (librt_c behind the same scorer
-  protocol, plus task-head fitting, full fine-tuning, and the XGBoost
-  backend as its `[xgboost]` extra). Install `relativedb[engine]` for the
-  old all-local behavior, or point the engine at a cloud backend instead:
-  `Engine(schema, wiring, model_backend="https://scoring.example.com")`.
-- **All query parsing and context creation moved out of C++.** The RelQL
-  parser, semantic pass, CSC index, walk primitives and graph assembler were
-  ported to Python (67/67 corpus ASTs identical to the removed parser;
-  randomized CSC/assembler batteries agreed with the removed native
-  implementations before deletion) and their C++ sources deleted. The
-  peer-ranking walk was then vectorized over walks on a raw PCG64 stream —
-  still deterministic per seed, no longer the reference rand-0.9.1 byte
-  stream — so context sampling changed once; the committed fingerprints pin
-  the new sampler, and the row and columnar paths share one draw protocol. The native
-  layer is model-serving only. The flat-feature evaluator stays native but
-  now consumes a feature-spec JSON derived by the new pure-Python
-  `relativedb.flat` — RelQL text never reaches C++.
-- **Text embedding is native-only.** `librt_c` gains a golden-verified
-  MiniLM-L12-v2 encoder (`cpp/src/minilm.*`; exact HF token ids, max |Δ|
-  3e-7 vs sentence-transformers over a 40-text corpus). The Python packages
-  no longer depend on sentence-transformers or torch; the engine package and
-  the serving backend embed through the same native encoder.
+- **Model execution runs on the shared `relational-transformers` runtime.**
+  The native C++ engine (`librt_c`, the `cpp/` tree, the bundled dylib, and
+  every ctypes binding) is gone. The `relativedb.rt` subpackage serves
+  RT-J through torch on CPU/MPS/CUDA, Triton on CUDA for target scores, and
+  ONNX for exported graphs; MiniLM text embedding runs in torch with the
+  same mean-pooled, un-normalized, bfloat16-rounded contract. torch loads
+  lazily, so `import relativedb` stays light for remote-scoring clients.
+- **One package again.** `relativedb-engine` merged back in as
+  `relativedb.rt`; the wheel is pure `py3-none-any`. `rt_triton_serve`
+  ships with `relativedb`.
+- **Shared surfaces live in `relational-transformers-utils`.** Schema
+  shapes, `Row`/`TemporalBound`, the CSC adjacency, the deterministic
+  sampling core (StdRng, rand sampling, the peer-ranking walk, the
+  array-backed `ContextGraph`), the traversal strategies and
+  `ContextPolicy`, the columnar store, per-column normalization statistics,
+  the bfloat16 boundary, and the embedding cache all import from the utils
+  package; relativedb binds them to RelQL through small adapters. The
+  committed sampling fingerprints pin byte parity across the move.
+- **All query parsing and context creation are pure Python.** The RelQL
+  parser, semantic pass, and context assembly ported from C++ earlier in
+  this cycle (67/67 corpus ASTs identical; randomized CSC/assembler
+  batteries agreed with the removed native implementations). The
+  peer-ranking walk is vectorized on a raw PCG64 stream — deterministic per
+  seed; the fingerprints pin the sampler.
+- **Failure feedback names the fix.** `shared_context` misconfiguration
+  reports the traversal in use and the remedies; a fitted head whose task
+  does not match the query warns once instead of being silently unused;
+  the missing-ONNX-export error precedes checkpoint resolution;
+  `RELATIVEDB_RT_QUANTIZED` accepts both the historical and the
+  `rt-quantize` sibling spellings.
+
+### Removed
+- **Training.** It is not reachable through queries, so it left the query
+  engine: `Engine.fit_head`, `Engine.finetune`, and the label-derivation
+  internals are gone. Fit heads with
+  `relational_transformers.fit_feature_head` (binary, regression,
+  multiclass with zero-shot class seeding, grouped ranking) and serve the
+  artifact here by passing `head=` to the backend; fine-tune full
+  checkpoints with `relational_transformers.RelationalTrainer`. Heads saved
+  by the retired native engine need a refit.
+- **The XGBoost flat-feature backend and `relativedb.flat`**, whose
+  evaluator existed only in C++.
+- **Checkpoint quantization tooling** — `rt-quantize` in
+  relational-transformers-utils produces fp8/int8/int4 checkpoints the
+  shared loader accepts.
 
 ### Added
-- **`rt_serve`, the model-serving web backend** (`cpp/src/serve.cpp`): plain
-  HTTP/1.1 over the prepared-token-batch protocol (`/health`, `/v1/embed`,
-  `/v1/forward`, `/v1/flat_features`). Context creation stays client-side;
-  the service embeds raw text and runs the forward. `RemoteBackend`
-  predictions match the in-process backend bit-for-bit.
-- **XGBoost flat-feature backend.** The C++ layer gains a flat-feature
-  planner/evaluator (`cpp/src/flat.*`, exposed as `relql_flat_analyze` /
-  `relql_flat_features` in `librt_c`): it decides whether a RelQL query can
-  run as flat features at all (scalar regression/binary, one horizon, no
-  RANK, no ASSUMING, no ABLATE), derives the feature columns from the query
-  and schema (entity scalars, the target mirrored into recent past windows,
-  the WHERE clause's own aggregates, and the standard per-table
-  COUNT/recency/SUM/AVG/MAX recipe), and evaluates them over assembled
-  contexts with the engine's window semantics (`(anchor+start, anchor+end]`,
-  NaN for missing). `relativedb.xgb.XgboostBackend` (optional extra
-  `relativedb[xgboost]`, XGBoost >= 3.3) wires that matrix into an XGBoost
-  model: `Engine.fit_xgboost(query, anchors)` is the adaptation path next
-  to `fit_head`/`finetune` with the same supervision contract (past-bounded
-  contexts, database-exact derived labels), `save()`/`load()` persist the
-  model with its feature schema, and the fitted backend serves
-  `Engine.execute` through the `ModelBackend` protocol. When the installed
-  XGBoost build has CUDA and a device is visible, fitting and scoring run
-  with `device="cuda"`. `analyze_flat()` answers "can this query run here"
-  without raising, so callers can route ineligible queries to the sequence
-  model.
+- **Real-model integration tiers.** An end-to-end `PREDICT` through
+  retrieval, torch MiniLM embedding, and the rt-j checkpoint; RelQL
+  language coverage on CPU with 256-cell contexts (every RETURN kind,
+  `AS OF` binding, `ASSUMING`, comparison targets, forecast horizons,
+  zero-shot multiclass and ranking, shared context, CSC/retriever sampler
+  parity, reference normalization, and the columnar serving shape); and an
+  error-feedback suite pinning the messages operators actually see.
 
 ## [0.1.3] — 2026-07-26
 
