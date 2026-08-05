@@ -262,7 +262,7 @@ def test_execute_many_pipelines_shared_cohorts_through_the_scorer(
 
 def test_shared_context_refuses_without_a_capable_backend(churn_schema):
     eng = _engine(churn_schema, BatchedStub(batch_size=99))
-    with pytest.raises(ExecutionError, match="shared_context requires"):
+    with pytest.raises(ExecutionError, match="needs a model backend"):
         eng.execute(ExecutionInput(query=CHURN, anchor_time=ANCHOR,
                                    params={"ids": IDS}, shared_context=True))
 

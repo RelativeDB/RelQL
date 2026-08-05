@@ -15,34 +15,65 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Optional, Protocol, Sequence, Union
+from typing import Any, Protocol
+
+from relational_transformers_utils.schema import Schema, TableDef, ValueType
 
 from . import strategies as _strategies
-from .plan import coerce_anchor, effective_anchor, parse_anchor_date
-from .retrieve import CscIndex
 from .errors import ExecutionError
 from .evaluate import eval_bool
 from .model import ModelConfig
-from .plan import (QueryPlan, aggregate_assumptions, assumptions, build_plan,
-                   pinned_ids, pure_pin)
-from .relql.ast import (Ablation, AggFunc, Explain, Operator, ParsedQuery,
-                        TaskType, _find_aggregations)
+from .plan import (
+    QueryPlan,
+    aggregate_assumptions,
+    assumptions,
+    build_plan,
+    coerce_anchor,
+    effective_anchor,
+    parse_anchor_date,
+    pinned_ids,
+    pure_pin,
+)
+from .relql.ast import (
+    Ablation,
+    AggFunc,
+    Explain,
+    Operator,
+    ParsedQuery,
+    TaskType,
+    _find_aggregations,
+)
 from .relql.parser import parse, validate
-from .retrieve import RetrieverWiring, Row, TemporalBound
-from relational_transformers_utils.schema import Schema, TableDef, ValueType
-from .traversal import (BreadthFirstTraversal, ContextPolicy,
-                        GraphTraversal, ReferenceTraversal)
+from .retrieve import CscIndex, RetrieverWiring, Row, TemporalBound
+from .traversal import (
+    BreadthFirstTraversal,
+    ContextPolicy,
+    GraphTraversal,
+    ReferenceTraversal,
+)
 
 __all__ = [
-    "SamplerMode", "ContextPolicy", "ExecutionInput", "EntityContext",
-    "EntityPrediction", "PredictionResult", "ExplainResult", "ModelBackend",
-    "Engine", "ExecutionError",
-    "ContextTruncationWarning", "AssumptionNotAppliedWarning",
-    "ContextCompositionWarning", "InvisibleTableWarning",
-    "GraphTraversal", "BreadthFirstTraversal", "ReferenceTraversal",
+    "AssumptionNotAppliedWarning",
+    "BreadthFirstTraversal",
+    "ContextCompositionWarning",
+    "ContextPolicy",
+    "ContextTruncationWarning",
+    "Engine",
+    "EntityContext",
+    "EntityPrediction",
+    "ExecutionError",
+    "ExecutionInput",
+    "ExplainResult",
+    "GraphTraversal",
+    "InvisibleTableWarning",
+    "ModelBackend",
+    "PredictionResult",
+    "ReferenceTraversal",
+    "SamplerMode",
 ]
 
 # Aggregations whose value grows with the number of rows in the window, and so
@@ -52,8 +83,8 @@ _COUNTING_AGGS = frozenset({AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG})
 
 
 def _apply_assumptions(assignments: list[tuple[str, str, Any]],
-                       ctx: "EntityContext",
-                       entity_table: Optional[str] = None) -> "EntityContext":
+                       ctx: EntityContext,
+                       entity_table: str | None = None) -> EntityContext:
     """A copy of ``ctx`` in which the assumed values hold.
 
     An assignment on the **entity table** intervenes on the entity's own row
@@ -98,7 +129,7 @@ def _apply_assumptions(assignments: list[tuple[str, str, Any]],
                          node_ids=dict(ctx.node_ids))
 
 
-def _apply_ablations(ablations, ctx: "EntityContext") -> "EntityContext":
+def _apply_ablations(ablations, ctx: EntityContext) -> EntityContext:
     """A copy of ``ctx`` with every row of each ablated table removed —
     ``ABLATE TABLE t`` scores the query as if ``t`` did not exist. The engine
     rejects ablating the entity table before this runs, so the entity's own
@@ -116,10 +147,10 @@ def _apply_ablations(ablations, ctx: "EntityContext") -> "EntityContext":
                          node_ids=dict(ctx.node_ids))
 
 
-def _apply_aggregate_assumptions(agg_conds, ctx: "EntityContext",
+def _apply_aggregate_assumptions(agg_conds, ctx: EntityContext,
                                  entity_table: str,
-                                 schema: Optional[Schema],
-                                 fetch_template=None) -> "EntityContext":
+                                 schema: Schema | None,
+                                 fetch_template=None) -> EntityContext:
     """Reshape the context so an ``ASSUMING COUNT(t.*) OVER (...) >= k``
     (or EXISTS / NOT EXISTS) bound holds for the entity.
 
@@ -237,9 +268,9 @@ def _apply_aggregate_assumptions(agg_conds, ctx: "EntityContext",
 
 
 def _warn_inert_assumptions(assignments: list[tuple[str, str, Any]],
-                            contexts: list["EntityContext"],
-                            entity_table: Optional[str] = None,
-                            schema: Optional[Schema] = None) -> None:
+                            contexts: list[EntityContext],
+                            entity_table: str | None = None,
+                            schema: Schema | None = None) -> None:
     """Say it when an ASSUMING assignment cannot reach the model.
 
     Three ways an assumption goes silently inert, each reported rather than
@@ -364,7 +395,7 @@ def _warn_invisible_tables(schema: Schema) -> None:
             InvisibleTableWarning, stacklevel=3)
 
 
-def _emitted_cells(r: Row, tdef: "TableDef",
+def _emitted_cells(r: Row, tdef: TableDef,
                    fk_feature_cols: Sequence[str]) -> int:
     """Feature tokens this row actually contributes to the model input:
     declared non-key non-null cells plus feature-typed FK values. A bare
@@ -376,9 +407,9 @@ def _emitted_cells(r: Row, tdef: "TableDef",
                    if r.parents.get(fk) is not None)
 
 
-def _warn_context_health(contexts: list["EntityContext"],
-                         schema: Optional[Schema],
-                         policy: "ContextPolicy") -> None:
+def _warn_context_health(contexts: list[EntityContext],
+                         schema: Schema | None,
+                         policy: ContextPolicy) -> None:
     """One aggregate report on what actually reached the model.
 
     Found the hard way: an experiment ran for hours with 100% of contexts
@@ -479,18 +510,18 @@ class SamplerMode(Enum):
 
 @dataclass(frozen=True)
 class ExecutionInput:
-    query: Union[str, ParsedQuery]
-    anchor_time: Optional[datetime] = None       # "now"; None = unbounded
+    query: str | ParsedQuery
+    anchor_time: datetime | None = None       # "now"; None = unbounded
     per_entity_anchor: bool = False              # anchor_time="entity" semantics
-    context_anchor_time: Optional[datetime] = None  # decouple context "now"
+    context_anchor_time: datetime | None = None  # decouple context "now"
     # `:name` bindings for the query text — the anchor (`AS OF :t`), the
     # cohort (`WHERE t.pk IN :ids`), and any other parameterized literal.
-    params: Optional[dict[str, Any]] = None
+    params: dict[str, Any] | None = None
     # The cohort as data: score exactly these entities of the FROM table,
     # leaving the query text untouched. Takes precedence over a WHERE-derived
     # cohort. This is how a caller evaluates one query over many batches
     # without rewriting it per batch.
-    entity_ids: Optional[Sequence[Any]] = None
+    entity_ids: Sequence[Any] | None = None
     # Score the whole cohort inside ONE shared context: every entity's target
     # is masked in the same sequence and read from its own token, so cohort
     # members never see each other's outcomes (strictly less exposure than
@@ -502,7 +533,7 @@ class ExecutionInput:
     # same cohort and predicts exactly 0 wherever that probability falls
     # below this gate. The gate is a protocol hyperparameter — tune it on a
     # validation split, never on test.
-    hurdle_gate: Optional[float] = None
+    hurdle_gate: float | None = None
 
 
 @dataclass
@@ -510,7 +541,7 @@ class EntityContext:
     """The assembled per-entity context: seed entity row + traversed rows."""
 
     entity_id: Any
-    anchor: Optional[datetime]
+    anchor: datetime | None
     rows: list[Row] = field(default_factory=list)
     truncated_children: int = 0     # children dropped by the fanout cap (F-trunc)
     hit_cell_budget: bool = False   # assembly stopped on max_context_cells
@@ -555,12 +586,12 @@ class EntityContext:
 @dataclass(frozen=True)
 class EntityPrediction:
     id: Any
-    value: Optional[float] = None                 # regression / score
-    probability: Optional[float] = None           # binary classification
+    value: float | None = None                 # regression / score
+    probability: float | None = None           # binary classification
     class_probs: dict[str, float] = field(default_factory=dict)
     ranked: tuple = ()                            # RANK TOP K
     forecast: tuple = ()                          # FORECAST N
-    predicted_class: Optional[str] = None         # RETURN CLASS hard label
+    predicted_class: str | None = None         # RETURN CLASS hard label
 
 
 @dataclass(frozen=True)
@@ -571,7 +602,7 @@ class PredictionResult:
     stats: dict = field(default_factory=dict)   # context-assembly diagnostics
 
 
-def _pred_to_dict(p: "EntityPrediction") -> dict:
+def _pred_to_dict(p: EntityPrediction) -> dict:
     return {
         "id": p.id,
         "value": p.value,
@@ -594,9 +625,9 @@ class ExplainResult:
     mode: str                        # PLAN | CONTEXT | ANALYZE | ABLATION
     format: str                      # TEXT | JSON
     plan: dict
-    context: Optional[dict] = None
-    predictions: Optional[tuple["EntityPrediction", ...]] = None
-    ablation: Optional[dict] = None
+    context: dict | None = None
+    predictions: tuple[EntityPrediction, ...] | None = None
+    ablation: dict | None = None
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -752,13 +783,13 @@ class _RetrieverSampler:
                     break
         return out
 
-    def all_ids(self, table: str) -> Optional[list[Any]]:
+    def all_ids(self, table: str) -> list[Any] | None:
         if table in self.wiring.scanners:
             scanner = self.wiring.scanner(table)
             return [r.id for r in scanner(table, TemporalBound.unbounded())]
         return None
 
-    def all_rows(self, table: str) -> Optional[list[Row]]:
+    def all_rows(self, table: str) -> list[Row] | None:
         scanner = self.wiring.scanners.get(table)
         return (None if scanner is None else
                 list(scanner(table, TemporalBound.unbounded())))
@@ -795,11 +826,11 @@ def _newest_first_key(r: Row):
 
 class Engine:
     def __init__(self, schema: Schema, wiring: RetrieverWiring, *,
-                 model_config: Optional[ModelConfig] = None,
-                 model_backend: Optional[Union[ModelBackend, str]] = None,
-                 context_policy: Optional[ContextPolicy] = None,
+                 model_config: ModelConfig | None = None,
+                 model_backend: ModelBackend | str | None = None,
+                 context_policy: ContextPolicy | None = None,
                  sampler_mode: SamplerMode = SamplerMode.RETRIEVER,
-                 traversal: Optional[GraphTraversal] = None):
+                 traversal: GraphTraversal | None = None):
         self.schema = schema
         self.wiring = wiring
         if isinstance(model_backend, str):
@@ -810,7 +841,7 @@ class Engine:
                                           wiring=wiring)
         _warn_invisible_tables(schema)
         self.model_config = model_config or ModelConfig.defaults()
-        self.model_backend: Optional[ModelBackend] = model_backend
+        self.model_backend: ModelBackend | None = model_backend
         self.context_policy = context_policy or ContextPolicy()
         self.sampler_mode = sampler_mode
         # Pull-per-hop by default. The retrievers turn a walk into bounded
@@ -825,7 +856,7 @@ class Engine:
         self.traversal = traversal or BreadthFirstTraversal()
         # Built on first use and immutable thereafter: to pick up changed
         # data, construct a new Engine.
-        self._csc_index: Optional[CscIndex] = None
+        self._csc_index: CscIndex | None = None
 
     def _check_ablations(self, pq: ParsedQuery) -> None:
         """ABLATE TABLE names must be real and must not be the entity table:
@@ -882,9 +913,9 @@ class Engine:
 
     # -- context assembly ---------------------------------------------------
     def assemble_context(self, entity_table: str, entity_id: Any,
-                         anchor: Optional[datetime],
-                         policy: Optional[ContextPolicy] = None, *,
-                         query: Optional[ParsedQuery] = None) -> EntityContext:
+                         anchor: datetime | None,
+                         policy: ContextPolicy | None = None, *,
+                         query: ParsedQuery | None = None) -> EntityContext:
         """Assemble a bounded context with the configured graph traversal."""
         policy = policy or self.context_policy
         sampler = self._sampler()
@@ -922,8 +953,8 @@ class Engine:
         if (workers <= 1 or len(ids) <= 1
                 or not isinstance(self.traversal, BreadthFirstTraversal)):
             return [build(eid) for eid in ids]
-        import contextvars
         import concurrent.futures as _futures
+        import contextvars
         workers = min(workers, len(ids))
         parent = contextvars.copy_context()
         with _futures.ThreadPoolExecutor(max_workers=workers,
@@ -932,7 +963,7 @@ class Engine:
             return [future.result() for future in futures]
 
     # -- execution ----------------------------------------------------------
-    def execute(self, input: Union[ExecutionInput, str], **kwargs) -> PredictionResult:
+    def execute(self, input: ExecutionInput | str, **kwargs) -> PredictionResult:
         if isinstance(input, str):
             input = ExecutionInput(query=input, **kwargs)
         pq = (parse(input.query) if isinstance(input.query, str)
@@ -1033,11 +1064,7 @@ class Engine:
                 "scoring")
         if not ids:
             return ("empty", None, None)
-        if (not hasattr(self.traversal, "cohort_targets")
-                or not hasattr(backend, "prepare_shared")):
-            raise ExecutionError(
-                "shared_context requires the reference traversal and the "
-                "native RT backend")
+        self._require_shared_capability(backend)
         seed = ids[0]
         anchor = self._anchor_for(entity_table, seed, input)
         # Chunk sizing just assembled this exact context (the first chunk's
@@ -1130,11 +1157,32 @@ class Engine:
             for i in range(0, len(group), limit):
                 yield group[i:i + limit]
 
+    def _require_shared_traversal(self) -> None:
+        if not hasattr(self.traversal, "cohort_targets"):
+            raise ExecutionError(
+                f"shared_context needs a traversal that can build cohort "
+                f"targets (ReferenceTraversal or ColumnarTraversal); this "
+                f"engine uses {type(self.traversal).__name__}. Construct the "
+                f"Engine with traversal=ReferenceTraversal(), or drop "
+                f"shared_context=True to score per entity")
+
+    def _require_shared_capability(self, backend) -> None:
+        """Fail fast, and precisely, when shared context cannot run."""
+        self._require_shared_traversal()
+        if not hasattr(backend, "prepare_shared"):
+            raise ExecutionError(
+                f"shared_context needs a model backend with prepare_shared "
+                f"(RtBackend or another SequenceBackend); this engine uses "
+                f"{type(backend).__name__}")
+
     def _cohort_chunk_limit(self, pq: ParsedQuery, input: ExecutionInput,
                             entity_table: str, group: list[Any],
                             backend) -> int:
         """Members per shared-context chunk, from measured injection cost
         unless ``ContextPolicy.cohort_chunk`` fixes it."""
+        # Fail here, precisely, rather than warn about a failed sizing probe
+        # and then fail one call later in _prepare_shared.
+        self._require_shared_traversal()
         configured = self.context_policy.cohort_chunk
         if configured is not None:
             return len(group) if configured <= 0 else configured
@@ -1173,7 +1221,7 @@ class Engine:
     def _execute_shared(self, pq: ParsedQuery, input: ExecutionInput,
                         task_type: TaskType, model_uri: str,
                         entity_table: str, ids: list[Any],
-                        backend) -> Optional[PredictionResult]:
+                        backend) -> PredictionResult | None:
         """Score the cohort in shared contexts (one forward per anchor group).
 
         Returns None when the traversal has no matching shared state, in
@@ -1297,7 +1345,7 @@ class Engine:
 
         # (idx, task_type, model_uri, [(future-or-preds, group_stats), ...])
         scored: list[tuple] = []
-        results: list[Optional[PredictionResult]] = [None] * len(inputs)
+        results: list[PredictionResult | None] = [None] * len(inputs)
         serial: list[int] = []
         producer = threading.Thread(target=produce, daemon=True)
         producer.start()
@@ -1407,7 +1455,7 @@ class Engine:
             scanner = self.wiring.scanners.get(table)
             if scanner is None:
                 return []
-            newest: Optional[Row] = None
+            newest: Row | None = None
             for r in scanner(table, bound):
                 if newest is None or _newest_first_key(r) < _newest_first_key(newest):
                     newest = r
@@ -1420,7 +1468,7 @@ class Engine:
 
     def _where_ok(self, pq: ParsedQuery, ctx: EntityContext,
                   entity_table: str,
-                  anchor_override: Optional[datetime] = None) -> bool:
+                  anchor_override: datetime | None = None) -> bool:
         # WHERE is a factual filter at the query's anchor. When
         # context_anchor_time decouples the context "now", the override keeps
         # WHERE at the true anchor instead of the context's.
@@ -1438,7 +1486,7 @@ class Engine:
 
     def _where_agg_rows(self, pq: ParsedQuery, ctx: EntityContext,
                         entity_table: str,
-                        anchor: Optional[datetime] = None
+                        anchor: datetime | None = None
                         ) -> dict[str, list[Row]]:
         """Database-exact rows for each table a WHERE aggregation touches.
 
@@ -1527,7 +1575,7 @@ class Engine:
         return ids
 
     def _anchor_for(self, entity_table: str, entity_id: Any,
-                    input: ExecutionInput) -> Optional[datetime]:
+                    input: ExecutionInput) -> datetime | None:
         anchor = input.context_anchor_time or input.anchor_time
         if input.per_entity_anchor:
             rows = self._sampler().entities(entity_table, [entity_id],
@@ -1551,7 +1599,7 @@ class Engine:
     # The rules live in relativedb.anchors (pure, no engine state). These stay
     # as methods because callers and subclasses already use them.
     def _effective_anchor(self, pq: ParsedQuery,
-                          input: ExecutionInput) -> Optional[datetime]:
+                          input: ExecutionInput) -> datetime | None:
         return effective_anchor(pq.as_of, input.anchor_time, input.params)
 
     _coerce_anchor = staticmethod(coerce_anchor)
@@ -1569,9 +1617,9 @@ class Engine:
         return "csc" if self.sampler_mode is SamplerMode.CSC else "retriever"
 
     def _plan(self, pq: ParsedQuery, input: ExecutionInput,
-              effective: Optional[datetime], *,
-              cohort_size: Optional[int] = None,
-              logical: Optional[dict] = None) -> QueryPlan:
+              effective: datetime | None, *,
+              cohort_size: int | None = None,
+              logical: dict | None = None) -> QueryPlan:
         """Build the plan for one query. Both execute() and explain() go
         through here, which is what keeps EXPLAIN honest.
 
@@ -1594,7 +1642,7 @@ class Engine:
             logical=logical,
         )
 
-    def explain(self, input: Union[ExecutionInput, str], **kwargs) -> ExplainResult:
+    def explain(self, input: ExecutionInput | str, **kwargs) -> ExplainResult:
         """Explain a query without (PLAN/CONTEXT) or with (ANALYZE) scoring.
         A non-EXPLAIN query is explained as PLAN by default."""
         if isinstance(input, str):
@@ -1615,9 +1663,9 @@ class Engine:
         # would actually happen rather than a separately-derived description.
         self._check_ablations(pq)
         plan = self._plan(pq, input, effective, logical=_logical).to_dict()
-        context: Optional[dict] = None
-        predictions: Optional[tuple[EntityPrediction, ...]] = None
-        ablation: Optional[dict] = None
+        context: dict | None = None
+        predictions: tuple[EntityPrediction, ...] | None = None
+        ablation: dict | None = None
 
         if mode == "ABLATION":
             ablation, predictions = self._ablation_report(pq, input, effective)
@@ -1640,7 +1688,7 @@ class Engine:
                              ablation=ablation)
 
     def _score_ready_contexts(self, pq: ParsedQuery, input: ExecutionInput,
-                              effective: Optional[datetime]
+                              effective: datetime | None
                               ) -> list[EntityContext]:
         """Contexts exactly as scoring would see them: assembled, WHERE-
         filtered, declared ablations dropped, assumptions applied."""
@@ -1666,7 +1714,7 @@ class Engine:
                 if ctx is not None]
 
     def _ablation_report(self, pq: ParsedQuery, input: ExecutionInput,
-                         effective: Optional[datetime]):
+                         effective: datetime | None):
         """Contract: EXPLAIN ABLATE. Score the query as written, then once
         per candidate ablation — every non-entity schema table present in the
         contexts, and every declared non-key column carrying values — and
@@ -1771,7 +1819,7 @@ class Engine:
         return report, tuple(base_preds)
 
     def _assemble_report(self, pq: ParsedQuery, input: ExecutionInput,
-                         effective: Optional[datetime]):
+                         effective: datetime | None):
         """Assemble per-entity context via the normal path (no scoring) and
         summarize it (contract: EXPLAIN CONTEXT)."""
         contexts = self._score_ready_contexts(pq, input, effective)

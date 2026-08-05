@@ -12,18 +12,26 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
-
-from relativedb.scoring import (D_TEXT, ForwardResult, ScoringError,
-                                TokenBatch, bf16_as_f32)
-
 from relational_transformers_utils.text import CachedEncoder
 
+from relativedb.scoring import (
+    D_TEXT,
+    ForwardResult,
+    ScoringError,
+    TokenBatch,
+    bf16_as_f32,
+)
 
-__all__ = ["RelationalScorer", "NativeScorer", "TextEncoder",
-           "NativeTextEncoder", "resolve_minilm_snapshot"]
+__all__ = [
+    "NativeScorer",
+    "NativeTextEncoder",
+    "RelationalScorer",
+    "TextEncoder",
+    "resolve_minilm_snapshot",
+]
 
 _MINILM_REPO = "sentence-transformers/all-MiniLM-L12-v2"
 DEFAULT_MODEL = _MINILM_REPO
@@ -39,7 +47,7 @@ _TORCH_DEVICE_NAMES = {
 }
 
 
-def torch_device_name(device: Optional[int]) -> Optional[str]:
+def torch_device_name(device: int | None) -> str | None:
     """Map a legacy integer device constant to a torch device string."""
     if device is None:
         return None
@@ -147,7 +155,7 @@ def resolve_model_path(uri: str) -> str:
         f"cannot resolve model uri {uri!r} (not a path, not hf://)")
 
 
-def resolve_minilm_snapshot() -> Optional[str]:
+def resolve_minilm_snapshot() -> str | None:
     """Resolve (and if needed download) the pinned MiniLM snapshot directory.
 
     Returns None when huggingface_hub is unavailable; the encoder then reports
@@ -165,7 +173,7 @@ def resolve_minilm_snapshot() -> Optional[str]:
 class TorchTextEncoder:
     """The MiniLM encoder, loaded once and kept on the device."""
 
-    def __init__(self, model_dir: Optional[str] = None,
+    def __init__(self, model_dir: str | None = None,
                  device: str = "cuda", batch: int = 256):
         import torch
         from transformers import AutoModel, AutoTokenizer
@@ -221,8 +229,8 @@ class TextEncoder(CachedEncoder):
     default (un-normalized) matches training for text CELL values.
     """
 
-    def __init__(self, *, snapshot_dir: Optional[str] = None,
-                 device: Optional[str] = None):
+    def __init__(self, *, snapshot_dir: str | None = None,
+                 device: str | None = None):
         super().__init__()
         self._snapshot_dir = snapshot_dir
         self._device = device
@@ -262,13 +270,13 @@ class RelationalScorer:
     chunks and multi-task queries do not reload 342 MB of weights.
     """
 
-    def __init__(self, *, lib_path: Optional[str] = None,
-                 embedder: Optional[TextEncoder] = None,
+    def __init__(self, *, lib_path: str | None = None,
+                 embedder: TextEncoder | None = None,
                  n_threads: int = 0,
-                 device: Optional[int] = None,
+                 device: int | None = None,
                  cuda_backend: str = "triton",
                  inference_backend: str = "auto",
-                 onnx_model_path: Optional[str] = None):
+                 onnx_model_path: str | None = None):
         if cuda_backend not in ("triton", "torch"):
             raise ValueError("cuda_backend must be 'triton' or 'torch'")
         if inference_backend not in ("auto", "torch", "triton", "onnx"):
@@ -348,14 +356,17 @@ class RelationalScorer:
         return "torch"
 
     def _relational_model_for(self, model_uri: str, backend: str, device: int):
-        path = resolve_model_path(model_uri)
         if backend == "onnx":
+            # Checked before checkpoint resolution: the actionable problem is
+            # the missing export, not whatever the torch URI resolves to.
             if not self.onnx_model_path:
                 raise ScoringError(
                     "inference_backend='onnx' requires onnx_model_path pointing "
                     "to an exported RT-J ONNX model"
                 )
             path = os.fspath(self.onnx_model_path)
+        else:
+            path = resolve_model_path(model_uri)
         torch_device = torch_device_name(device)
         key = (path, backend, torch_device)
         if key not in self._relational_models:

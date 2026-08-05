@@ -29,35 +29,65 @@ from __future__ import annotations
 import json
 import math
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Protocol
 
 import numpy as np
+from relational_transformers_utils.normalize import ColumnStats as _ColumnStats
+from relational_transformers_utils.normalize import (
+    NormalizationError,
+    bf16_as_f32,
+    normalize_sequence,
+)
+from relational_transformers_utils.normalize import mean_std as _mean_std
+from relational_transformers_utils.schema import Schema, ValueType
 
 from .engine import EntityContext, EntityPrediction
 from .evaluate import eval_bool, eval_value
-from relational_transformers_utils.normalize import ColumnStats as _ColumnStats
-from relational_transformers_utils.normalize import NormalizationError
-from relational_transformers_utils.normalize import bf16_as_f32  # noqa: F401 (re-export)
-from relational_transformers_utils.normalize import normalize_sequence
-from relational_transformers_utils.normalize import mean_std as _mean_std
-
 from .model import ModelConfig, NormalizationMode
-from .relql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef,
-                        Condition, Func, LogicalOp, Not, ParsedQuery, TaskType)
+from .relql.ast import (
+    AggFunc,
+    Aggregation,
+    Arith,
+    Case,
+    ColumnRef,
+    Condition,
+    Func,
+    LogicalOp,
+    Not,
+    ParsedQuery,
+    TaskType,
+)
 from .retrieve import RetrieverWiring, Row, TemporalBound
-from relational_transformers_utils.schema import Schema, ValueType
 from .task import TaskSpec, TaskSpecFactory
 
-__all__ = ["ScoringError", "ContextConnectivityWarning",
-           "ContextTruncationWarning", "ColumnStats", "TokenBatch",
-           "ForwardResult", "Scorer", "SequenceBackend",
-           "D_TEXT", "D_MODEL", "MAX_F2P",
-           "SEM_NUMBER", "SEM_TEXT", "SEM_DATETIME", "SEM_BOOLEAN",
-           "MAX_MULTICLASS_CLASSES", "MAX_RANK_CANDIDATES", "T_SOFTMAX",
-           "FT_BINARY", "FT_REGRESSION", "FT_MULTICLASS", "FT_RANKING",
-           "bf16_as_f32"]
+__all__ = [
+    "D_MODEL",
+    "D_TEXT",
+    "FT_BINARY",
+    "FT_MULTICLASS",
+    "FT_RANKING",
+    "FT_REGRESSION",
+    "MAX_F2P",
+    "MAX_MULTICLASS_CLASSES",
+    "MAX_RANK_CANDIDATES",
+    "SEM_BOOLEAN",
+    "SEM_DATETIME",
+    "SEM_NUMBER",
+    "SEM_TEXT",
+    "T_SOFTMAX",
+    "ColumnStats",
+    "ContextConnectivityWarning",
+    "ContextTruncationWarning",
+    "ForwardResult",
+    "Scorer",
+    "ScoringError",
+    "SequenceBackend",
+    "TokenBatch",
+    "bf16_as_f32",
+]
 
 D_TEXT = 384                    # MiniLM-L12-v2 embedding width
 D_MODEL = 512                   # frozen-backbone feature width (rt_c.h)
@@ -128,7 +158,7 @@ class ColumnStats(_ColumnStats):
 
     @classmethod
     def fit(cls, schema: Schema, wiring: RetrieverWiring,
-            bound: Optional[TemporalBound] = None) -> "ColumnStats":
+            bound: TemporalBound | None = None) -> ColumnStats:
         bound = TemporalBound.unbounded() if bound is None else bound
         scalar = (ValueType.NUMBER, ValueType.BOOLEAN, ValueType.DATETIME)
         tables = {}
@@ -179,7 +209,7 @@ class TokenBatch:
     datetime_v: np.ndarray          # [B, S] float32 (bf16-rounded)
     col_phrases: list[str] = field(default_factory=list)   # per col vocab id
     texts: list[str] = field(default_factory=list)          # distinct strings
-    text_idx: Optional[np.ndarray] = None    # [B, S] int32, -1 = no text
+    text_idx: np.ndarray | None = None    # [B, S] int32, -1 = no text
 
     @property
     def b(self) -> int:
@@ -202,9 +232,9 @@ class ForwardResult:
     * ``"target_features"``: ``features`` is [B, 512] — the frozen backbone's
       output-normalized target-cell state (what task heads train on).
     """
-    scores: Optional[np.ndarray] = None
-    target_text: Optional[np.ndarray] = None
-    features: Optional[np.ndarray] = None
+    scores: np.ndarray | None = None
+    target_text: np.ndarray | None = None
+    features: np.ndarray | None = None
 
 
 class Scorer(Protocol):
@@ -232,7 +262,7 @@ _TASK_TIME_COL = "timestamp"
 _TASK_LABEL_COL = "label"
 
 
-def _sem_of_python_value(v: Any) -> Optional[int]:
+def _sem_of_python_value(v: Any) -> int | None:
     if isinstance(v, bool):
         return SEM_BOOLEAN
     if isinstance(v, (int, float)) and not isinstance(v, bool):
@@ -273,7 +303,7 @@ class _Seq:
     def __len__(self) -> int:
         return len(self.node)
 
-    def clone(self) -> "_Seq":
+    def clone(self) -> _Seq:
         """A deep-enough copy: independent lists so per-candidate ranking rows
         can diverge (target-cell f2p) and normalize their own values."""
         s = _Seq()
@@ -326,16 +356,16 @@ class SequenceBackend:
     ``classes`` and ``column_stats``/``normalization_mode`` attributes.
     """
 
-    def __init__(self, scorer: Scorer, *, schema: Optional[Schema] = None,
-                 wiring: Optional[RetrieverWiring] = None,
+    def __init__(self, scorer: Scorer, *, schema: Schema | None = None,
+                 wiring: RetrieverWiring | None = None,
                  n_threads: int = 0,
                  num_history_windows: int = 3,
                  max_seq_len: int = 2048,      # reference eval uses 8192
-                 column_stats: Optional["ColumnStats"] = None,
-                 normalization_mode: Optional[NormalizationMode | str] = None,
-                 task_spec_factory: Optional[TaskSpecFactory] = None,
-                 head: Optional[Any] = None,
-                 batch_size: Optional[int] = None):
+                 column_stats: ColumnStats | None = None,
+                 normalization_mode: NormalizationMode | str | None = None,
+                 task_spec_factory: TaskSpecFactory | None = None,
+                 head: Any | None = None,
+                 batch_size: int | None = None):
         self.scorer = scorer
         self.schema = schema
         self.wiring = wiring
@@ -363,9 +393,9 @@ class SequenceBackend:
                     head.normalization_mode)
         # A fine-tuned head replaces the checkpoint's zero-shot head for the
         # task it was trained on; every other task still scores zero-shot.
-        self.head: Optional[Any] = head
+        self.head: Any | None = head
 
-    def _mode(self, config: Optional[ModelConfig] = None) -> NormalizationMode:
+    def _mode(self, config: ModelConfig | None = None) -> NormalizationMode:
         return (self.normalization_mode
                 or (config.normalization_mode if config is not None else
                     NormalizationMode.ZERO_SHOT))
@@ -376,14 +406,24 @@ class SequenceBackend:
             raise TypeError("task_spec_factory must return a TaskSpec")
         return spec
 
-    def _head_for(self, task_type: TaskType) -> Optional[Any]:
+    def _head_for(self, task_type: TaskType) -> Any | None:
         """The fine-tuned head, when it was trained for this task type."""
         if self.head is None:
             return None
-        return (self.head if _HEAD_TASK_OF.get(task_type) == self.head.task
-                else None)
+        if _HEAD_TASK_OF.get(task_type) == self.head.task:
+            return self.head
+        if not getattr(self, "_warned_head_mismatch", False):
+            self._warned_head_mismatch = True
+            warnings.warn(
+                f"a fitted head for task {self.head.task!r} is attached, but "
+                f"this query infers {_HEAD_TASK_OF.get(task_type)!r}; the "
+                f"head is NOT used and the zero-shot checkpoint scores "
+                f"instead. Fit a head for this task, or detach head= if "
+                f"zero-shot scoring is intended",
+                UserWarning, stacklevel=4)
+        return None
 
-    def _encode(self, seqs: list["_Seq"], model_uri: str) -> np.ndarray:
+    def _encode(self, seqs: list[_Seq], model_uri: str) -> np.ndarray:
         """Frozen-backbone features ``[len(seqs), 512]`` for these sequences."""
         return self._forward_batched(seqs, model_uri, output="target_features")
 
@@ -524,7 +564,7 @@ class SequenceBackend:
     # one call.
     DEFAULT_PHYSICAL_BATCH = 64
 
-    def _forward_batched(self, seqs: list["_Seq"], model_uri: str, *,
+    def _forward_batched(self, seqs: list[_Seq], model_uri: str, *,
                          output: str = "target_scores"):
         """Run bounded physical forwards while preserving logical ordering."""
         bs = self.batch_size or self.DEFAULT_PHYSICAL_BATCH
@@ -645,7 +685,7 @@ class SequenceBackend:
                 for ctx, vals in zip(contexts, per_ctx)]
 
     @staticmethod
-    def _shape_binary(entity_id: Any, ret_kind: Optional[str],
+    def _shape_binary(entity_id: Any, ret_kind: str | None,
                       p: float) -> EntityPrediction:
         """Shape the model's binary probability per the RETURN clause (moved
         here from the deleted history baseline; operates on the model output,
@@ -664,7 +704,7 @@ class SequenceBackend:
         return EntityPrediction(entity_id, probability=p)
 
     # -- batch building -----------------------------------------------------
-    def _sem_for_cell(self, table: str, col: str, value: Any) -> Optional[int]:
+    def _sem_for_cell(self, table: str, col: str, value: Any) -> int | None:
         if self.schema is not None:
             tdef = self.schema.table(table)
             cdef = tdef.column(col) if tdef else None
@@ -734,7 +774,7 @@ class SequenceBackend:
                 for t in self.schema.tables}
 
     @staticmethod
-    def _severed_parents(seq: "_Seq", node_of: dict) -> set:
+    def _severed_parents(seq: _Seq, node_of: dict) -> set:
         """Tables whose rows are referenced as a parent but emit no tokens.
 
         Attention reaches a row only through its tokens, so a token-less parent
@@ -754,8 +794,8 @@ class SequenceBackend:
     def _build_ctx_seq(self, query: ParsedQuery, task_type: TaskType,
                        ctx: EntityContext, fk_to_parent: dict, labels: list,
                        *, target_sem: int = SEM_NUMBER,
-                       task_spec: Optional[TaskSpec] = None,
-                       target_time_shift: Optional[timedelta] = None,
+                       task_spec: TaskSpec | None = None,
+                       target_time_shift: timedelta | None = None,
                        ) -> tuple[_Seq, dict, int, int]:
         """Assemble one entity's context into a token sequence. Returns
         ``(seq, node_of, entity_node, tgt_idx)``. ``target_sem`` overrides the
@@ -923,9 +963,9 @@ class SequenceBackend:
     def _build_sequences(self, query: ParsedQuery, task_type: TaskType,
                          contexts: list[EntityContext], *,
                          target_sem: int = SEM_NUMBER,
-                         normalization_mode: Optional[NormalizationMode | str] = None,
-                         task_spec: Optional[TaskSpec] = None,
-                         target_time_shift: Optional[timedelta] = None,
+                         normalization_mode: NormalizationMode | str | None = None,
+                         task_spec: TaskSpec | None = None,
+                         target_time_shift: timedelta | None = None,
                          ) -> tuple[list[_Seq], list[float], list[float]]:
         fk_to_parent = self._fk_to_parent()
         task_spec = task_spec or self.task_spec(query, task_type)
@@ -1247,8 +1287,8 @@ class SequenceBackend:
 
     def candidate_seqs(self, query: ParsedQuery, ctx: EntityContext,
                        parent_table: str, candidates: list, *,
-                       normalization_mode: Optional[NormalizationMode | str] = None,
-                       ) -> list["_Seq"]:
+                       normalization_mode: NormalizationMode | str | None = None,
+                       ) -> list[_Seq]:
         """One existence sequence per candidate parent row (§3.2).
 
         The candidate is attached as the masked target cell's parent; if it is
