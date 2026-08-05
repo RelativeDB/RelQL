@@ -550,7 +550,7 @@ class ParsedQuery:
     def _static_or_categorical(col: ColumnRef, schema, default: TaskType) -> TaskType:
         if schema is None:
             return default
-        from ..schema import ValueType
+        from relational_transformers_utils.schema import ValueType
         table = schema.table(col.table)
         cdef = table.column(col.column) if table else None
         if cdef is None:

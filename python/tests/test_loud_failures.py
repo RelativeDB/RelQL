@@ -148,8 +148,8 @@ def test_context_truncation_is_an_error():
     sized from the cell budget therefore binds on a real graph, and used to
     drop the tail of the context before the model saw it."""
     import numpy as np
-    from relativedb.graph import ContextGraph as NativeGraph
-    from relativedb.graph import ContextTruncated
+    from relational_transformers_utils.graph import ContextGraph as NativeGraph
+    from relational_transformers_utils.graph import ContextTruncated
 
     n = 64
     ts = np.full(n, np.nan)

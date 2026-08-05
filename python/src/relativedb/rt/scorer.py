@@ -27,6 +27,8 @@ __all__ = ["RelationalScorer", "NativeScorer", "TextEncoder",
            "NativeTextEncoder", "resolve_minilm_snapshot"]
 
 _MINILM_REPO = "sentence-transformers/all-MiniLM-L12-v2"
+DEFAULT_MODEL = _MINILM_REPO
+D_TEXT_WIDTH = 384
 
 
 def resolve_minilm_snapshot() -> Optional[str]:
@@ -42,6 +44,53 @@ def resolve_minilm_snapshot() -> Optional[str]:
         return snapshot_download(_MINILM_REPO, local_files_only=True)
     except Exception:
         return snapshot_download(_MINILM_REPO)
+
+
+class TorchTextEncoder:
+    """The MiniLM encoder, loaded once and kept on the device."""
+
+    def __init__(self, model_dir: Optional[str] = None,
+                 device: str = "cuda", batch: int = 256):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        name = (model_dir or os.environ.get("RELATIVEDB_MINILM_DIR")
+                or _MINILM_REPO)
+        self._torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(name)
+        # bf16 on GPU, exactly as the reference loads it (rt/embed.py), so the
+        # embeddings the model sees at inference are rounded the same way as
+        # the ones it was trained on.
+        dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
+        self.model = (AutoModel.from_pretrained(name, dtype=dtype)
+                      .to(device).eval())
+        self.device = device
+        self.batch = batch
+
+    def encode(self, texts: Sequence[str], *,
+               normalize: bool = False) -> np.ndarray:
+        texts = list(texts)
+        if not texts:
+            return np.zeros((0, D_TEXT_WIDTH), np.float32)
+        torch = self._torch
+        out = []
+        with torch.inference_mode():
+            for i in range(0, len(texts), self.batch):
+                chunk = texts[i:i + self.batch]
+                enc = self.tokenizer(chunk, padding=True, truncation=True,
+                                     return_tensors="pt").to(self.device)
+                hidden = self.model(**enc).last_hidden_state
+                # Mean pool over real tokens only: padding must not drag a
+                # short phrase toward zero.
+                mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                if normalize:
+                    pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+                # The reference stores these as bf16; round through it so a
+                # value here is bit-for-bit the value training saw, then widen
+                # for the float32 wire.
+                out.append(pooled.to(torch.bfloat16).float().cpu().numpy())
+        return np.concatenate(out, 0).astype(np.float32, copy=False)
 
 
 class TextEncoder(CachedEncoder):
@@ -66,8 +115,6 @@ class TextEncoder(CachedEncoder):
     def _load(self):
         if self._encoder is None:
             import torch
-
-            from .torch_minilm import TorchTextEncoder
 
             device = self._device
             if device is None:

@@ -22,8 +22,8 @@ from typing import Any, Optional, Protocol, Sequence, Union
 
 from . import strategies as _strategies
 from . import training as _training
-from .anchors import coerce_anchor, effective_anchor, parse_anchor_date
-from .csc import CscIndex
+from .plan import coerce_anchor, effective_anchor, parse_anchor_date
+from .retrieve import CscIndex
 from .errors import ExecutionError
 from .evaluate import eval_bool
 from .model import ModelConfig
@@ -33,7 +33,7 @@ from .relql.ast import (Ablation, AggFunc, Explain, Operator, ParsedQuery,
                         TaskType, _find_aggregations)
 from .relql.parser import parse, validate
 from .retrieve import RetrieverWiring, Row, TemporalBound
-from .schema import Schema, TableDef, ValueType
+from relational_transformers_utils.schema import Schema, TableDef, ValueType
 from .traversal import (BreadthFirstTraversal, ContextPolicy,
                         GraphTraversal, ReferenceTraversal)
 

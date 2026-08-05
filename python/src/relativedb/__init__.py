@@ -4,7 +4,7 @@ GraphQL-style execution: the engine owns the query language, planning,
 context assembly, and model routing — all data access goes through
 user-defined retrievers. No bundled database connectors.
 """
-from .schema import ColumnDef, LinkDef, Schema, SchemaError, TableDef, ValueType
+from relational_transformers_utils.schema import ColumnDef, LinkDef, Schema, SchemaError, TableDef, ValueType
 from .retrieve import (CohortRetriever, EntityRetriever, LinkRetriever, Row,
                        RetrieverWiring, TableScanner, TemporalBound,
                        WiringError)
@@ -23,7 +23,7 @@ from .engine import (AssumptionNotAppliedWarning,
                      EntityPrediction, ExecutionError, ExecutionInput,
                      ExplainResult, InvisibleTableWarning, ModelBackend,
                      PredictionResult, SamplerMode)
-from .csc import CscIndex
+from .retrieve import CscIndex
 from .scoring import (ColumnStats, ContextConnectivityWarning, ForwardResult,
                       Scorer, ScoringError, SequenceBackend, TokenBatch)
 from .remote import RemoteBackend, RemoteScorer, RemoteScoringError

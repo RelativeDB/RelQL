@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 from relativedb import parse, validate
-from relativedb.anchors import coerce_anchor, effective_anchor, parse_anchor_date
+from relativedb.plan import coerce_anchor, effective_anchor, parse_anchor_date
 from relativedb.errors import ExecutionError
 
 BASE = "PREDICT NOT EXISTS(orders.*) OVER (90 DAYS FOLLOWING) FROM customers"

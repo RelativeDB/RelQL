@@ -15,7 +15,7 @@ import numpy as np
 from relativedb.model import NormalizationMode
 from relativedb.relql.ast import TaskType
 from relativedb.retrieve import RetrieverWiring
-from relativedb.schema import Schema
+from relational_transformers_utils.schema import Schema
 from relativedb.scoring import (D_MODEL, _FT_TASK_OF, FT_BINARY,
                                 FT_MULTICLASS, FT_RANKING, FT_REGRESSION,
                                 ColumnStats, SequenceBackend, TokenBatch)

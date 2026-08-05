@@ -45,7 +45,7 @@ import numpy as np
 
 from .relql import ParsedQuery, TaskType
 from .retrieve import RetrieverWiring
-from .schema import Schema
+from relational_transformers_utils.schema import Schema
 from .scoring import (MAX_F2P, D_TEXT, ForwardResult,
                       SequenceBackend, TokenBatch)
 

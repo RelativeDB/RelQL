@@ -8,8 +8,8 @@ import pytest
 
 from relativedb import (BreadthFirstTraversal, ContextPolicy, ReferenceTraversal, Engine, ExecutionInput, ModelConfig,
                       Row, SamplerMode, TaskType, TemporalBound)
-from relativedb.csc import CscIndex
-from relativedb.schema import LinkDef
+from relativedb.retrieve import CscIndex
+from relational_transformers_utils.schema import LinkDef
 
 from conftest import StubBackend, churn_rows, dt, in_memory_wiring
 

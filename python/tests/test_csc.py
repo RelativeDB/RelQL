@@ -10,7 +10,7 @@ import random
 
 import pytest
 
-from relativedb.csc import CscAdjacency as NativeCsc
+from relativedb.retrieve import CscAdjacency as NativeCsc
 
 _NEG_INF = -math.inf
 

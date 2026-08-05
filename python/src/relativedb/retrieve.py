@@ -12,12 +12,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Protocol, Sequence, runtime_checkable
 
+from relational_transformers_utils.csc import CscAdjacency  # noqa: F401
+from relational_transformers_utils.csc import CscIndex as _CscIndex
 from relational_transformers_utils.rows import Row, TemporalBound
+from relational_transformers_utils.schema import LinkDef, Schema
 
-from .schema import LinkDef
 
 __all__ = [
-    "TemporalBound", "Row", "EntityRetriever", "LinkRetriever",
+    "TemporalBound", "Row", "CscAdjacency", "CscIndex",
+    "EntityRetriever", "LinkRetriever",
     "CohortRetriever", "TableScanner", "RetrieverWiring", "WiringError",
 ]
 
@@ -125,3 +128,27 @@ class RetrieverWiring:
 
         def build(self) -> "RetrieverWiring":
             return self._w
+
+
+class CscIndex(_CscIndex):
+    """Snapshot index over scanner-provided tables. Rebuild via a new build()."""
+
+    @staticmethod
+    def build(schema: Schema, wiring: RetrieverWiring,
+              bound: TemporalBound = TemporalBound.unbounded(), *,
+              allow_missing_scanners: bool = False) -> "CscIndex":
+        tables = {}
+        for table in schema.tables:
+            scanner = wiring.scanners.get(table.name)
+            if scanner is None:
+                if not allow_missing_scanners:
+                    scanner = wiring.scanner(table.name)  # raises precise error
+                else:
+                    continue  # empty table in the snapshot
+            tables[table.name] = scanner(table.name, bound)
+        built = _CscIndex.build(schema, tables, bound)
+        index = CscIndex()
+        index.rows = built.rows
+        index.dense = built.dense
+        index.adjacency = built.adjacency
+        return index

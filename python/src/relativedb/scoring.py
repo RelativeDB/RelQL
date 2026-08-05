@@ -47,7 +47,7 @@ from .model import ModelConfig, NormalizationMode
 from .relql.ast import (AggFunc, Aggregation, Arith, Case, ColumnRef,
                         Condition, Func, LogicalOp, Not, ParsedQuery, TaskType)
 from .retrieve import RetrieverWiring, Row, TemporalBound
-from .schema import Schema, ValueType
+from relational_transformers_utils.schema import Schema, ValueType
 from .task import TaskSpec, TaskSpecFactory
 
 __all__ = ["ScoringError", "ContextConnectivityWarning",

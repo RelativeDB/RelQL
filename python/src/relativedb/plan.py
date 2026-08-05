@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .errors import ExecutionError
 from .relql.ast import (AggFunc, Aggregation, Arith, BoolOp, Case, ColumnRef,
                         Condition, Func, Lit, LogicalOp, Not, Operator,
                         ParsedQuery, TaskType, Window)
-from .schema import Schema
+from relational_transformers_utils.schema import Schema
 
 __all__ = ["QueryPlan", "build_plan"]
 
@@ -463,3 +463,58 @@ def build_plan(schema: Schema, pq: ParsedQuery, input, *,
         scoring_batch_size=scoring_batch_size,
         pipelined=pipelined,
     )
+
+
+# ---------------------------------------------------------------------------
+# AS OF resolution: the query's clause plus the caller's anchor_time become
+# the one effective anchor everything downstream uses. Pure: needs no schema,
+# wiring, or model.
+# ---------------------------------------------------------------------------
+
+def parse_anchor_date(text: Optional[str]) -> datetime:
+    """``YYYY-MM-DD`` or ``YYYY-MM-DD HH:MM:SS`` -> an aware UTC datetime."""
+    s = (text or "").strip()
+    fmt = "%Y-%m-%d %H:%M:%S" if " " in s else "%Y-%m-%d"
+    try:
+        d = datetime.strptime(s, fmt)
+    except ValueError as e:
+        raise ExecutionError(
+            f"AS OF: cannot parse date {text!r} "
+            f"(expected YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'): {e}")
+    return d.replace(tzinfo=timezone.utc)
+
+
+def coerce_anchor(v: Any) -> datetime:
+    """A bound ``AS OF :param`` value -> an aware UTC datetime."""
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    if isinstance(v, str):
+        return parse_anchor_date(v)
+    raise ExecutionError(
+        f"AS OF param must bind to a datetime or date string, got {v!r}")
+
+
+def effective_anchor(as_of: Any, anchor_time: Optional[datetime],
+                     params: Optional[dict]) -> Optional[datetime]:
+    """Resolve the effective anchor from the query's ``AS OF`` clause.
+
+    Absent/NOW -> ``anchor_time`` (the execution anchor, NOT wall clock);
+    DATE -> the parsed date (overrides); PARAM -> ``params[name]``, else
+    ``anchor_time``, else a clear error.
+    """
+    if as_of is None or as_of.kind == "now":
+        return anchor_time
+    if as_of.kind == "date":
+        return parse_anchor_date(as_of.value)
+    if as_of.kind == "param":
+        name = as_of.value
+        bound = params or {}
+        if name in bound:
+            return coerce_anchor(bound[name])
+        if anchor_time is not None:
+            return anchor_time
+        raise ExecutionError(
+            f"AS OF :{name} — no value bound for parameter {name!r} "
+            f"(supply ExecutionInput.params={{{name!r}: <datetime>}}) and "
+            f"no anchor_time fallback is available")
+    raise ExecutionError(f"unknown AS OF kind {as_of.kind!r}")
