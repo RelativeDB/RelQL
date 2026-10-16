@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -68,7 +68,7 @@ jobs:
           ls ${{ matrix.path }}/dist
           ls ${{ matrix.path }}/dist | grep -q 'py3-none-any\.whl'
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.package }}-dist
           path: ${{ matrix.path }}/dist/*
